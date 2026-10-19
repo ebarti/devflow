@@ -259,6 +259,18 @@ class DeliveryService:
                 continue
             await _dispatch_start(self, client, item, spec)
 
+    async def dispatch_merges_once(self):
+        from .delivery_merge_followup import dispatch
+
+        def pending_requests():
+            with self.store._connect() as db:
+                return db.execute("SELECT 1 FROM delivery_merge_requests "
+                                  "WHERE dispatched=0 AND phase='queued'").fetchone() is not None
+
+        pending = await asyncio.to_thread(pending_requests)
+        if pending:
+            await dispatch(self, await self.healthy_client())
+
     async def dispatch_loop(self) -> None:
         self._retry_stopped = threading.Event()
         self._retry_task = None
@@ -271,6 +283,12 @@ class DeliveryService:
 
     async def _dispatch_loop(self) -> None:
         while True:
+            try:
+                await self.dispatch_merges_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Merge dispatch pending: %s", exc)
             try:
                 await self.dispatch_once()
             except asyncio.CancelledError:
@@ -452,10 +470,14 @@ def create_app(config_path: Path) -> FastAPI:
             service.temporal_status = "disconnected"
         def active_attempts() -> int:
             with service.store._connect() as db:
-                return db.execute(
+                roles = db.execute(
                     """SELECT COUNT(*) FROM delivery_attempts
                        WHERE state IN ('starting','running','unknown')"""
                 ).fetchone()[0]
+                merges = db.execute("SELECT COUNT(*) FROM delivery_merge_requests WHERE "
+                                    "phase IN ('queued','merging','waiting_ci','waiting_tracker',"
+                                    "'unknown')").fetchone()[0]
+                return roles + merges
 
         active = await asyncio.to_thread(active_attempts)
         from .delivery_dashboard import runtime_identity
@@ -584,6 +606,28 @@ def create_app(config_path: Path) -> FastAPI:
             )
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/merge-preflight")
+    async def merge_preflight(request: Request, run_id: str):
+        _host(request)
+        from .delivery_merge_followup import preflight
+
+        try:
+            return await asyncio.to_thread(preflight, service.store, run_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/merge")
+    async def merge_run(request: Request, run_id: str):
+        _mutation(request)
+        from .delivery_merge_followup import admit
+
+        try:
+            return await asyncio.to_thread(admit, service.store, run_id, await request.json())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except TRANSPORT_FAILURES as exc:
+            raise HTTPException(503, str(exc)) from exc
 
 
     @app.get("/api/runs/{run_id}/gates-only-preflight")

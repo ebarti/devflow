@@ -456,6 +456,10 @@ class RunResources:
         finally:
             os.close(descriptor)
 
+    def _admitted_gate_roots(self):
+        observed = getattr(self, "_observation_gate_roots", None)
+        return observed if observed is not None else _gate_roots(self.spec)
+
     def _allowed(self, path: Path, kind: str, *, finalizing: bool = False) -> None:
         installed = Path(__file__).resolve().parents[3]
         resolved = path.resolve()
@@ -467,7 +471,7 @@ class RunResources:
             valid = path == self._execution_scratch_root()
         if kind == "check-artifacts":
             valid = False
-            for root in _gate_roots(self.spec)[1]:
+            for root in self._admitted_gate_roots()[1]:
                 if not path.is_relative_to(root):
                     continue
                 relative = path.relative_to(root)
@@ -480,7 +484,7 @@ class RunResources:
             valid = path == Path(self.spec["checkout"])
         elif kind == "gate":
             valid = False
-            for root in _gate_roots(self.spec)[1]:
+            for root in self._admitted_gate_roots()[1]:
                 if not path.is_relative_to(root / 'gates'):
                     continue
                 relative = path.relative_to(root / 'gates')
@@ -1487,9 +1491,13 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
     # Finalizers publish intermediate manifests under this same exclusive lease.
     # Authenticate one complete generation, including the returned raw-byte hashes.
     with registry.locked(read_only=True) as manifest, ExitStack() as role_leases:
-        return _observe_locked_resources(spec, registry, manifest, role_leases,
-                                         unknown_allowed=unknown_allowed,
-                                         freshly_completed=freshly_completed, attempts=attempts)
+        registry._observation_gate_roots = _gate_roots(spec)
+        result = _observe_locked_resources(spec, registry, manifest, role_leases,
+                                           unknown_allowed=unknown_allowed,
+                                           freshly_completed=freshly_completed, attempts=attempts)
+        if _gate_roots(spec) != registry._observation_gate_roots:
+            raise ValueError("resource execution authority changed during observation")
+        return result
 
 
 def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_allowed=False,

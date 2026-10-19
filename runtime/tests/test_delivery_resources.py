@@ -189,6 +189,35 @@ def spec(root: Path, name: str = "run") -> dict:
     }
 
 
+@pytest.mark.parametrize("changed", [False, True])
+def test_resource_readback_reuses_only_one_observation_and_rechecks_authority(
+    tmp_path, monkeypatch, changed,
+):
+    from devflow_temporal import delivery_resources as resources
+
+    owned = spec(tmp_path)
+    registry = RunResources(owned)
+    registry.scratch("role", "implement")
+    registry.finalize("delivered")
+    original = resources._gate_roots
+    calls = []
+
+    def roots(value):
+        found = original(value)
+        calls.append(found)
+        if changed and len(calls) == 2:
+            return found[0], {*found[1], tmp_path / "new-authority"}
+        return found
+
+    monkeypatch.setattr(resources, "_gate_roots", roots)
+    if changed:
+        with pytest.raises(ValueError, match="authority changed"):
+            resources.observe_finalized_resources(owned)
+    else:
+        assert resources.observe_finalized_resources(owned)["finalization_sha256"]
+    assert len(calls) == 2
+
+
 def test_plan_environment_has_real_broker_ownership_and_safe_cleanup(tmp_path):
     from test_delivery_store import _git
 

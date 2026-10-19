@@ -334,6 +334,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     {run.error ? <p className="inline-alert" role="alert">{run.error}</p> : null}
     <BlockingFindings run={run} />
     {!run.feature_delivery ? <PhaseStrip gates={run.phase_gates} /> : null}
+    <MergeRun key={`merge-${run.id}`} run={run} onRefresh={onRefresh} />
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
     <IntakeHistory run={run} />
     <FeatureDelivery key={`feature-${run.id}`} run={run} onRefresh={onRefresh} />
@@ -348,4 +349,43 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     <TrackerRecovery key={run.id} run={run} onRefresh={onRefresh} />
     <CancelRun run={run} onRefresh={onRefresh} />
   </div>
+}
+
+function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [body, setBody] = useState<Parameters<typeof api.merge>[1] | null>(null)
+  const merge = run.merge
+  if (!merge || merge.phase === 'unavailable' || run.feature_delivery || run.execution_retired) return null
+  const ready = merge.available && run.protocol_revision != null && !!merge.candidate_id && !!merge.head && !!merge.pr_number
+
+  async function submit() {
+    if (busy || (!ready && !body)) return
+    const request = body ?? {
+      command_id: crypto.randomUUID(), expected_revision: run.protocol_revision!,
+      candidate_id: merge!.candidate_id!, head: merge!.head!,
+      pr_number: merge!.pr_number!, answer: 'merge' as const,
+    }
+    setBody(request); setBusy(true); setError('')
+    try {
+      await api.merge(run.id, request)
+      setBody(null)
+      await onRefresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Merge admission could not be confirmed.')
+      if (cause instanceof ApiError && cause.status === 409) setBody(null)
+      await onRefresh()
+    } finally { setBusy(false) }
+  }
+
+  return <section className="section" aria-labelledby="merge-heading">
+    <h2 id="merge-heading">{merge.phase === 'merged' ? 'PR merged' : 'Merge delivered work'}</h2>
+    {merge.available ? <>
+      <p>Merge PR #{merge.pr_number} and close its issue. Devflow will reconcile changes from main, wait for the required checks on the combined result, and report the merge here.</p>
+      <p className="subtle">Conflicting changes that need a product decision will be reported for your input.</p>
+    </> : <p role="status">{merge.phase === 'merged' ? `Merge confirmed ${time(merge.result?.merged_at)}.` : `Merge status: ${titleCase(merge.phase)}.`}{merge.result?.reason ? ` ${merge.result.reason}` : ''}</p>}
+    {merge.available || body ? <button type="button" className="primary-button" disabled={busy || (!ready && !body)} onClick={() => void submit()}>{busy ? 'Requesting merge…' : body && error ? 'Retry same merge request' : `Merge PR #${merge.pr_number}`}</button> : null}
+    {merge.result?.merged_commit ? <p className="mono">Merged commit: {merge.result.merged_commit}</p> : null}
+    {error || merge.error ? <p className="form-error" role="alert">{error || merge.error}{body ? ' The request identity is retained; retrying uses the same authorization.' : ''}</p> : null}
+  </section>
 }

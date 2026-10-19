@@ -352,6 +352,17 @@ class MergeBroker:
 def merge_verified(store, spec, request, cancel_event=None):
     from .delivery_policy_recovery import work_binding
 
+    followup = request.get("merge_authorization")
+    if followup:
+        from .delivery_merge_followup import authorize
+
+        proof = authorize(store, spec, followup)
+        if any(key in request and request[key] != proof[key]
+               for key in ("candidate", "pull_request", "checks")):
+            raise ValueError("merge follow-up request differs from its authorized evidence")
+        return _merge_effect(store, {**spec, "merge_reconciliation_version": 1},
+                             proof["candidate"], proof["pull_request"], proof["checks"],
+                             proof["resources"], cancel_event)
     candidate, pr, checks = (request[key] for key in ("candidate", "pull_request", "checks"))
     with store._connect() as db:
         work_binding(store, spec, db)
@@ -378,6 +389,11 @@ def merge_verified(store, spec, request, cancel_event=None):
     require_merge_gates(spec, candidate, pr, checks, attempts,
                        json.loads(publication["request_json"]))
     resources = observe_finalized_resources(spec)
+    return _merge_effect(store, spec, candidate, pr, saved, resources, cancel_event)
+
+
+def _merge_effect(store, spec, candidate, pr, saved, resources, cancel_event=None):
+    """Shared owned merge/reconciliation path; callers authenticate endpoint authority."""
     broker = MergeBroker(store, spec, cancel_event)
     reconciliation = None
     if spec.get("merge_reconciliation_version") == 1:

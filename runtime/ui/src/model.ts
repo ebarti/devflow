@@ -25,6 +25,17 @@ export interface FeatureState {
 }
 
 export interface RunSummary {
+  merge?: {
+    available: boolean
+    phase: string
+    candidate_id?: string | null
+    head?: string | null
+    pr_number?: number | null
+    command_id?: string | null
+    updated_at?: string | null
+    error?: string | null
+    result?: { state: string; reason?: string; merged_commit?: string; merged_at?: string; head?: string } | null
+  } | null
   feature?: FeatureState | null
   archived?: boolean
   runtime_identity?: RuntimeIdentity | null
@@ -173,6 +184,7 @@ export interface RunDetail extends RunSummary {
   queued?: boolean | null
   cleanup?: string | null
   candidate?: {
+    id?: string | null
     base?: string | null
     base_sha?: string | null
     head?: string | null

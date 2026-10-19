@@ -461,6 +461,9 @@ class DeliveryStore:
             from .delivery_features import initialize as initialize_features
 
             initialize_features(db)
+            from .delivery_merge_followup import initialize as initialize_merges
+
+            initialize_merges(db)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -3883,6 +3886,9 @@ class DeliveryStore:
                 "SELECT COUNT(*),COALESCE(SUM(state!='finished'),0) FROM delivery_attempts "
                 "WHERE run_id=? AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
             ).fetchone()
+            from .delivery_merge_followup import action as merge_action
+
+            merge = merge_action(db, row, spec)
         execution_readback = self._historical_execution_readback(row, spec, unfinished=unfinished)
         if execution_readback:
             effective = self.spec(row["run_id"])
@@ -3899,7 +3905,9 @@ class DeliveryStore:
             "id": row["run_id"],
             "run_id": row["run_id"],
             "work_id": row["work_id"],
-            "title": spec["goal"].splitlines()[0][:120],
+            "title": self._display_title(spec),
+            "goal": spec["goal"],
+            "merge": merge,
             "issue": row["issue_url"],
             "issue_url": row["issue_url"],
             "repository": row["repository_key"],
@@ -3920,6 +3928,15 @@ class DeliveryStore:
             "cleanup_recorded": row["cleanup"],
             **({"execution_readback": execution_readback} if execution_readback else {}),
         }
+
+    @staticmethod
+    def _display_title(spec):
+        summary = spec.get("publication_summary") or spec["goal"].splitlines()[0]
+        summary = re.sub(r"^[a-z]+(?:\([^\n)]+\))?!?:\s+", "", summary)
+        issue = spec.get("issue_url", "").rsplit("/", 1)[-1]
+        repository = spec.get("github_repo", "").rsplit("/", 1)[-1]
+        prefix = f"{repository} #{issue} · " if repository and issue.isdecimal() else ""
+        return prefix + summary[:1].upper() + summary[1:200 - len(prefix)]
 
     def detail(self, run_id: str) -> dict[str, Any]:
         from .delivery_features import projection_failures

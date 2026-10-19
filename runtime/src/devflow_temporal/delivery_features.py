@@ -174,10 +174,18 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
             "checked_at": observation["checked_at"] if observation else None,
             "error": observation["error"] if observation else None,
         })
+    merge_status = None
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_merge_requests'").fetchone():
+        merge = db.execute("SELECT phase FROM delivery_merge_requests WHERE run_id=?",
+                           (run_id,)).fetchone()
+        if merge:
+            merge_status = {"merged": "Merged", "blocked": "Blocked",
+                            "decision_required": "Needs validation", "unknown": "Needs validation"}
+            merge_status = merge_status.get(merge[0], "Merging")
     payload = {
         "issue": key, "run_id": run_id, "work_id": row["work_id"],
         "admitted_at": row["created_at"], "run_revision": row["revision"],
-        "status": _status(row, observations, receipt), "binding": binding,
+        "status": merge_status or _status(row, observations, receipt), "binding": binding,
         "legacy_tracking": spec.get("project_sync_version") != 1
         and row["execution_state"] not in {"terminal", "blocked", "cancelled"},
         "pull_requests": observations,

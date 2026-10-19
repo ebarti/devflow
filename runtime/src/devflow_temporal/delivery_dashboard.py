@@ -135,6 +135,11 @@ def mutate(store, run_id, kind, payload):
         if row["revision"] != payload["expected_revision"]:
             raise ValueError("run state changed; refresh before sending this command")
         if kind == "archive":
+            from .delivery_merge_followup import ACTIVE, current
+
+            merge = current(db, run_id)
+            if merge and merge["phase"] in ACTIVE:
+                raise ValueError("only stopped tasks can be archived; merge is still active")
             active = db.execute(
                 "SELECT 1 FROM delivery_attempts WHERE run_id=? "
                 "AND (state!='finished' OR cleanup='unknown') LIMIT 1",

@@ -127,12 +127,34 @@ request includes `command_id`, `expected_revision` (the protocol revision),
 An explicitly admitted `authorized_endpoint: "merged"` authorizes that transition
 up front; ordinary publication does not.
 
+An ordinary issue-level run that already delivered an unmerged PR has a
+**Merge PR #…** button on its run page. Clicking it is an explicit merge
+instruction; no pending feature decision is required. The equivalent MCP tool is
+`merge_run`. Read `get_run` and send `command_id`, `expected_revision` from
+`protocol_revision`, `candidate_id`, `head` and `pr_number` from `merge`, and
+`answer: "merge"`. The CLI equivalent is `devflow-delivery --config CONFIG merge
+--id RUN --request FILE`; `merge-preflight --id RUN` checks retained native
+evidence without requesting a merge. Keep the entire command stable when its
+response is uncertain. The HTTP boundary is `POST /api/runs/RUN/merge` with the
+normal local session and CSRF protection.
+
+This follow-up keeps the same issue, run, PR, accepted implementation, independent
+reviews, repair count and original publication-only authorization. A separate
+durable merge command owns its Temporal workflow and claim. It mechanically
+reconciles a later main into the PR and waits for required CI on the combined
+tree, without replaying implementation/review workers. Conflicting upstream
+changes are reported for a user decision. The run's `merge` field and event
+timestamps distinguish requested, merging, waiting for CI, uncertain,
+decision-required and confirmed merge states. A lost update or merge response
+is observed under its existing effect identity, never blindly submitted again.
+
 The merge boundary rereads the recorded stack and PR IDs, verifies the exact
 native evidence and required GitHub checks, and requires strict trunk protection
 without bypass actors. It uses `gh stack merge <number> --yes --squash` once for a
 stack, or a head-bound `gh pr merge` for one chunk. Unknown submission results are
-read back without blind replay. A changed head or target requiring new integration
-cannot reuse previous proof. Only confirmed merges whose trees match the verified
+read back without blind replay. Unowned source changes cannot reuse previous
+proof. Mechanical target reconciliation retains original source evidence and
+requires fresh current-target CI. Only confirmed merges whose trees match the verified
 chunks and are incorporated into the target close the issues. An incomplete
 feature with merged PRs is **Partially merged**, never **Merged**. Each child is
 **Merged** only when every required chunk has a confirmed merge observation.

@@ -1,0 +1,523 @@
+"""Public ordinary merge admission keeps native evidence and publication immutable."""
+
+from __future__ import annotations
+
+import copy
+import json
+from threading import Event
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from test_delivery_merge import gates
+from test_delivery_store import service as service
+
+from devflow_temporal import delivery_merge_followup as followup
+from devflow_temporal.contracts import canonical_json, digest
+from devflow_temporal.delivery_api import create_app
+from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_merge import MergeBroker
+from devflow_temporal.delivery_resources import write_private
+from devflow_temporal.supervisor import DeliverySupervisor
+
+
+@pytest.fixture
+def delivered(service, monkeypatch):
+    store, request = service
+    spec = store.config.admit(request)
+    spec.update(
+        provider="codex",
+        resource_cleanup_version=1,
+        terminal_tracker_version=1,
+        publication_base_ref="main",
+    )
+    spec["policy"]["required_ci"] = ["test"]
+    spec["policy"]["execution_backend"] = "native-macos"
+    spec["policy_digest"] = digest(spec["policy"])
+    monkeypatch.setattr(DeliveryConfig, "admit", lambda *_: copy.deepcopy(spec))
+    store.submit(request)
+    spec = store.effective_spec("run-1")
+    _, candidate, pr, checks, attempts, publication = gates()
+    candidate.update(base_sha=spec["base_sha"], policy_digest=spec["policy_digest"])
+    pr.update(url="https://github.com/example/fixture/pull/1", candidate=candidate)
+    # A real supervisor-bound implementation result, not a caller-provided pass.
+    native_request = {
+        "spec": spec,
+        "role": "implement",
+        "iteration": 0,
+        "candidate": {"id": "input"},
+        "workspace": spec["checkout"],
+    }
+    job = DeliverySupervisor._job_key(native_request)
+    from pathlib import Path
+
+    root = Path(spec["state_dir"]) / "attempts" / job
+    assessment = {"status": "pass", "session_id": "implement", "findings": []}
+    process = {
+        "state": "finished",
+        "monitoring_complete": True,
+        "cleanup": "observed-native-confirmed",
+        "journal": str(root / "native-process.json"),
+    }
+    saved = {
+        **assessment,
+        "cleanup": "confirmed",
+        "process_cleanup": "observed-native-confirmed",
+        "resource_cleanup": "pending_workflow_finalization",
+        "native_process": process,
+    }
+    journal = {
+        "phase": "finished",
+        "owned": {"123": {"identity": "owned"}},
+        "intent": {
+            "run_id": spec["run_id"],
+            "policy_digest": spec["policy_digest"],
+            "cwd": spec["checkout"],
+        },
+        "result": process,
+        "provider_session": {
+            "role": "implement",
+            "iteration": 0,
+            "session_id": "implement",
+            "output_candidate": {
+                "id": "source",
+                "head": "source-head",
+                "content_sha256": "contents",
+            },
+            "result_digest": digest(saved),
+        },
+    }
+    for name, value in (
+        ("request.json", native_request),
+        ("result.json", assessment),
+        ("native-process.json", journal),
+    ):
+        write_private(root / name, value)
+    attempts[0].update(
+        job_key=job,
+        candidate_id="input",
+        result_json=canonical_json(saved),
+        result_path=str(root / "result.json"),
+    )
+    with store._connect() as db:
+        for index, attempt in enumerate(attempts):
+            db.execute(
+                "INSERT INTO delivery_attempts "
+                "(job_key,run_id,role,iteration,candidate_id,state,cleanup,session_id,"
+                "result_json,result_path) VALUES (?,?,?,0,?,'finished','confirmed',?,?,?)",
+                (
+                    attempt.get("job_key", str(index)),
+                    spec["run_id"],
+                    attempt["role"],
+                    attempt["candidate_id"],
+                    attempt["session_id"],
+                    attempt["result_json"],
+                    attempt.get("result_path"),
+                ),
+            )
+        db.execute(
+            "UPDATE delivery_runs SET phase='delivered',execution_state='terminal',"
+            "outcome='delivered',cleanup='confirmed',protocol_revision=7,"
+            "candidate_json=?,pr_json=?,checks_json=? WHERE run_id='run-1'",
+            tuple(canonical_json(value) for value in (candidate, pr, checks)),
+        )
+        db.execute(
+            "INSERT INTO delivery_effects VALUES "
+            "('publish:run-1:0','run-1','publish',?,'complete',?,?)",
+            (canonical_json(publication), canonical_json(pr), "2026-10-19T10:00:00Z"),
+        )
+        db.execute("UPDATE delivery_outbox SET state='sent'")
+        store.state.release_work(db, spec["work_id"], "external:devflow:run-1")
+        row = db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone()
+        snapshot = dict(row)
+    monkeypatch.setattr(followup, "observe_finalized_resources", lambda _: {"state": "confirmed"})
+    closed = {
+        "workflow_id": "delivery-run-1",
+        "execution_run_id": "original-execution",
+        "closed_at": "2026-10-19T10:01:00Z",
+        "request_digest": row["request_digest"],
+        "recovery_digest": None,
+        "result": {
+            "run_id": "run-1",
+            "revision": 7,
+            "outcome": "delivered",
+            "cleanup": "confirmed",
+            "candidate": candidate,
+            "pull_request": pr,
+        },
+    }
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda *_, **__: copy.deepcopy(closed))
+    remote = {
+        "number": 1,
+        "html_url": pr["url"],
+        "draft": False,
+        "head": {
+            "sha": pr["head"],
+            "ref": spec["branch"],
+            "repo": {"full_name": spec["github_repo"]},
+        },
+        "base": {
+            "sha": spec["base_sha"],
+            "ref": spec["publication_base_ref"],
+            "repo": {"full_name": spec["github_repo"]},
+        },
+        "merged": False,
+        "state": "open",
+    }
+    monkeypatch.setattr(MergeBroker, "api", lambda *_args, **_kwargs: copy.deepcopy(remote))
+    command = {
+        "command_id": "merge-1",
+        "expected_revision": 7,
+        "candidate_id": candidate["id"],
+        "head": pr["head"],
+        "pr_number": 1,
+        "answer": "merge",
+    }
+    return SimpleNamespace(
+        store=store,
+        spec=spec,
+        command=command,
+        before=snapshot,
+        remote=remote,
+        closed=closed,
+        root=root,
+    )
+
+
+def test_explicit_merge_admission_is_durable_exact_and_does_not_rewrite_delivery(delivered):
+    d = delivered
+    assert followup.preflight(d.store, "run-1")["head"] == "h"
+    first = followup.admit(d.store, "run-1", d.command)
+    assert followup.admit(d.store, "run-1", d.command) == first
+    assert (
+        followup.authorize(d.store, d.spec, first["grant_sha256"])["candidate"]["id"] == "published"
+    )
+    with d.store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+        assert row == d.before
+        assert db.execute("SELECT COUNT(*) FROM delivery_merge_requests").fetchone()[0] == 1
+        assert d.store.state.claim_for(db, d.spec["work_id"])["owner"] == "external:devflow:run-1"
+    assert d.store.effective_spec("run-1")["authorized_endpoint"] == "published_unmerged"
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "revision",
+        "head",
+        "candidate",
+        "permission",
+        "closed",
+        "native",
+        "claim",
+        "pending_effect",
+        "unfinished",
+        "gate",
+    ],
+)
+def test_stale_unowned_or_unverified_work_cannot_acquire_merge_authority(delivered, drift):
+    d = delivered
+    if drift in {"revision", "head", "candidate", "permission"}:
+        key = {
+            "revision": "expected_revision",
+            "head": "head",
+            "candidate": "candidate_id",
+            "permission": "answer",
+        }[drift]
+        d.command[key] = 0 if drift == "revision" else "other"
+    elif drift == "closed":
+        d.closed["result"]["outcome"] = "blocked"
+    elif drift == "native":
+        write_private(d.root / "result.json", {"status": "pass", "session_id": "foreign"})
+    else:
+        with d.store._connect() as db:
+            if drift == "claim":
+                d.store.state.claim_work(db, d.spec["work_id"], "external:other")
+            elif drift == "pending_effect":
+                db.execute("UPDATE delivery_effects SET state='pending'")
+            elif drift == "unfinished":
+                db.execute("UPDATE delivery_attempts SET state='running' WHERE role='verify'")
+            else:
+                checks = json.loads(d.before["checks_json"])
+                checks["qa"]["candidate_id"] = "stale"
+                db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
+    with pytest.raises(ValueError):
+        followup.admit(d.store, "run-1", d.command)
+    with d.store._connect() as db:
+        assert followup.current(db, "run-1") is None
+
+
+def test_second_command_cannot_replace_accepted_authority(delivered):
+    d = delivered
+    first = followup.admit(d.store, "run-1", d.command)
+    with pytest.raises(ValueError):
+        followup.admit(d.store, "run-1", {**d.command, "command_id": "different"})
+    with pytest.raises(ValueError, match="different inputs"):
+        followup.admit(d.store, "run-1", {**d.command, "answer": "merge", "head": "other"})
+    assert followup.admit(d.store, "run-1", d.command) == first
+
+
+def test_active_merge_cannot_be_archived_and_dispatch_error_does_not_replace_completion(delivered):
+    from devflow_temporal.delivery_dashboard import mutate
+
+    d = delivered
+    followup.admit(d.store, "run-1", d.command)
+    with pytest.raises(ValueError, match="merge is still active"):
+        mutate(
+            d.store,
+            "run-1",
+            "archive",
+            {"command_id": "archive", "expected_revision": 1, "archived": True},
+        )
+    followup.record(d.store, d.spec, "merged", {"state": "confirmed"})
+    followup.record(
+        d.store, d.spec, "queued", {"state": "pending"}, "late transport error", only_if="queued"
+    )
+    with d.store._connect() as db:
+        assert followup.current(db, "run-1")["phase"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_public_endpoint_needs_csrf_and_records_only_explicit_merge(delivered):
+    d = delivered
+    app = create_app(d.store.config.path)
+    app.state.delivery.store = d.store
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=d.store.config.dashboard_url
+    ) as client:
+        url = "/api/runs/run-1/merge"
+        assert (await client.post(url, json=d.command)).status_code == 403
+        session = (await client.get("/api/session")).json()
+        headers = {"X-Devflow-CSRF": session["csrf_token"], "Origin": d.store.config.dashboard_url}
+        response = await client.post(url, json=d.command, headers=headers)
+        assert response.status_code == 200, response.text
+        assert (await client.post(url, json=d.command, headers=headers)).json() == response.json()
+
+
+@pytest.mark.parametrize("state", ["pending", "decision_required", "confirmed"])
+def test_merge_only_step_projects_result_and_settles_its_claim(delivered, monkeypatch, state):
+    import devflow_temporal.delivery_merge as merger
+
+    d = delivered
+    admitted = followup.admit(d.store, "run-1", d.command)
+    calls = []
+
+    def merge(store, spec, request, _cancelled):
+        followup.authorize(store, spec, request["merge_authorization"])
+        calls.append("merge")
+        return {"state": state, "reason": "test observation"}
+
+    monkeypatch.setattr(merger, "merge_verified", merge)
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_activities._tracker_sync",
+        lambda *_args, **_kw: {"state": "recorded", "pending": False},
+    )
+    result = followup.step(d.store, d.spec, admitted["grant_sha256"], Event())
+    assert result["state"] == state and calls == ["merge"]
+    with d.store._connect() as db:
+        saved = followup.current(db, "run-1")
+        assert saved["phase"] == {"pending": "waiting_ci", "confirmed": "merged"}.get(state, state)
+        assert bool(d.store.state.claim_for(db, d.spec["work_id"])) == (state == "pending")
+        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 3
+
+
+def test_title_identifies_actual_change_without_altering_original_goal(delivered):
+    spec = {
+        **delivered.spec,
+        "publication_summary": "feat: preview exact cover-letter PDFs",
+        "github_repo": "ebarti/JobCtrl",
+        "issue_url": "https://github.com/ebarti/JobCtrl/issues/1042",
+    }
+    before = copy.deepcopy(spec)
+    assert delivered.store._display_title(spec) == "JobCtrl #1042 · Preview exact cover-letter PDFs"
+    assert spec == before
+
+
+def git_remote(d, monkeypatch):
+    """Real Git trees with a controlled GitHub boundary; never a real PR."""
+    from pathlib import Path
+
+    from test_delivery_merge_reconciliation import Remote
+    from test_delivery_store import _git
+
+    repo = Path(d.spec["source_path"])
+    base = d.spec["base_sha"]
+    (repo / "feature.txt").write_text("Reviewed source\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "feat: reviewed fixture")
+    feature = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "--detach", base)
+    (repo / "main.txt").write_text("New main work\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "chore: advance fixture main")
+    target = _git(repo, "rev-parse", "HEAD")
+    remote = Remote(repo, base)
+    remote.head, remote.target = feature, target
+    remote.merged, remote.merge_calls, remote.issue_state, remote.ci_ready = False, 0, "open", False
+    remote.squash = None
+    remote.lose_merge_ack = False
+
+    def raw():
+        value = remote.raw()
+        value.update(
+            html_url=d.remote["html_url"],
+            merged=remote.merged,
+            state="closed" if remote.merged else "open",
+            merged_at="2026-10-19T10:10:00Z" if remote.merged else None,
+        )
+        value["head"].update(ref=d.spec["branch"], repo={"full_name": d.spec["github_repo"]})
+        value["base"].update(repo={"full_name": d.spec["github_repo"]})
+        if remote.merged:
+            value["merge_commit_sha"] = remote.squash
+        return value
+
+    def api(_broker, endpoint, *, method="GET", body=None, raw=False):
+        if endpoint.endswith("/pulls/1"):
+            return remote.current_raw()
+        if endpoint.endswith("/pulls/1/merge"):
+            assert method == "PUT" and body == {"sha": remote.head, "merge_method": "squash"}
+            remote.squash = _git(
+                repo,
+                "commit-tree",
+                remote.head + "^{tree}",
+                "-p",
+                remote.target,
+                "-m",
+                "Squash fixture",
+            )
+            remote.merged = True
+            remote.merge_calls += 1
+            if remote.lose_merge_ack:
+                remote.lose_merge_ack = False
+                raise TimeoutError("accepted merge response lost")
+            return {"merged": True, "sha": remote.squash}
+        if endpoint.endswith("/issues/3"):
+            if method == "PATCH":
+                remote.issue_state = "closed"
+            return {
+                "html_url": d.spec["issue_url"],
+                "state": remote.issue_state,
+                "state_reason": "completed" if remote.issue_state == "closed" else None,
+            }
+        return remote.api(endpoint, method=method, body=body)
+
+    def live_ci(broker, pr, found, tree):
+        from devflow_temporal.delivery_merge_reconciliation import MergeChecksPending
+
+        assert broker.spec["base_sha"] == remote.target
+        assert pr["head"] == remote.head and tree == remote.commit(remote.head)["tree"]["sha"]
+        if not remote.ci_ready:
+            raise MergeChecksPending("waiting for current-target CI: test")
+        return {"head": remote.head, "base": remote.target, "jobs": [{"name": "test"}]}
+
+    remote.current_raw = raw
+    monkeypatch.setattr(MergeBroker, "api", api)
+    monkeypatch.setattr(MergeBroker, "live_ci", live_ci)
+    monkeypatch.setattr(MergeBroker, "require_base_enforcement", lambda _: {"strict": True})
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_activities._tracker_sync",
+        lambda *_args, **_kw: {"state": "recorded", "pending": False},
+    )
+    with d.store._connect() as db:
+        candidate = json.loads(d.before["candidate_json"])
+        candidate["head"] = feature
+        pr = {**json.loads(d.before["pr_json"]), "candidate": candidate, "head": feature}
+        checks = json.loads(d.before["checks_json"])
+        checks["ci"]["head"] = feature
+        db.execute(
+            "UPDATE delivery_runs SET candidate_json=?,pr_json=?,checks_json=?",
+            tuple(canonical_json(v) for v in (candidate, pr, checks)),
+        )
+        db.execute("UPDATE delivery_effects SET observed_json=?", (canonical_json(pr),))
+    d.command["head"] = feature
+    d.closed["result"].update(candidate=candidate, pull_request=pr)
+    return remote
+
+
+@pytest.mark.parametrize("lost", ["none", "update", "merge"])
+def test_merge_entry_reconciles_real_main_and_waits_for_new_ci_without_another_worker(
+    delivered,
+    monkeypatch,
+    lost,
+):
+    from test_delivery_store import _git
+
+    d = delivered
+    remote = git_remote(d, monkeypatch)
+    remote.lost = lost == "update"
+    remote.lose_merge_ack = lost == "merge"
+    admitted = followup.admit(d.store, "run-1", d.command)
+    bound = admitted["grant_sha256"]
+    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert remote.updates == 1 and remote.merge_calls == 0
+    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert remote.updates == 1 and remote.merge_calls == 0
+    remote.ci_ready = True
+    result = followup.step(d.store, d.spec, bound, Event())
+    if lost == "merge":
+        assert result["state"] == "pending"
+        result = followup.step(d.store, d.spec, bound, Event())
+    assert result["state"] == "confirmed", result
+    assert result["base"] == remote.target and result["head"] == remote.head
+    assert _git(remote.repo, "show", remote.squash + ":feature.txt") == "Reviewed source"
+    assert _git(remote.repo, "show", remote.squash + ":main.txt") == "New main work"
+    assert followup.step(d.store, d.spec, bound, Event()) == result
+    assert remote.merge_calls == 1 and remote.issue_state == "closed"
+    with d.store._connect() as db:
+        assert d.store.state.claim_for(db, d.spec["work_id"]) is None
+        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 3
+        assert followup.current(db, "run-1")["phase"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_real_temporal_dispatch_starts_merge_only_workflow_and_recovers_lost_start_ack(
+    delivered,
+    monkeypatch,
+):
+    import asyncio
+
+    from temporal_test_server import local_temporal
+    from temporalio.worker import Worker
+
+    from devflow_temporal.delivery_activities import (
+        delivery_merge_followup,
+        delivery_merge_followup_failed,
+    )
+    from devflow_temporal.delivery_merge_workflow import MergeWorkflow
+
+    d = delivered
+    remote = git_remote(d, monkeypatch)
+    # This workflow test starts from an already current target; the separate
+    # real-Git test above exercises both asynchronous reconciliation and CI waits.
+    remote.target = remote.original
+    remote.ci_ready = True
+    admitted = followup.admit(d.store, "run-1", d.command)
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_activities._context", lambda _spec: (d.store, None)
+    )
+    service = SimpleNamespace(store=d.store, config=d.store.config)
+    async with local_temporal() as environment:
+        starts = []
+
+        async def start(*args, **kwargs):
+            starts.append(kwargs["id"])
+            return await environment.client.start_workflow(*args, **kwargs)
+
+        transport = SimpleNamespace(
+            get_workflow_handle=environment.client.get_workflow_handle, start_workflow=start
+        )
+        await followup.dispatch(service, transport)
+        with d.store._connect() as db:
+            db.execute("UPDATE delivery_merge_requests SET dispatched=0")
+        await followup.dispatch(service, transport)
+        assert starts == [admitted["workflow_id"]]
+        async with Worker(
+            environment.client,
+            task_queue=d.store.config.queue,
+            workflows=[MergeWorkflow],
+            activities=[delivery_merge_followup, delivery_merge_followup_failed],
+        ):
+            handle = environment.client.get_workflow_handle(admitted["workflow_id"])
+            result = await asyncio.wait_for(handle.result(), 30)
+            assert result["state"] == "confirmed", result
+    assert remote.merge_calls == 1

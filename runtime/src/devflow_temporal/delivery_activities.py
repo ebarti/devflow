@@ -1410,6 +1410,31 @@ async def delivery_merge(request):
         cancelled.set()
 
 
+@activity.defn(name="delivery_merge_followup")
+async def delivery_merge_followup(request):
+    from threading import Event
+
+    from .delivery_merge_followup import step
+
+    store, _ = await asyncio.to_thread(_context, request["spec"])
+    cancelled = Event()
+    try:
+        return await _with_heartbeat(asyncio.to_thread(
+            step, store, request["spec"], request["merge_authorization"], cancelled),
+            request, "merge")
+    finally:
+        cancelled.set()
+
+
+@activity.defn(name="delivery_merge_followup_failed")
+async def delivery_merge_followup_failed(request):
+    from .delivery_merge_followup import failed
+
+    store, _ = await asyncio.to_thread(_context, request["spec"])
+    return await asyncio.to_thread(failed, store, request["spec"],
+                                  request["merge_authorization"], request["reason"])
+
+
 @activity.defn(name="delivery_terminal_preflight")
 async def delivery_terminal_preflight(request):
     def execute():
@@ -1426,6 +1451,8 @@ DELIVERY_ACTIVITIES = [
     delivery_terminal_preflight,
     delivery_terminal_tracker,
     delivery_merge,
+    delivery_merge_followup,
+    delivery_merge_followup_failed,
     delivery_project,
     delivery_prepare,
     delivery_baseline_checks,
