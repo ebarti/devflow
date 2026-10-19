@@ -307,7 +307,7 @@ def audit_feature(db, work, feature):
         field = (observed or {}).get("fieldValueByName") or {}
         result["project_observed"] = observed
         if (not observed or observed["project"]["id"] != receipt["project_id"]
-                or field.get("name") != feature["status"]
+                or str(field.get("name", "")).casefold() != feature["status"].casefold()
                 or field.get("optionId") != receipt["option_id"]):
             result["reconciliation_required"].append("project_status_mismatch")
     for pr in feature["pull_requests"]:

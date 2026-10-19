@@ -342,8 +342,9 @@ def test_project_drift_is_rechecked_at_twenty_four_hours(service):
 
 @pytest.mark.parametrize("assignee", ["owner", "@me"])
 @pytest.mark.parametrize("already_assigned", [True, False])
+@pytest.mark.parametrize("existing_status", [None, "mErGeD"])
 def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
-    assignee, already_assigned,
+    assignee, already_assigned, existing_status,
 ):
     from devflow_temporal.delivery_project_sync import GitHub
 
@@ -351,6 +352,9 @@ def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
         def __init__(self):
             self.options = [{"id": "existing", "name": "Existing", "color": "BLUE",
                              "description": "keep"}]
+            if existing_status:
+                self.options.append({"id": "merged", "name": existing_status,
+                                     "color": "GREEN", "description": "keep"})
             self.status = {"optionId": "existing", "name": "Existing"}
             self.cursors = []
             self.changes = []
@@ -393,7 +397,7 @@ def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
                 }}}
             if "updateProjectV2ItemFieldValue(" in query:
                 self.changes.append(variables)
-                self.status = {"name": "Merged", "optionId": "merged"}
+                self.status = {"name": existing_status or "Merged", "optionId": "merged"}
                 return {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "item"}}}
             if "fieldValueByName" in query:
                 return {"node": {"project": {"id": "project"}, "fieldValueByName": self.status}}
@@ -414,8 +418,9 @@ def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
 
 
 @pytest.mark.parametrize("assignee", ["owner", "@me"])
+@pytest.mark.parametrize("observed_name", ["Awaiting merge", "aWaItInG MeRgE"])
 def test_audit_compares_canonical_status_and_live_pr_not_historical_mapping(
-    service, monkeypatch, assignee,
+    service, monkeypatch, assignee, observed_name,
 ):
     import importlib.util
     import sys
@@ -444,7 +449,7 @@ def test_audit_compares_canonical_status_and_live_pr_not_historical_mapping(
     monkeypatch.setattr(helper, "view", lambda _: {"state": "OPEN",
                                                     "assignees": [{"login": "owner"}]})
     monkeypatch.setattr(helper, "project_item", lambda *_: {
-        "project": {"id": "p"}, "fieldValueByName": {"optionId": "o", "name": "Awaiting merge"},
+        "project": {"id": "p"}, "fieldValueByName": {"optionId": "o", "name": observed_name},
     })
     monkeypatch.setattr(helper, "gh", lambda *args, **_kw: {"login": "owner"}
                         if args[:2] == ("api", "user") else {
