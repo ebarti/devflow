@@ -363,6 +363,40 @@ def test_node_preparation_handoff_names_tool_paths_and_login_shell_environment(s
     assert 'set the recorded environment inside that shell' in task.goal
 
 
+@pytest.mark.parametrize('role', ['implement', 'review', 'verify'])
+def test_large_retained_history_stays_complete_without_overflowing_role_input(service, role):
+    from devflow_temporal.delivery_role_evidence import allocate, read_context
+    from devflow_temporal.role_runner import _task
+
+    _, _broker, request = setup(service)
+    diagnostic = 'retained-diagnostic-' + 'x' * 1_100_000
+    checked = {'candidate_id': request['candidate']['id'], 'state': 'failed',
+               'results': [{'id': 'failed-original-command', 'passed': False,
+                            'diagnostic': diagnostic}]}
+    context = {'checks': {'local': checked}, 'previous_iterations': [
+        {'iteration': 1, 'checks': {'local': checked}}]}
+    request = {**request, 'role': role, 'findings': ['Keep the unresolved source defect'],
+               'evidence_context': context}
+    if role != 'implement':
+        request['check_evidence'] = checked
+    enriched = allocate(request, 'a' * 64)
+    reference = enriched['receipt_handoff']
+    original = Path(reference['path']).read_bytes()
+    assert len(original) > 1_048_576
+    assert read_context(enriched) == context
+    goal = _task(enriched).goal
+    assert len(goal) < 100_000
+    assert reference['path'] in goal and reference['sha256'] in goal
+    assert 'previous_iterations' in goal and 'checks' in goal
+    assert 'Keep the unresolved source defect' in goal
+    assert diagnostic not in goal
+    assert Path(reference['path']).read_bytes() == original
+    # A small prompt cannot waive authentication of its complete evidence.
+    Path(reference['path']).write_bytes(original + b' ')
+    with pytest.raises(ValueError, match='handoff changed'):
+        _task(enriched)
+
+
 @pytest.fixture
 def dependency_handoff(service, monkeypatch):
     """Real receipt producer/store/checkpoints; modeled GitHub transport and role verdicts."""
