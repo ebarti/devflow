@@ -2636,9 +2636,9 @@ class DeliveryWorkflow:
                 self.state["revision"] += 1
                 await self._project(
                     spec, "prepublish_checks",
-                    "Checking preserved candidate before the PR"
+                    "Checking preserved candidate before publication"
                     if resume_prechecks and iteration == start_iteration
-                    else "Checking candidate before the first PR",
+                    else "Checking candidate before publication",
                 )
                 try:
                     prechecked = await self._activity(
