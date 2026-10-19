@@ -66,7 +66,8 @@ def _observe(broker, request, raw):
     return {"head": head, "tree": request["tree"], "base": request["target"]}
 
 
-def reconcile(broker, pr, raw, *, branch=None, base_ref=None, original_base=None):
+def reconcile(broker, pr, raw, *, branch=None, base_ref=None, original_base=None,
+              resolve_conflicts=False):
     """Return current PR/tree/base, a pending readback, or an explicit conflict decision.
 
     GitHub's update-branch endpoint merges the base into the expected head. Its
@@ -117,6 +118,9 @@ def reconcile(broker, pr, raw, *, branch=None, base_ref=None, original_base=None
         return {"state": "decision_required", "reason": "target_history_changed",
                 "target": target, "original_head": pr["head"]}
     if raw.get("mergeable") is False:
+        if resolve_conflicts:
+            return {"state": "resolve_conflicts", "target": target,
+                    "original_head": pr["head"], "previous_head": expected}
         return {"state": "decision_required", "reason": "conflicting_upstream_changes",
                 "target": target, "original_head": pr["head"],
                 "instruction": "Retain the feature and main. Resolve mechanical conflicts; "

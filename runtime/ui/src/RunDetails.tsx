@@ -384,7 +384,14 @@ function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise
       <p>Merge PR #{merge.pr_number} and close its issue. Devflow will reconcile changes from main, wait for the required checks on the combined result, and report the merge here.</p>
       <p className="subtle">Conflicting changes that need a product decision will be reported for your input.</p>
     </> : <p role="status">{merge.phase === 'merged' ? `Merge confirmed ${time(merge.result?.merged_at)}.` : `Merge status: ${titleCase(merge.phase)}.`}{merge.result?.reason ? ` ${merge.result.reason}` : ''}</p>}
-    {merge.available || body ? <button type="button" className="primary-button" disabled={busy || (!ready && !body)} onClick={() => void submit()}>{busy ? 'Requesting merge…' : body && error ? 'Retry same merge request' : `Merge PR #${merge.pr_number}`}</button> : null}
+    {merge.available || body ? <button type="button" className="primary-button" disabled={busy || (!ready && !body)} onClick={() => void submit()}>{busy ? 'Requesting merge…' : body && error ? 'Retry same merge request' : merge.resume ? 'Continue merge reconciliation' : `Merge PR #${merge.pr_number}`}</button> : null}
+    {merge.result?.conflicts?.length ? <p>Resolving {merge.result.conflicts.length} conflicting files while preserving the feature and current main.</p> : null}
+    {merge.result?.decision ? <div role="alert">
+      <p>{merge.result.decision.question}</p>
+      <p>Feature requirement: {merge.result.decision.feature_requirement}</p>
+      <p>Main requirement: {merge.result.decision.main_requirement}</p>
+      <p>{merge.result.decision.why_incompatible}</p>
+    </div> : null}
     {merge.result?.merged_commit ? <p className="mono">Merged commit: {merge.result.merged_commit}</p> : null}
     {error || merge.error ? <p className="form-error" role="alert">{error || merge.error}{body ? ' The request identity is retained; retrying uses the same authorization.' : ''}</p> : null}
   </section>

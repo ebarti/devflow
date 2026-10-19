@@ -22,7 +22,12 @@ and `candidate_id`, `head`, `pr_number` from `merge`. Add a new `command_id` and
 `answer: "merge"`. `merge_preflight` is read-only and does not authorize a merge.
 The runtime retains the original delivery, source evidence, issue and PR;
 mechanically reconciles current main and waits for the combined candidate's CI.
-It reports conflicting directions for user input. Keep the exact request stable
+Textual conflicts run a scoped resolver and independent review on an isolated
+checkout. Both parents' behavior must be preserved; only incompatible product
+requirements produce a user question. A historical generic conflict stop exposes
+**Continue merge reconciliation**; submit a new command with the same observed
+candidate fields to continue under its original grant. It reports conflicting
+directions for user input. Keep the exact request stable
 after uncertainty, and read the run before retrying. Its `merge.phase` and
 `merge.result` distinguish a pending request from a confirmed merge. Never submit
 a replacement run or merge outside this supported boundary as a fallback.

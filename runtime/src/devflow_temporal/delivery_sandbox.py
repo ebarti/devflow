@@ -431,13 +431,20 @@ def prepare_native_role(
     codex_home = role_home / "codex"
     from .delivery_resources import RunResources
 
-    ephemeral_home = RunResources(spec).scratch("role", request["role"])
+    merge_context = request.get("merge_context")
+    if merge_context:
+        from .delivery_merge_resolution import scratch as merge_scratch
+
+        ephemeral_home = merge_scratch(request) / "home"
+    else:
+        ephemeral_home = RunResources(spec).scratch("role", request["role"])
     for path in (role_home, codex_home, ephemeral_home, attempt_dir):
         _private(path)
     environment_version = _native_environment_version(
         attempt_dir, attempt_dir / "native-process.json",
     )
-    scratch = (RunResources(spec).execution_scratch("role", request["role"])
+    scratch = (ephemeral_home.parent / "tmp" if merge_context else
+               RunResources(spec).execution_scratch("role", request["role"])
                if environment_version >= 2 else ephemeral_home / "tmp")
     _private(scratch)
     source = Path(spec["policy"].get("codex_auth_path") or Path.home() / ".codex" / "auth.json")
@@ -457,6 +464,7 @@ def prepare_native_role(
         + ((Path(spec["state_dir"]) / "role-evidence",)
            if request.get("role_evidence_key") else ())
         + (Path(sys.base_prefix),)
+        + ((Path(merge_context["evidence_path"]),) if merge_context else ())
     )
     profile_workspace = workspace
     profile_home = ephemeral_home

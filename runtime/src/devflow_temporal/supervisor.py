@@ -266,6 +266,8 @@ class DeliverySupervisor:
         revision = revision_role_identity(request)
         if revision is not None:
             identity["plan_revision"] = revision
+        if request.get("merge_context"):
+            identity["merge_resolution"] = digest(request["merge_context"])
         return hashlib.sha256(canonical_json(identity).encode()).hexdigest()
 
     def retained_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -339,6 +341,9 @@ class DeliverySupervisor:
         from .delivery_native_guard import validate_revision_role
 
         validate_revision_role(request, self.store)
+        from .delivery_merge_resolution import authenticate as authenticate_merge_role
+
+        authenticate_merge_role(request, self.store)
         if spec["policy"].get("execution_backend") == "native-macos":
             from .delivery_native_guard import validate_native_turn
 
@@ -649,6 +654,9 @@ class DeliverySupervisor:
                 from .delivery_native_guard import validate_revision_role
 
                 validate_revision_role(request, self.store)
+                from .delivery_merge_resolution import authenticate as authenticate_merge_role
+
+                authenticate_merge_role(request, self.store)
                 from .delivery_dashboard import launch_steering
                 from .delivery_role_evidence import allocate
 
@@ -673,6 +681,7 @@ class DeliverySupervisor:
                     timeout=int(spec["policy"]["roles"][request["role"]].get(
                         "timeout_seconds", 7200)),
                     cancelled=cancelled,
+                    register_resources=not bool(request.get("merge_context")),
                 )
                 if cancelled():
                     raise ValueError("native role cancelled before monitor entry")
@@ -1079,6 +1088,16 @@ class DeliverySupervisor:
             return None
 
     def _admit_role_output(self, request: dict[str, Any], result: dict[str, Any]) -> None:
+        if request.get("merge_context"):
+            from .delivery_merge_resolution import validate_output
+
+            try:
+                validate_output(request, result)
+            except (ValueError, RuntimeError, OSError) as exc:
+                result["status"] = "blocked"
+                result["merge_decision"] = None
+                result.setdefault("findings", []).append(str(exc))
+            return
         if request['role'] != 'implement':
             return
         from .delivery_broker import DeliveryBroker

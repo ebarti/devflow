@@ -200,6 +200,52 @@ def test_explicit_merge_admission_is_durable_exact_and_does_not_rewrite_delivery
     assert d.store.effective_spec("run-1")["authorized_endpoint"] == "published_unmerged"
 
 
+def test_conflict_continuation_retains_original_grant_and_is_idempotent(delivered):
+    d = delivered
+    original = followup.admit(d.store, "run-1", d.command)
+    followup.record(d.store, d.spec, "decision_required", {
+        "state": "decision_required", "reason": "conflicting_upstream_changes"})
+    with d.store._connect() as db:
+        before = followup.current(db, "run-1")
+        projected = followup.action(db, d.before, d.spec)
+    assert projected["available"] and projected["resume"]
+    command = {**d.command, "command_id": "continue-conflicts"}
+    continued = followup.admit(d.store, "run-1", command)
+    assert continued["grant_sha256"] == original["grant_sha256"]
+    assert continued["workflow_id"] != original["workflow_id"]
+    assert followup.admit(d.store, "run-1", command) == continued
+    assert followup.authorize(d.store, d.spec, original["grant_sha256"])
+    with d.store._connect() as db:
+        after = followup.current(db, "run-1")
+        assert after["grant_json"] == before["grant_json"]
+        assert after["command_id"] == d.command["command_id"]
+        assert after["phase"] == "queued" and after["dispatched"] == 0
+        assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == d.before
+
+
+def test_real_product_decision_cannot_be_restarted_as_a_routine_conflict(delivered):
+    d = delivered
+    followup.admit(d.store, "run-1", d.command)
+    followup.record(d.store, d.spec, "decision_required", {
+        "state": "decision_required", "reason": "divergent_product_direction"})
+    with pytest.raises(ValueError, match="already owns"):
+        followup.admit(d.store, "run-1", {**d.command, "command_id": "retry"})
+
+
+def test_merge_turns_do_not_replace_original_delivery_gates(delivered):
+    d = delivered
+    first = followup.admit(d.store, "run-1", d.command)
+    with d.store._connect() as db:
+        db.execute("INSERT INTO delivery_effects VALUES "
+                   "('merge-role','run-1','merge_resolution',?,'complete','{}','now')",
+                   (canonical_json({"job_key": "merge-attempt"}),))
+        db.execute("INSERT INTO delivery_attempts "
+                   "(job_key,run_id,role,iteration,candidate_id,state,cleanup,result_json) "
+                   "VALUES ('merge-attempt','run-1','implement',0,'combined','finished',"
+                   "'confirmed','{}')")
+    assert followup.authorize(d.store, d.spec, first["grant_sha256"])
+
+
 @pytest.mark.parametrize(
     "drift",
     [

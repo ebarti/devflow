@@ -136,6 +136,17 @@ def test_upstream_conflict_names_decision_without_mutating_or_rebuilding(service
         assert not db.execute("SELECT 1 FROM delivery_effects").fetchall()
 
 
+def test_ordinary_followup_routes_textual_conflicts_to_resolution_instead_of_a_user_decision(
+    service, tmp_path,
+):
+    broker, pr, remote = fixture(service, tmp_path)
+    remote.mergeable = False
+    result = reconcile(broker, pr, remote.raw(), resolve_conflicts=True)
+    assert result == {"state": "resolve_conflicts", "target": remote.target,
+                      "original_head": pr["head"], "previous_head": pr["head"]}
+    assert remote.updates == 0
+
+
 def test_unknown_original_update_is_read_back_never_resubmitted(service, tmp_path):
     broker, pr, remote = fixture(service, tmp_path)
     update = remote.api

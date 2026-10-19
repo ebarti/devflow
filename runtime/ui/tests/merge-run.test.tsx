@@ -50,3 +50,25 @@ it('hides merge controls from an ineligible ordinary run', () => {
   render(<RunDetails run={{ ...mockRun, merge: { available: false, phase: 'unavailable' } }} onRefresh={vi.fn()} />)
   expect(screen.queryByRole('button', { name: /Merge PR/ })).toBeNull()
 })
+
+it('continues a historical textual conflict under its existing merge authority', async () => {
+  const merge = vi.spyOn(api, 'merge').mockResolvedValue({ run_id: delivered.id, phase: 'queued', command_id: 'continued' })
+  const refresh = vi.fn().mockResolvedValue(undefined)
+  render(<RunDetails run={{ ...delivered, merge: { ...delivered.merge!, resume: true, phase: 'decision_required' } }} onRefresh={refresh} />)
+  await userEvent.click(screen.getByRole('button', { name: 'Continue merge reconciliation' }))
+  await waitFor(() => expect(refresh).toHaveBeenCalledOnce())
+  expect(merge.mock.calls[0][1]).toMatchObject({ candidate_id: 'candidate', head: 'head', pr_number: 1109 })
+})
+
+it('shows the exact incompatible requirements instead of a generic Git conflict', () => {
+  const run = { ...delivered, merge: { available: false, phase: 'decision_required', result: {
+    state: 'decision_required', reason: 'divergent_product_direction', decision: {
+      question: 'Should this action require confirmation?', feature_requirement: 'Always require confirmation',
+      main_requirement: 'Never ask for confirmation', why_incompatible: 'Both requirements apply to the same action', files: ['action.ts'],
+    },
+  } } }
+  render(<RunDetails run={run} onRefresh={vi.fn()} />)
+  expect(screen.getByText('Should this action require confirmation?')).toBeTruthy()
+  expect(screen.getByText('Feature requirement: Always require confirmation')).toBeTruthy()
+  expect(screen.queryByRole('button', { name: /Merge PR/ })).toBeNull()
+})

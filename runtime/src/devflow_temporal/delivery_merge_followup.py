@@ -20,7 +20,7 @@ from .delivery_preparation import execution_retired
 from .delivery_resources import observe_finalized_resources
 from .delivery_store import _now
 
-ACTIVE = {"queued", "merging", "waiting_ci", "waiting_tracker", "unknown"}
+ACTIVE = {"queued", "merging", "resolving_conflicts", "waiting_ci", "waiting_tracker", "unknown"}
 _FIELDS = (
     "request_digest",
     "request_json",
@@ -51,6 +51,12 @@ def current(db, run_id):
     return dict(row) if row else None
 
 
+def _continuable(saved):
+    return (saved is not None and saved["phase"] == "decision_required"
+            and json.loads(saved["result_json"] or "{}").get("reason")
+            == "conflicting_upstream_changes")
+
+
 def _snapshot(row):
     return {key: row[key] for key in _FIELDS}
 
@@ -58,8 +64,11 @@ def _snapshot(row):
 def action(db, row, spec):
     saved = current(db, row["run_id"])
     if saved:
+        request = json.loads(saved["grant_json"])["request"]
         return {
-            "available": False,
+            "available": _continuable(saved),
+            "resume": _continuable(saved),
+            **{key: request[key] for key in ("candidate_id", "head", "pr_number")},
             "phase": saved["phase"],
             "error": saved["error"],
             "command_id": saved["command_id"],
@@ -153,6 +162,10 @@ def evidence(store, spec):
                 "SELECT * FROM delivery_attempts WHERE run_id=? ORDER BY rowid", (spec["run_id"],)
             )
         ]
+        from .delivery_merge_resolution import role_keys
+
+        merge_roles = role_keys(db, spec["run_id"])
+        attempts = [a for a in attempts if a["job_key"] not in merge_roles]
         publications = [
             dict(item)
             for item in db.execute(
@@ -280,6 +293,7 @@ def admit(store, run_id, request):
             if prior["run_id"] != run_id or prior["request_digest"] != bound:
                 raise ValueError("merge command ID belongs to different inputs")
             return json.loads(prior["response_json"])
+        previous_merge = current(db, run_id)
     spec = store.effective_spec(run_id)
     proof = evidence(store, spec)
     if request["expected_revision"] != proof["row"]["protocol_revision"] or any(
@@ -328,6 +342,14 @@ def admit(store, run_id, request):
         "command_id": request["command_id"],
         "grant_sha256": digest(grant),
     }
+    if previous_merge is not None:
+        if not _continuable(previous_merge):
+            raise ValueError("merge already owns a request; read its current result")
+        original = json.loads(previous_merge["grant_json"])
+        if original["row"] != proof["row"] or original["proof_sha256"] != digest(proof):
+            raise ValueError("merge continuation changed its original delivered evidence")
+        grant = original
+        response["grant_sha256"] = digest(original)
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         prior = db.execute(
@@ -340,7 +362,7 @@ def admit(store, run_id, request):
         row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
         if (
             _snapshot(row) != proof["row"]
-            or current(db, run_id)
+            or current(db, run_id) != previous_merge
             or digest(store.effective_spec(run_id)) != grant["spec_sha256"]
         ):
             raise ValueError("merge authority changed during admission")
@@ -351,12 +373,19 @@ def admit(store, run_id, request):
             "external:devflow:" + run_id,
             store.config.dashboard_url + "/runs/" + run_id,
         )
-        db.execute(
-            "INSERT INTO delivery_merge_requests "
-            "(run_id,command_id,grant_json,workflow_id,phase,created_at,updated_at) "
-            "VALUES (?,?,?,?,'queued',?,?)",
-            (run_id, request["command_id"], canonical_json(grant), workflow_id, _now(), _now()),
-        )
+        if previous_merge:
+            db.execute(
+                "UPDATE delivery_merge_requests SET workflow_id=?,phase='queued',dispatched=0,"
+                "result_json=NULL,error=NULL,updated_at=? WHERE run_id=?",
+                (workflow_id, _now(), run_id),
+            )
+        else:
+            db.execute(
+                "INSERT INTO delivery_merge_requests "
+                "(run_id,command_id,grant_json,workflow_id,phase,created_at,updated_at) "
+                "VALUES (?,?,?,?,'queued',?,?)",
+                (run_id, request["command_id"], canonical_json(grant), workflow_id, _now(), _now()),
+            )
         db.execute(
             "INSERT INTO delivery_commands VALUES (?,?,?,?)",
             (request["command_id"], run_id, bound, canonical_json(response)),
@@ -365,8 +394,9 @@ def admit(store, run_id, request):
             db,
             run_id,
             row["revision"],
-            "merge_requested",
-            "Merge authorized for the existing delivered PR",
+            "merge_continued" if previous_merge else "merge_requested",
+            ("Continuing conflict resolution under the existing merge authorization"
+             if previous_merge else "Merge authorized for the existing delivered PR"),
             response,
         )
     return response
@@ -470,7 +500,9 @@ def step(store, spec, grant_sha256, cancel_event):
         if phase == "queued":
             record(store, spec, "merging")
         result = merge_verified(store, spec, {"merge_authorization": grant_sha256}, cancel_event)
-        if result["state"] == "pending":
+        if result["state"] == "resolve_conflicts":
+            record(store, spec, "resolving_conflicts", result)
+        elif result["state"] == "pending":
             record(store, spec, "waiting_ci", result)
         elif result["state"] == "confirmed":
             tracker = _tracker_sync(spec, "done", release=False)

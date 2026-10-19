@@ -27,6 +27,7 @@ export interface FeatureState {
 export interface RunSummary {
   merge?: {
     available: boolean
+    resume?: boolean
     phase: string
     candidate_id?: string | null
     head?: string | null
@@ -34,7 +35,9 @@ export interface RunSummary {
     command_id?: string | null
     updated_at?: string | null
     error?: string | null
-    result?: { state: string; reason?: string; merged_commit?: string; merged_at?: string; head?: string } | null
+    result?: { state: string; reason?: string; merged_commit?: string; merged_at?: string; head?: string;
+      conflicts?: string[]; decision?: { question: string; feature_requirement: string;
+        main_requirement: string; why_incompatible: string; files: string[] } | null } | null
   } | null
   feature?: FeatureState | null
   archived?: boolean

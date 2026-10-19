@@ -363,6 +363,7 @@ class NativeProcess:
         timeout: int,
         ports: tuple[int, ...] = (),
         cancelled: Callable[[], bool] = lambda: False,
+        register_resources: bool = True,
     ) -> None:
         if spec["policy"].get("execution_backend") != "native-macos":
             raise ValueError("native process did not receive native authority")
@@ -370,6 +371,7 @@ class NativeProcess:
 
         reject_nested_controller()
         self.spec, self.folder = spec, folder
+        self.register_resources = register_resources
         self.argv, self.cwd, self.environment = argv, cwd, environment
         self.timeout, self.ports, self.cancelled = timeout, ports, cancelled
         private_directory(folder)
@@ -377,7 +379,7 @@ class NativeProcess:
         self.launch_absent = False
         if not self.journal.exists() and any(listeners(port) for port in ports):
             raise ValueError("native fixture port belongs to another process")
-        if self.journal.exists() or self.journal.is_symlink():
+        if self.register_resources and (self.journal.exists() or self.journal.is_symlink()):
             RunResources(spec).process(self.journal)
 
     def run(self) -> dict:
@@ -425,6 +427,7 @@ class NativeProcess:
                     "spec": self.spec, "folder": str(self.folder), "argv": self.argv,
                     "cwd": str(self.cwd), "environment": self.environment,
                     "timeout": self.timeout, "ports": self.ports, "monitor_lock": lock,
+                    "register_resources": self.register_resources,
                 }).encode())
             finally:
                 monitor.stdin.close()
@@ -492,7 +495,8 @@ class NativeProcess:
             intent = self._intent()
             if self.journal.exists() or self.journal.is_symlink():
                 # Custody also covers journals appearing after construction.
-                RunResources(self.spec).process(self.journal)
+                if self.register_resources:
+                    RunResources(self.spec).process(self.journal)
                 old = read_private(self.journal)
                 if old["intent"] != intent:
                     raise ValueError("native attempt authority changed")
@@ -540,7 +544,8 @@ class NativeProcess:
                         journal["lifecycle_locks"][name] = {
                             "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}
             write_private(self.journal, journal)
-            RunResources(self.spec).process(self.journal)
+            if self.register_resources:
+                RunResources(self.spec).process(self.journal)
             write_private(
                 self.folder / "launch.json", {"argv": self.argv, "environment": self.environment}
             )

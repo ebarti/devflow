@@ -1435,6 +1435,36 @@ async def delivery_merge_followup_failed(request):
                                   request["merge_authorization"], request["reason"])
 
 
+@activity.defn(name="delivery_resolve_merge_conflicts")
+async def delivery_resolve_merge_conflicts(request):
+    from .delivery_merge_followup import failed
+    from .delivery_merge_resolution import resolve
+
+    store, _ = await asyncio.to_thread(_context, request["spec"])
+    try:
+        return await _with_heartbeat(
+            resolve(store, request["spec"], request["merge_authorization"], request["conflict"]),
+            request, "merge_resolution",
+        )
+    except Exception as exc:
+        if isinstance(exc, (OSError, RuntimeError)):
+            with store._connect() as db:
+                pending = db.execute(
+                    "SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='merge_reconcile' "
+                    "AND state!='complete'", (request["spec"]["run_id"],),
+                ).fetchone()
+            if pending:
+                from .delivery_merge_followup import record
+
+                result = {"state": "pending", "reason": "resolved_target_update_readback"}
+                await asyncio.to_thread(record, store, request["spec"], "unknown", result,
+                                        f"{type(exc).__name__}: {str(exc)[:500]}")
+                return result
+        return await asyncio.to_thread(failed, store, request["spec"],
+                                      request["merge_authorization"],
+                                      f"{type(exc).__name__}: {str(exc)[:500]}")
+
+
 @activity.defn(name="delivery_terminal_preflight")
 async def delivery_terminal_preflight(request):
     def execute():
@@ -1453,6 +1483,7 @@ DELIVERY_ACTIVITIES = [
     delivery_merge,
     delivery_merge_followup,
     delivery_merge_followup_failed,
+    delivery_resolve_merge_conflicts,
     delivery_project,
     delivery_prepare,
     delivery_baseline_checks,

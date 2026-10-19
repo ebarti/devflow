@@ -9,6 +9,7 @@ export function failedAttempt(run: RunSummary): boolean {
 export function runStatus(run: RunSummary): string {
   const merge = run.merge?.phase
   if (merge === 'merged') return 'Merged'
+  if (merge === 'resolving_conflicts') return 'Resolving merge conflicts'
   if (merge === 'decision_required') return 'Merge needs a decision'
   if (merge === 'blocked' || merge === 'unknown') return 'Merge needs attention'
   if (merge && !['available', 'unavailable'].includes(merge)) return 'Merging'

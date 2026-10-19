@@ -362,7 +362,7 @@ def merge_verified(store, spec, request, cancel_event=None):
             raise ValueError("merge follow-up request differs from its authorized evidence")
         return _merge_effect(store, {**spec, "merge_reconciliation_version": 1},
                              proof["candidate"], proof["pull_request"], proof["checks"],
-                             proof["resources"], cancel_event)
+                             proof["resources"], cancel_event, resolve_conflicts=True)
     candidate, pr, checks = (request[key] for key in ("candidate", "pull_request", "checks"))
     with store._connect() as db:
         work_binding(store, spec, db)
@@ -392,7 +392,8 @@ def merge_verified(store, spec, request, cancel_event=None):
     return _merge_effect(store, spec, candidate, pr, saved, resources, cancel_event)
 
 
-def _merge_effect(store, spec, candidate, pr, saved, resources, cancel_event=None):
+def _merge_effect(store, spec, candidate, pr, saved, resources, cancel_event=None, *,
+                  resolve_conflicts=False):
     """Shared owned merge/reconciliation path; callers authenticate endpoint authority."""
     broker = MergeBroker(store, spec, cancel_event)
     reconciliation = None
@@ -400,7 +401,7 @@ def _merge_effect(store, spec, candidate, pr, saved, resources, cancel_event=Non
         from .delivery_merge_reconciliation import reconcile
 
         raw = broker.api(f"repos/{spec['github_repo']}/pulls/{pr['number']}")
-        reconciliation = reconcile(broker, pr, raw)
+        reconciliation = reconcile(broker, pr, raw, resolve_conflicts=resolve_conflicts)
         if reconciliation["state"] != "ready":
             return reconciliation
         pr = reconciliation["pr"]
