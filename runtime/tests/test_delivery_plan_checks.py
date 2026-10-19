@@ -103,6 +103,48 @@ def test_future_test_preparation_rejects_unsealed_owners_and_metadata(project, f
         planned_checks(spec, checkout, evidence, preparation=True)
 
 
+@pytest.mark.parametrize('node', [False, True])
+@pytest.mark.parametrize('failure', [None, 'unauthorized', 'ambiguous', 'symlink', 'ignored'])
+def test_retained_untracked_tests_prepare_with_frozen_root_authority(project, node, failure):
+    spec, checkout, root, evidence = project
+    if node:
+        root = checkout / 'api'
+        (root / 'test').mkdir(parents=True)
+        (root / 'package.json').write_text(json.dumps({'devDependencies': {'vitest': '4.1.11'}}))
+        (checkout / 'package.json').write_text('{"packageManager":"pnpm@10.33.3"}')
+        (checkout / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
+        relative = 'api/test/retained.test.ts'
+        _git(checkout, 'add', '.')
+    else:
+        relative = 'worker/tests/test_retained.py'
+    retained = checkout / relative
+    retained.write_text('retained source')
+    spec.update(accepted_plan=json.dumps({'verification': [f'Run {relative}']}),
+                policy={'allowed_paths': [], 'source_scope': {
+                    'version': 1, 'allowed_roots': [root.name],
+                    'allowed_files': [], 'protected_paths': []}})
+    before_index = _git(checkout, 'diff', '--cached')
+    if failure == 'unauthorized':
+        spec['policy']['source_scope']['protected_paths'] = [relative]
+    elif failure == 'ambiguous':
+        (root / retained.name).write_text('another candidate')
+    elif failure == 'symlink':
+        retained.unlink()
+        retained.symlink_to(Path(__file__).resolve())
+    elif failure == 'ignored':
+        (checkout / '.git/info/exclude').write_text(relative + '\n')
+    if failure:
+        with pytest.raises(ValueError):
+            planned_checks(spec, checkout, evidence, preparation=True)
+    else:
+        checks = planned_checks(spec, checkout, evidence, preparation=True)
+        assert any(retained.name in ' '.join(check['argv']) for check in checks)
+        with pytest.raises(ValueError, match='tracked owner'):
+            planned_checks(spec, checkout, evidence)
+        assert retained.read_text() == 'retained source'
+    assert _git(checkout, 'diff', '--cached') == before_index
+
+
 def test_broker_prepares_only_dependencies_and_records_future_project_custody(project, monkeypatch):
     from devflow_temporal.delivery_broker import DeliveryBroker
     from devflow_temporal.delivery_resources import RunResources
@@ -429,6 +471,28 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     assert checks[0]['argv'] == ['git', 'diff', '--check', 'origin/main...HEAD']
     assert all(c['kind'] == 'static' and not c.get('junit_required') for c in checks)
     assert json.dumps(spec, sort_keys=True) == before
+
+
+def test_frozen_plan_static_recipe_shares_configured_execution_without_losing_provenance(
+    junit_project,
+):
+    from devflow_temporal.delivery_validation_schedule import local_checks
+
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text(metadata.read_text() + '\n[checks.docs]\nkind="static"\n'
+                        'argv=["corepack","pnpm","docs:build"]\n')
+    freeze_recipes(spec, checkout)
+    spec.update(validation_schedule_version=2, accepted_plan=json.dumps({
+        'verification': ['Execute tracked scripts/checks.toml checks.docs.']}))
+    configured = {'id': 'docs-build', 'kind': 'check', 'cwd': '.',
+                  'argv': ['corepack', 'pnpm', 'docs:build'], 'timeout_seconds': 900}
+    planned = planned_checks(spec, checkout, evidence)
+    scheduled = local_checks(spec, [configured], planned)
+    assert len(scheduled) == 1
+    assert scheduled[0]['satisfies'] == ['docs-build', planned[0]['id']]
+    assert scheduled[0]['plan_provenance'] == planned[0]['plan_provenance']
+    assert scheduled[0]['plan_provenance']['base_sha'] == spec['base_sha']
+    assert scheduled[0]['timeout_seconds'] == 600
 
 
 @pytest.mark.parametrize('name,configured,reference', [

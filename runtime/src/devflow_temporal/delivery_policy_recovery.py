@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 from .contracts import canonical_json, digest
@@ -263,6 +264,76 @@ def completed_cleanup_binding(record, closed, state):
             and receipt.get('process_cleanup') == 'observed-native-confirmed')
 
 
+def _published_cleanup_chain(store, row, state, closed):
+    """Compose only owner cleanup projections after a bound published closure."""
+    if not closed or closed.get('result') != state:
+        return None
+    checks = json.loads(row['checks_json'] or '{}')
+    receipt = checks.get('resource_cleanup') or {}
+    if (receipt.get('state') != receipt.get('resource_cleanup')
+            or receipt.get('state') != 'confirmed'
+            or receipt.get('process_cleanup') != 'observed-native-confirmed'
+            or not isinstance(receipt.get('processes'), list)):
+        return None
+    keys = ('workflow_id', 'execution_run_id', 'closed_at', 'request_digest', 'recovery_digest')
+    identity = {key: closed.get(key) for key in keys}
+    if not all(identity[key] for key in keys[:-1]):
+        return None
+    maintenance_identity = {key: identity[key] for key in keys[:3]}
+    maintenance_identity['status'] = 'COMPLETED'
+    expected = digest({'closed_workflow': maintenance_identity,
+                       'native_observations': receipt['processes'], 'resource_cleanup': receipt})
+    with store._connect() as db:
+        events = [dict(item) for item in db.execute(
+            'SELECT * FROM delivery_events WHERE run_id=? ORDER BY sequence', (row['run_id'],))]
+    for anchor in reversed(events):
+        record = json.loads(anchor['payload_json'])
+        old = record.get('resource_cleanup') or {}
+        if (anchor['type'] != 'resource_cleanup_reconciled'
+                or record.get('closure') != 'published'
+                or record.get('original_result_digest') != digest(state)
+                or record.get('closed_workflow') != identity
+                or record.get('tracker') != json.loads(row['tracker_json'] or 'null')
+                or old.get('state') != old.get('resource_cleanup')
+                or old.get('state') != 'confirmed'
+                or old.get('process_cleanup') != 'observed-native-confirmed'):
+            continue
+        revision, written = anchor['run_revision'], datetime.fromisoformat(anchor['timestamp'])
+        if written <= datetime.fromisoformat(identity['closed_at']):
+            continue
+        latest = None
+        for event in events:
+            if event['sequence'] <= anchor['sequence'] or event['run_revision'] <= revision:
+                continue
+            payload = json.loads(event['payload_json'])
+            timestamp = datetime.fromisoformat(event['timestamp'])
+            marker = payload.get('key')
+            if (
+                event["run_revision"] != revision + 1
+                or event["type"] != "resource_cleanup_reconciled"
+                or set(payload) != {"key", "iteration", "candidate_id"}
+                or payload["iteration"] != row["iteration"]
+                or payload["candidate_id"] is not None
+                or not isinstance(marker, str)
+                or len(marker) != 64
+                or any(char not in "0123456789abcdef" for char in marker)
+                or timestamp <= written
+            ):
+                break
+            revision, written, latest = event['run_revision'], timestamp, event
+        else:
+            if (latest and revision == row['revision']
+                    and json.loads(latest['payload_json'])['key'] == expected
+                    and datetime.fromisoformat(row['updated_at']) <= written):
+                return {'closure': 'published', 'original_result_digest': digest(state),
+                        'resource_cleanup': receipt, 'tracker': record['tracker'],
+                        'maintenance_chain': {'anchor_sequence': anchor['sequence'],
+                                              'anchor_sha256': digest(record),
+                                              'latest_sequence': latest['sequence'],
+                                              'latest_key': expected}}
+    return None
+
+
 def reconciled_cleanup(store, row, state, *, closed=None):
     """The maintenance record that later confirmed this closed result's cleanup, if any.
 
@@ -280,12 +351,13 @@ def reconciled_cleanup(store, row, state, *, closed=None):
     # An unpublished automatic retry supersedes its old run. A cleanup-only build
     # instead continues the exact completed result authenticated by its caller.
     build = closed is not None and cleanup_only_build(json.loads(row['request_json']), state)
-    return next((item for item in records
+    direct = next((item for item in records
                  if ((item.get('closure') == 'published'
                       and item.get('original_result_digest') == digest(state))
                      or (build and completed_cleanup_binding(item, closed, state)))
                  and item.get('resource_cleanup') == checks.get('resource_cleanup')
                  and item.get('tracker') == json.loads(row['tracker_json'] or '{}')), None)
+    return direct or _published_cleanup_chain(store, row, state, closed)
 
 
 def closed_checks(row, state, reconciled):

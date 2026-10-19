@@ -192,7 +192,10 @@ def frozen_native_projects(spec: dict, checkout: Path) -> list[str]:
 
 def native_addon_authority(spec: dict, checkout: Path, projects: list[str]) -> dict | None:
     """A single registry target explicitly allowed by unchanged frozen manifests."""
-    manager, _ = frozen_pnpm_inputs(spec, checkout)
+    manager, inputs = frozen_pnpm_inputs(spec, checkout)
+    importers = yaml.safe_load(inputs['pnpm-lock.yaml']).get('importers', {})
+    if not isinstance(importers, dict):
+        raise ValueError('native dependency importers are malformed')
     hashes = {}
 
     def unchanged(name):
@@ -220,6 +223,12 @@ def native_addon_authority(spec: dict, checkout: Path, projects: list[str]) -> d
         path = Path(project)
         if path.is_absolute() or ".." in path.parts:
             raise ValueError("native addon project escaped its tracked owner")
+        importer = importers.get(project, {})
+        dependencies = importer.get('dependencies', {}) if isinstance(importer, dict) else None
+        if not isinstance(dependencies, dict):
+            raise ValueError('native dependency importer is malformed')
+        if 'better-sqlite3' not in dependencies:
+            continue
         manifest = json.loads(unchanged((path / "package.json").as_posix()))
         if "better-sqlite3" in manifest.get("dependencies", {}):
             selected.append(project)

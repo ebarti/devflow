@@ -233,6 +233,88 @@ def test_missing_rollout_cannot_hide_provider_work_or_an_unrelated_failure(missi
         custody.implementation_custody(spec, state, changed, previous)
 
 
+@pytest.fixture
+def rejected_input(missing_session):
+    store, state, command, spec, attempts, previous, transcript = missing_session
+    spec['implementation_role_home_generation'] = ''
+    attempt = attempts[-1]
+    folder = Path(attempt['result_path']).parent
+    request = json.loads((folder / 'request.json').read_text())
+    request['spec'] = spec
+    home = _native_role_home(request)
+    environment = {'CODEX_HOME': str(home / 'codex')}
+    raw = json.loads((folder / 'result.json').read_text())
+    message = 'JSON-RPC error -32602: Input exceeds the maximum length of 1048576 characters.'
+    raw.update(summary='role process failed: InvalidParamsError', findings=[message])
+    result = {**raw, 'cleanup': 'confirmed',
+              'native_process': json.loads(attempt['result_json'])['native_process']}
+    attempt['result_json'] = canonical_json(result)
+    state['roles'][-1] = {**result, 'role': 'implement', 'iteration': 1,
+                          'candidate': state['candidate']}
+    journal = json.loads((folder / 'native-process.json').read_text())
+    journal['intent']['environment_sha256'] = digest(environment)
+    journal['provider_session']['result_digest'] = digest(result)
+    observation = json.loads((folder / 'native-thread-observation.json').read_text())
+    session = state['roles'][0]['session_id']
+    observation.update(parent_thread_id=session, thread_inventory_before=[session], turns=[{
+        'thread_id': session, 'start_error': {'type': 'InvalidParamsError', 'code': -32602,
+        'message': message, 'data': {'input_error_code': 'input_too_large',
+                                   'actual_chars': 1_061_179, 'max_chars': 1_048_576}}}])
+    for name, value in [
+        ("request.json", request),
+        ("result.json", raw),
+        ("native-process.json", journal),
+        ("launch.json", {"environment": environment}),
+        ("native-thread-observation.json", observation),
+    ]:
+        write_private(folder / name, value)
+    return spec, state, attempts, previous, transcript, folder
+
+
+def test_typed_input_rejection_proves_original_session_and_no_provider_turn(rejected_input):
+    spec, state, attempts, previous, transcript, folder = rejected_input
+    original = transcript.read_bytes()
+    proof = custody.implementation_custody(spec, state, attempts, previous)
+    assert proof['session_id'] == 'original-implementation'
+    assert set(proof["input_rejection"]) == {
+        "request",
+        "journal",
+        "observation",
+        "launch",
+        "result",
+    }
+    assert 'missing_rollout' not in proof and proof['session_origin']
+    assert transcript.read_bytes() == original
+
+
+@pytest.mark.parametrize('drift', ['started-turn', 'items', 'wrong-code', 'wrong-size',
+                                  'extra-thread', 'unconfirmed-process', 'original-session'])
+def test_input_rejection_cannot_hide_started_work_or_changed_custody(rejected_input, drift):
+    spec, state, attempts, previous, transcript, folder = rejected_input
+    path = folder / 'native-thread-observation.json'
+    observed = json.loads(path.read_text())
+    if drift == 'started-turn':
+        observed['turns'][0]['turn_id'] = 'provider-started'
+    elif drift == 'items':
+        observed['raw_turn_items'] = 1
+    elif drift == 'wrong-code':
+        observed['turns'][0]['start_error']['data']['input_error_code'] = 'different_failure'
+    elif drift == 'wrong-size':
+        observed['turns'][0]['start_error']['data']['actual_chars'] = 100
+    elif drift == 'extra-thread':
+        observed['thread_inventory_before'].append('unrelated-thread')
+    elif drift == 'unconfirmed-process':
+        journal_path = folder / 'native-process.json'
+        journal = json.loads(journal_path.read_text())
+        journal["monitoring_complete"] = False
+        write_private(journal_path, journal)
+    else:
+        observed['parent_thread_id'] = 'different-session'
+    write_private(path, observed)
+    with pytest.raises(ValueError, match='authenticated failure'):
+        custody.implementation_custody(spec, state, attempts, previous)
+
+
 def test_legacy_gate_chain_retains_the_real_policy_session_home(tmp_path):
     base = {"run_id": "run-1", "state_dir": str(tmp_path), "role_home_generation": "policy-1"}
     first = {**base, "role_home_generation": "gate-retry-1"}

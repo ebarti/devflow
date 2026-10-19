@@ -52,7 +52,7 @@ def _same_assessment(raw, result):
     )
 
 
-def _missing_rollout(spec, state, attempt, session, generation):
+def _unstarted_native_launch(spec, state, attempt, session, generation, *, input_rejection=False):
     from .delivery_gates_admission import _native_result_bytes
     from .delivery_sandbox import _native_role_home
     from .supervisor import DeliverySupervisor
@@ -79,6 +79,33 @@ def _missing_rollout(spec, state, attempt, session, generation):
     correct_home = _native_role_home(
         {**request, "spec": {**spec, "implementation_role_home_generation": generation}}
     )
+    message = f"JSON-RPC error -32600: no rollout found for thread id {session}"
+    launch_failure = (
+        result.get('summary') == 'role process failed: InvalidRequestError'
+        and result.get('findings') == [message]
+        and observation.get('parent_thread_id') is None
+        and observation.get('turns') == []
+        and observation.get('thread_inventory_before') == []
+        and wrong_home != correct_home)
+    if input_rejection:
+        turns = observation.get('turns') or []
+        start = turns[0].get('start_error', {}) if len(turns) == 1 else {}
+        data = start.get('data') or {}
+        message = 'JSON-RPC error -32602: Input exceeds the maximum length of 1048576 characters.'
+        launch_failure = (
+            result.get('summary') == 'role process failed: InvalidParamsError'
+            and result.get('findings') == [message]
+            and result.get('session_id') is None
+            and start == {'type': 'InvalidParamsError', 'code': -32602,
+                          'message': message, 'data': data}
+            and set(data) == {'input_error_code', 'actual_chars', 'max_chars'}
+            and data.get('input_error_code') == 'input_too_large'
+            and data.get('max_chars') == 1048576
+            and type(data.get('actual_chars')) is int and data['actual_chars'] > 1048576
+            and turns == [{'thread_id': session, 'start_error': start}]
+            and observation.get('parent_thread_id') == session
+            and observation.get('thread_inventory_before') == [session]
+            and wrong_home == correct_home)
     if (
         request["spec"] != spec
         or request["role"] != "implement"
@@ -93,9 +120,7 @@ def _missing_rollout(spec, state, attempt, session, generation):
         or not _same_assessment(raw, result)
         or result.get("status") != "blocked"
         or result.get("finish_reason") != "exception"
-        or result.get("summary") != "role process failed: InvalidRequestError"
-        or result.get("findings")
-        != [f"JSON-RPC error -32600: no rollout found for thread id {session}"]
+        or not launch_failure
         or result.get("usage") is not None
         or journal.get("phase") != "finished"
         or journal.get("monitoring_complete") is not True
@@ -122,14 +147,10 @@ def _missing_rollout(spec, state, attempt, session, generation):
         != observation.get("start_identity")
         or observation.get("start_identity") is None
         or observation.get("state") != "unknown"
-        or observation.get("parent_thread_id") is not None
-        or observation.get("turns") != []
         or observation.get("raw_turn_items") is not None
         or observation.get("collaboration_items") != []
-        or observation.get("thread_inventory_before") != []
         or observation.get("thread_inventory_after") is not None
         or observation.get("new_child_thread_ids") is not None
-        or wrong_home == correct_home
         or launch["environment"].get("CODEX_HOME") != str(wrong_home / "codex")
     ):
         raise ValueError("missing session is not an authenticated failure before the provider turn")
@@ -231,5 +252,7 @@ def implementation_custody(spec, state, attempts, previous):
         if len(matching) != 1:
             raise ValueError("missing session requires one exact completed implementation attempt")
         result["session_origin"] = _session_origin(spec, state, attempts, session, home)
-        result["missing_rollout"] = _missing_rollout(spec, state, matching[0], session, generation)
+        rejected = latest.get('summary') == 'role process failed: InvalidParamsError'
+        result['input_rejection' if rejected else 'missing_rollout'] = _unstarted_native_launch(
+            spec, state, matching[0], session, generation, input_rejection=rejected)
     return result

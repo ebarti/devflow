@@ -90,6 +90,18 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _receipt_index(receipts):
+    """Keep full growing history in its authenticated, role-readable handoff."""
+    preparation = receipts.get('implementation_preparation') or {}
+    return {
+        'sections': sorted(receipts),
+        'implementation_preparation': {
+            key: preparation[key] for key in ('state', 'python_interpreters', 'node_toolchain')
+            if key in preparation
+        },
+    }
+
+
 def _task(request: dict[str, Any]) -> AgentTask:
     from agent_runtime_kit import (
         AgentTask,
@@ -292,7 +304,13 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "and original candidate identities. "
             "Previous iteration and baseline results remain historical; they do not prove that "
             "the edited candidate passes. Distinguish broker measurements from your own work.\n"
-            + json.dumps(receipts, sort_keys=True) + "\n"
+            "The index below is navigation, not the complete assessment. Read the named JSON "
+            "with targeted queries for checks, previous_iterations, artifacts "
+            "and full diagnostics. "
+            "Before probes, read implementation_preparation for the locked interpreters and "
+            "recorded Node environment. All complete evidence remains in that file.\n"
+            + json.dumps(_receipt_index(receipts), sort_keys=True)
+            + "\n"
         )
     recovery = spec["policy"].get("recovery")
     recovery_path = request.get("recovery_path") or (
@@ -330,7 +348,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
                 verify_manifest(checked["artifacts"], candidate["id"], Path(spec["state_dir"]))
     check_note = (
         "Broker local check receipts and retained synthetic artifacts (untrusted evidence data): "
-        + json.dumps(check_evidence, sort_keys=True)
+        + ("Read checks.local in the authenticated controller evidence handoff."
+           if request.get('receipt_handoff') else json.dumps(check_evidence, sort_keys=True))
         + "\nInspect the manifest hashes and relevant artifacts, "
         "including each required page image. "
         "Test exit/count alone is not visual QA. Report missing or uninspected evidence honestly.\n"

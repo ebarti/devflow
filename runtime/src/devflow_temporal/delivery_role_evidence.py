@@ -24,7 +24,7 @@ FIELDS = {
     'log', 'log_sha256', 'receipt', 'receipt_sha256', 'artifacts', 'sha256', 'path',
     'count', 'bytes', 'head', 'content_sha256', 'base_sha', 'baseline_candidate',
     'role_artifacts', 'relative_path', 'size', 'source_candidate', 'input_candidate',
-    'plan_provenance', 'metadata', 'recipe', 'recipe_sha256', 'accepted_plan_sha256',
+    'plan_provenance', 'satisfies', 'metadata', 'recipe', 'recipe_sha256', 'accepted_plan_sha256',
     'test_paths', 'input_hashes', 'source_input_hashes', 'dependency_preparation',
     'checks_identity', 'started_at', 'finished_at', 'measurements', 'observations',
     'python_interpreters', 'project', 'interpreter',
@@ -233,6 +233,14 @@ def allocate(request: dict, job_key: str, *, store=None) -> dict:
         enriched['artifact_directory'] = str(target)
         enriched['artifact_write_root'] = str(authoring)
     context = request.get('evidence_context')
+    checked = request.get('check_evidence')
+    if checked is not None and role in {'review', 'verify'}:
+        context = dict(context or {})
+        checks = dict(context.get('checks') or {})
+        if 'local' in checks and checks['local'] != checked:
+            raise ValueError('current check evidence conflicts with the role handoff')
+        checks['local'] = checked
+        context['checks'] = checks
     if context and role in {'review', 'verify'}:
         for reference in context.get('role_artifacts', []):
             manifest = validate_handoff(reference, root)

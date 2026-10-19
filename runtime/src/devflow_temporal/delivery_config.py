@@ -606,7 +606,7 @@ class DeliveryConfig:
             "policy_digest": digest(policy),
             "workflow_failure_boundary_version": 1,
             "assessment_batch_version": 1,
-            "validation_schedule_version": 1,
+            "validation_schedule_version": 2,
             "merge_reconciliation_version": 1,
             **({"delivery_limits_version": 1} if time_limits else {}),
             "config_digest": digest(self.raw),
@@ -649,14 +649,24 @@ def scope_amendment_config(
     old_raw, new_raw = deepcopy(original_config.raw), deepcopy(amended.raw)
     old_repository = old_raw["repositories"][repository_key]
     new_repository = new_raw["repositories"][repository_key]
-    old_allowed = old_repository["allowed_paths"]
-    if (
-        old_allowed != original["policy"]["allowed_paths"]
-        or any(name in old_allowed for name in added_paths)
-        or new_repository["allowed_paths"] != [*old_allowed, *added_paths]
-    ):
-        raise ValueError("scope amendment changed more than the named file list")
-    new_repository["allowed_paths"] = old_allowed
+    from .delivery_source_scope import amended_scope, authority
+
+    old_scope = authority(original['policy'])
+    if old_scope['version'] == 1:
+        if old_repository.get("source_scope") != old_scope or new_repository.get(
+            "source_scope"
+        ) != amended_scope(original["policy"], added_paths):
+            raise ValueError('scope amendment changed more than the named source files')
+        new_repository['source_scope'] = old_scope
+    else:
+        old_allowed = old_repository["allowed_paths"]
+        if (
+            old_allowed != original["policy"]["allowed_paths"]
+            or any(name in old_allowed for name in added_paths)
+            or new_repository["allowed_paths"] != [*old_allowed, *added_paths]
+        ):
+            raise ValueError("scope amendment changed more than the named file list")
+        new_repository["allowed_paths"] = old_allowed
     if new_raw != old_raw:
         raise ValueError("scope amendment changed unrelated execution authority")
     return amended

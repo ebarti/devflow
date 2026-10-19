@@ -49,6 +49,11 @@ def exercise(monkeypatch, *, enabled=True, failed="all", unsafe=None):
                     "receipt": "qa.json", "receipt_sha256": "qa-hash",
                     "log": "qa.log", "log_sha256": "log-hash"}
         assert stage in {"review", "verify"}
+        if failed in {'prelaunch', 'review-prelaunch'} and (
+                failed == 'prelaunch' or stage == 'review'):
+            return {'status': 'blocked', 'candidate': candidate, 'session_id': None,
+                    'cleanup': 'confirmed', 'finish_reason': 'prelaunch',
+                    'findings': ['controller evidence could not be prepared']}
         return {"status": "findings" if failed in {"all", stage} else "pass",
                 "candidate": ({"id": "changed"} if unsafe == "review-candidate"
                               and stage == "review" else candidate),
@@ -90,3 +95,14 @@ def test_recorded_legacy_input_keeps_first_failure_order(monkeypatch):
     calls, repairs, _state = exercise(monkeypatch, enabled=False)
     assert calls == ["checks", "implement"]
     assert len(repairs[0]) == 1
+
+
+@pytest.mark.parametrize('failed', ['prelaunch', 'review-prelaunch'])
+def test_prelaunch_failures_finish_independent_collection_without_a_coding_turn(
+    monkeypatch, failed
+):
+    calls, repairs, state = exercise(monkeypatch, failed=failed)
+    assert calls == ['checks', 'browser', 'review', 'verify']
+    assert repairs == []
+    assert state['outcome'] == 'blocked'
+    assert state['error'] == 'independent assessment launch failed before provider'

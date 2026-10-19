@@ -110,6 +110,38 @@ def test_candidate_manifest_and_lock_drift_refuse_before_build(addon, metadata):
         native_addon_authority(spec, checkout, ["apps/api"])
 
 
+def test_non_native_test_project_does_not_expand_addon_authority(addon, monkeypatch):
+    from devflow_temporal import delivery_native_dependencies as native
+
+    spec, checkout, authority, *_ = addon
+    project = checkout / 'apps/web'
+    project.mkdir()
+    (project / "package.json").write_text(
+        '{"scripts":{"test":"vitest","pdf-tools":"node tools.cjs"}}'
+    )
+    original = native.subprocess.check_output
+
+    def git(argv):
+        if 'ls-tree' in argv and argv[-1] == 'apps/web/package.json':
+            return b'100644 blob fixture\tapps/web/package.json\n'
+        if argv[-1] == 'frozen:apps/web/package.json':
+            return b'{"scripts":{"test":"vitest"}}'
+        return original(argv)
+
+    monkeypatch.setattr(native.subprocess, 'check_output', git)
+    assert native_addon_authority(spec, checkout, ['apps/api', 'apps/web']) == authority
+
+
+def test_actual_native_owner_manifest_remains_frozen(addon):
+    spec, checkout, *_ = addon
+    path = checkout / 'apps/api/package.json'
+    value = json.loads(path.read_bytes())
+    value['scripts'] = {'install': 'unapproved build command'}
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match='frozen Git base'):
+        native_addon_authority(spec, checkout, ['apps/api'])
+
+
 @pytest.mark.parametrize("config", [".npmrc", "pnpmfile.cjs"])
 def test_candidate_package_manager_hooks_are_not_native_authority(addon, config):
     spec, checkout, *_ = addon

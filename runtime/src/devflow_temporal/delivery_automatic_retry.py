@@ -125,24 +125,46 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         records = [json.loads(item[0]) for item in db.execute(
             "SELECT payload_json FROM delivery_events WHERE run_id=? "
             "AND type='resource_cleanup_reconciled' ORDER BY rowid DESC", (spec['run_id'],))]
-    saved = next((item['predecessor_resources'] for item in records
+    prior = next((item for item in records
                   if item.get('original_result_digest') == binding
                   and item.get('original_checks') == original
                   and 'predecessor_resources' in item), None)
+    saved = prior['predecessor_resources'] if prior else None
+    superseding = prior.get('superseding_finalization') if prior else None
     expected = {'manifest.json': before['manifest_sha256'],
                 'finalization.json': original['resource_cleanup']['receipt_sha256']}
     if saved is None:
+        historical = None
         if before['finalization_sha256'] != expected['finalization.json']:
-            raise ValueError('original finalization changed before preservation')
+            producer = original['resource_cleanup']
+            current = json.loads(row['checks_json']).get('resource_cleanup') or {}
+            body = {k: v for k, v in producer.items() if k not in {'receipt', 'receipt_sha256'}}
+            historical = (json.dumps(body, sort_keys=True, indent=2) + '\n').encode()
+            if (not published or producer.get('receipt') != str(root / 'finalization.json')
+                    or current.get('receipt') != producer['receipt']
+                    or current.get('receipt_sha256') != before['finalization_sha256']
+                    or hashlib.sha256(historical).hexdigest() != expected['finalization.json']):
+                raise ValueError('original finalization changed before preservation')
+            superseding = before['finalization_sha256']
         with RunResources(execution, read_only=True).locked():
+            current_bytes = {}
             for name, sha in expected.items():
-                read_private(root / name)
-                if hashlib.sha256((root / name).read_bytes()).hexdigest() != sha:
+                raw = read_private(root / name, raw=True)
+                expected_hash = superseding if name == 'finalization.json' and historical else sha
+                if hashlib.sha256(raw).hexdigest() != expected_hash:
                     raise ValueError('original resource bytes changed before archive')
+                current_bytes[name] = raw
+            if historical and json.loads(current_bytes['finalization.json']) != {
+                    k: v for k, v in current.items() if k not in {'receipt', 'receipt_sha256'}}:
+                raise ValueError('later finalization differs from the recorded observation')
             private_directory(archive)
+            if historical:
+                raw = current_bytes['finalization.json']
+                _immutable(archive / 'observed-finalization.json', json.loads(raw), raw=raw)
+                current_bytes['finalization.json'] = historical
             for name in expected:
-                _immutable(archive / name,
-                           read_private(root / name), raw=(root / name).read_bytes())
+                raw = current_bytes[name]
+                _immutable(archive / name, json.loads(raw), raw=raw)
             saved = expected
     if set(saved) != set(expected):
         raise ValueError('archived original inventory changed')
@@ -153,6 +175,10 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
             raise ValueError('archived original resource bytes changed')
     if saved.get('finalization.json') != expected['finalization.json']:
         raise ValueError('archived finalization differs from the original closed result')
+    if superseding is not None:
+        raw = read_private(archive / 'observed-finalization.json', raw=True)
+        if hashlib.sha256(raw).hexdigest() != superseding:
+            raise ValueError('archived later finalization changed')
     if any('predecessor_resources' in item and item.get('original_result_digest') == binding
            and item.get('original_checks') == original for item in records):
         return
@@ -177,7 +203,9 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         store._event(db, spec['run_id'], row['revision'], 'resource_cleanup_reconciled',
             'Original cleanup bytes retained before refreshing the latest observation',
             {'original_checks': original, 'original_result_digest': binding,
-             'predecessor_resources': saved})
+             'predecessor_resources': saved,
+             **({'superseding_finalization': superseding,
+                 'producer_receipt_source': 'closed_workflow'} if superseding else {})})
 
 
 def _tracker_closed(spec, tracker):

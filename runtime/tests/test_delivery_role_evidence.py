@@ -363,6 +363,91 @@ def test_node_preparation_handoff_names_tool_paths_and_login_shell_environment(s
     assert 'set the recorded environment inside that shell' in task.goal
 
 
+@pytest.mark.parametrize('role', ['implement', 'review', 'verify'])
+def test_large_retained_history_stays_complete_without_overflowing_role_input(service, role):
+    from devflow_temporal.delivery_role_evidence import allocate, read_context
+    from devflow_temporal.role_runner import _task
+
+    _, _broker, request = setup(service)
+    diagnostic = 'retained-diagnostic-' + 'x' * 1_100_000
+    checked = {'candidate_id': request['candidate']['id'], 'state': 'failed',
+               'results': [{'id': 'failed-original-command', 'passed': False,
+                            'diagnostic': diagnostic}]}
+    context = {'checks': {'local': checked}, 'previous_iterations': [
+        {'iteration': 1, 'checks': {'local': checked}}]}
+    request = {**request, 'role': role, 'findings': ['Keep the unresolved source defect'],
+               'evidence_context': context}
+    if role != 'implement':
+        request['check_evidence'] = checked
+    enriched = allocate(request, 'a' * 64)
+    reference = enriched['receipt_handoff']
+    original = Path(reference['path']).read_bytes()
+    assert len(original) > 1_048_576
+    assert read_context(enriched) == context
+    goal = _task(enriched).goal
+    assert len(goal) < 100_000
+    assert reference['path'] in goal and reference['sha256'] in goal
+    assert 'previous_iterations' in goal and 'checks' in goal
+    assert 'Keep the unresolved source defect' in goal
+    assert diagnostic not in goal
+    assert Path(reference['path']).read_bytes() == original
+    # A small prompt cannot waive authentication of its complete evidence.
+    Path(reference['path']).write_bytes(original + b' ')
+    with pytest.raises(ValueError, match='handoff changed'):
+        _task(enriched)
+
+
+def test_rejected_same_iteration_artifacts_do_not_replace_the_accepted_producer(service):
+    from devflow_temporal.delivery_role_evidence import allocate, read_context, seal
+    from devflow_temporal.delivery_workflow import _implementation_artifacts
+
+    _, broker, request = setup(service)
+    rejected = allocate(request, '1' * 64)
+    stale = seal(rejected)['role_artifacts']
+    old_bytes = Path(stale['path']).read_bytes()
+    (broker.checkout / 'README.md').write_text('Actual accepted repair\n')
+    request = {**request, 'candidate': broker.candidate()}
+    accepted = allocate(request, '2' * 64)
+    (Path(accepted['artifact_directory']) / 'HANDOFF.md').write_text('Accepted repair evidence\n')
+    current = seal(accepted)['role_artifacts']
+    roles = [{'role': 'implement', 'iteration': 0, 'status': 'blocked', 'role_artifacts': stale},
+             {'role': 'implement', 'iteration': 0, 'status': 'pass', 'role_artifacts': current}]
+    review = {**request, 'role': 'review'}
+    # The actual old boundary fails when a rejected empty seal is marked current.
+    with pytest.raises(ValueError, match='another candidate content'):
+        allocate({**review, 'evidence_context': {'role_artifacts': [stale, current]}}, '3' * 64)
+    references = _implementation_artifacts(roles, 0)
+    handoff = allocate({**review, 'evidence_context': {'role_artifacts': references}}, '4' * 64)
+    assert references == [current]
+    assert read_context(handoff)['role_artifacts']
+    assert Path(stale['path']).read_bytes() == old_bytes
+    # Never silently fall back to older evidence if the accepted producer is corrupt.
+    bad = [*roles, {**roles[-1], 'role_artifacts': stale}]
+    with pytest.raises(ValueError, match='another candidate content'):
+        allocate({**review, 'evidence_context': {
+            'role_artifacts': _implementation_artifacts(bad, 0)}}, '5' * 64)
+
+
+@pytest.mark.parametrize('role', ['review', 'verify'])
+def test_separate_current_checks_are_in_the_authenticated_prompt_handoff(service, role):
+    from devflow_temporal.delivery_role_evidence import allocate, read_context
+    from devflow_temporal.role_runner import _task
+
+    _, _broker, request = setup(service)
+    checked = {'state': 'passed', 'candidate_id': request['candidate']['id'],
+               'results': [{'id': 'actual-local-check', 'passed': True,
+                            'diagnostic': 'complete current receipt'}]}
+    request = {**request, 'role': role, 'evidence_context': {'role_artifacts': []},
+               'check_evidence': checked}
+    enriched = allocate(request, 'b' * 64)
+    assert read_context(enriched)['checks']['local'] == checked
+    assert request['evidence_context'] == {'role_artifacts': []}
+    assert 'checks.local' in _task(enriched).goal
+    with pytest.raises(ValueError, match='conflicts'):
+        allocate({**request, 'evidence_context': {'checks': {'local': {
+            **checked, 'candidate_id': 'stale'}}}}, 'c' * 64)
+
+
 @pytest.fixture
 def dependency_handoff(service, monkeypatch):
     """Real receipt producer/store/checkpoints; modeled GitHub transport and role verdicts."""

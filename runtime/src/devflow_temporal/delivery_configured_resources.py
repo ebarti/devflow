@@ -88,8 +88,8 @@ def declared_generated_directories(spec: dict) -> set[str]:
     return names
 
 
-def workspace_dependency_directories(root: Path) -> dict[str, str]:
-    """Authorize nested node_modules from unchanged regular tracked workspace data."""
+def workspace_dependency_directories(root: Path, *, policy: dict | None = None) -> dict[str, str]:
+    """Bind nested dependencies to tracked layout, allowing authorized script edits."""
     import fnmatch
     import hashlib
     import json
@@ -108,11 +108,24 @@ def workspace_dependency_directories(root: Path) -> dict[str, str]:
                 or path.resolve(strict=True) != path or not path.is_file()):
             raise ValueError('workspace metadata is not fixed tracked regular data')
         content = path.read_bytes()
-        if len(content) > 1024 * 1024 or content != subprocess.check_output([
-                    'git', '-c', 'core.fsmonitor=false', '-C', str(root), 'show', 'HEAD:' + name],
-                    timeout=30):
+        committed = subprocess.check_output([
+            'git', '-c', 'core.fsmonitor=false', '-C', str(root), 'show', 'HEAD:' + name],
+            timeout=30)
+        if len(content) > 1024 * 1024 or len(committed) > 1024 * 1024:
             raise ValueError('workspace metadata changed from its tracked declaration')
-        return content
+        if content != committed:
+            from .delivery_source_scope import outside_scope
+
+            permitted = (policy is not None and Path(name).name == 'package.json'
+                         and not outside_scope(policy, [name], checkout=root))
+            if permitted:
+                current, original = json.loads(content), json.loads(committed)
+                permitted = (isinstance(current, dict) and isinstance(original, dict)
+                             and {k: v for k, v in current.items() if k != 'scripts'}
+                             == {k: v for k, v in original.items() if k != 'scripts'})
+            if not permitted:
+                raise ValueError('workspace metadata changed from its tracked declaration')
+        return committed
 
     metadata, patterns = {}, []
     manifest = tracked('package.json')

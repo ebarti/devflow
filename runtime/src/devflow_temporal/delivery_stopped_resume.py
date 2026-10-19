@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 from pathlib import Path
@@ -76,7 +77,9 @@ def scope_spec(store, seal, command, *, _feature_scope=None):
             if not stat.S_ISDIR(parent.lstat().st_mode) or parent.is_symlink():
                 raise ValueError('scope amendment file has an unsafe ancestor')
             parent = parent.parent
-    amended = DeliveryBroker(store, effective).candidate()
+    # The delta is still a proposal. Keep source observation under the sealed
+    # predecessor custody until admission grants the new execution namespace.
+    amended = broker.candidate()
     if any(amended[key] != seal['candidate'][key] for key in (
             'id', 'head', 'content_sha256', 'base_sha', 'environment_digest')):
         raise ValueError('scope amendment changed stopped implementation bytes')
@@ -243,7 +246,7 @@ def pending_repair(seal, *, db=None):
 
 
 def _unstarted_repair(seal, previous, db, *, closing=False):
-    """An exact admitted and charged repair has not reached a provider attempt."""
+    """An exact admitted and charged repair has not reached a provider turn."""
     from .delivery_feature_execution import registry
 
     spec, state = seal['predecessor_spec'], seal['state']
@@ -251,10 +254,16 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
     iteration = state['iteration']
     requested = (previous.get('pending_repair') or {}).get(
         'iteration', previous.get('resume_iteration', prior['iteration'] + 1))
-    if (not spec.get('feature_worker') or not spec.get('repair_allowance')
+    if ((spec.get('feature_worker') and not spec.get('repair_allowance'))
+            or (not spec.get('feature_worker') and spec.get('retry_budget_version') != 1)
             or requested != iteration or iteration <= 0
             or (requested == prior['iteration'] and not previous.get('pending_repair'))):
         return False
+    rejected_input = (not spec.get('feature_worker')
+                      and bool(seal.get('session_custody', {}).get('input_rejection')))
+    current_attempts = [a for a in seal['attempts'] if a['iteration'] == iteration]
+    if not spec.get('feature_worker') and current_attempts and not rejected_input:
+        return False  # A consumed ordinary turn follows the normal repair rules.
     if custody(db, seal['original_recovery']) != spec:
         raise ValueError('unstarted repair lost its exact predecessor admission')
     candidate = seal['candidate']
@@ -278,20 +287,39 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
                           for item in preparation['results'])
                   and preparation['results'][-1].get('launched') is False
                   and preparation['results'][-1].get('failure_kind') == 'preparation')
+    rejected_input = (rejected_input and len(remainder) == len(current_attempts) == 1
+                      and remainder[0].get('role') == current_attempts[0]['role'] == 'implement'
+                      and remainder[0].get('iteration') == iteration
+                      and remainder[0].get('status') == 'blocked'
+                      and remainder[0].get('session_id') is None
+                      and remainder[0].get('finish_reason') == 'exception'
+                      and remainder[0].get('cleanup') == 'confirmed'
+                      and remainder[0].get('candidate') == candidate)
+    attempts_before = ([a for a in seal['attempts'] if a not in current_attempts]
+                       if rejected_input else seal['attempts'])
+    current_custody, prior_custody = seal.get('session_custody'), previous.get('session_custody')
+    if rejected_input:
+        # SDK resume may append settings metadata before rejecting turn/start.
+        # Exact typed rejection proof retains the same session/home and original
+        # owner; the new admission seals its observed session bytes, not a rewind.
+        current_custody, prior_custody = [
+            {k: v for k, v in (value or {}).items()
+             if k not in {'input_rejection', 'session_origin', 'session_state_digest'}}
+            for value in (current_custody, prior_custody)]
     if (previous['execution_spec'] != spec
             or candidate != state.get('candidate')
             or candidate != previous['execution_candidate']
             or candidate != {**previous['candidate'], 'policy_digest': spec['policy_digest']}
-            or roles[:len(before)] != before or (remainder and not unlaunched)
-            or seal['attempts'] != previous['attempts']
+            or roles[:len(before)] != before or (remainder and not (unlaunched or rejected_input))
+            or attempts_before != previous['attempts']
             or seal['effects'] != previous['effects']
-            or any(attempt['iteration'] == iteration for attempt in seal['attempts'])
+            or (current_attempts and not rejected_input)
             or any(attempt['state'] != 'finished' or attempt['cleanup'] != 'confirmed'
                    for attempt in seal['attempts'])
             or any(effect['state'] != 'complete' or effect['observed_json'] is None
                    for effect in seal['effects'])
             or seal.get('session_id') != previous.get('session_id')
-            or seal.get('session_custody') != previous.get('session_custody')
+            or current_custody != prior_custody
             or (not closing and (state.get('phase') not in {'blocked', 'cancelled'}
                                   or state.get('cleanup') != 'confirmed'))
             or (closing and (state.get('phase') != 'cancelling'
@@ -312,6 +340,11 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
                 or origin['pending_repair'].get('iteration') != iteration):
             raise ValueError('unstarted repair lost its original debit admission')
         origin = prior_link
+    if not spec.get('feature_worker'):
+        # Ordinary deliveries have no shared feature debit. The immutable
+        # admission plus unchanged inventory and absent provider turn above prove
+        # that this exact fixed-budget iteration has not executed yet.
+        return True
     shared = registry(spec)
     owner = origin['execution_spec']['repair_allowance']['owner']
     current_owner = spec['repair_allowance']['owner']
@@ -430,6 +463,73 @@ def _interrupted_preparation(seal):
     return stage
 
 
+def _unlaunched_assessments(seal):
+    """Ordinary published work needs gates, not coding, after exact no-process launches."""
+    from .supervisor import DeliverySupervisor
+
+    spec, state, candidate = seal['predecessor_spec'], seal['state'], seal['candidate']
+    if (spec.get('feature_worker') or state.get('phase') != 'blocked'
+            or state.get('error') not in {'repair limit exhausted',
+                                         'independent assessment launch failed before provider'}
+            or (state.get('pull_request') or {}).get('head') != candidate['head']):
+        return False
+    roles = state.get('roles', [])
+    last = next((i for i in range(len(roles) - 1, -1, -1)
+                 if roles[i].get('role') == 'implement'), None)
+    later = roles[last + 1:] if last is not None else []
+    if not later or [r.get('role') for r in later] not in (
+            ['review'], ['review', 'verify']):
+        return False
+    checks = state.get('checks') or {}
+    for stage in ['local', *(['browser_qa'] if spec['policy'].get('browser_qa') else [])]:
+        checked = checks.get(stage, {})
+        if (checked.get('state') != 'passed' or checked.get('candidate_id') != candidate['id']
+                or checked.get('source_unchanged') is not True
+                or (stage == 'browser_qa' and checked.get('cleanup') != 'confirmed')):
+            return False
+    unlaunched = False
+    for role in later:
+        key = DeliverySupervisor._job_key({'spec': spec, 'role': role['role'],
+            'iteration': state['iteration'], 'candidate': candidate})
+        matches = [a for a in seal['attempts'] if a['job_key'] == key]
+        if len(matches) != 1:
+            return False
+        attempt = matches[0]
+        if (role.get('cleanup') != 'confirmed' or role.get('candidate') != candidate
+                or role.get('iteration') != state['iteration']
+                or attempt.get('role') != role['role']
+                or attempt.get('iteration') != state['iteration']
+                or attempt.get('state') != 'finished' or attempt.get('cleanup') != 'confirmed'
+                or not _implementation_receipt(spec, role, attempt)):
+            return False
+        if role.get('status') == 'pass':
+            if (not isinstance(role.get('session_id'), str) or not role['session_id']
+                    or attempt.get('session_id') != role['session_id'] or role.get('findings')):
+                return False
+            continue
+        folder = Path(spec['state_dir']) / 'attempts' / key
+        try:
+            info = folder.lstat()
+            absent = (folder.resolve(strict=True) == folder and stat.S_ISDIR(info.st_mode)
+                      and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+                      and not any(folder.iterdir()))
+        except OSError:
+            return False
+        if (
+            role.get("status") != "blocked"
+            or role.get("finish_reason") != "prelaunch"
+            or role.get("summary") != "role launch failed before any provider process started"
+            or role.get("session_id") is not None
+            or role.get("usage") is not None
+            or any(attempt.get(k) is not None for k in ("pid", "process_identity", "session_id"))
+            or attempt.get("result_path") != str(folder / "result.json")
+            or not absent
+        ):
+            return False
+        unlaunched = True
+    return unlaunched
+
+
 def interrupted_resume(seal):
     """Plan a stopped worker's continuation that needs no product repair, if any.
 
@@ -443,10 +543,13 @@ def interrupted_resume(seal):
     cleanup = (cleanup_only_build(spec, state) and completed_cleanup_binding(
         seal.get('cleanup_reconciliation'), seal.get('closed'), state))
     preparation = _interrupted_preparation(seal)
-    if (not spec.get('feature_worker')
-            or (state.get('phase') != 'cancelled' and not cleanup and not preparation)
+    assessments = _unlaunched_assessments(seal)
+    if ((not spec.get('feature_worker') and not assessments)
+            or (state.get('phase') != 'cancelled' and not cleanup and not preparation
+                and not assessments)
             or any(isinstance(check, dict) and check.get('state') == 'failed'
-                   and name != preparation for name, check in state.get('checks', {}).items())):
+                   and name != preparation and not (assessments and name in {'review', 'qa'})
+                   for name, check in state.get('checks', {}).items())):
         return None
     roles, iteration = state.get('roles', []), state['iteration']
     if not roles:
@@ -462,9 +565,10 @@ def interrupted_resume(seal):
             or attempt['iteration'] != roles[last]['iteration']
             # The iteration only advances past a passed implementation for a repair.
             or roles[last]['iteration'] != iteration
-            or any(role.get('status') != 'pass' for role in roles[last + 1:])):
+            or (not assessments and any(role.get('status') != 'pass'
+                                        for role in roles[last + 1:]))):
         return None
-    published = (spec['feature_worker'].get('kind') != 'build'
+    published = (spec.get('feature_worker', {}).get('kind') != 'build'
                  and (state.get('pull_request') or {}).get('head') == seal['candidate']['head']
                  and (not preparation
                       or state['pull_request'].get('candidate') == seal['candidate']))
@@ -601,7 +705,12 @@ def custody(db, recovery, *, retained_memo=None):
             amended = scope_amendment_config(
                 recovery['predecessor_spec'], Path(scope['amended_config_path']),
                 scope['amended_config_sha256'], scope['added_paths'])
-            allowed = amended.raw['repositories'][spec['repository_key']]['allowed_paths']
+            repository = amended.raw['repositories'][spec['repository_key']]
+            allowed = repository['allowed_paths']
+            from .delivery_source_scope import authority
+
+            if authority(spec['policy']) != authority(repository):
+                raise ValueError('stopped scope resume changed its versioned source authority')
         if (spec['policy']['allowed_paths'] != allowed
                 or spec['config_digest'] != digest(amended.raw)):
             raise ValueError('stopped scope resume changed its sealed file authority')
@@ -734,7 +843,8 @@ def _implementation_receipt(spec, role, attempt):
     return result == expected
 
 
-def _candidate(broker, state, attempts, *, missing_rollout=None, recovery=None, pending=None):
+def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection=None,
+               recovery=None, pending=None):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
@@ -759,7 +869,8 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, recovery=None, 
         if len(matches) != 1 and not no_provider:
             raise ValueError('blocked implementation lacks its exact supervisor receipt')
         if latest.get('session_id') is None and not no_provider and (
-                latest.get('finish_reason') != 'prelaunch' and not missing_rollout):
+                latest.get('finish_reason') != 'prelaunch'
+                and not (missing_rollout or input_rejection)):
             raise ValueError('blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
         raise ValueError('stopped candidate changed after its sealed checkpoint')
@@ -892,6 +1003,7 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
         pending = pending_repair(pending_seal, db=db)
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
+        input_rejection=(session_custody or {}).get('input_rejection'),
         recovery=previous, pending=pending)
     publication = state.get('pull_request')
     if publication:
