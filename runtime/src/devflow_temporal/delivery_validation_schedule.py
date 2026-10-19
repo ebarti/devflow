@@ -1,6 +1,7 @@
 """Schedule identical broad validation once, without synthesizing cached evidence."""
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import PurePosixPath
 
 from .contracts import canonical_json
@@ -27,7 +28,7 @@ def prepublication(spec):
     earlier build output, so their presence conservatively keeps the whole list.
     """
     checks = list(spec["policy"].get("prepublish_checks", []))
-    if (spec.get("validation_schedule_version") != 1
+    if (spec.get("validation_schedule_version") not in {1, 2}
             or spec.get("feature_worker", {}).get("kind") == "build"):
         return checks, {}
     post = {_signature(c): c for c in spec["policy"].get("checks", [])}
@@ -42,6 +43,54 @@ def prepublication(spec):
             if not history and not _preparation(check):
                 return checks, {}
     return retained, deferred
+
+
+def local_checks(spec, configured, planned):
+    """Bind compatible static plan requirements to one configured execution.
+
+    Keep old admitted schedules intact. Tests, selected recipes, Git history and
+    preparation commands retain separate execution and evidence. A merged static
+    command uses the stricter deadline and retains both requirement identities;
+    it never emits a second synthetic pass or a cached duration.
+    """
+    dependencies = [c for c in planned
+                    if c['id'].startswith('planned-python-dependencies-')]
+    remaining = [c for c in planned if c not in dependencies]
+    result = deepcopy(configured)
+    if spec.get('validation_schedule_version') != 2:
+        return dependencies + result + remaining
+    ordinary = {'id', 'kind', 'argv', 'cwd', 'timeout_seconds',
+                'min_tests', 'junit_required', 'generated_directories'}
+
+    def compatible(check):
+        return (check.get('kind') in {'check', 'static'}
+                and check.get('min_tests', 1) == 1
+                and not check.get('junit_required', False)
+                and PurePosixPath(check['argv'][0]).name != 'git'
+                and not _preparation(check))
+
+    retained = []
+    for check in remaining:
+        matches = [c for c in result
+                   if set(c) <= ordinary and compatible(c)
+                   and c['argv'] == check['argv']
+                   and c.get('cwd', '.') == check.get('cwd', '.')]
+        if (check.get('kind') != 'static'
+                or set(check) - ordinary != {'plan_provenance'}
+                or not check.get('plan_provenance') or not compatible(check)
+                or len(matches) != 1):
+            retained.append(check)
+            continue
+        match = matches[0]
+        match['timeout_seconds'] = min(match.get('timeout_seconds', 600),
+                                       check.get('timeout_seconds', 600))
+        match['plan_provenance'] = deepcopy(check['plan_provenance'])
+        match['satisfies'] = [match['id'], check['id']]
+        generated = sorted(set(match.get('generated_directories', []))
+                           | set(check.get('generated_directories', [])))
+        if generated:
+            match['generated_directories'] = generated
+    return dependencies + result + retained
 
 
 def require_deferred_checks(spec, prechecked, checked):

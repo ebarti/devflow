@@ -473,6 +473,26 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     assert json.dumps(spec, sort_keys=True) == before
 
 
+def test_frozen_plan_static_recipe_shares_configured_execution_without_losing_provenance(junit_project):
+    from devflow_temporal.delivery_validation_schedule import local_checks
+
+    spec, checkout, metadata, evidence = junit_project
+    metadata.write_text(metadata.read_text() + '\n[checks.docs]\nkind="static"\n'
+                        'argv=["corepack","pnpm","docs:build"]\n')
+    freeze_recipes(spec, checkout)
+    spec.update(validation_schedule_version=2, accepted_plan=json.dumps({
+        'verification': ['Execute tracked scripts/checks.toml checks.docs.']}))
+    configured = {'id': 'docs-build', 'kind': 'check', 'cwd': '.',
+                  'argv': ['corepack', 'pnpm', 'docs:build'], 'timeout_seconds': 900}
+    planned = planned_checks(spec, checkout, evidence)
+    scheduled = local_checks(spec, [configured], planned)
+    assert len(scheduled) == 1
+    assert scheduled[0]['satisfies'] == ['docs-build', planned[0]['id']]
+    assert scheduled[0]['plan_provenance'] == planned[0]['plan_provenance']
+    assert scheduled[0]['plan_provenance']['base_sha'] == spec['base_sha']
+    assert scheduled[0]['timeout_seconds'] == 600
+
+
 @pytest.mark.parametrize('name,configured,reference', [
     (name, configured, 'checks.{name}')
     for name in ('python-lint', 'python..lint', 'python,lint')

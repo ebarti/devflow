@@ -24,7 +24,7 @@ FIELDS = {
     'log', 'log_sha256', 'receipt', 'receipt_sha256', 'artifacts', 'sha256', 'path',
     'count', 'bytes', 'head', 'content_sha256', 'base_sha', 'baseline_candidate',
     'role_artifacts', 'relative_path', 'size', 'source_candidate', 'input_candidate',
-    'plan_provenance', 'metadata', 'recipe', 'recipe_sha256', 'accepted_plan_sha256',
+    'plan_provenance', 'satisfies', 'metadata', 'recipe', 'recipe_sha256', 'accepted_plan_sha256',
     'test_paths', 'input_hashes', 'source_input_hashes', 'dependency_preparation',
     'checks_identity', 'started_at', 'finished_at', 'measurements', 'observations',
     'python_interpreters', 'project', 'interpreter',

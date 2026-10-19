@@ -142,6 +142,7 @@ def _checks(spec, state, broker, root):
         selector_evidence,
     )
     from .delivery_plan_checks import planned_checks
+    from .delivery_validation_schedule import local_checks
 
     candidate, iteration = state["candidate"], state["iteration"]
     gate = root / "gates" / str(iteration) / "verify"
@@ -151,10 +152,7 @@ def _checks(spec, state, broker, root):
         recipes = list(spec["policy"][configured])
         if stage == "local" and spec["policy"].get("host_sandbox") == "trusted-local":
             planned = planned_checks(spec, broker.checkout, folder)
-            dependencies = [
-                c for c in planned if c["id"].startswith("planned-python-dependencies-")
-            ]
-            recipes = dependencies + recipes + [c for c in planned if c not in dependencies]
+            recipes = local_checks(spec, recipes, planned)
         results = check.get("results") or []
         ids = {c["id"] for c in recipes}
         original = [r for r in results if r.get("id") in ids]
@@ -188,6 +186,7 @@ def _checks(spec, state, broker, root):
                 result.get("argv") != bound["argv"]
                 or result.get("cwd") != str(gate / recipe.get("cwd", "."))
                 or result.get("plan_provenance") != recipe.get("plan_provenance")
+                or result.get("satisfies") != recipe.get("satisfies")
             ):
                 raise ValueError("listener verification changed its frozen check command")
             selectors = resolve_required_selectors(recipe, broker.checkout, spec=spec)

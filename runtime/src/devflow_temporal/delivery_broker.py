@@ -854,6 +854,7 @@ class DeliveryBroker:
                     "log_sha256": _sha256(artifact),
                     **({"plan_provenance": check["plan_provenance"]}
                        if check.get("plan_provenance") else {}),
+                    **({"satisfies": check["satisfies"]} if check.get("satisfies") else {}),
                     **({"artifacts": check_evidence} if check_evidence else {}),
                     **({"evidence_failure": evidence_failure} if evidence_failure else {}),
                     "cleanup": ('unknown' if artifact_cleanup and artifact_cleanup['state']
@@ -1368,14 +1369,13 @@ class DeliveryBroker:
         if self.spec["provider"] == "codex" and (
                 self.spec["policy"].get("host_sandbox") == "trusted-local"):
             from .delivery_plan_checks import planned_checks
+            from .delivery_validation_schedule import local_checks
 
             try:
                 planned = planned_checks(
                     self.spec, checkout, self.evidence_dir / "checks" / str(iteration)
                 )
-                dependencies = [c for c in planned
-                                if c['id'].startswith('planned-python-dependencies-')]
-                checks = dependencies + checks + [c for c in planned if c not in dependencies]
+                checks = local_checks(self.spec, checks, planned)
             except (ValueError, OSError) as exc:
                 raise CheckPreparationFailure('accepted-plan-recipes', exc) from exc
         return self._run_check_list(

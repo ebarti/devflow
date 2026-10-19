@@ -606,7 +606,7 @@ class DeliveryConfig:
             "policy_digest": digest(policy),
             "workflow_failure_boundary_version": 1,
             "assessment_batch_version": 1,
-            "validation_schedule_version": 1,
+            "validation_schedule_version": 2,
             "merge_reconciliation_version": 1,
             **({"delivery_limits_version": 1} if time_limits else {}),
             "config_digest": digest(self.raw),
