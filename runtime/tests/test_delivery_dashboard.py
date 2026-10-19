@@ -160,6 +160,32 @@ def test_steering_closes_before_final_qa_even_if_projection_lags(service):
     assert store.detail("run-1")["steering"] == []
 
 
+@pytest.mark.parametrize('changed,allowed', [({}, True), ({'state': 'queued'}, False),
+    ({'cleanup': 'unknown'}, False), ({'pid': 123}, False),
+    ({'session_id': 'actual-verifier'}, False),
+    ({'result_json': '{"finish_reason":"done"}'}, False)])
+def test_no_process_prelaunch_history_does_not_close_a_new_gate_feedback_window(service, changed, allowed):
+    store, raw = service
+    store.submit(raw)
+    store.project('run-1', phase='checks', execution_state='running', event_type='checks_started',
+                  message='New gate admission at the same iteration')
+    attempt = {'job_key': 'old-prelaunch', 'run_id': 'run-1', 'role': 'verify', 'iteration': 0,
+               'candidate_id': 'candidate', 'state': 'finished', 'cleanup': 'confirmed',
+               'result_json': '{"finish_reason":"prelaunch"}', **changed}
+    with store._connect() as db:
+        columns = ','.join(attempt)
+        db.execute(f'INSERT INTO delivery_attempts({columns}) VALUES ({",".join("?" for _ in attempt)})',
+                   tuple(attempt.values()))
+    assert store.detail('run-1')['can_steer'] is allowed
+    if allowed:
+        revision = store.detail('run-1')['projection_revision']
+        assert mutate(store, 'run-1', 'steer', {'command_id': 'new-gate-note',
+            'expected_revision': revision, 'message': 'Inspect the actual current CI failure'})['state'] == 'queued'
+        store.project('run-1', phase='waiting_ci', execution_state='running', event_type='ci_wait',
+                      message='No future assessment launch remains')
+        assert store.detail('run-1')['can_steer'] is False
+
+
 def test_upgrade_preserves_input_of_a_role_started_before_steering_existed(service):
     from devflow_temporal.delivery_resources import write_private
 

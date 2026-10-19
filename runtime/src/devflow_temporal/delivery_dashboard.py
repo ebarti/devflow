@@ -91,10 +91,12 @@ def steering_open(db, row):
             "cancelling",
             "waiting_tracker",
         }
-        and row["phase"] not in {"verify", "ci_wait", "tracker", "delivered"}
+        and row["phase"] not in {"verify", "ci_wait", "waiting_ci", "tracker", "delivered"}
         and not db.execute(
             "SELECT 1 FROM delivery_attempts WHERE run_id=? AND role='verify' "
-            "AND iteration=? LIMIT 1",
+            "AND iteration=? AND NOT (state='finished' AND cleanup='confirmed' "
+            "AND pid IS NULL AND process_identity IS NULL AND session_id IS NULL "
+            "AND COALESCE(json_extract(result_json,'$.finish_reason'),'')='prelaunch') LIMIT 1",
             (row["run_id"], row["iteration"]),
         ).fetchone()
     )
