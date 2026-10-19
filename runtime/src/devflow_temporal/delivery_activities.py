@@ -590,6 +590,9 @@ async def _run_intake(request: dict[str, Any]) -> dict[str, Any]:
     candidate = request["candidate"]
     if await asyncio.to_thread(broker.candidate) != candidate:
         raise ValueError("intake checkout changed before investigation")
+    from .delivery_issue_context import prepare_intake
+
+    request = await asyncio.to_thread(prepare_intake, store, request)
     result = await get_supervisor(store).run(
         {**request, "role": "intake", "workspace": str(broker.checkout)}
     )

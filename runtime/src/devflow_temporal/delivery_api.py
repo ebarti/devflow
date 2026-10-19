@@ -580,6 +580,22 @@ def create_app(config_path: Path) -> FastAPI:
         except TRANSPORT_FAILURES as exc:
             raise HTTPException(503, str(exc)) from exc
 
+    @app.post("/api/runs/{run_id}/issue-context")
+    async def refresh_issue_context(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        from .delivery_issue_context import refresh
+
+        try:
+            context = await asyncio.to_thread(refresh, service.store, run_id, await request.json())
+            return {"run_id": run_id, "context_sha256": digest(context),
+                    "fetched_at": context["fetched_at"], "issue_url": context["issue"]["url"],
+                    "evidence_count": len(context["evidence"]),
+                    "unavailable": context["unavailable"]}
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except TRANSPORT_FAILURES as exc:
+            raise HTTPException(503, str(exc)) from exc
+
     @app.post("/api/runs/{run_id}/revise-feature-plan")
     async def revise_feature_plan(request: Request, run_id: str) -> dict[str, Any]:
         _mutation(request)

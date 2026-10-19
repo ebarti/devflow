@@ -104,6 +104,15 @@ def build_server(config_path: Path) -> FastMCP:
         return await forward_write("decision", run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
+    async def refresh_issue_context(run_id: str, request_json: str) -> dict:
+        """Fetch the linked issue, acceptance and evidence without changing run authority.
+
+        Supply a stable command_id. Normal new intake turns fetch automatically;
+        this command supplies context to existing runs without replaying roles.
+        """
+        return await forward_write("refresh_issue_context", run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
     async def continue_feature(run_id: str, request_json: str) -> dict:
         """Continue a stopped feature's exact plan and stack under a successor run.
 

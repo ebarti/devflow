@@ -455,6 +455,9 @@ class DeliveryStore:
             from .delivery_dashboard import initialize
 
             initialize(db)
+            from .delivery_issue_context import initialize as initialize_issue_context
+
+            initialize_issue_context(db)
             from .delivery_settings import initialize as initialize_settings
 
             initialize_settings(db)
@@ -4246,6 +4249,13 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        context_root = root / "issue-context"
+        if context_root.is_dir() and not context_root.is_symlink():
+            for path in sorted(context_root.glob("*.json")):
+                if path.is_file() and not path.is_symlink():
+                    indexed.append({"id": "issue-context-" + path.stem,
+                                    "label": "GitHub issue body and linked evidence",
+                                    "path": path, "limit": 4 * 1024 * 1024})
         merge_root = root / "merge"
         if merge_root.is_dir() and not merge_root.is_symlink():
             for path in sorted(merge_root.glob("*.json")):

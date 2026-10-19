@@ -51,6 +51,25 @@ approval and adoption, the original implementation session still requires normal
 repair, fresh gates and product review.
 
 
+### Automatic issue context
+
+Every new native intake turn automatically receives the linked GitHub issue's
+complete body and acceptance criteria, bounded comments, cross-referenced earlier
+PRs and directly linked issue, PR and immutable file evidence. This read-only
+controller retrieval also applies when feature decomposition is disabled. Each
+snapshot records source identities, retrieval time and explicit unavailable or
+truncated references; source text never expands the frozen execution authority.
+Retries and reattachment preserve the exact snapshot of a launched turn.
+
+Existing runs can record current context with
+`devflow-delivery --config /absolute/service.json refresh-issue-context --id RUN --request /absolute/context.json`,
+where the request contains a stable `command_id`. The HTTP route is
+`POST /api/runs/{id}/issue-context`; the client and MCP operation are
+`refresh_issue_context`. Indexed evidence exposes the snapshot. Refresh supplies
+subsequent role launches and leaves completed role inputs, decisions, run outcomes,
+claims, plans and limits unchanged. It does not answer a pending human decision or
+restart a run.
+
 ### Native provider turn retries
 
 New admissions freeze `provider_max_attempts` from the service configuration

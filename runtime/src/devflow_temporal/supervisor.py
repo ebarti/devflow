@@ -288,7 +288,7 @@ class DeliverySupervisor:
         # These fields are added by the controller after activity admission.
         enriched = {'native_authorized', 'result_path', 'start_path', 'role_evidence_key',
                     'artifact_directory', 'artifact_write_root', 'receipt_handoff', 'steering',
-                    'review_diff'}
+                    'review_diff', 'issue_context'}
         for name in saved.keys() | request.keys():
             if name in enriched and name not in request:
                 continue
@@ -665,6 +665,9 @@ class DeliverySupervisor:
                     "start_path": str(folder / "start.json"),
                 }, job_key)
                 if not request_path.exists():
+                    from .delivery_issue_context import attach_latest
+
+                    native_request = attach_latest(self.store, native_request)
                     native_request = allocate(native_request, job_key, store=self.store)
                 else:
                     # Reattachment keeps the original durable launch contract.
