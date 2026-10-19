@@ -14,9 +14,10 @@ from devflow_temporal import delivery_merge_followup as followup
 from devflow_temporal import delivery_merge_resolution as resolution
 from devflow_temporal import supervisor
 from devflow_temporal.candidate import candidate_for
+from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_merge import MergeBroker
 from devflow_temporal.delivery_merge_reconciliation import reconcile
-from devflow_temporal.delivery_resources import read_private
+from devflow_temporal.delivery_resources import read_private, write_private
 
 
 @pytest.fixture
@@ -187,6 +188,68 @@ def test_merge_process_cleanup_preserves_historical_resource_registry(tmp_path):
     assert result["monitoring_complete"] and result["exit_code"] == 0
     assert read_private(process.journal)["result"] == result
     assert not (state / "resources").exists()
+
+
+def test_merge_role_home_isolated_from_original_implementation_and_other_merges(delivered):
+    from devflow_temporal.delivery_sandbox import _native_role_home
+
+    request = {"spec": delivered.spec, "role": "implement", "iteration": 0}
+    original = _native_role_home(request)
+    first = {**request, "merge_context": {"effect_key": "first-merge"}}
+    second = {**request, "merge_context": {"effect_key": "second-merge"}}
+    assert len({original, _native_role_home(first), _native_role_home(second)}) == 3
+    assert _native_role_home(first) == _native_role_home(first)
+
+
+@pytest.mark.parametrize("launched", [False, True])
+def test_proven_prelaunch_continues_same_grant_without_replaying_the_failed_attempt(
+    delivered, launched,
+):
+    d = delivered
+    original = followup.admit(d.store, "run-1", d.command)
+    key = "merge-resolution:run-1:failed:implement"
+    request = {"spec": d.spec, "role": "implement", "iteration": 0,
+               "workspace": d.spec["source_path"],
+               "candidate": candidate_for(Path(d.spec["source_path"])),
+               "merge_context": {"effect_key": key}}
+    job = supervisor.DeliverySupervisor._job_key(request)
+    folder = Path(d.spec["state_dir"]) / "attempts" / job
+    write_private(folder / "request.json", request)
+    write_private(folder / "native-environment.json", {"version": 3})
+    if launched:
+        write_private(folder / "launch.json", {"proof": "a process may have started"})
+    failed = {"status": "blocked", "summary": "configuration collision", "findings": [],
+              "cleanup": "confirmed", "finish_reason": "prelaunch", "session_id": None}
+    bound = {"job_key": job, "merge_authorization": original["grant_sha256"],
+             "merge_context": request["merge_context"], "workspace": request["workspace"],
+             "candidate": request["candidate"], "spec_sha256": digest(d.spec)}
+    with d.store._connect() as db:
+        db.execute("INSERT INTO delivery_effects VALUES (?,?,?,?,'pending',NULL,'now')",
+                   (key, "run-1", "merge_resolution", canonical_json(bound)))
+        db.execute("INSERT INTO delivery_attempts "
+                   "(job_key,run_id,role,iteration,candidate_id,state,cleanup,"
+                   "result_json,result_path) "
+                   "VALUES (?,'run-1','implement',0,?,'finished','confirmed',?,?)",
+                   (job, request["candidate"]["id"], canonical_json(failed),
+                    str(folder / "result.json")))
+    followup.record(d.store, d.spec, "unknown", {
+        "state": "unknown",
+        "reason": "RuntimeError: merge resolution native cleanup remains unconfirmed"})
+    command = {**d.command, "command_id": "continue-proven-prelaunch"}
+    if launched:
+        with pytest.raises(ValueError, match="provider absence"):
+            followup.admit(d.store, "run-1", command)
+        return
+    continued = followup.admit(d.store, "run-1", command)
+    assert continued["grant_sha256"] == original["grant_sha256"]
+    assert followup.admit(d.store, "run-1", command) == continued
+    with d.store._connect() as db:
+        assert followup.current(db, "run-1")["phase"] == "queued"
+        assert db.execute("SELECT state FROM delivery_effects WHERE effect_key=?", (key,)
+                          ).fetchone()[0] == "complete"
+        assert db.execute("SELECT result_json FROM delivery_attempts WHERE job_key=?", (job,)
+                          ).fetchone()[0] == canonical_json(failed)
+    assert followup.authorize(d.store, d.spec, original["grant_sha256"])
 
 
 @pytest.mark.asyncio

@@ -497,6 +497,11 @@ def prepare_native_role(
 
 def _native_role_home(request: dict[str, Any]) -> Path:
     spec = request['spec']
+    if request.get('merge_context'):
+        from .contracts import digest
+
+        return (Path(spec['state_dir']) / 'role-homes' / 'merge'
+                / digest(request['merge_context']['effect_key']))
     generation = spec.get('role_home_generation', '')
     if request['role'] == 'implement':
         generation = spec.get('implementation_role_home_generation', generation)

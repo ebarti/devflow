@@ -52,9 +52,12 @@ def current(db, run_id):
 
 
 def _continuable(saved):
-    return (saved is not None and saved["phase"] == "decision_required"
-            and json.loads(saved["result_json"] or "{}").get("reason")
-            == "conflicting_upstream_changes")
+    if saved is None:
+        return False
+    reason = json.loads(saved["result_json"] or "{}").get("reason")
+    return ((saved["phase"] == "decision_required" and reason == "conflicting_upstream_changes")
+            or (saved["phase"] == "unknown" and reason
+                == "RuntimeError: merge resolution native cleanup remains unconfirmed"))
 
 
 def _snapshot(row):
@@ -223,7 +226,7 @@ def evidence(store, spec):
     }
 
 
-def _exclusive(store, db, row):
+def _exclusive(store, db, row, *, retained_owner=None):
     spec = json.loads(row["request_json"])
     work_binding(store, spec, db)
     issue = store.state.issue_resource(row["issue_url"])
@@ -237,7 +240,8 @@ def _exclusive(store, db, row):
     )
     if (
         latest != row["run_id"]
-        or store.state.claim_for(db, row["work_id"]) is not None
+        or (store.state.claim_for(db, row["work_id"]) is not None
+            and store.state.claim_for(db, row["work_id"])["owner"] != retained_owner)
         or db.execute(
             "SELECT 1 FROM delivery_effects WHERE run_id=? AND state!='complete'", (row["run_id"],)
         ).fetchone()
@@ -350,6 +354,11 @@ def admit(store, run_id, request):
             raise ValueError("merge continuation changed its original delivered evidence")
         grant = original
         response["grant_sha256"] = digest(original)
+    prelaunch = []
+    if previous_merge and previous_merge["phase"] == "unknown":
+        from .delivery_merge_resolution import prelaunch_receipts
+
+        prelaunch = prelaunch_receipts(store, spec, previous_merge)
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         prior = db.execute(
@@ -366,13 +375,21 @@ def admit(store, run_id, request):
             or digest(store.effective_spec(run_id)) != grant["spec_sha256"]
         ):
             raise ValueError("merge authority changed during admission")
-        _exclusive(store, db, row)
-        store.state.claim_work(
-            db,
-            spec["work_id"],
-            "external:devflow:" + run_id,
-            store.config.dashboard_url + "/runs/" + run_id,
-        )
+        for receipt in prelaunch:
+            found = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
+                               (receipt["effect_key"],)).fetchone()
+            if found["request_json"] != receipt["request_json"] or found["state"] == "complete":
+                raise ValueError("merge prelaunch effect changed during continuation")
+            db.execute("UPDATE delivery_effects SET state='complete',observed_json=?,updated_at=? "
+                       "WHERE effect_key=?",
+                       (canonical_json(receipt), _now(), receipt["effect_key"]))
+        _exclusive(store, db, row,
+                   retained_owner="external:devflow:" + run_id if prelaunch else None)
+        if store.state.claim_for(db, spec["work_id"]) is None:
+            store.state.claim_work(
+                db, spec["work_id"], "external:devflow:" + run_id,
+                store.config.dashboard_url + "/runs/" + run_id,
+            )
         if previous_merge:
             db.execute(
                 "UPDATE delivery_merge_requests SET workflow_id=?,phase='queued',dispatched=0,"
