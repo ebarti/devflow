@@ -9,6 +9,7 @@ from test_delivery_api import api_fixture as api_fixture
 from test_delivery_store import service as service
 
 from devflow_temporal.delivery_api import create_app
+from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_dashboard import (
     launch_steering,
     mutate,
@@ -316,3 +317,33 @@ async def test_dashboard_commands_require_csrf_and_use_real_persistent_store(api
         assert (await browser.get("/api/runs")).json()["runs"] == []
         assert (await browser.get("/api/runs?archived=true")).json()["runs"][0]["archived"]
         assert (await browser.get("/api/statistics")).json()["total_runs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_statistics_reset_keeps_history_and_retries_keep_the_same_boundary(api_fixture):
+    config, request = api_fixture
+    app = create_app(config)
+    store = app.state.delivery.store
+    store.submit(request)
+    with store._connect() as db:
+        original = dict(db.execute("SELECT * FROM delivery_runs").fetchone())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://127.0.0.1:18770") as browser:
+        payload = {"command_id": "reset-sample"}
+        assert (await browser.post("/api/statistics/reset", json=payload)).status_code == 403
+        token = (await browser.get("/api/session")).json()["csrf_token"]
+        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+        first = (await browser.post("/api/statistics/reset", json=payload, headers=headers)).json()
+        assert first["total_runs"] == 0 and first["cohorts"] == [] and first["reset_at"]
+        store.submit({**request, "run_id": "later-run", "command_id": "later-submit",
+                      "work_id": "later-work", "branch": "feat/later",
+                      "issue_url": "https://github.com/example/fixture/issues/999"})
+        retried = (await browser.post(
+            "/api/statistics/reset", json=payload, headers=headers)).json()
+        assert retried["total_runs"] == 1 and retried["reset_at"] == first["reset_at"]
+    reloaded = DeliveryStore(DeliveryConfig.load(config))
+    assert statistics_for(reloaded) == retried
+    with store._connect() as db:
+        assert dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                               (request["run_id"],)).fetchone()) == original
+        assert db.execute("SELECT COUNT(*) FROM delivery_statistics_resets").fetchone()[0] == 1

@@ -541,6 +541,16 @@ def create_app(config_path: Path) -> FastAPI:
 
         return await asyncio.to_thread(statistics_for, service.store)
 
+    @app.post("/api/statistics/reset")
+    async def statistics_reset(request: Request) -> dict[str, Any]:
+        _mutation(request)
+        from .delivery_dashboard import reset_statistics
+
+        try:
+            return await asyncio.to_thread(reset_statistics, service.store, await request.json())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     async def dashboard_command(request: Request, run_id: str, kind: str):
         _mutation(request)
         from .delivery_dashboard import mutate

@@ -13,6 +13,21 @@ vi.mock('../src/stream', () => ({ subscribeRun: vi.fn(() => () => {}) }))
 afterEach(() => { cleanup(); vi.restoreAllMocks(); window.history.replaceState(null, '', '/') })
 
 describe('workflow board and controls', () => {
+  it('starts a new reporting sample and shows its reset time', async () => {
+    const sample = { total_runs: 0, cohorts: [], definitions: 'History is retained.' }
+    const baseline = {
+      ...sample, reset_at: '2026-10-19T14:00:00Z',
+    }
+    vi.spyOn(api, 'getStatistics').mockResolvedValueOnce(sample).mockResolvedValue(baseline)
+    const reset = vi.spyOn(api, 'resetStatistics').mockResolvedValue(baseline)
+    render(<Statistics />)
+    await screen.findByText('No recorded runs yet.')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Reset statistics' }))
+    expect(reset).toHaveBeenCalledWith({ command_id: expect.any(String) })
+    await screen.findByRole('status')
+    expect(screen.getByRole('status').textContent).toContain('Earlier run history is retained.')
+  })
+
   it('shows revision samples and telemetry gaps, retaining the sample on refresh failure', async () => {
     const cohort: Cohort = {
       release: 'v-test', revision: 'a'.repeat(40), local_digest: null, provider: 'fake',

@@ -99,6 +99,7 @@ export const api = {
     return { ...page, next_cursor: page.next_cursor ?? null }
   },
   getStatistics: (): Promise<Statistics> => request('/api/statistics'),
+  resetStatistics: (body: { command_id: string }): Promise<Statistics> => command('/api/statistics/reset', body),
   archive: async (runId: string, body: { command_id: string; expected_revision: number; archived: boolean }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/archive`, body)
   },

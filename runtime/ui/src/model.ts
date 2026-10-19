@@ -275,7 +275,7 @@ export interface Cohort extends RuntimeIdentity {
   roles: Record<string, { attempts: number; observed_tokens: number; token_observations: number }>
 }
 
-export interface Statistics { total_runs: number; cohorts: Cohort[]; definitions: string }
+export interface Statistics { total_runs: number; reset_at?: string | null; cohorts: Cohort[]; definitions: string }
 
 export interface NewRunRequest {
   command_id: string
