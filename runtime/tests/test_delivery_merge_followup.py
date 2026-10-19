@@ -246,6 +246,106 @@ def test_merge_turns_do_not_replace_original_delivery_gates(delivered):
     assert followup.authorize(d.store, d.spec, first["grant_sha256"])
 
 
+def test_fresh_custody_observation_does_not_replace_native_source_authority(delivered, monkeypatch):
+    d = delivered
+    first = followup.admit(d.store, "run-1", d.command)
+    checks = json.loads(d.before["checks_json"])
+    checks["resource_cleanup"]["observed_at"] = "later"
+    with d.store._connect() as db:
+        db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
+    monkeypatch.setattr(followup, "observe_finalized_resources",
+                        lambda _: {"manifest_sha256": "freshly-confirmed"})
+    assert followup.authorize(d.store, d.spec, first["grant_sha256"])
+    checks["qa"]["candidate_id"] = "foreign"
+    with d.store._connect() as db:
+        db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
+    with pytest.raises(ValueError, match="authority, candidate or ownership changed"):
+        followup.authorize(d.store, d.spec, first["grant_sha256"])
+
+
+def test_cleanup_wait_preserves_claim_then_merges_same_candidate(delivered, monkeypatch):
+    d = delivered
+    remote = git_remote(d, monkeypatch)
+    admitted = followup.admit(d.store, "run-1", d.command)
+    bound = admitted["grant_sha256"]
+    with d.store._connect() as db:
+        db.execute("UPDATE delivery_runs SET cleanup='unknown'")
+    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    with d.store._connect() as db:
+        assert followup.current(db, "run-1")["phase"] == "waiting_cleanup"
+        assert d.store.state.claim_for(db, d.spec["work_id"])
+        db.execute("UPDATE delivery_runs SET cleanup='confirmed'")
+
+    def uncertain(_):
+        raise ValueError("fresh process observation is incomplete")
+
+    monkeypatch.setattr(followup, "observe_finalized_resources", uncertain)
+    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert remote.merge_calls == remote.updates == 0
+    monkeypatch.setattr(followup, "observe_finalized_resources", lambda _: {"state": "confirmed"})
+    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    remote.ci_ready = True
+    assert followup.step(d.store, d.spec, bound, Event())["state"] == "confirmed"
+    assert remote.updates == remote.merge_calls == 1
+
+
+def test_closed_delivery_maintenance_leaves_the_later_merge_to_its_owner(delivered, monkeypatch):
+    from devflow_temporal import delivery_orphans
+
+    d = delivered
+    followup.admit(d.store, "run-1", d.command)
+
+    def forbidden(*_):
+        raise AssertionError("Historical delivery maintenance entered the later merge")
+
+    monkeypatch.setattr(delivery_orphans, "_unchanged", forbidden)
+    delivery_orphans._reconcile(d.store, d.before, d.spec, {})
+    with d.store._connect() as db:
+        assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == d.before
+
+
+def test_legacy_continuation_requalifies_custody_and_owned_head_without_replaying_work(
+    delivered, monkeypatch,
+):
+    d = delivered
+    remote = git_remote(d, monkeypatch)
+    admitted = followup.admit(d.store, "run-1", d.command)
+    assert followup.step(d.store, d.spec, admitted["grant_sha256"], Event())["state"] == "pending"
+    assert followup.step(d.store, d.spec, admitted["grant_sha256"], Event())["state"] == "pending"
+    # Model a v1 grant that predated a separate immutable native evidence digest.
+    with d.store._connect() as db:
+        saved = followup.current(db, "run-1")
+        grant = json.loads(saved["grant_json"])
+        grant.pop("native_proof_sha256")
+        legacy_grant = canonical_json(grant)
+        bound = digest(grant)
+        response = {k: v for k, v in admitted.items() if k != "native_proof_sha256"}
+        response["grant_sha256"] = bound
+        db.execute("UPDATE delivery_merge_requests SET grant_json=?", (legacy_grant,))
+        db.execute("UPDATE delivery_commands SET response_json=? WHERE command_id=?",
+                   (canonical_json(response), d.command["command_id"]))
+        checks = json.loads(db.execute("SELECT checks_json FROM delivery_runs").fetchone()[0])
+        checks["resource_cleanup"]["observed_at"] = "later"
+        db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
+    monkeypatch.setattr(followup, "observe_finalized_resources",
+                        lambda _: {"manifest_sha256": "later-observation"})
+    with pytest.raises(ValueError, match="native evidence changed"):
+        followup.authorize(d.store, d.spec, bound)
+    followup.record(d.store, d.spec, "blocked", {
+        "state": "blocked",
+        "reason": "ValueError: predecessor process/root custody is unconfirmed"})
+    remote.ci_ready = True
+    command = {**d.command, "command_id": "continue-custody"}
+    continued = followup.admit(d.store, "run-1", command)
+    assert continued["grant_sha256"] == bound
+    assert followup.authorize(d.store, d.spec, bound)
+    with d.store._connect() as db:
+        assert followup.current(db, "run-1")["grant_json"] == legacy_grant
+    assert remote.updates == 1 and remote.merge_calls == 0
+    assert followup.step(d.store, d.spec, bound, Event())["state"] == "confirmed"
+    assert remote.updates == remote.merge_calls == 1
+
+
 @pytest.mark.parametrize(
     "drift",
     [

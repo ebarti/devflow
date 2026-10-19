@@ -20,7 +20,14 @@ from .delivery_preparation import execution_retired
 from .delivery_resources import observe_finalized_resources
 from .delivery_store import _now
 
-ACTIVE = {"queued", "merging", "resolving_conflicts", "waiting_ci", "waiting_tracker", "unknown"}
+ACTIVE = {"queued", "merging", "resolving_conflicts", "waiting_ci", "waiting_tracker",
+          "waiting_cleanup", "unknown"}
+
+
+class MergeCleanupPending(ValueError):
+    """Fresh custody is required, independently of the immutable source grant."""
+
+
 _FIELDS = (
     "request_digest",
     "request_json",
@@ -57,11 +64,28 @@ def _continuable(saved):
     reason = json.loads(saved["result_json"] or "{}").get("reason")
     return ((saved["phase"] == "decision_required" and reason == "conflicting_upstream_changes")
             or (saved["phase"] == "unknown" and reason
-                == "RuntimeError: merge resolution native cleanup remains unconfirmed"))
+                == "RuntimeError: merge resolution native cleanup remains unconfirmed")
+            or (saved["phase"] == "blocked" and reason
+                == "ValueError: predecessor process/root custody is unconfirmed"))
 
 
 def _snapshot(row):
     return {key: row[key] for key in _FIELDS}
+
+
+def _immutable_row(row):
+    result = _snapshot(row)
+    result.pop("cleanup")
+    checks = json.loads(result["checks_json"] or "{}")
+    checks.pop("resource_cleanup", None)
+    result["checks_json"] = canonical_json(checks)
+    return result
+
+
+def _native_proof(proof):
+    return {**{k: v for k, v in proof.items() if k not in {"row", "checks", "resources"}},
+            "row": _immutable_row(proof["row"]),
+            "checks": {k: v for k, v in proof["checks"].items() if k != "resource_cleanup"}}
 
 
 def action(db, row, spec):
@@ -177,15 +201,18 @@ def evidence(store, spec):
                 (spec["run_id"],),
             )
         ]
-    if (
-        row["outcome"] != "delivered"
-        or row["execution_state"] != "terminal"
-        or row["cleanup"] != "confirmed"
-    ):
+    if row["outcome"] != "delivered" or row["execution_state"] != "terminal":
         raise ValueError("merge requires a delivered run with confirmed terminal cleanup")
+    if row["cleanup"] != "confirmed":
+        raise MergeCleanupPending("predecessor process/root custody is unconfirmed")
     candidate, pr, checks = [
         json.loads(row[key] or "null") for key in ("candidate_json", "pr_json", "checks_json")
     ]
+    cleanup = checks.get("resource_cleanup", {})
+    if (cleanup.get("state") != "confirmed"
+            or cleanup.get("process_cleanup") != "observed-native-confirmed"
+            or cleanup.get("resource_cleanup") != "confirmed"):
+        raise MergeCleanupPending("predecessor process/root custody is unconfirmed")
     matching = [item for item in publications if json.loads(item["observed_json"] or "null") == pr]
     if not matching:
         raise ValueError("merge has no authenticated completed publication")
@@ -214,7 +241,10 @@ def evidence(store, spec):
         ordered,
         publication,
     )
-    resources = observe_finalized_resources(spec)
+    try:
+        resources = observe_finalized_resources(spec)
+    except ValueError as exc:
+        raise MergeCleanupPending(str(exc)) from exc
     return {
         "row": _snapshot(row),
         "candidate": candidate,
@@ -271,6 +301,15 @@ def preflight(store, run_id):
 
 
 def admit(store, run_id, request):
+    from .delivery_interrupted_recovery import installation_recovery_lease
+
+    # Closed-run maintenance holds the shared installation fence throughout its
+    # finalization. Admission must not overlap its last historical projection.
+    with installation_recovery_lease(store.config, exclusive=True):
+        return _admit(store, run_id, request)
+
+
+def _admit(store, run_id, request):
     required = {"command_id", "expected_revision", "candidate_id", "head", "pr_number", "answer"}
     if (
         not isinstance(request, dict)
@@ -328,7 +367,15 @@ def admit(store, run_id, request):
     ):
         raise ValueError("merge predecessor is not the completed delivered candidate")
     # Read only: a changed remote PR never acquires a merge grant.
-    remote = MergeBroker(store, spec).publication(proof["pull_request"])
+    broker = MergeBroker(store, spec)
+    if previous_merge:
+        from .delivery_merge_reconciliation import reconcile
+
+        remote = broker.api(f"repos/{spec['github_repo']}/pulls/{proof['pull_request']['number']}")
+        if reconcile(broker, proof["pull_request"], remote, lineage_only=True)["state"] != "ready":
+            raise ValueError("original target reconciliation still needs its readback")
+    else:
+        remote = broker.publication(proof["pull_request"])
     if remote["merged"] or remote["state"] != "open":
         raise ValueError("merge requires the existing open unmerged PR")
     workflow_id = "delivery-" + run_id + "-merge-" + bound[:20]
@@ -336,6 +383,7 @@ def admit(store, run_id, request):
         "request": request,
         "spec_sha256": digest(spec),
         "proof_sha256": digest(proof),
+        "native_proof_sha256": digest(_native_proof(proof)),
         "row": proof["row"],
         "closed": {k: v for k, v in closed.items() if k != "result"},
     }
@@ -345,12 +393,15 @@ def admit(store, run_id, request):
         "workflow_id": workflow_id,
         "command_id": request["command_id"],
         "grant_sha256": digest(grant),
+        "native_proof_sha256": digest(_native_proof(proof)),
     }
     if previous_merge is not None:
         if not _continuable(previous_merge):
             raise ValueError("merge already owns a request; read its current result")
         original = json.loads(previous_merge["grant_json"])
-        if original["row"] != proof["row"] or original["proof_sha256"] != digest(proof):
+        if (_immutable_row(original["row"]) != _immutable_row(proof["row"])
+                or (original.get("native_proof_sha256") is not None
+                    and original["native_proof_sha256"] != digest(_native_proof(proof)))):
             raise ValueError("merge continuation changed its original delivered evidence")
         grant = original
         response["grant_sha256"] = digest(original)
@@ -431,10 +482,19 @@ def authorize(store, spec, grant_sha256):
         row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (spec["run_id"],)).fetchone()
         work_binding(store, spec, db)
         claim = store.state.claim_for(db, spec["work_id"])
+        witness = grant.get("native_proof_sha256")
+        for item in db.execute("SELECT * FROM delivery_commands WHERE run_id=?", (spec["run_id"],)):
+            response = json.loads(item["response_json"])
+            resumed_request = {**grant["request"], "command_id": item["command_id"]}
+            if (response.get("workflow_id") == saved["workflow_id"]
+                    and response.get("grant_sha256") == grant_sha256
+                    and item["request_digest"] == digest({"kind": "merge_run",
+                        "run_id": spec["run_id"], "request": resumed_request})):
+                witness = response.get("native_proof_sha256", witness)
         if (
             digest(grant) != grant_sha256
             or grant["spec_sha256"] != digest(spec)
-            or _snapshot(row) != grant["row"]
+            or _immutable_row(row) != _immutable_row(grant["row"])
             or not command
             or json.loads(command["response_json"])["grant_sha256"] != grant_sha256
             or command["request_digest"]
@@ -445,7 +505,8 @@ def authorize(store, spec, grant_sha256):
         ):
             raise ValueError("merge follow-up authority, candidate or ownership changed")
     proof = evidence(store, spec)
-    if digest(proof) != grant["proof_sha256"]:
+    if (digest(_native_proof(proof)) != witness if witness is not None
+            else digest(proof) != grant["proof_sha256"]):
         raise ValueError("merge follow-up native evidence changed")
     return proof
 
@@ -536,6 +597,10 @@ def step(store, spec, grant_sha256, cancel_event):
                 record(store, spec, "merged", result)
         else:
             record(store, spec, result["state"], result, result.get("reason"))
+        return result
+    except MergeCleanupPending as exc:
+        result = {"state": "pending", "reason": "Waiting for resource custody: " + str(exc)}
+        record(store, spec, "waiting_cleanup", result, str(exc))
         return result
     except Exception as exc:
         # A transport error may follow a submitted write. Keep its claim and

@@ -147,6 +147,25 @@ def test_ordinary_followup_routes_textual_conflicts_to_resolution_instead_of_a_u
     assert remote.updates == 0
 
 
+def test_continuation_lineage_read_is_strict_and_never_updates_the_branch(service, tmp_path):
+    broker, pr, remote = fixture(service, tmp_path)
+    original = reconcile(broker, pr, remote.raw(), lineage_only=True)
+    assert original["state"] == "ready" and original["pr"]["head"] == pr["head"]
+    assert remote.updates == 0
+    assert reconcile(broker, pr, remote.raw())["state"] == "pending"
+    with broker.store._connect() as db:
+        before = [dict(row) for row in db.execute("SELECT * FROM delivery_effects")]
+    current = reconcile(broker, pr, remote.raw(), lineage_only=True)
+    assert current["state"] == "ready" and current["pr"]["head"] == remote.head
+    with broker.store._connect() as db:
+        assert [dict(row) for row in db.execute("SELECT * FROM delivery_effects")] == before
+    assert remote.updates == 1
+    remote.head = _git(remote.repo, "commit-tree", remote.head + "^{tree}", "-p", remote.head,
+                       "-m", "Unowned change")
+    with pytest.raises(ValueError, match="exact mechanical|unowned head"):
+        reconcile(broker, pr, remote.raw(), lineage_only=True)
+
+
 def test_unknown_original_update_is_read_back_never_resubmitted(service, tmp_path):
     broker, pr, remote = fixture(service, tmp_path)
     update = remote.api

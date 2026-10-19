@@ -67,7 +67,7 @@ def _observe(broker, request, raw):
 
 
 def reconcile(broker, pr, raw, *, branch=None, base_ref=None, original_base=None,
-              resolve_conflicts=False):
+              resolve_conflicts=False, lineage_only=False):
     """Return current PR/tree/base, a pending readback, or an explicit conflict decision.
 
     GitHub's update-branch endpoint merges the base into the expected head. Its
@@ -101,11 +101,15 @@ def reconcile(broker, pr, raw, *, branch=None, base_ref=None, original_base=None
             if raw["head"]["sha"] == expected:
                 return {"state": "pending", "reason": "original_target_update_readback"}
             result = _observe(broker, request, raw)
-            _finish(broker, effect["effect_key"], result)
+            if not lineage_only:
+                _finish(broker, effect["effect_key"], result)
         expected, base = result["head"], result["base"]
         bindings.append({"previous_head": request["previous_head"], **result})
     if raw["head"]["sha"] != expected:
         raise ValueError("unowned head change cannot use reviewed source evidence")
+    if lineage_only:
+        return {"state": "ready", "pr": {**deepcopy(pr), "head": expected},
+                "base": base, "bindings": bindings}
     repo = f"repos/{broker.spec['github_repo']}"
     target = broker.api(f"{repo}/git/ref/heads/{base_ref}")["object"]["sha"]
     if raw["merged"] or target == base:
