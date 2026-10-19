@@ -253,10 +253,14 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
     iteration = state['iteration']
     requested = (previous.get('pending_repair') or {}).get(
         'iteration', previous.get('resume_iteration', prior['iteration'] + 1))
-    if (not spec.get('feature_worker') or not spec.get('repair_allowance')
+    if ((spec.get('feature_worker') and not spec.get('repair_allowance'))
+            or (not spec.get('feature_worker') and spec.get('retry_budget_version') != 1)
             or requested != iteration or iteration <= 0
             or (requested == prior['iteration'] and not previous.get('pending_repair'))):
         return False
+    if not spec.get('feature_worker') and any(
+            attempt['iteration'] == iteration for attempt in seal['attempts']):
+        return False  # A consumed ordinary turn follows the normal repair rules.
     if custody(db, seal['original_recovery']) != spec:
         raise ValueError('unstarted repair lost its exact predecessor admission')
     candidate = seal['candidate']
@@ -314,6 +318,11 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
                 or origin['pending_repair'].get('iteration') != iteration):
             raise ValueError('unstarted repair lost its original debit admission')
         origin = prior_link
+    if not spec.get('feature_worker'):
+        # Ordinary deliveries have no shared feature debit. The immutable
+        # admission plus unchanged inventory and absent attempt above prove
+        # that this exact fixed-budget iteration has not executed yet.
+        return True
     shared = registry(spec)
     owner = origin['execution_spec']['repair_allowance']['owner']
     current_owner = spec['repair_allowance']['owner']
