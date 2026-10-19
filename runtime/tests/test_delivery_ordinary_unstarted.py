@@ -6,6 +6,7 @@ import copy
 import pytest
 from test_delivery_stopped_resume import project, saved
 from test_delivery_store import service as service
+from test_delivery_unused_budget_resume import fixed_stop as fixed_stop
 
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import digest
