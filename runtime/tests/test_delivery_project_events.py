@@ -115,7 +115,8 @@ def test_wait_coalesces_notifications_without_discarding_later_wakeups():
     assert not received
 
 
-def test_service_waits_for_events_and_daily_deadlines_without_local_polling(service):
+@pytest.mark.parametrize("interval", [300, DAY])
+def test_service_waits_for_events_and_configured_deadlines_without_polling(service, interval):
     store, request = service
     store.submit(request)
     store.project(request['run_id'], phase='implementation', execution_state='running',
@@ -124,7 +125,8 @@ def test_service_waits_for_events_and_daily_deadlines_without_local_polling(serv
                       'state': 'OPEN', 'head': 'a' * 40, 'number': 7})
     stamp = datetime(2026, 10, 9, tzinfo=UTC)
     remote = Remote()
-    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    sync = ProjectSynchronizer([store], remote, interval=interval,
+                               project_interval=interval, clock=lambda: stamp)
     waits = []
 
     class StopTest(BaseException):
@@ -135,19 +137,19 @@ def test_service_waits_for_events_and_daily_deadlines_without_local_polling(serv
             waits.append(timeout)
             if len(waits) == 1:
                 assert remote.writes == ['In progress']
-                assert timeout == DAY
+                assert timeout == interval
                 # A new local event interrupts the daily wait immediately.
                 store.project(request['run_id'], phase='blocked', execution_state='blocked',
                               event_type='blocked', message='committed', outcome='blocked')
                 return True
             assert remote.writes == ['In progress', 'Blocked']
             assert len(remote.reads) == 1
-            assert timeout == DAY
+            assert timeout == interval
             raise StopTest
 
     with pytest.raises(StopTest):
         serve(sync, NotificationStub())
-    assert waits == [DAY, DAY]
+    assert waits == [interval, interval]
 
 
 def test_pending_project_retry_wakes_without_new_event_or_daily_read(service):
@@ -155,10 +157,12 @@ def test_pending_project_retry_wakes_without_new_event_or_daily_read(service):
     stamp = datetime(2026, 10, 9, tzinfo=UTC)
     remote = Remote()
     remote.failure = True
-    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    sync = ProjectSynchronizer([store], remote, interval=DAY,
+                               project_interval=DAY, clock=lambda: stamp)
     sync.tick()
     assert sync.next_delay() == 15
-    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=lambda: stamp)
+    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, interval=DAY,
+                                    project_interval=DAY, clock=lambda: stamp)
     restarted.tick()
     assert restarted.next_delay() == 15 and len(remote.writes) == 1
     stamp += timedelta(seconds=15)
@@ -179,9 +183,11 @@ def test_daily_configuration_rebases_old_deadlines_once_without_remote_reads(ser
     with store._connect() as db:
         db.execute('DELETE FROM delivery_sync_settings')  # Original worker had no settings.
         before = db.execute('SELECT count(*) FROM delivery_feature_events').fetchone()[0]
-    daily = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    daily = ProjectSynchronizer([store], remote, interval=DAY,
+                               project_interval=DAY, clock=lambda: stamp)
     daily.tick()
-    restarted = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    restarted = ProjectSynchronizer([store], remote, interval=DAY,
+                               project_interval=DAY, clock=lambda: stamp)
     restarted.tick()
     assert len(remote.reads) == len(remote.writes) == 1
     assert restarted.next_delay() == DAY
@@ -206,7 +212,8 @@ def test_new_interval_preserves_pending_retry_deadline(service):
     stamp = datetime(2026, 10, 9, tzinfo=UTC)
     ProjectSynchronizer([store], remote, interval=300, project_interval=300,
                         clock=lambda: stamp).tick()
-    daily = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    daily = ProjectSynchronizer([store], remote, interval=DAY,
+                               project_interval=DAY, clock=lambda: stamp)
     daily.tick()
     assert daily.next_delay() == 15
     assert len(remote.writes) == len(remote.reads) == 1
@@ -216,7 +223,8 @@ def test_pr_and_project_schedules_are_independent(service):
     store, _, _ = published(service)
     remote = Remote()
     stamp = datetime(2026, 10, 9, tzinfo=UTC)
-    sync = ProjectSynchronizer([store], remote, project_interval=300, clock=lambda: stamp)
+    sync = ProjectSynchronizer([store], remote, interval=DAY,
+                               project_interval=300, clock=lambda: stamp)
     sync.tick()
     stamp += timedelta(seconds=300)
     sync.tick()
@@ -298,7 +306,8 @@ def test_same_pr_new_validated_publication_refreshes_immediately_and_replays_onc
                   event_type='published', message='first publication', pull_request=receipt)
     stamp = datetime(2026, 10, 9, tzinfo=UTC)
     remote = Remote()
-    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
+    sync = ProjectSynchronizer([store], remote, interval=DAY,
+                               project_interval=DAY, clock=lambda: stamp)
     sync.tick()
     assert len(remote.reads) == 1
     stamp += timedelta(seconds=60)
@@ -311,7 +320,8 @@ def test_same_pr_new_validated_publication_refreshes_immediately_and_replays_onc
     assert view['status'] == 'Awaiting merge'
     assert view['pull_requests'][0]['observation']['head'] == updated['head']
     assert len(remote.reads) == 2
-    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=lambda: stamp)
+    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, interval=DAY,
+                                    project_interval=DAY, clock=lambda: stamp)
     restarted.tick()
     restarted.tick()
     assert len(remote.reads) == 2

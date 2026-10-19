@@ -147,6 +147,13 @@ async def test_maintenance_passes_read_the_store_off_the_event_loop(api_fixture,
     from devflow_temporal.delivery_orphans import reconcile_closed_native
 
     path, request = api_fixture
+    # This pure fixture must not contend with parallel installer tests or the
+    # user's real installation-recovery lease.
+    import json
+
+    raw = json.loads(path.read_text())
+    raw["execution_registry"] = str(path.parent / "ownership/registry.sqlite3")
+    path.write_text(json.dumps(raw))
     app = create_app(path)
     store = app.state.delivery.store
     store.submit(request)
