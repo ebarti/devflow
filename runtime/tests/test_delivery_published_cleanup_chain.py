@@ -45,8 +45,10 @@ def cleanup_chain(tmp_path):
         return db
 
     with connect() as db:
-        db.execute("CREATE TABLE delivery_events (run_id TEXT,sequence INTEGER,run_revision INTEGER,"
-                   "type TEXT,timestamp TEXT,payload_json TEXT)")
+        db.execute(
+            "CREATE TABLE delivery_events (run_id TEXT,sequence INTEGER,run_revision INTEGER,"
+            "type TEXT,timestamp TEXT,payload_json TEXT)"
+        )
         for event in events:
             db.execute("INSERT INTO delivery_events VALUES (?,?,?,?,?,?)",
                        (state["run_id"], *event.values()))
@@ -100,9 +102,11 @@ def test_published_cleanup_refuses_an_unbound_chain(cleanup_chain, drift):
             event["timestamp"] = c.closed["closed_at"]
         event["payload_json"] = json.dumps(payload)
         with c.store._connect() as db:
-            db.execute("UPDATE delivery_events SET run_revision=?,type=?,timestamp=?,payload_json=? "
-                       "WHERE sequence=11", (event["run_revision"], event["type"],
-                                             event["timestamp"], event["payload_json"]))
+            db.execute(
+                "UPDATE delivery_events SET run_revision=?,type=?,timestamp=?,payload_json=? "
+                "WHERE sequence=11",
+                (event["run_revision"], event["type"], event["timestamp"], event["payload_json"]),
+            )
     assert reconciled_cleanup(c.store, c.row, c.state, closed=c.closed) is None
 
 

@@ -470,7 +470,9 @@ def test_versioned_scope_resume_grants_one_protected_ci_file_on_the_same_run(ser
     store, broker, state, command = scope_stop.__wrapped__((owner, request), monkeypatch)
     original = copy.deepcopy(store.submitted_spec('run-1'))
     amended = copy.deepcopy(store.config.raw)
-    amended['repositories']['fixture']['source_scope'] = amended_scope(broker.spec['policy'], [workflow])
+    amended["repositories"]["fixture"]["source_scope"] = amended_scope(
+        broker.spec["policy"], [workflow]
+    )
     config_path = Path(command['amended_config_path'])
     config_path.write_text(json.dumps(amended))
     command.update(added_paths=[workflow],

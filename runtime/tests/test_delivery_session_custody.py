@@ -260,9 +260,13 @@ def rejected_input(missing_session):
         'thread_id': session, 'start_error': {'type': 'InvalidParamsError', 'code': -32602,
         'message': message, 'data': {'input_error_code': 'input_too_large',
                                    'actual_chars': 1_061_179, 'max_chars': 1_048_576}}}])
-    for name, value in [('request.json', request), ('result.json', raw),
-                        ('native-process.json', journal), ('launch.json', {'environment': environment}),
-                        ('native-thread-observation.json', observation)]:
+    for name, value in [
+        ("request.json", request),
+        ("result.json", raw),
+        ("native-process.json", journal),
+        ("launch.json", {"environment": environment}),
+        ("native-thread-observation.json", observation),
+    ]:
         write_private(folder / name, value)
     return spec, state, attempts, previous, transcript, folder
 
@@ -272,7 +276,13 @@ def test_typed_input_rejection_proves_original_session_and_no_provider_turn(reje
     original = transcript.read_bytes()
     proof = custody.implementation_custody(spec, state, attempts, previous)
     assert proof['session_id'] == 'original-implementation'
-    assert set(proof['input_rejection']) == {'request', 'journal', 'observation', 'launch', 'result'}
+    assert set(proof["input_rejection"]) == {
+        "request",
+        "journal",
+        "observation",
+        "launch",
+        "result",
+    }
     assert 'missing_rollout' not in proof and proof['session_origin']
     assert transcript.read_bytes() == original
 
@@ -295,7 +305,8 @@ def test_input_rejection_cannot_hide_started_work_or_changed_custody(rejected_in
         observed['thread_inventory_before'].append('unrelated-thread')
     elif drift == 'unconfirmed-process':
         journal_path = folder / 'native-process.json'
-        journal = json.loads(journal_path.read_text());journal['monitoring_complete'] = False
+        journal = json.loads(journal_path.read_text())
+        journal["monitoring_complete"] = False
         write_private(journal_path, journal)
     else:
         observed['parent_thread_id'] = 'different-session'

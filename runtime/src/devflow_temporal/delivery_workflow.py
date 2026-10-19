@@ -2901,7 +2901,9 @@ class DeliveryWorkflow:
                     if not collect_assessments:
                         break
             if unlaunched_assessments:
-                return await self._stop(spec, 'independent assessment launch failed before provider')
+                return await self._stop(
+                    spec, "independent assessment launch failed before provider"
+                )
             if repair_findings:
                 self.state["findings"].extend(repair_findings)
                 if self.post_publish_v1:

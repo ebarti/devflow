@@ -12,7 +12,9 @@ from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_validation_schedule import (
-    local_checks, prepublication, require_deferred_checks,
+    local_checks,
+    prepublication,
+    require_deferred_checks,
 )
 
 
@@ -189,7 +191,9 @@ def test_real_static_command_runs_once_with_real_verdict_and_again_on_new_candid
         require_deferred_checks(require, {'deferred_to_checks': {'before': 'configured'}}, checked)
     else:
         with pytest.raises(ValueError, match='no passing execution'):
-            require_deferred_checks(require, {'deferred_to_checks': {'before': 'configured'}}, checked)
+            require_deferred_checks(
+                require, {"deferred_to_checks": {"before": "configured"}}, checked
+            )
     (broker.checkout / 'README.md').write_text('Changed candidate\n')
     _git(broker.checkout, 'add', 'README.md')
     _git(broker.checkout, '-c', 'commit.gpgsign=false', '-c', 'user.name=Fixture',

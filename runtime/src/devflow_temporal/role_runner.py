@@ -305,10 +305,12 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Previous iteration and baseline results remain historical; they do not prove that "
             "the edited candidate passes. Distinguish broker measurements from your own work.\n"
             "The index below is navigation, not the complete assessment. Read the named JSON "
-            "with targeted queries for checks, previous_iterations, artifacts and full diagnostics. "
+            "with targeted queries for checks, previous_iterations, artifacts "
+            "and full diagnostics. "
             "Before probes, read implementation_preparation for the locked interpreters and "
             "recorded Node environment. All complete evidence remains in that file.\n"
-            + json.dumps(_receipt_index(receipts), sort_keys=True) + "\n"
+            + json.dumps(_receipt_index(receipts), sort_keys=True)
+            + "\n"
         )
     recovery = spec["policy"].get("recovery")
     recovery_path = request.get("recovery_path") or (

@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import copy
-import pytest
 
-from test_delivery_browser_reconciliation import recovery
+import pytest
 
 
 @pytest.fixture

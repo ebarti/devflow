@@ -18,8 +18,13 @@ from devflow_temporal.delivery_browser_qa import reconcile_browser_attempt
 
 @pytest.fixture
 def recovery(tmp_path, monkeypatch):
-    from devflow_temporal import delivery_automatic_retry, delivery_broker, delivery_browser_qa
-    from devflow_temporal import delivery_interrupted_recovery, delivery_policy_recovery
+    from devflow_temporal import (
+        delivery_automatic_retry,
+        delivery_broker,
+        delivery_browser_qa,
+        delivery_interrupted_recovery,
+        delivery_policy_recovery,
+    )
 
     candidate = {"id": "exact-candidate", "head": "a" * 40}
     publication = {"number": 1, "head": candidate["head"], "state": "OPEN"}
@@ -67,8 +72,13 @@ def recovery(tmp_path, monkeypatch):
     gate.mkdir()
     receipt = tmp_path / "receipt.json"
     receipt.write_text("retained failed gate")
-    result = {"state": "failed", "cleanup": "confirmed", "test_count": 10,
-              "receipt": str(receipt), "receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest()}
+    result = {
+        "state": "failed",
+        "cleanup": "confirmed",
+        "test_count": 10,
+        "receipt": str(receipt),
+        "receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+    }
     calls = []
 
     def reconcile(iteration, current, *, reconcile_only):
@@ -92,7 +102,9 @@ def recovery(tmp_path, monkeypatch):
     monkeypatch.setattr(delivery_broker, "DeliveryBroker", lambda *_: broker)
     monkeypatch.setattr(delivery_browser_qa, "candidate_for", lambda _: candidate)
     monkeypatch.setattr(delivery_automatic_retry, "_close_cleanup", cleanup)
-    monkeypatch.setattr(delivery_policy_recovery, "reconciled_cleanup", lambda *a, **k: {"bound": True})
+    monkeypatch.setattr(
+        delivery_policy_recovery, "reconciled_cleanup", lambda *a, **k: {"bound": True}
+    )
     return SimpleNamespace(store=store, closed=closed, state=state, spec=spec, calls=calls,
                            broker=broker, gate=gate, result=result)
 
@@ -122,7 +134,10 @@ def test_owner_reconciliation_refuses_changed_authority_before_effects(recovery,
             if drift == "active":
                 db.execute("UPDATE delivery_runs SET phase='checks'")
             elif drift == "other_effect":
-                db.execute("INSERT INTO delivery_effects VALUES ('other','run-owned','publish','pending',NULL)")
+                db.execute(
+                    "INSERT INTO delivery_effects VALUES "
+                    "('other','run-owned','publish','pending',NULL)"
+                )
             elif drift == "mutation":
                 db.execute("INSERT INTO delivery_mutations VALUES ('run-owned','pending','cancel')")
             elif drift == "unfinished_role":

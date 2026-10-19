@@ -29,7 +29,9 @@ def test_selected_playwright_keeps_existing_trace_and_reporter_contract(tmp_path
     assert Path(env['PLAYWRIGHT_JUNIT_OUTPUT_FILE']).parent == tmp_path / 'dist/owned-browser'
 
 
-@pytest.mark.parametrize('qa', [recipe(argv=['node', 'owned-browser.cjs']), recipe(artifact_paths=[])])
+@pytest.mark.parametrize(
+    "qa", [recipe(argv=["node", "owned-browser.cjs"]), recipe(artifact_paths=[])]
+)
 def test_generic_browser_recipes_keep_their_configured_behavior(tmp_path, qa):
     assert _playwright_evidence(qa, tmp_path) == (qa['argv'], {})
 

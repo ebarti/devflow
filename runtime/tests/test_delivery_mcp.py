@@ -194,7 +194,9 @@ async def test_mutations_start_and_forward_off_the_mcp_loop_once(monkeypatch, to
     args = {} if tool == 'start_service' else {'request_json': json.dumps(payload)}
     if tool not in {'start_service', 'submit_run'}:
         args['run_id'] = 'same-run'
-    async with create_connected_server_and_client_session(build_server(Path('/fixture/config'))) as session:
+    async with create_connected_server_and_client_session(
+        build_server(Path("/fixture/config"))
+    ) as session:
         result = await session.call_tool(tool, args)
         assert not result.isError, result.content
         assert json.loads(result.content[0].text) == {'forwarded': method}
@@ -217,7 +219,9 @@ async def test_uncertain_mcp_mutation_is_not_replayed(monkeypatch):
         return SimpleNamespace(continue_repair=uncertain)
 
     monkeypatch.setattr('devflow_temporal.delivery_mcp.client', startup)
-    async with create_connected_server_and_client_session(build_server(Path('/fixture/config'))) as session:
+    async with create_connected_server_and_client_session(
+        build_server(Path("/fixture/config"))
+    ) as session:
         result = await session.call_tool('continue_repair', {
             'run_id': 'same-run', 'request_json': '{"command_id":"stable"}',
         })
@@ -233,7 +237,9 @@ async def test_async_submission_keeps_per_request_origin_and_rejects_mismatch(mo
     seen = []
     monkeypatch.setattr('devflow_temporal.delivery_mcp.client', lambda _: SimpleNamespace(
         submit=lambda request: (seen.append(request.copy()) or request)))
-    async with create_connected_server_and_client_session(build_server(Path('/fixture/config'))) as session:
+    async with create_connected_server_and_client_session(
+        build_server(Path("/fixture/config"))
+    ) as session:
         for origin in (first, second):
             result = await session.call_tool('submit_run', {
                 'request_json': '{"command_id":"per-request"}',

@@ -19,7 +19,6 @@ from .delivery_feature_gates import (
 from .delivery_output import observed_test_count, rejection_causes, visible_output
 from .delivery_sandbox import prepare_browser_qa, trusted_local
 
-
 # Full, every-page PDF evidence has many small files. Bound the aggregate bytes
 # as well as the entry count, instead of treating 128 files as a failed runtime.
 MAX_BROWSER_ARTIFACTS = 2048
@@ -74,8 +73,9 @@ def _artifacts(checkout: Path, configured: list[str]) -> list[dict[str, Any]]:
 
 
 
-def _playwright_evidence(qa: dict, checkout: Path, *,
-                         reconcile_argv: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
+def _playwright_evidence(
+    qa: dict, checkout: Path, *, reconcile_argv: list[str] | None = None
+) -> tuple[list[str], dict[str, str]]:
     """Retain real runner reports for owned Playwright recipes and frozen v2 inputs."""
     argv = list(qa["argv"])
     start = next((i + 2 for i in range(len(argv) - 1)
@@ -350,18 +350,24 @@ def reconcile_browser_attempt(store, run_id: str, iteration: int) -> dict[str, A
         closed = store._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
         state = closed["result"]
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-        if (closed["workflow_id"] != row["workflow_id"]
-                or not closed["execution_run_id"] or not closed["closed_at"]
-                or closed["request_digest"] != row["request_digest"]
-                or closed["recovery_digest"] != (digest(recovery) if recovery else None)
-                or state.get("run_id") != run_id or state.get("revision") != row["protocol_revision"]
-                or any(state.get(key) != row[key] for key in
-                       ("phase", "outcome", "execution_state", "iteration", "error"))
-                or {k: v for k, v in state.get("checks", {}).items() if k != "resource_cleanup"}
-                != {k: v for k, v in checks.items() if k != "resource_cleanup"}
-                or state.get("candidate") != json.loads(row["candidate_json"])
-                or state.get("pull_request") != json.loads(row["pr_json"])
-                or state.get("tracker") != json.loads(row["tracker_json"] or "null")):
+        if (
+            closed["workflow_id"] != row["workflow_id"]
+            or not closed["execution_run_id"]
+            or not closed["closed_at"]
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"] != (digest(recovery) if recovery else None)
+            or state.get("run_id") != run_id
+            or state.get("revision") != row["protocol_revision"]
+            or any(
+                state.get(key) != row[key]
+                for key in ("phase", "outcome", "execution_state", "iteration", "error")
+            )
+            or {k: v for k, v in state.get("checks", {}).items() if k != "resource_cleanup"}
+            != {k: v for k, v in checks.items() if k != "resource_cleanup"}
+            or state.get("candidate") != json.loads(row["candidate_json"])
+            or state.get("pull_request") != json.loads(row["pr_json"])
+            or state.get("tracker") != json.loads(row["tracker_json"] or "null")
+        ):
             raise ValueError("browser reconciliation lost its exact closed execution")
         broker = DeliveryBroker(store, spec)
         if broker.evidence_dir != broker.state_dir:
@@ -369,14 +375,24 @@ def reconcile_browser_attempt(store, run_id: str, iteration: int) -> dict[str, A
             broker.effect_namespace = ":" + namespace
         key = f"browser_qa:{run_id}:{iteration}" + broker.effect_namespace
         with store._connect() as db:
-            effect = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?", (key,)).fetchone()
+            effect = db.execute(
+                "SELECT * FROM delivery_effects WHERE effect_key=?", (key,)
+            ).fetchone()
             busy = (
-                db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND effect_key!=? "
-                           "AND state!='complete'", (run_id, key)).fetchone()
-                or db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? AND state!='finished'",
-                              (run_id,)).fetchone()
-                or db.execute("SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
-                              "(state!='complete' OR kind='cancel')", (run_id,)).fetchone()
+                db.execute(
+                    "SELECT 1 FROM delivery_effects WHERE run_id=? AND effect_key!=? "
+                    "AND state!='complete'",
+                    (run_id, key),
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM delivery_attempts WHERE run_id=? AND state!='finished'",
+                    (run_id,),
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
+                    "(state!='complete' OR kind='cancel')",
+                    (run_id,),
+                ).fetchone()
             )
         candidate = state["candidate"]
         if (busy or effect is None or effect["run_id"] != run_id or effect["kind"] != "browser_qa"

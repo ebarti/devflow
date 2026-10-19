@@ -31,26 +31,40 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
         state = closed['result']
         recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
         checks = json.loads(row['checks_json'] or '{}')
-        if (closed['workflow_id'] != row['workflow_id']
-                or not closed['execution_run_id'] or not closed['closed_at']
-                or closed['request_digest'] != row['request_digest']
-                or closed['recovery_digest'] != (digest(recovery) if recovery else None)
-                or state.get('run_id') != run_id or state.get('revision') != row['protocol_revision']
-                or state.get('cleanup') != 'unknown'
-                or any(state.get(key) != row[key] for key in
-                       ('phase', 'outcome', 'execution_state', 'iteration', 'error'))
-                or {k: v for k, v in state.get('checks', {}).items() if k != 'resource_cleanup'}
-                != {k: v for k, v in checks.items() if k != 'resource_cleanup'}
-                or state.get('candidate') != json.loads(row['candidate_json'])
-                or state.get('pull_request') != json.loads(row['pr_json'])):
+        if (
+            closed["workflow_id"] != row["workflow_id"]
+            or not closed["execution_run_id"]
+            or not closed["closed_at"]
+            or closed["request_digest"] != row["request_digest"]
+            or closed["recovery_digest"] != (digest(recovery) if recovery else None)
+            or state.get("run_id") != run_id
+            or state.get("revision") != row["protocol_revision"]
+            or state.get("cleanup") != "unknown"
+            or any(
+                state.get(key) != row[key]
+                for key in ("phase", "outcome", "execution_state", "iteration", "error")
+            )
+            or {k: v for k, v in state.get("checks", {}).items() if k != "resource_cleanup"}
+            != {k: v for k, v in checks.items() if k != "resource_cleanup"}
+            or state.get("candidate") != json.loads(row["candidate_json"])
+            or state.get("pull_request") != json.loads(row["pr_json"])
+        ):
             raise ValueError('cleanup reconciliation lost its exact closed execution')
         with store._connect() as db:
-            if (db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND state!='complete'",
-                           (run_id,)).fetchone()
-                    or db.execute("SELECT 1 FROM delivery_attempts WHERE run_id=? AND state!='finished'",
-                                  (run_id,)).fetchone()
-                    or db.execute("SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
-                                  "(state!='complete' OR kind='cancel')", (run_id,)).fetchone()):
+            if (
+                db.execute(
+                    "SELECT 1 FROM delivery_effects WHERE run_id=? AND state!='complete'", (run_id,)
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM delivery_attempts WHERE run_id=? AND state!='finished'",
+                    (run_id,),
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM delivery_mutations WHERE run_id=? AND "
+                    "(state!='complete' OR kind='cancel')",
+                    (run_id,),
+                ).fetchone()
+            ):
                 raise ValueError('cleanup reconciliation has an unfinished effect or role')
         outcome = {'state': 'finished', 'cleanup': 'confirmed', 'changed': False,
                    'run_id': run_id, 'iteration': iteration}

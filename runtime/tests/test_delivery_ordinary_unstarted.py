@@ -4,10 +4,8 @@ from __future__ import annotations
 import copy
 
 import pytest
-
 from test_delivery_stopped_resume import project, saved
 from test_delivery_store import service as service
-from test_delivery_unused_budget_resume import fixed_stop
 
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import digest
@@ -39,7 +37,9 @@ def unstarted(fixed_stop, monkeypatch):
     return store, broker, original, prior, later, retry
 
 
-def test_ordinary_unstarted_turn_preserves_its_fixed_ceiling_and_original_session(unstarted, monkeypatch):
+def test_ordinary_unstarted_turn_preserves_its_fixed_ceiling_and_original_session(
+    unstarted, monkeypatch
+):
     store, _broker, original, prior, later, command = unstarted
     preflight = store.repair_admission_preflight('run-1', command)
     assert preflight['authorized_through_iteration'] == 2
@@ -57,6 +57,7 @@ def test_ordinary_unstarted_turn_preserves_its_fixed_ceiling_and_original_sessio
         assert db.execute('SELECT count(*) FROM delivery_runs').fetchone()[0] == 1
         assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
     import asyncio
+
     from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
     flow = DeliveryWorkflow()
@@ -94,10 +95,12 @@ def test_ordinary_unstarted_proof_cannot_replay_consumed_or_changed_authority(un
     else:
         with store._connect() as db:
             if drift == 'provider_attempt':
-                db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
-                           "state,session_id,result_json,cleanup) VALUES"
-                           "('consumed','run-1','implement',2,?,'finished',?,'{}','confirmed')",
-                           (command['expected_candidate_id'], prior['session_id']))
+                db.execute(
+                    "INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
+                    "state,session_id,result_json,cleanup) VALUES"
+                    "('consumed','run-1','implement',2,?,'finished',?,'{}','confirmed')",
+                    (command["expected_candidate_id"], prior["session_id"]),
+                )
             else:
                 db.execute("INSERT INTO delivery_effects(effect_key,run_id,kind,request_json,"
                            "state,observed_json,updated_at) VALUES"

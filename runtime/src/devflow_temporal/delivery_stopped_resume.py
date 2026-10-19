@@ -515,12 +515,16 @@ def _unlaunched_assessments(seal):
                       and not any(folder.iterdir()))
         except OSError:
             return False
-        if (role.get('status') != 'blocked' or role.get('finish_reason') != 'prelaunch'
-                or role.get('summary') != 'role launch failed before any provider process started'
-                or role.get('session_id') is not None or role.get('usage') is not None
-                or any(attempt.get(k) is not None for k in ('pid', 'process_identity', 'session_id'))
-                or attempt.get('result_path') != str(folder / 'result.json')
-                or not absent):
+        if (
+            role.get("status") != "blocked"
+            or role.get("finish_reason") != "prelaunch"
+            or role.get("summary") != "role launch failed before any provider process started"
+            or role.get("session_id") is not None
+            or role.get("usage") is not None
+            or any(attempt.get(k) is not None for k in ("pid", "process_identity", "session_id"))
+            or attempt.get("result_path") != str(folder / "result.json")
+            or not absent
+        ):
             return False
         unlaunched = True
     return unlaunched

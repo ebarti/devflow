@@ -623,8 +623,11 @@ class RunResources:
                             parent = Path(raw_root)
                             if (parent_entry['kind'] in {'checkout', 'gate'}
                                     and path.is_relative_to(parent) and path.parent != parent):
-                                old['workspace_declaration_sha256'] = workspace_dependency_directories(
-                                    parent, policy=self.spec['policy'])[path.relative_to(parent).as_posix()]
+                                old["workspace_declaration_sha256"] = (
+                                    workspace_dependency_directories(
+                                        parent, policy=self.spec["policy"]
+                                    )[path.relative_to(parent).as_posix()]
+                                )
                                 break
                     write_private(self.manifest, manifest)
                 return
@@ -650,9 +653,11 @@ class RunResources:
                     parent = Path(root)
                     if (entry['kind'] in {'checkout', 'gate'} and path.is_relative_to(parent)
                             and path.parent != parent):
-                        manifest['roots'][str(path)]['workspace_declaration_sha256'] = (
-                            workspace_dependency_directories(parent, policy=self.spec['policy'])[path.relative_to(
-                                parent).as_posix()])
+                        manifest["roots"][str(path)]["workspace_declaration_sha256"] = (
+                            workspace_dependency_directories(parent, policy=self.spec["policy"])[
+                                path.relative_to(parent).as_posix()
+                            ]
+                        )
                         break
             write_private(self.manifest, manifest)
 

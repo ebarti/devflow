@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 from pathlib import Path
 
 import pytest
-from test_delivery_store import _git, service as service
 from test_delivery_stopped_resume import project, saved
-from test_delivery_unused_budget_resume import fixed_stop
+from test_delivery_store import _git
+from test_delivery_store import service as service
 
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json
@@ -48,10 +47,15 @@ def assessment_stop(fixed_stop, monkeypatch):
             key = DeliverySupervisor._job_key(request)
             folder = Path(broker.spec['state_dir']) / 'attempts' / key
             private_directory(folder)
-            result = {'status': 'blocked', 'summary': 'role launch failed before any provider process started',
-                      'findings': ['implementation artifacts describe another candidate content'],
-                      'session_id': None, 'cleanup': 'confirmed', 'usage': None,
-                      'finish_reason': 'prelaunch'}
+            result = {
+                "status": "blocked",
+                "summary": "role launch failed before any provider process started",
+                "findings": ["implementation artifacts describe another candidate content"],
+                "session_id": None,
+                "cleanup": "confirmed",
+                "usage": None,
+                "finish_reason": "prelaunch",
+            }
             state['roles'].append({**result, 'role': role, 'iteration': state['iteration'],
                                     'candidate': candidate})
             attempt = {'job_key': key, 'run_id': 'run-1', 'role': role,
@@ -59,12 +63,17 @@ def assessment_stop(fixed_stop, monkeypatch):
                        'state': 'finished', 'result_path': str(folder / 'result.json'),
                        'result_json': canonical_json(result), 'cleanup': 'confirmed'}
             columns = ','.join(attempt)
-            db.execute(f'INSERT INTO delivery_attempts({columns}) VALUES ({",".join("?" for _ in attempt)})',
-                       tuple(attempt.values()))
+            placeholders = ','.join('?' for _ in attempt)
+            db.execute(
+                f"INSERT INTO delivery_attempts({columns}) VALUES ({placeholders})",
+                tuple(attempt.values()),
+            )
             attempts.append(attempt)
     project(store, state)
     closed = {**store._completed_temporal_result('run-1'), 'result': state}
-    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_k: copy.deepcopy(closed))
+    monkeypatch.setattr(
+        store, "_completed_temporal_result", lambda *_a, **_k: copy.deepcopy(closed)
+    )
     # Only the external GitHub transport is modeled; Git/source/store/admission run normally.
     monkeypatch.setattr(resume, 'published_identity', lambda *_a: state['pull_request'])
     command.update(command_id='resume-unlaunched-assessments', additional_iterations=0,
@@ -72,15 +81,21 @@ def assessment_stop(fixed_stop, monkeypatch):
     return store, broker, state, command, attempts
 
 
-def test_public_assessment_prelaunch_resume_preserves_source_pr_and_paid_iteration(assessment_stop, monkeypatch):
+def test_public_assessment_prelaunch_resume_preserves_source_pr_and_paid_iteration(
+    assessment_stop, monkeypatch
+):
     store, broker, state, command, _ = assessment_stop
     original = copy.deepcopy(store.submitted_spec('run-1'))
     stopped = copy.deepcopy(state)
     observed = resume.snapshot(store, 'run-1')
     assert resume._unlaunched_assessments(observed), {
-        'state': {k: observed['state'].get(k) for k in ['error', 'phase', 'iteration']},
-        'roles': observed['state']['roles'], 'attempts': observed['attempts'],
-        'spec': {k: observed['predecessor_spec'].get(k) for k in ['gate_admission', 'policy_digest']}}
+        "state": {k: observed["state"].get(k) for k in ["error", "phase", "iteration"]},
+        "roles": observed["state"]["roles"],
+        "attempts": observed["attempts"],
+        "spec": {
+            k: observed["predecessor_spec"].get(k) for k in ["gate_admission", "policy_digest"]
+        },
+    }
     assert resume.interrupted_resume(observed), 'eligible assessment gates need an interrupted plan'
     assert store.repair_admission_preflight('run-1', command)['authorized_through_iteration'] == 1
     store.continue_repair('run-1', command)
@@ -109,9 +124,23 @@ def test_public_assessment_prelaunch_resume_preserves_source_pr_and_paid_iterati
         'outcome': 'gates-only'}
 
 
-@pytest.mark.parametrize('drift', ['pid', 'session', 'result', 'files', 'candidate',
-                                  'local-failure', 'prepublish-failure', 'source-changed', 'coding-finding'])
-def test_assessment_retry_rejects_started_work_changed_source_and_real_findings(assessment_stop, drift):
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "pid",
+        "session",
+        "result",
+        "files",
+        "candidate",
+        "local-failure",
+        "prepublish-failure",
+        "source-changed",
+        "coding-finding",
+    ],
+)
+def test_assessment_retry_rejects_started_work_changed_source_and_real_findings(
+    assessment_stop, drift
+):
     store, broker, state, command, attempts = assessment_stop
     if drift in {'pid', 'session', 'result'}:
         field, value = {'pid': ('pid', 123), 'session': ('session_id', 'started'),

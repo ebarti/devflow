@@ -116,7 +116,9 @@ def test_non_native_test_project_does_not_expand_addon_authority(addon, monkeypa
     spec, checkout, authority, *_ = addon
     project = checkout / 'apps/web'
     project.mkdir()
-    (project / 'package.json').write_text('{"scripts":{"test":"vitest","pdf-tools":"node tools.cjs"}}')
+    (project / "package.json").write_text(
+        '{"scripts":{"test":"vitest","pdf-tools":"node tools.cjs"}}'
+    )
     original = native.subprocess.check_output
 
     def git(argv):

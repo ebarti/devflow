@@ -653,8 +653,9 @@ def scope_amendment_config(
 
     old_scope = authority(original['policy'])
     if old_scope['version'] == 1:
-        if (old_repository.get('source_scope') != old_scope
-                or new_repository.get('source_scope') != amended_scope(original['policy'], added_paths)):
+        if old_repository.get("source_scope") != old_scope or new_repository.get(
+            "source_scope"
+        ) != amended_scope(original["policy"], added_paths):
             raise ValueError('scope amendment changed more than the named source files')
         new_repository['source_scope'] = old_scope
     else:

@@ -308,13 +308,17 @@ def _published_cleanup_chain(store, row, state, closed):
             payload = json.loads(event['payload_json'])
             timestamp = datetime.fromisoformat(event['timestamp'])
             marker = payload.get('key')
-            if (event['run_revision'] != revision + 1
-                    or event['type'] != 'resource_cleanup_reconciled'
-                    or set(payload) != {'key', 'iteration', 'candidate_id'}
-                    or payload['iteration'] != row['iteration'] or payload['candidate_id'] is not None
-                    or not isinstance(marker, str) or len(marker) != 64
-                    or any(char not in '0123456789abcdef' for char in marker)
-                    or timestamp <= written):
+            if (
+                event["run_revision"] != revision + 1
+                or event["type"] != "resource_cleanup_reconciled"
+                or set(payload) != {"key", "iteration", "candidate_id"}
+                or payload["iteration"] != row["iteration"]
+                or payload["candidate_id"] is not None
+                or not isinstance(marker, str)
+                or len(marker) != 64
+                or any(char not in "0123456789abcdef" for char in marker)
+                or timestamp <= written
+            ):
                 break
             revision, written, latest = event['run_revision'], timestamp, event
         else:

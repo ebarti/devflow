@@ -473,7 +473,9 @@ def test_named_static_recipes_preserve_exact_range_and_frozen_checks(junit_proje
     assert json.dumps(spec, sort_keys=True) == before
 
 
-def test_frozen_plan_static_recipe_shares_configured_execution_without_losing_provenance(junit_project):
+def test_frozen_plan_static_recipe_shares_configured_execution_without_losing_provenance(
+    junit_project,
+):
     from devflow_temporal.delivery_validation_schedule import local_checks
 
     spec, checkout, metadata, evidence = junit_project

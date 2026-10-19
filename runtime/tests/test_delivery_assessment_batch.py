@@ -98,7 +98,9 @@ def test_recorded_legacy_input_keeps_first_failure_order(monkeypatch):
 
 
 @pytest.mark.parametrize('failed', ['prelaunch', 'review-prelaunch'])
-def test_prelaunch_failures_finish_independent_collection_without_a_coding_turn(monkeypatch, failed):
+def test_prelaunch_failures_finish_independent_collection_without_a_coding_turn(
+    monkeypatch, failed
+):
     calls, repairs, state = exercise(monkeypatch, failed=failed)
     assert calls == ['checks', 'browser', 'review', 'verify']
     assert repairs == []

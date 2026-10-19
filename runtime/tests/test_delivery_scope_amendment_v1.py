@@ -37,7 +37,9 @@ def amendment(tmp_path, monkeypatch):
 
     monkeypatch.setattr('devflow_temporal.delivery_execution_config.load_execution_config',
                         lambda _: SimpleNamespace(raw=copy.deepcopy(old)))
-    monkeypatch.setattr(DeliveryConfig, 'load', lambda p: SimpleNamespace(raw=json.loads(p.read_text())))
+    monkeypatch.setattr(
+        DeliveryConfig, "load", lambda p: SimpleNamespace(raw=json.loads(p.read_text()))
+    )
     return SimpleNamespace(old=old, new=new, original=original, path=path, save=save)
 
 
@@ -45,7 +47,10 @@ def test_versioned_amendment_grants_only_the_named_ci_file(amendment):
     a = amendment
     before = copy.deepcopy(a.original)
     amended = scope_amendment_config(a.original, a.path, a.save(), [WORKFLOW])
-    policy = {'allowed_paths': [], 'source_scope': amended.raw['repositories']['fixture']['source_scope']}
+    policy = {
+        "allowed_paths": [],
+        "source_scope": amended.raw["repositories"]["fixture"]["source_scope"],
+    }
     paths = [WORKFLOW, '.github/workflows/release.yml', '.github/new.yml', '.github/other/config',
              '.git/config', '.codex/config.toml', '.agents/AGENTS.md', 'apps/main.ts', 'other.txt']
     old_denied = outside_scope(a.original['policy'], paths)
