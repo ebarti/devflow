@@ -51,7 +51,8 @@ function Facts({ run }: { run: RunDetail }) {
     <div><dt>Authorized endpoint</dt><dd><span className="outline-pill">{titleCase(run.authorized_endpoint)}</span></dd></div>
     {run.feature ? <>
       <div><dt>Feature status</dt><dd>{run.feature.status}</dd></div>
-      <div><dt>Project sync</dt><dd>{run.feature.mirror?.state === 'consistent' ? 'Synced' : 'Pending'}{run.feature.mirror?.last_error ? `: ${run.feature.mirror.last_error}` : ''}</dd></div>
+      <div><dt>Project sync</dt><dd>{run.feature.mirror?.state === 'consistent' ? `Confirmed ${time(run.feature.mirror.checked_at)}` : 'Pending'}{run.feature.mirror?.last_error ? `: ${run.feature.mirror.last_error}` : ''}</dd></div>
+      {run.feature.issue_observation ? <div><dt>GitHub issue</dt><dd>{titleCase(run.feature.issue_observation.observation?.state)}{run.feature.issue_observation.observation?.state_reason ? ` · ${titleCase(run.feature.issue_observation.observation.state_reason)}` : ''} · checked {time(run.feature.issue_observation.checked_at)}{run.feature.issue_observation.error ? ` · ${run.feature.issue_observation.error}` : ''}</dd></div> : null}
       <div><dt>Attempt status</dt><dd>{runStatus(run)}</dd></div>
       <div><dt>Run phase</dt><dd>{titleCase(run.phase)}</dd></div>
       {run.feature.pull_requests.map(pr => {
@@ -77,6 +78,12 @@ function RoleTable({ roles }: { roles: RoleState[] | null | undefined }) {
   </section>
 }
 
+function activityLabel(event: ActivityEvent): string {
+  if (event.type === 'published') return 'Pull request published on GitHub'
+  if (event.type === 'candidate_ready') return 'Before-PR checks passed; publishing pull request'
+  return display(event.message, titleCase(event.type))
+}
+
 function Activity({ events }: { events: ActivityEvent[] | null | undefined }) {
   const ordered = [...(events ?? [])].sort((a, b) => b.sequence - a.sequence)
   return <section className="section activity-section" aria-labelledby="activity-heading">
@@ -84,7 +91,7 @@ function Activity({ events }: { events: ActivityEvent[] | null | undefined }) {
     {ordered.length ? <ol className="timeline">{ordered.map(event => <li key={event.sequence}>
       <span className="timeline__dot" aria-hidden="true" />
       <time dateTime={event.timestamp ?? undefined}>{timelineTime(event.timestamp)}</time>
-      <span>{display(event.message, titleCase(event.type))}</span>
+      <span>{activityLabel(event)}</span>
       <span className="timeline__sequence">#{event.sequence}</span>
     </li>)}</ol> : <p className="empty-section">No activity has been recorded yet.</p>}
   </section>
@@ -149,7 +156,8 @@ function Operations({ run }: { run: RunDetail }) {
       <div><dt>Service active roles</dt><dd>{display(run.capacity?.active)}</dd></div>
       <div><dt>Run queued</dt><dd>{run.queued == null ? 'Unknown' : run.queued ? 'Yes' : 'No'}</dd></div>
       <div><dt>Service capacity</dt><dd>{display(run.capacity?.limit)}</dd></div>
-      <div><dt>Cleanup</dt><dd>{titleCase(run.cleanup)}</dd></div>
+      <div><dt>Process/resource settlement</dt><dd>{titleCase(run.cleanup)}</dd></div>
+      <div><dt>Retained worktrees</dt><dd>{run.retained_worktrees?.state === 'observed' ? run.retained_worktrees.count : 'Not observed'}{run.retained_worktrees?.roots.length ? <ul>{run.retained_worktrees.roots.map(root => <li key={root.path}>{root.path}{root.reason ? ` · Original retention: ${root.reason}` : ''}</li>)}</ul> : null}</dd></div>
       <div><dt>Tracker desired</dt><dd>{display(run.tracker?.desired)}</dd></div>
       <div><dt>Tracker observed</dt><dd>{display(run.tracker?.observed)}</dd></div>
       <div><dt>{run.feature ? "Historical tracker receipt" : "Tracker sync"}</dt><dd>{titleCase(run.tracker?.state)}</dd></div>

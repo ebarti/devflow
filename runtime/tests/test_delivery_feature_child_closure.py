@@ -117,6 +117,39 @@ def test_child_status_uses_all_required_pr_merges_not_parent_or_worker_proofs(
     assert children["ui"]["status"] == ui_status
 
 
+def test_child_completed_outside_cancelled_attempt_uses_issue_observation(service, monkeypatch):
+    store, spec, record, _requested, _command, _gh = setup_feature(service, monkeypatch)
+    member = record["manifest"]["publication"]["members"][0]
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET phase='cancelled',execution_state='cancelled',"
+                   "outcome='cancelled',pr_json=? WHERE run_id=?",
+                   (json.dumps({"scope_complete": False, "pull_requests": [member]}),
+                    spec["run_id"]))
+        db.execute("INSERT INTO delivery_pr_observations VALUES (?,?,?,?,NULL)",
+                   (member["url"], json.dumps({"state": "MERGED", "head": member["head"]}),
+                    "2026-10-19T12:00:00Z", "2026-10-19T12:05:00Z"))
+        issue = "https://github.com/example/fixture/issues/10"
+        db.execute("INSERT INTO delivery_issue_observations VALUES (?,?,?,?,NULL)",
+                   (issue, json.dumps({"state": "CLOSED", "state_reason": "COMPLETED"}),
+                    "2026-10-19T12:00:00Z", "2026-10-19T12:05:00Z"))
+        transition(db, store.config, spec["run_id"])
+    feature = store.feature(spec["run_id"])
+    api = next(stream for stream in feature["workstreams"] if stream["id"] == "api")
+    assert api["status"] == "Merged"
+    assert len(api["pull_requests"]) == 1  # Do not manufacture the other chunk's PR.
+    with store._connect() as db:
+        row = db.execute("SELECT outcome,pr_json FROM delivery_runs WHERE run_id=?",
+                         (spec["run_id"],)).fetchone()
+        assert row["outcome"] == "cancelled"
+        assert json.loads(row["pr_json"])["scope_complete"] is False
+        db.execute("UPDATE delivery_issue_observations SET observation_json=? WHERE url=?",
+                   (json.dumps({"state": "OPEN", "state_reason": None}), issue))
+        transition(db, store.config, spec["run_id"])
+    api = next(stream for stream in store.feature(spec["run_id"])["workstreams"]
+               if stream["id"] == "api")
+    assert api["status"] == "Partially merged"
+
+
 @pytest.mark.parametrize(
     "field,value",
     [("workstream_id", "ui"), ("issue_url", "https://github.com/example/fixture/issues/11")],

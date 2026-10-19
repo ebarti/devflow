@@ -2,16 +2,16 @@ import { display, time } from './format'
 import { failedAttempt, runStatus } from './runStatus'
 import type { RunSummary } from './model'
 
-const lanes = ['Queued', 'Planning', 'Implementation', 'Review', 'QA & CI', 'Tracking', 'Awaiting merge', 'Merged', 'Delivered', 'Failed', 'Needs attention'] as const
+const lanes = ['Queued', 'Planning', 'Implementation', 'Review', 'QA & CI', 'Tracking', 'Awaiting merge', 'Merged', 'Done', 'Delivered', 'Failed', 'Needs attention'] as const
 
 export function laneFor(run: RunSummary): typeof lanes[number] {
-  if (failedAttempt(run) && !['Merged', 'Awaiting merge'].includes(run.feature?.status ?? '')) return 'Failed'
+  if (failedAttempt(run) && !['Merged', 'Done', 'Awaiting merge', 'Needs validation'].includes(run.feature?.status ?? '')) return 'Failed'
   if (runStatus(run) === 'Waiting for decision') return 'Needs attention'
   if (run.feature) {
     const featureLanes: Record<string, typeof lanes[number]> = {
       Queued: 'Queued', Planning: 'Planning', 'In progress': 'Implementation',
       'In review': 'Review', Validating: 'QA & CI', 'Awaiting merge': 'Awaiting merge',
-      Merging: 'Tracking', 'Waiting for GitHub': 'Tracking', Merged: 'Merged', Blocked: 'Needs attention',
+      Merging: 'Tracking', 'Waiting for GitHub': 'Tracking', Merged: 'Merged', Done: 'Done', Blocked: 'Needs attention',
       Cancelled: 'Needs attention', 'PR closed': 'Needs attention', 'Needs validation': 'Needs attention',
     }
     return featureLanes[run.feature.status] ?? 'Needs attention'
@@ -65,12 +65,12 @@ export function RunBoard({ runs, archived, onSelect, onToggle, onRefresh }: {
   const groups = new Map(lanes.map(lane => [lane, [] as Task[]]))
   for (const task of tasks) groups.get(laneFor(task.run))!.push(task)
   return <section aria-label="Task status board">
-    <div className="board-toolbar"><div><h2>{archived ? 'Archived tasks' : 'Task board'}</h2><p className="subtle">{tasks.length} {archived ? 'archived attempts' : 'tasks · one current card per issue'} · refreshed every 5 seconds</p></div><div className="button-row"><button className="outline-button" onClick={onToggle}>{archived ? 'Show current tasks' : 'Show archived tasks'}</button><button className="text-button" onClick={onRefresh}>Refresh board</button></div></div>
+    <div className="board-toolbar"><div><h2>{archived ? 'Archived tasks' : 'Task board'}</h2><p className="subtle">{tasks.length} {archived ? 'archived attempts' : 'Devflow issues · one current card per issue'} · refreshed every 5 seconds</p>{!archived ? <p className="subtle">This board shows issues admitted to this Devflow installation. The GitHub Project also includes other backlog items. Each card shows the last confirmed Project readback.</p> : null}</div><div className="button-row"><button className="outline-button" onClick={onToggle}>{archived ? 'Show current tasks' : 'Show archived tasks'}</button><button className="text-button" onClick={onRefresh}>Refresh board</button></div></div>
     {!tasks.length ? <p className="empty-section">{archived ? 'No archived tasks.' : 'No current tasks. Start a new run to see it progress here.'}</p> : null}
     <div className="kanban-board">{lanes.map(lane => <section className="kanban-lane" key={lane} aria-label={`${lane} column`}><h3>{lane}<span>{groups.get(lane)!.length}</span></h3><div className="kanban-cards">{groups.get(lane)!.map(({ run, previous, currentMissing }) => <article key={run.id}>
       <button className="task-card" onClick={() => onSelect(run.id)}>
         <span className="task-card__repo">{display(run.repository || run.repository_key)}</span><strong>{display(run.title || run.goal, 'Untitled task')}</strong><span className={`task-card__status${lane === 'Failed' ? ' task-card__status--failed' : ''}`}>{lane === 'Failed' ? 'Failed attempt' : run.feature?.status ?? runStatus(run)}</span>
-        {currentMissing ? <small>Open current run · details not loaded</small> : <small>{run.outcome ? 'Last attempt' : 'Run'}: {runStatus(run)}{run.feature ? ` · Project: ${run.feature.mirror?.state === 'consistent' ? 'Synced' : 'Sync pending'}` : ''}</small>}
+        {currentMissing ? <small>Open current run · details not loaded</small> : <small>{run.outcome ? 'Last attempt' : 'Run'}: {runStatus(run)}{run.feature ? ` · Project: ${run.feature.mirror?.state === 'consistent' ? `Confirmed ${time(run.feature.mirror.checked_at)}` : 'Sync pending'}` : ''}</small>}
         {lane === 'Failed' ? <small>This attempt stopped. Open it for the reason and recovery options.</small> : null}
         {!currentMissing ? <small>Last update {time(run.updated_at)}</small> : null}
       </button>

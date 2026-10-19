@@ -2,25 +2,8 @@
 
 The feature's current status is canonical. GitHub Project Status is an exact mirror of
 that value; delivery phase, historical outcome, publication receipt, and execution
-ownership are separate facts. GitHub supplies current PR lifecycle facts. Observing a
+ownership are separate facts. GitHub supplies current issue completion and PR lifecycle facts. Observing a
 merge does not rewrite a historical delivery outcome or authorize closing an issue.
-
-## Root cause
-
-The observed failure was a merged PR whose delivery receipt still said OPEN, whose
-work was waiting, and whose Project said In review, while audit reported consistent.
-
-1. PR receipts are written at publication, so later merges were invisible.
-2. Run cards and audit read those receipts and the saved Project mapping as current truth.
-3. Audit compared the Project to that mapping, and skipped local status comparison for waiting.
-4. The failure appeared after external PR changes and after claim release changed active to waiting.
-5. There was no independently reconciled current feature record. Execution ownership,
-   publication history, and business status were serving different purposes under one label.
-
-The fix belongs at the state/event and external-projection boundaries. Runtime
-transactions record feature changes durably. A separate synchronizer observes PRs
-and projects current feature status. Remote availability must not govern execution
-ownership or consume delivery repair cycles.
 
 ## Contract
 
@@ -41,7 +24,7 @@ ownership or consume delivery repair cycles.
 - The worker consumes committed changes, coalescing obsolete projections, with durable
   retry state. An acknowledged mirror requires remote readback of the exact status and
   assignee. A failed mirror remains pending and does not change the feature's status.
-- Known PRs and Project drift are checked every 24 hours, including historical receipts. Their
+- Admitted issues, known PRs and Project drift are checked every five minutes by default. Their
   observation schedule survives restarts. No agents or product repairs are dispatched.
 - PR state, head changes, Project drift, duplicate events, and worker restarts reconcile
   idempotently. Unknown remote observations retain the last known fact with an error and
@@ -49,8 +32,17 @@ ownership or consume delivery repair cycles.
 - New deliveries acknowledge local tracking transitions without waiting for GitHub.
   Terminal publication still requires its PR custody readback before local acknowledgement.
   Historical run data is not rewritten to adopt new execution policies.
-- Project Status option names match the local feature status literally. Creating missing
-  options preserves the existing option IDs and values; there are no status aliases.
+- Project Status options reuse case-insensitive matching names, so an existing
+  `In Progress` option does not create a second `In progress` column. Creating missing
+  options preserves existing IDs and values.
+- A GitHub issue closed as completed supplies current completion evidence. Bound PRs
+  observed merged produce `Merged`; completion without a complete merged-PR record
+  produces `Done`. This never rewrites the old attempt, its checks or scope receipt.
+  Reopening an issue removes that external completion evidence. A closed unmerged PR
+  remains `PR closed`; an intervention needed by the current attempt remains `Blocked`.
+- The dashboard contains admitted Devflow issues. The GitHub Project also contains
+  backlog items and work executed elsewhere; absence from this installation is not
+  evidence of completion.
 
 Post-publication merge authorization, stack merge execution, repair-budget changes,
 and learning retrospectives are separate changes. This component observes merge facts
@@ -63,7 +55,7 @@ features. Do not run separate consumers with disjoint owner lists for the same P
 The list is intentionally explicit; the worker never scans arbitrary local databases.
 
 ```json
-{"version":1,"owners":["/absolute/runtime/service.json"],"pr_interval_seconds":86400,"project_interval_seconds":86400}
+{"version":1,"owners":["/absolute/runtime/service.json"],"pr_interval_seconds":300,"project_interval_seconds":300}
 ```
 
 Use `devflow-project-sync --config /absolute/project-sync.json --once` for one
@@ -72,10 +64,10 @@ Unix datagram endpoint for every configured database before its initial catch-up
 then waits for notifications or the next durable retry/check deadline. It does not
 poll local state on a two-second timer. Notifications carry no state or authority;
 the service always reads committed SQLite state, coalescing duplicate notifications.
-Daily reconciliation also recovers a writer crash between commit and notification.
+Periodic reconciliation also recovers a writer crash between commit and notification.
 A stopped service catches up immediately on restart.
 
-GitHub PR observation and Project drift checks default to 24 hours, independently
+GitHub issue/PR observation and Project drift checks default to five minutes, independently
 configurable from 300 to 86400 seconds. Newly recorded PRs and newly published heads
 on existing PRs trigger an immediate observation. The consumed publication identity
 is durable, so duplicate notifications and service restarts do not repeat that read.

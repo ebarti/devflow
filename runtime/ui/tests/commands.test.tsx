@@ -109,7 +109,7 @@ describe('dashboard commands', () => {
       candidate_revision: 1, answer: 'proceed',
     })
     expect(screen.getByText('Run queued').closest('div')?.querySelector('dd')?.textContent).toBe('No')
-    expect(screen.getByText('Cleanup').closest('div')?.querySelector('dd')?.textContent).toBe('None')
+    expect(screen.getByText('Process/resource settlement').closest('div')?.querySelector('dd')?.textContent).toBe('None')
     expect(screen.getByText('Tracker observed').closest('div')?.querySelector('dd')?.textContent).toBe('{"state":"consistent","claim":true}')
     expect(screen.queryByText('[object Object]')).toBeNull()
     expect(screen.getByText('Total').closest('div')?.querySelector('dd')?.textContent).toBe('Unknown')

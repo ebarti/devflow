@@ -65,11 +65,31 @@ historical command timestamps remain unknown. CPU, memory, I/O and swap profilin
 are outside this change.
 
 The installed controller is excluded explicitly from temporary resource cleanup.
+Inside authenticated, source-clean worktrees, finalization removes ignored
+`.pytest_cache`, `.ruff_cache`, `__pycache__` and `docs/.vitepress/dist` directories
+after checking for live users. Unknown ignored files, dirty/unpushed source and
+blocked-run recovery candidates remain preserved. A published ancestor remains
+safe to remove when its commit is contained in the same remote branch's current
+head. Process/resource settlement and retained directory counts are shown
+separately.
+
+For already-settled runs, use the installed Python with
+`-m devflow_temporal.delivery_resource_maintenance --config CONFIG --run RUN`.
+Repeat `--run` for explicitly selected runs. This rechecks actors, ownership and
+source preservation, then writes a separate pruning receipt; it preserves the
+original manifest, finalization, sessions and durable evidence. It cannot prune
+an active run or treat unknown cleanup as confirmed.
+
 The production checkout stays Git-locked. Supported upgrades stop its owned stack
 before changing imported source, retain the same persistence, start the qualified
 worker and API, then independently read back readiness and configuration. Recovery
 qualification covers the real maintenance, settlement and continuation paths with
 original candidate, session and repair accounting retained.
+
+Product documentation explains final behavior, contracts and limitations.
+Role handoffs and retained run evidence hold execution history, attempt IDs,
+check/repair chronology and receipt inventories. Useful source citations and
+product reproduction instructions can remain in documentation.
 
 Use real issues for subsequent trials so completed and partial work is useful.
 Configure an elapsed limit only when authorized, retain the same work on fallback,

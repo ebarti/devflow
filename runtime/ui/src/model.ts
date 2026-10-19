@@ -20,6 +20,8 @@ export interface FeatureState {
   status: string
   version: number
   mirror?: { state: string; last_error?: string | null; checked_at?: string | null }
+  issue_observation?: { checked_at?: string | null; error?: string | null;
+    observation?: { state: string; state_reason: string; closed_at: string | null } | null } | null
   pull_requests: { url: string; checked_at?: string | null; error?: string | null;
     observation?: { state: string; head: string; base: string; merged_at?: string | null } | null }[]
 }
@@ -186,6 +188,7 @@ export interface RunDetail extends RunSummary {
   } | null
   queued?: boolean | null
   cleanup?: string | null
+  retained_worktrees?: { state: string; count: number | null; roots: Array<{ path: string; reason?: string | null }> }
   candidate?: {
     id?: string | null
     base?: string | null

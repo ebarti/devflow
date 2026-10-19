@@ -80,3 +80,20 @@ it('retains repeated review attempts without duplicate React keys', () => {
   expect(screen.getByText('fresh-review')).toBeTruthy()
   expect(errors).not.toHaveBeenCalled()
 })
+
+it('shows publication and directory retention separately from process settlement', () => {
+  render(<RunDetails run={{ ...mockRun, decisions: [], cleanup: 'confirmed',
+    retained_worktrees: { state: 'observed', count: 1, roots: [
+      { path: '/owned/candidate', reason: 'blocked-run candidate and recovery source are preserved' },
+    ] },
+    events: [
+      { sequence: 1, type: 'candidate_ready', message: 'Candidate ready for publication' },
+      { sequence: 2, type: 'published', message: 'Regular pull request read back at candidate head' },
+    ],
+  }} onRefresh={async () => {}} />)
+  expect(screen.getByText('Pull request published on GitHub')).toBeTruthy()
+  expect(screen.queryByText('Regular pull request read back at candidate head')).toBeNull()
+  expect(screen.getByText('Process/resource settlement')).toBeTruthy()
+  expect(screen.getByText('Retained worktrees')).toBeTruthy()
+  expect(screen.getByText(/blocked-run candidate and recovery source/)).toBeTruthy()
+})

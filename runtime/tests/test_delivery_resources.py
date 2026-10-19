@@ -477,6 +477,105 @@ def test_dirty_and_blocked_worktrees_are_retained_with_reason(tmp_path):
     assert not checkout.exists()
 
 
+@pytest.mark.parametrize("cache", ["docs/.vitepress/dist", ".pytest_cache", ".ruff_cache",
+                                   "worker/package/__pycache__"])
+def test_known_ignored_caches_do_not_keep_clean_source_forever(tmp_path, cache):
+    _owned, resources, source, checkout = owned_worktree(tmp_path)
+    (source / ".git/info/exclude").write_text(cache + "/\n")
+    generated = checkout / cache
+    generated.mkdir(parents=True)
+    (generated / "output").write_text("disposable")
+    result = resources.finalize("cancelled")
+    assert result["state"] == "confirmed"
+    assert result["roots"][0]["state"] == "removed"
+    assert result["roots"][0]["discarded_caches"] == [str(generated)]
+    assert not checkout.exists()
+
+
+def test_cache_disposal_preserves_unknown_ignored_files_and_symlink_targets(tmp_path):
+    _owned, resources, source, checkout = owned_worktree(tmp_path)
+    (source / ".git/info/exclude").write_text(".pytest_cache/\n.env\n")
+    cache = checkout / ".pytest_cache"
+    cache.mkdir()
+    sentinel = tmp_path / "important"
+    sentinel.mkdir()
+    (sentinel / "file").write_text("preserved")
+    (cache / "external").symlink_to(sentinel, target_is_directory=True)
+    (checkout / ".env").write_text("preserved unknown data")
+    result = resources.finalize("delivered")
+    assert result["state"] == "confirmed"
+    assert result["roots"][0]["state"] == "retained"
+    assert "ignored worktree data" in result["roots"][0]["reason"]
+    assert not cache.exists()
+    assert (checkout / ".env").read_text() == "preserved unknown data"
+    assert (sentinel / "file").read_text() == "preserved"
+
+
+def test_explicit_pruning_preserves_original_receipts_and_blocked_source(tmp_path, monkeypatch):
+    from devflow_temporal.delivery_resources import retained_worktrees
+
+    owned, resources, source, checkout = owned_worktree(tmp_path)
+    (source / ".git/info/exclude").write_text(".pytest_cache/\n")
+    original_discard = resources._discard_worktree_caches
+    monkeypatch.setattr(resources, "_discard_worktree_caches", lambda _path: [])
+    cache = checkout / ".pytest_cache"
+    cache.mkdir()
+    (cache / "output").write_text("old disposable cache")
+    result = resources.finalize("blocked")
+    originals = {name: (resources.root / name).read_bytes()
+                 for name in ("manifest.json", "finalization.json")}
+    assert result["roots"][0]["state"] == "retained"
+    monkeypatch.setattr(resources, "_discard_worktree_caches", original_discard)
+    pruned = resources.prune_retained()
+    assert not cache.exists() and checkout.exists()
+    assert pruned["roots"][0]["state"] == "retained"
+    assert "blocked-run" in pruned["roots"][0]["reason"]
+    assert all((resources.root / name).read_bytes() == raw for name, raw in originals.items())
+    assert Path(pruned["receipt"]).is_file()
+    assert retained_worktrees(owned)["count"] == 1
+    assert resources.prune_retained()["roots"][0]["discarded_caches"] == []
+
+
+def test_pruning_removes_old_cache_only_retention_without_rewriting_history(tmp_path, monkeypatch):
+    owned, resources, source, checkout = owned_worktree(tmp_path)
+    (source / ".git/info/exclude").write_text(".ruff_cache/\n")
+    cache = checkout / ".ruff_cache"
+    cache.mkdir()
+    (cache / "output").write_text("cache")
+    original_discard = resources._discard_worktree_caches
+    monkeypatch.setattr(resources, "_discard_worktree_caches", lambda _path: [])
+    resources.finalize("cancelled")
+    originals = {name: (resources.root / name).read_bytes()
+                 for name in ("manifest.json", "finalization.json")}
+    monkeypatch.setattr(resources, "_discard_worktree_caches", original_discard)
+    result = resources.prune_retained()
+    assert result["roots"][0]["state"] == "removed" and not checkout.exists()
+    assert all((resources.root / name).read_bytes() == raw for name, raw in originals.items())
+
+
+def test_published_ancestor_is_preserved_when_remote_branch_advances(tmp_path):
+    owned, resources, source, checkout = owned_worktree(tmp_path)
+    (checkout / "file").write_text("published candidate")
+    subprocess.run(["git", "-C", str(checkout), "commit", "-am", "candidate"],
+                   check=True, capture_output=True)
+    head = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                   text=True).strip()
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+    (checkout / "file").write_text("later documentation fix")
+    subprocess.run(["git", "-C", str(checkout), "commit", "-am", "followup"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(checkout), "push", "origin", owned["branch"]],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(checkout), "reset", "--hard", head],
+                   check=True, capture_output=True)
+    result = resources.finalize("delivered")
+    assert result["roots"][0]["state"] == "removed"
+    assert result["roots"][0]["source_preservation"]["state"] == "published_ancestor"
+    assert result["roots"][0]["source_preservation"]["head"] == head
+
+
 def test_unpushed_then_published_worktree_requires_remote_and_no_live_user(tmp_path):
     owned, resources, source, checkout = owned_worktree(tmp_path)
     (checkout / "file").write_text("candidate")

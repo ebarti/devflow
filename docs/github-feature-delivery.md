@@ -16,7 +16,7 @@ The final chunk also carries the whole feature's acceptance criteria.
 | GitHub | Parent and sub-issues, hierarchy, scope, acceptance, accepted chunk plan, owning stack ID, exact PR membership, branches, PR heads and actual merge state |
 | Shared local execution registry | One coordinator claim per GitHub issue node ID, ownership generation, worker assignments, immutable input snapshots, checkpoints, effect intents and receipts, cumulative repairs and learning flag |
 | Runtime database | Immutable admitted requests, workflow IDs and revisions, original role sessions and evidence, candidate/gate receipts, durable start outbox, derived status events and cached Project readbacks |
-| Independent synchronizer | Event consumption, Project updates, retry receipts and the daily PR/Project drift schedule |
+| Independent synchronizer | Event consumption, Project updates, retry receipts and the configured issue/PR/Project reconciliation schedule |
 
 Version 2 publishes a compact `devflow-delivery:v2` index on the parent and
 readable, immutable detailed plan comments on each exact child issue. The parent

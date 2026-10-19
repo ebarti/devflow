@@ -161,8 +161,8 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "gates, not that the feature is verified. Report checks you could not run as "
             "pending in your summary, not as current product-documentation facts. For "
             "investigations, retain reproducible probe code, inputs and actual outputs "
-            "with source provenance and hashes in the authorized document or an explicitly "
-            "supplied retained evidence location. A temporary host directory cited only "
+            "with source provenance and hashes in the explicitly supplied retained evidence "
+            "location. A temporary host directory cited only "
             "in a summary is not a durable handoff. Report actual implementation defects "
             "as findings. "
             "Do not push, open a PR, merge, or change GitHub tracking."
@@ -188,6 +188,13 @@ def _task(request: dict[str, Any]) -> AgentTask:
             "Do not push, open a PR, or change GitHub tracking."
         ),
     }[role]
+    instructions += (
+        " Product, user and architecture documentation describes the resulting behavior, "
+        "design and limitations. Keep execution history, attempt IDs, repair/check chronology, "
+        "controller instructions and receipt inventories in retained run evidence and the "
+        "handoff, rather than product documentation. Concise source citations and useful "
+        "reproduction instructions belong in documentation when they explain the product."
+    )
     if role == "intake" and spec.get("feature_delivery") and spec.get("feature_plan_version") == 2:
         from .delivery_feature_gates import intake_recipe_catalog
 

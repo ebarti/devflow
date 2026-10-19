@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 STATUSES = (
     "Queued", "Planning", "In progress", "In review", "Validating", "Awaiting merge",
     "Merging", "Merged", "Blocked", "Cancelled", "PR closed", "Needs validation",
-    "Partially merged",
+    "Partially merged", "Done",
 )
 
 
@@ -38,6 +38,9 @@ def initialize(db: sqlite3.Connection) -> None:
         next_check_at TEXT NOT NULL, error TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pr_refresh_requests (
         url TEXT PRIMARY KEY, request_id TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_issue_observations (
+        url TEXT PRIMARY KEY, observation_json TEXT, checked_at TEXT,
+        next_check_at TEXT NOT NULL, error TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_legacy_publication_bindings (
         issue TEXT PRIMARY KEY, projection_run_id TEXT NOT NULL,
         publication_run_id TEXT NOT NULL, publication_json TEXT NOT NULL)""")
@@ -90,13 +93,24 @@ def publication_urls(receipt: dict | None) -> list[str]:
     return sorted({member["url"] for member in members if member.get("url")})
 
 
-def _status(row: dict, observations: list[dict], receipt: dict | None = None) -> str:
+def _status(row: dict, observations: list[dict], receipt: dict | None = None,
+            issue_observation: dict | None = None) -> str:
     known = [item.get("observation") for item in observations]
     receipt = receipt or json.loads(row["pr_json"] or "{}")
     spec = json.loads(row["request_json"])
-    complete = not spec.get("feature_delivery") or receipt.get("scope_complete") is True
+    settled = (row.get("execution_state") in {"terminal", "blocked", "cancelled"}
+               or row.get("outcome") in {"blocked", "cancelled", "published_unmerged"})
+    completed_issue = bool(settled and issue_observation
+                           and issue_observation.get("state") == "CLOSED"
+                           and issue_observation.get("state_reason") == "COMPLETED")
+    complete = (not spec.get("feature_delivery") or receipt.get("scope_complete") is True
+                or completed_issue)
     if complete and known and all(item and item["state"] == "MERGED" for item in known):
         return "Merged"
+    if completed_issue:
+        # Current GitHub outcome is separate from this attempt's historical
+        # publication/verification receipt. Never manufacture scope completion.
+        return "Done"
     if spec.get("feature_delivery") and any(item and item["state"] == "MERGED" for item in known):
         return "Partially merged"
     if any(item and item["state"] == "CLOSED" for item in known):
@@ -107,6 +121,11 @@ def _status(row: dict, observations: list[dict], receipt: dict | None = None) ->
     if row["outcome"] == "cancelled" or phase == "cancelled":
         return "Cancelled"
     if row["outcome"] == "blocked" or phase == "blocked":
+        heads = {item["url"]: item.get("head") for item in
+                 (receipt.get("pull_requests") or [receipt]) if item.get("url")}
+        if any(item and item["state"] == "OPEN" and item.get("head") != heads.get(item["url"])
+               for item in known):
+            return "Needs validation"
         return "Blocked"
     if phase in {"delivered", "awaiting_merge", "merged"}:
         heads = {item["url"]: item.get("head") for item in
@@ -162,6 +181,11 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
     from .delivery_legacy_publication import publication
 
     receipt, publication_binding = publication(db, row)
+    issue_row = db.execute("SELECT * FROM delivery_issue_observations WHERE url=?",
+                           (key,)).fetchone()
+    issue_observation = ({"observation": json.loads(issue_row["observation_json"] or "null"),
+                          "checked_at": issue_row["checked_at"], "error": issue_row["error"]}
+                         if issue_row else None)
     observations = []
     for url in publication_urls(receipt):
         observation = db.execute(
@@ -182,10 +206,14 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
             merge_status = {"merged": "Merged", "blocked": "Blocked",
                             "decision_required": "Needs validation", "unknown": "Needs validation"}
             merge_status = merge_status.get(merge[0], "Merging")
+    current_status = _status(
+        row, observations, receipt, (issue_observation or {}).get("observation"))
     payload = {
         "issue": key, "run_id": run_id, "work_id": row["work_id"],
         "admitted_at": row["created_at"], "run_revision": row["revision"],
-        "status": merge_status or _status(row, observations, receipt), "binding": binding,
+        "status": (current_status if current_status in {"Merged", "Done"}
+                   else merge_status or current_status),
+        "binding": binding, "issue_observation": issue_observation,
         "legacy_tracking": spec.get("project_sync_version") != 1
         and row["execution_state"] not in {"terminal", "blocked", "cancelled"},
         "pull_requests": observations,
@@ -232,12 +260,25 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
             child_observations = [observation_by_url[member["url"]] for member in child_members
                                   if member["url"] in observation_by_url]
             observed = [item.get("observation") for item in child_observations]
-            fully_merged = (len(child_members) == len(chunk_ids)
-                            and len(observed) == len(chunk_ids)
+            child_issue = issue_key(binding["url"])
+            child_row = db.execute("SELECT * FROM delivery_issue_observations WHERE url=?",
+                                   (child_issue,)).fetchone()
+            child_observation = ({
+                "observation": json.loads(child_row["observation_json"] or "null"),
+                "checked_at": child_row["checked_at"], "error": child_row["error"],
+            } if child_row else None)
+            child_fact = (child_observation or {}).get("observation") or {}
+            child_completed = (row["execution_state"] in {"terminal", "blocked", "cancelled"}
+                               and child_fact.get("state") == "CLOSED"
+                               and child_fact.get("state_reason") == "COMPLETED")
+            fully_merged = ((len(child_members) == len(chunk_ids) or child_completed)
+                            and observed
                             and all(item and item["state"] == "MERGED" for item in observed))
             status = "Queued"
             if fully_merged:
                 status = "Merged"
+            elif child_completed:
+                status = "Done"
             elif any(item and item["state"] == "MERGED" for item in observed):
                 status = "Partially merged"
             elif any(item and item["state"] == "CLOSED" for item in observed):
@@ -254,7 +295,8 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
                                 "issue": issue_key(binding["url"]),
                                 "issue_number": binding["number"], "status": status,
                                 "required_chunks": chunk_ids,
-                                "pull_requests": child_observations})
+                                "pull_requests": child_observations,
+                                "issue_observation": child_observation})
         payload["workstreams"] = workstreams
     encoded = canonical_json(payload)
     prior = db.execute("SELECT * FROM delivery_features WHERE issue=?", (key,)).fetchone()

@@ -69,7 +69,7 @@ describe('workflow board and controls', () => {
     const review = screen.getByRole('region', { name: 'Review column' })
     expect(review.querySelectorAll('.task-card')).toHaveLength(1)
     expect(review.querySelector('details')?.open).toBe(false)
-    expect(review.textContent).toContain('Project: Synced')
+    expect(review.textContent).toContain('Project: Confirmed')
     await userEvent.setup().click(within(review).getByRole('button', { name: /Fixture workflow/ }))
     expect(select).toHaveBeenLastCalledWith('current-run')
     await userEvent.setup().click(screen.getByText('11 previous attempts'))
@@ -99,6 +99,13 @@ describe('workflow board and controls', () => {
     const lane = screen.getByRole('region', { name: 'Merged column' })
     expect(lane.querySelector('.task-card__status')?.textContent).toBe('Merged')
     expect(lane.textContent).toContain('Last attempt: Failed')
+  })
+
+  it.each(['Done', 'Needs validation'])('shows current %s ahead of a historical failed attempt', status => {
+    const feature = { issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id,
+      status, version: 5, pull_requests: [] }
+    const run = { ...mockRun, phase: 'blocked', outcome: 'blocked', execution_state: 'blocked', feature }
+    expect(laneFor(run)).toBe(status === 'Done' ? 'Done' : 'Needs attention')
   })
 
   it('keeps terminal failure distinct from waiting for a decision and an unknown blocked phase', () => {

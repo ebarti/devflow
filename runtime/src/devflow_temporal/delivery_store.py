@@ -4133,7 +4133,7 @@ class DeliveryStore:
             }
             for name, label, completion in gate_specs
         ]
-        from .delivery_resources import projected_cleanup
+        from .delivery_resources import projected_cleanup, retained_worktrees
 
         cleanup = projected_cleanup(
             spec, checks, row["cleanup"], terminal=(not own_unconfirmed
@@ -4143,6 +4143,7 @@ class DeliveryStore:
         )
         return {
             **compact,
+            "retained_worktrees": retained_worktrees(spec),
             "run": compact,
             "phase_gates": gates,
             "roles": roles,
