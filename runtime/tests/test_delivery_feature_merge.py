@@ -183,7 +183,7 @@ def test_one_stack_merge_closes_issues_only_after_tree_and_trunk_readback(servic
         projected = json.loads(db.execute(
             "SELECT payload_json FROM delivery_features").fetchone()[0])
     assert len(observations) == 3 and all(item["state"] == "MERGED" for item in observations)
-    assert projected["status"] == "Merged"
+    assert projected["status"] == "Done"
     assert merger.merge(store, spec, requested, command, gh=gh, execute=execute) == result
     assert len(commands) == 1
 

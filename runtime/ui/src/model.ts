@@ -1,5 +1,24 @@
 export type GateState = string | null
 
+export interface ProjectItem {
+  id: string
+  url: string
+  title: string
+  number: number
+  repository: string
+  type: string
+  state: string
+  status: string
+  priority?: string | null
+  labels: string[]
+  checked_at?: string | null
+}
+
+export interface ProjectBoard {
+  items: ProjectItem[]
+  projects: { url: string; checked_at: string | null; error: string | null; state: string }[]
+}
+
 export interface Usage {
   input_tokens?: number | null
   cached_input_tokens?: number | null
@@ -21,7 +40,7 @@ export interface FeatureState {
   version: number
   mirror?: { state: string; last_error?: string | null; checked_at?: string | null }
   issue_observation?: { checked_at?: string | null; error?: string | null;
-    observation?: { state: string; state_reason: string; closed_at: string | null } | null } | null
+    observation?: { state: string; state_reason: string; closed_at: string | null; labels?: string[] } | null } | null
   pull_requests: { url: string; checked_at?: string | null; error?: string | null;
     observation?: { state: string; head: string; base: string; merged_at?: string | null } | null }[]
 }

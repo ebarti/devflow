@@ -75,13 +75,13 @@ def test_merge_observation_preserves_receipts_and_run_outcome(service):
     remote.state = "MERGED"
     sync = ProjectSynchronizer([store], remote)
     result = sync.tick()[request["issue_url"]]
-    assert result["status"] == "Merged"
+    assert result["status"] == "Done"
     assert result["mirror"]["state"] == "consistent"
     detail = store.detail(request["run_id"])
     assert detail["pull_request"] == receipt
     assert detail["outcome"] == "published_unmerged"
     assert detail["phase"] == "delivered"
-    assert detail["feature"]["status"] == "Merged"
+    assert detail["feature"]["status"] == "Done"
 
 
 def test_external_issue_completion_and_reopening_preserve_failed_attempt(service):
@@ -95,7 +95,7 @@ def test_external_issue_completion_and_reopening_preserve_failed_attempt(service
     stamp = datetime(2026, 10, 19, tzinfo=UTC)
     sync = ProjectSynchronizer([store], remote, clock=lambda: stamp)
     completed = sync.tick()[request["issue_url"]]
-    assert completed["status"] == "Done"  # An open PR does not prove it merged.
+    assert completed["status"] == "Backlog"  # An open PR does not prove it merged.
     after = store.detail(request["run_id"])
     for key in ("phase", "outcome", "pull_request", "checks", "cleanup_recorded"):
         assert after[key] == original[key]
@@ -114,12 +114,12 @@ def test_closed_completed_issue_finishes_legacy_partial_projection_without_forgi
     row = {"request_json": json.dumps({"feature_delivery": True}),
            "pr_json": json.dumps(receipt), "phase": "cancelled", "outcome": "cancelled"}
     observed = [{"observation": {"state": "MERGED"}}]
-    assert _status(row, observed) == "Partially merged"
+    assert _status(row, observed) == "In Progress"
     assert _status(row, observed, issue_observation={"state": "CLOSED",
-                                                    "state_reason": "COMPLETED"}) == "Merged"
+                                                    "state_reason": "COMPLETED"}) == "Done"
     assert receipt["scope_complete"] is False and row["outcome"] == "cancelled"
     assert _status(row, observed, issue_observation={"state": "CLOSED",
-                                                    "state_reason": "NOT_PLANNED"}) != "Merged"
+                                                    "state_reason": "NOT_PLANNED"}) != "Done"
 
 
 def test_issue_read_failure_never_acknowledges_synced_project(service):
@@ -138,7 +138,7 @@ def test_issue_read_failure_never_acknowledges_synced_project(service):
 
 @pytest.mark.parametrize(
     ("state", "head", "expected"),
-    [("OPEN", "a" * 40, "Awaiting merge"), ("OPEN", "c" * 40, "Needs validation")],
+    [("OPEN", "a" * 40, "Awaiting merge"), ("OPEN", "c" * 40, "Validating")],
 )
 def test_current_pr_lifecycle(service, state, head, expected):
     store, request, _ = published(service)
@@ -183,7 +183,7 @@ def test_local_tracking_releases_claim_without_any_remote_call(
     store, request = service
     if mapped:
         store.config.raw["repositories"]["fixture"]["project_statuses"] = {
-            status: "Needs validation",
+            status: "Validating",
         }
         store.config.path.write_text(json.dumps(store.config.raw))
     store.submit(request)
@@ -299,7 +299,7 @@ def test_stack_requires_every_member_to_merge(service):
     remote.pull_request = lambda url: {
         **read(url), "state": "MERGED" if url.endswith("7") else "OPEN",
     }
-    assert ProjectSynchronizer([store], remote).tick()[request["issue_url"]]["status"] != "Merged"
+    assert ProjectSynchronizer([store], remote).tick()[request["issue_url"]]["status"] != "Done"
 
 
 def test_multiple_databases_select_one_owner_and_mirror_same_view(service, tmp_path):
@@ -342,7 +342,7 @@ def test_project_drift_is_rechecked_at_twenty_four_hours(service):
 
 @pytest.mark.parametrize("assignee", ["owner", "@me"])
 @pytest.mark.parametrize("already_assigned", [True, False])
-@pytest.mark.parametrize("existing_status", [None, "mErGeD"])
+@pytest.mark.parametrize("existing_status", [None, "dOnE"])
 def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
     assignee, already_assigned, existing_status,
 ):
@@ -397,18 +397,18 @@ def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
                 }}}
             if "updateProjectV2ItemFieldValue(" in query:
                 self.changes.append(variables)
-                self.status = {"name": existing_status or "Merged", "optionId": "merged"}
+                self.status = {"name": existing_status or "Done", "optionId": "merged"}
                 return {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "item"}}}
             if "fieldValueByName" in query:
                 return {"node": {"project": {"id": "project"}, "fieldValueByName": self.status}}
             pytest.fail(query)
 
     remote = FakeGraph()
-    feature = {"issue": "https://github.com/example/fixture/issues/3", "status": "Merged",
+    feature = {"issue": "https://github.com/example/fixture/issues/3", "status": "Done",
                "binding": {"project": "https://github.com/users/example/projects/1",
                            "assignee": assignee}}
     result = remote.mirror(feature, lambda: None)
-    assert result["status"] == "Merged"
+    assert result["status"] == "Done"
     assert remote.cursors == [None, "next"]
     assert len(remote.changes) == 1
     remote.mirror(feature, lambda: None)
@@ -666,7 +666,7 @@ def test_explicit_refresh_is_durable_and_preserves_execution_and_daily_schedule(
     remote.state = "MERGED"
     restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote,
                                      clock=lambda: stamp, interval=DAY, project_interval=DAY)
-    assert restarted.tick()[request["issue_url"]]["status"] == "Merged"
+    assert restarted.tick()[request["issue_url"]]["status"] == "Done"
     detail = store.detail(request["run_id"])
     for key in ("outcome", "phase", "pull_request", "iteration"):
         assert detail[key] == original[key]
@@ -685,7 +685,7 @@ def test_unchanged_pr_refresh_reconciles_project_drift_before_daily_deadline(ser
     stamp = datetime(2026, 10, 10, tzinfo=UTC)
     sync = ProjectSynchronizer([store], remote,
                                      clock=lambda: stamp, interval=DAY, project_interval=DAY)
-    project = {"status": "Merged"}
+    project = {"status": "Done"}
     mirror = remote.mirror
 
     def apply(feature, fence):
@@ -701,7 +701,7 @@ def test_unchanged_pr_refresh_reconciles_project_drift_before_daily_deadline(ser
     restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote,
                                      clock=lambda: stamp, interval=DAY, project_interval=DAY)
     after = restarted.tick()[request["issue_url"]]
-    assert after["status"] == first["status"] == project["status"] == "Merged"
+    assert after["status"] == first["status"] == project["status"] == "Done"
     assert after["version"] > first["version"]
     assert after["mirror"]["checked_at"] == stamp.isoformat()
     assert after["mirror"]["next_attempt_at"] == (stamp + timedelta(days=1)).isoformat()
@@ -723,7 +723,7 @@ def test_same_status_event_requires_new_readback_with_durable_failure_retry(serv
     remote.failure = True
     assert sync.next_delay() == 15
     pending = sync.tick()[request["issue_url"]]
-    assert pending["status"] == first["status"] == "Merged"
+    assert pending["status"] == first["status"] == "Done"
     assert pending["mirror"]["state"] == "pending"
     assert pending["project_receipt"] is None
     restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote,
@@ -757,7 +757,7 @@ def test_same_status_revision_during_mirror_cannot_acknowledge_old_event(service
     remote.mirror = mirror
     result = sync.tick()[request["issue_url"]]
     assert result["mirror"]["state"] == "consistent"
-    assert remote.writes == ["Merged", "Merged"]
+    assert remote.writes == ["Done", "Done"]
 
 
 def test_refresh_rejects_unbound_urls_before_queueing_any_request(service):

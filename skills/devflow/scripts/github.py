@@ -18,8 +18,8 @@ import state
 
 
 STATUSES = {
-    "in-progress": ("active", "implementation", "In progress"),
-    "in-review": ("active", "review", "In review"),
+    "in-progress": ("active", "implementation", "In Progress"),
+    "in-review": ("active", "review", "Awaiting merge"),
     "blocked": ("blocked", None, "Blocked"),
     "paused": ("paused", None, "Paused"),
     "done": ("done", "delivered", "Done"),
@@ -28,6 +28,17 @@ STATUSES = {
 
 class GitHubTransientError(RuntimeError):
     """A recognized transport failure, rather than a mapping or permission error."""
+
+
+def canonical_project_status(name, work_status=None):
+    if not isinstance(name, str):
+        return name
+    if name.casefold() == "needs validation":
+        return {"blocked": "Blocked", "in-review": "Awaiting merge",
+                "in-progress": "In Progress"}.get(work_status, "Backlog")
+    return {"in review": "Awaiting merge", "pr closed": "Backlog", "paused": "Backlog",
+            "merged": "Done", "done": "Done", "in progress": "In Progress",
+            "backlog": "Backlog", "awaiting merge": "Awaiting merge"}.get(name.casefold(), name)
 
 
 def gh(*args, as_json=False):
@@ -105,6 +116,7 @@ def legacy_project_item(project_url, issue_id):
 
 
 def project(url, status_name):
+    status_name = canonical_project_status(status_name)
     parsed = urlsplit(url or "")
     parts = parsed.path.strip("/").split("/")
     if (parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password
@@ -186,6 +198,7 @@ def synchronize(db, args):
             state.require_owner(db, args.work_id, args.owner)
         saved = details(work).get("github", {})
     status_name = args.project_status or saved.get("statuses", {}).get(args.status) or STATUSES[args.status][2]
+    status_name = canonical_project_status(status_name, args.status)
     # For an already linked issue, preserve the requested transition even if
     # the mapping/API read fails before the normal sync path reaches GitHub.
     if args.action == "set" and work and work["issue"] and (args.project or saved.get("project")):

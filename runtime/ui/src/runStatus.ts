@@ -8,14 +8,15 @@ export function failedAttempt(run: RunSummary): boolean {
 
 export function runStatus(run: RunSummary): string {
   const merge = run.merge?.phase
-  if (merge === 'merged') return 'Merged'
+  if (merge === 'merged') return 'Done'
   if (merge === 'resolving_conflicts') return 'Resolving merge conflicts'
   if (merge === 'decision_required') return 'Merge needs a decision'
   if (merge === 'blocked' || merge === 'unknown') return 'Merge needs attention'
   if (merge && !['available', 'unavailable'].includes(merge)) return 'Merging'
   if (failedAttempt(run)) return 'Failed'
   if (run.outcome === 'cancelled' || run.execution_state === 'cancelled') return 'Cancelled'
-  if (run.outcome === 'delivered') return 'Delivered'
+  if (run.outcome === 'delivered') return 'PR published'
+  if (['tracker', 'tracker_start', 'waiting_tracker'].includes(run.phase ?? '')) return 'Finalizing delivery'
   if (['needs_decision', 'waiting_decision', 'waiting_question', 'waiting_plan', 'waiting_plan_revision'].includes(run.phase ?? '')
     || ['waiting_decision', 'waiting_question', 'waiting_plan'].includes(run.execution_state ?? '')) return 'Waiting for decision'
   return titleCase(run.phase)

@@ -80,7 +80,7 @@ class ReconcileCLI(unittest.TestCase):
         self.remote_path.write_text(json.dumps({
             "project": PROJECT, "issue": {"id": "ISSUE", "url": ISSUE, "title": "Work",
                                          "state": "OPEN", "assignees": [{"login": "owner"}]},
-            "item": True, "option": "I", "options": {"I": "In progress", "R": "In review",
+            "item": True, "option": "I", "options": {"I": "In progress", "R": "Awaiting merge",
                 "B": "Blocked", "D": "Done", "P": "Paused"}, "writes": [],
             "run": {"status": "in_progress", "conclusion": None, "url": RUN}}))
         binpath = self.root / "bin"

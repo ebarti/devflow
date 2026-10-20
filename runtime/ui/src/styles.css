@@ -360,3 +360,10 @@ th:nth-child(3), td:nth-child(3) { width: 24%; }
 .feature-workers-table { min-width: 540px; }
 .feature-workers-table th, .feature-workers-table td { width: auto; padding-right: 18px; }
 .feature-revision-form { margin-top: 16px; }
+
+.project-card { color: inherit; text-decoration: none; }
+
+.kanban-board { align-items: start; }
+.kanban-lane { display: flex; flex-direction: column; max-height: max(320px, calc(100vh - 300px)); }
+.kanban-lane h3 { flex-shrink: 0; }
+.kanban-cards { overflow-y: auto; min-height: 0; }

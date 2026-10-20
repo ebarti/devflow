@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Settings } from '../src/Settings'
@@ -8,6 +8,7 @@ import { mockService } from './fixtures'
 
 const access = { revision: 0, repositories: [{ name: 'ebarti/JobCtrl', allowed: true }] }
 const service = { ...mockService, capacity: { active: 0, limit: 2 }, repository_access: access, repositories: [{ key: 'jobctrl', github_repo: 'ebarti/JobCtrl', label: 'JobCtrl', base_ref: 'HEAD' }] }
+beforeEach(() => { vi.spyOn(api, 'getProjectBoard').mockResolvedValue({ items: [], projects: [] }) })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); window.history.replaceState({}, '', '/') })
 
 it('shows one configurable identity, clear parallel-agent wording, and saves permission', async () => {

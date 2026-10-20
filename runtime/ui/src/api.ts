@@ -1,4 +1,4 @@
-import type { NewRunRequest, RepositoryAccess, RunDetail, RunSummary, ServiceInfo, Statistics, Usage } from './model'
+import type { NewRunRequest, ProjectBoard, RepositoryAccess, RunDetail, RunSummary, ServiceInfo, Statistics, Usage } from './model'
 
 /** The only HTTP path/contract adapter. No credentials are persisted or put in URLs. */
 export class ApiError extends Error {
@@ -89,6 +89,7 @@ async function command<T>(path: string, body: object): Promise<T> {
 
 export const api = {
   session,
+  getProjectBoard: (): Promise<ProjectBoard> => request('/api/project-board'),
   listRuns: async (archived = false): Promise<RunSummary[]> => (await api.listRunsPage(archived)).runs,
   listRunsPage: async (archived = false, cursor?: string): Promise<{ runs: RunSummary[]; next_cursor: string | null }> => {
     const params = new URLSearchParams()

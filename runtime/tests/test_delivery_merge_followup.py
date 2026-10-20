@@ -184,6 +184,27 @@ def delivered(service, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("hold", [False, True])
+def test_updated_pr_or_explicit_owner_hold_cannot_advertise_or_admit_merge(delivered, hold):
+    d = delivered
+    with d.store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+        pr = json.loads(row["pr_json"])
+        if hold:
+            db.execute("INSERT INTO delivery_issue_observations VALUES (?,?,?,?,NULL)",
+                       (d.spec["issue_url"].casefold(), canonical_json(
+                           {"state": "OPEN", "labels": ["do not merge yet"]}), "now", "later"))
+        else:
+            db.execute("INSERT INTO delivery_pr_observations VALUES (?,?,?,?,NULL)",
+                       (pr["url"], canonical_json({"state": "OPEN", "head": "new-commit"}),
+                        "now", "later"))
+        assert followup.action(db, row, d.spec)["available"] is False
+    with pytest.raises(ValueError, match="current validated PR commit"):
+        followup.preflight(d.store, "run-1")
+    with d.store._connect() as db:
+        assert db.execute("SELECT count(*) FROM delivery_merge_requests").fetchone()[0] == 0
+
+
 def test_explicit_merge_admission_is_durable_exact_and_does_not_rewrite_delivery(delivered):
     d = delivered
     assert followup.preflight(d.store, "run-1")["head"] == "h"

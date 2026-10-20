@@ -35,14 +35,20 @@ merge does not rewrite a historical delivery outcome or authorize closing an iss
 - Project Status options reuse case-insensitive matching names, so an existing
   `In Progress` option does not create a second `In progress` column. Creating missing
   options preserves existing IDs and values.
-- A GitHub issue closed as completed supplies current completion evidence. Bound PRs
-  observed merged produce `Merged`; completion without a complete merged-PR record
-  produces `Done`. This never rewrites the old attempt, its checks or scope receipt.
-  Reopening an issue removes that external completion evidence. A closed unmerged PR
-  remains `PR closed`; an intervention needed by the current attempt remains `Blocked`.
-- The dashboard contains admitted Devflow issues. The GitHub Project also contains
-  backlog items and work executed elsewhere; absence from this installation is not
-  evidence of completion.
+- Required bound PRs observed merged produce `Done`. Closing an issue alone does not
+  prove delivery. A closed unmerged PR returns unfinished work to `Backlog`; explicit
+  owner deferral is retained in the backlog, and an explicit decision not to do the
+  work remains cancelled. Attempt outcomes, checks and scope receipts stay immutable.
+- The dashboard combines current Devflow issues with a cached, paginated snapshot of
+  the configured GitHub Projects. Backlog cards link to GitHub without admitting work.
+  Remote failures retain the last snapshot with its timestamp and error.
+- Board columns map to Project statuses as follows: Queued to `Queued`, Planning to
+  `Planning`, Implementation to `In Progress`, automated Review and QA & CI to
+  `Validating`, Awaiting merge to `Awaiting merge`, Blocked to `Blocked`, and Done to
+  `Done`. Backlog is `Backlog` in both. Tracking runs in the background, and failed
+  attempts remain in history rather than a second failure column.
+- A changed PR commit requires new validation. Merge availability is withdrawn for
+  changed commits, closed PRs and owner holds; earlier gates never validate new code.
 
 Post-publication merge authorization, stack merge execution, repair-budget changes,
 and learning retrospectives are separate changes. This component observes merge facts

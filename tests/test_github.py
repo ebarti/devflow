@@ -16,6 +16,19 @@ import state  # noqa: E402
 PROJECT = "https://github.com/users/owner/projects/1"
 
 
+class CanonicalStatusTests(unittest.TestCase):
+    def test_retired_names_and_old_configurations_resolve_to_current_work_status(self):
+        for old, local, expected in [
+            ("Merged", "done", "Done"), ("PR closed", None, "Backlog"),
+            ("In review", "in-review", "Awaiting merge"),
+            ("Needs validation", "blocked", "Blocked"),
+            ("Needs validation", "in-review", "Awaiting merge"),
+            ("In progress", "in-progress", "In Progress"),
+        ]:
+            with self.subTest(old=old, local=local):
+                self.assertEqual(github.canonical_project_status(old, local), expected)
+
+
 class CreateIssueTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

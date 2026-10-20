@@ -156,8 +156,8 @@ read back without blind replay. Unowned source changes cannot reuse previous
 proof. Mechanical target reconciliation retains original source evidence and
 requires fresh current-target CI. Only confirmed merges whose trees match the verified
 chunks and are incorporated into the target close the issues. An incomplete
-feature with merged PRs is **Partially merged**, never **Merged**. Each child is
-**Merged** only when every required chunk has a confirmed merge observation.
+feature with only some merged PRs remains **In Progress**, never **Done**. Each child is
+**Done** only when its required delivery has confirmed merge evidence.
 Closure intents identify that child's required chunks and exact merge receipts.
 
 Every published PR records its chunk, workstream, exact child issue and parent,

@@ -15,9 +15,8 @@ from .contracts import canonical_json
 logger = logging.getLogger(__name__)
 
 STATUSES = (
-    "Queued", "Planning", "In progress", "In review", "Validating", "Awaiting merge",
-    "Merging", "Merged", "Blocked", "Cancelled", "PR closed", "Needs validation",
-    "Partially merged", "Done",
+    "Backlog", "Queued", "Planning", "In Progress", "Validating", "Awaiting merge",
+    "Done", "Blocked", "Cancelled",
 )
 
 
@@ -26,6 +25,9 @@ def now() -> str:
 
 
 def initialize(db: sqlite3.Connection) -> None:
+    from .delivery_project_board import initialize as initialize_board
+
+    initialize_board(db)
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_features (
         issue TEXT PRIMARY KEY, run_id TEXT NOT NULL, version INTEGER NOT NULL,
         payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)""")
@@ -106,44 +108,53 @@ def _status(row: dict, observations: list[dict], receipt: dict | None = None,
     complete = (not spec.get("feature_delivery") or receipt.get("scope_complete") is True
                 or completed_issue)
     if complete and known and all(item and item["state"] == "MERGED" for item in known):
-        return "Merged"
-    if completed_issue:
-        # Current GitHub outcome is separate from this attempt's historical
-        # publication/verification receipt. Never manufacture scope completion.
         return "Done"
-    if spec.get("feature_delivery") and any(item and item["state"] == "MERGED" for item in known):
-        return "Partially merged"
+    labels = {item.casefold() for item in (issue_observation or {}).get("labels", [])}
+    if (issue_observation or {}).get("state_reason") == "NOT_PLANNED" or labels & {
+        "status: cancelled", "wontfix", "won't fix",
+    }:
+        return "Cancelled"
+    if labels & {"status: deferred", "do not merge yet"}:
+        return "Backlog"
     if any(item and item["state"] == "CLOSED" for item in known):
-        return "PR closed"
+        return "Backlog"
+    if completed_issue:
+        return "Backlog"  # Issue closure alone does not prove delivery.
+    if spec.get("feature_delivery") and any(item and item["state"] == "MERGED" for item in known):
+        return "In Progress"
     phase = row["phase"]
     if phase == "waiting_feature_readback":
-        return "Waiting for GitHub"
+        return "In Progress"
     if row["outcome"] == "cancelled" or phase == "cancelled":
-        return "Cancelled"
+        return "Backlog"
     if row["outcome"] == "blocked" or phase == "blocked":
         heads = {item["url"]: item.get("head") for item in
                  (receipt.get("pull_requests") or [receipt]) if item.get("url")}
         if any(item and item["state"] == "OPEN" and item.get("head") != heads.get(item["url"])
                for item in known):
-            return "Needs validation"
+            return "Validating"
         return "Blocked"
     if phase in {"delivered", "awaiting_merge", "merged"}:
         heads = {item["url"]: item.get("head") for item in
                  (receipt.get("pull_requests") or [receipt]) if item.get("url")}
         if any(item and item.get("head") != heads.get(item["url"]) for item in known):
-            return "Needs validation"
-        return "Merged" if phase == "merged" else "Awaiting merge"
+            return "Validating"
+        return "Awaiting merge"
     if phase in {"accepted", "queued", "preparing", "temporal_pending"}:
         return "Queued"
+    if phase in {"waiting_question", "waiting_plan", "waiting_plan_revision",
+                 "waiting_decision", "needs_decision",
+                 "awaiting_answers", "awaiting_plan"}:
+        return "Blocked"
     if any(part in phase for part in ("intake", "plan", "decision", "question")):
         return "Planning"
     if phase in {"merging", "merge"}:
-        return "Merging"
+        return "In Progress"
     if "review" in phase:
-        return "In review"
+        return "Validating"
     if any(part in phase for part in ("verify", "verification", "qa", "ci", "check", "gate")):
         return "Validating"
-    return "In progress"
+    return "In Progress"
 
 
 def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
@@ -203,15 +214,16 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         merge = db.execute("SELECT phase FROM delivery_merge_requests WHERE run_id=?",
                            (run_id,)).fetchone()
         if merge:
-            merge_status = {"merged": "Merged", "blocked": "Blocked",
-                            "decision_required": "Needs validation", "unknown": "Needs validation"}
-            merge_status = merge_status.get(merge[0], "Merging")
+            merge_status = {"merged": "Done", "blocked": "Blocked",
+                            "decision_required": "Blocked", "unknown": "Blocked",
+                            "waiting_ci": "Validating"}
+            merge_status = merge_status.get(merge[0], "In Progress")
     current_status = _status(
         row, observations, receipt, (issue_observation or {}).get("observation"))
     payload = {
         "issue": key, "run_id": run_id, "work_id": row["work_id"],
         "admitted_at": row["created_at"], "run_revision": row["revision"],
-        "status": (current_status if current_status in {"Merged", "Done"}
+        "status": (current_status if current_status in {"Done", "Backlog", "Cancelled"}
                    else merge_status or current_status),
         "binding": binding, "issue_observation": issue_observation,
         "legacy_tracking": spec.get("project_sync_version") != 1
@@ -276,21 +288,21 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
                             and all(item and item["state"] == "MERGED" for item in observed))
             status = "Queued"
             if fully_merged:
-                status = "Merged"
-            elif child_completed:
                 status = "Done"
+            elif child_completed:
+                status = "Backlog"
             elif any(item and item["state"] == "MERGED" for item in observed):
-                status = "Partially merged"
+                status = "In Progress"
             elif any(item and item["state"] == "CLOSED" for item in observed):
-                status = "PR closed"
+                status = "Backlog"
             elif finished == len(stream["chunks"]):
                 status = "Awaiting merge"
             elif any(worker["outcome"] == "blocked" for worker in workers):
                 status = "Blocked"
-            elif payload["status"] in {"Cancelled", "Blocked", "PR closed", "Needs validation"}:
+            elif payload["status"] in {"Cancelled", "Blocked", "Backlog", "Validating"}:
                 status = payload["status"]
             elif workers:
-                status = "In progress"
+                status = "In Progress"
             workstreams.append({"id": stream["id"], "issue_id": binding["id"],
                                 "issue": issue_key(binding["url"]),
                                 "issue_number": binding["number"], "status": status,

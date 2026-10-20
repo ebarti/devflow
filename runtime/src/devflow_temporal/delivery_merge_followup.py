@@ -88,6 +88,29 @@ def _native_proof(proof):
             "checks": {k: v for k, v in proof["checks"].items() if k != "resource_cleanup"}}
 
 
+def _current_publication_ready(db, row, pr):
+    if not pr:
+        return False
+    observed = db.execute("SELECT observation_json,error FROM delivery_pr_observations "
+                          "WHERE lower(url)=lower(?)", (pr["url"],)).fetchone()
+    if observed:
+        value = json.loads(observed[0] or "null")
+        if observed[1] or not value or value.get("state") != "OPEN" or (
+            value.get("head") != pr.get("head")
+        ):
+            return False
+    issue = db.execute("SELECT observation_json,error FROM delivery_issue_observations "
+                       "WHERE lower(url)=lower(?)", (row["issue_url"],)).fetchone()
+    if issue:
+        value = json.loads(issue[0] or "{}")
+        labels = {item.casefold() for item in value.get("labels", [])}
+        if issue[1] or value.get("state") == "CLOSED" or labels & {
+            "status: deferred", "do not merge yet", "status: cancelled", "wontfix", "won't fix",
+        }:
+            return False
+    return True
+
+
 def action(db, row, spec):
     saved = current(db, row["run_id"])
     if saved:
@@ -114,6 +137,7 @@ def action(db, row, spec):
         and row["cleanup"] == "confirmed"
         and pr
         and candidate
+        and _current_publication_ready(db, row, pr)
         and all(
             checks.get(stage, {}).get("state") == "passed"
             for stage in ("prepublish", "local", "review", "qa", "ci")
@@ -183,6 +207,10 @@ def evidence(store, spec):
         row = dict(
             db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (spec["run_id"],)).fetchone()
         )
+        if not current(db, spec["run_id"]) and not _current_publication_ready(
+            db, row, json.loads(row["pr_json"] or "null")
+        ):
+            raise ValueError("merge requires the current validated PR commit without an owner hold")
         attempts = [
             dict(item)
             for item in db.execute(

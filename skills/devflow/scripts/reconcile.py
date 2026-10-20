@@ -43,6 +43,9 @@ def owner_token(db, claim):
 
 def queue(db, work_id, kind, payload, owner=None, next_action=None, force=False):
     """Call within a short write transaction, before any requested remote mutation."""
+    if payload.get("project_status"):
+        payload = dict(payload, project_status=github.canonical_project_status(
+            payload["project_status"], payload.get("status")))
     work = state.row(db, "works", work_id)
     if not work or not work["issue"]:
         raise ValueError("reconciliation needs a linked issue")
@@ -161,7 +164,8 @@ def apply_sync(db, saved):
     # Resolve only the final desired option. A terminal owner stop may have
     # queued Blocked before an external actor closed the issue; Blocked can be
     # absent even though configured Done is valid for that closed issue.
-    selected = github.project(payload["project"], payload["project_status"])
+    selected = github.project(payload["project"], github.canonical_project_status(
+        payload["project_status"], payload.get("status")))
     if urlsplit(payload["issue"]).netloc.casefold() != selected["host"].casefold():
         raise ValueError("issue and Project must belong to the same GitHub host")
     login = payload["assignee"]
@@ -478,7 +482,8 @@ def preview_pending(db, queued):
     if observed["state"] == "OPEN" and payload["status"] == "done":
         summary["next_action"] = "resolve open issue before Done transition"
         return summary, [], []
-    selected = github.project(payload["project"], payload["project_status"])
+    selected = github.project(payload["project"], github.canonical_project_status(
+        payload["project_status"], payload.get("status")))
     login = payload["assignee"]
     if login == "@me":
         login = github.gh("api", "--hostname", selected["host"], "user", "--jq", ".login")

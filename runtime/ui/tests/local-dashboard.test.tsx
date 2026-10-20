@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { RunDetails } from '../src/RunDetails'
@@ -8,6 +8,7 @@ import { subscribeRun } from '../src/stream'
 import { mockRun, mockService } from './fixtures'
 
 vi.mock('../src/stream', () => ({ subscribeRun: vi.fn(() => () => {}) }))
+beforeEach(() => { vi.spyOn(api, 'getProjectBoard').mockResolvedValue({ items: [], projects: [] }) })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState(null, '', '/') })
 
 describe('tokenless local dashboard', () => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
@@ -10,6 +10,7 @@ import type { Cohort } from '../src/model'
 import { mockRun, mockService } from './fixtures'
 
 vi.mock('../src/stream', () => ({ subscribeRun: vi.fn(() => () => {}) }))
+beforeEach(() => { vi.spyOn(api, 'getProjectBoard').mockResolvedValue({ items: [], projects: [] }) })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); window.history.replaceState(null, '', '/') })
 
 describe('workflow board and controls', () => {
@@ -54,8 +55,8 @@ describe('workflow board and controls', () => {
   it.each([
     ['preparing', 'Queued'], ['investigating', 'Planning'], ['prepublish_checks', 'Implementation'],
     ['repair_preflight', 'Implementation'], ['review', 'Review'], ['verify', 'QA & CI'],
-    ['waiting_ci', 'QA & CI'], ['tracker', 'Tracking'], ['delivered', 'Delivered'],
-    ['blocked', 'Needs attention'], ['waiting_plan', 'Needs attention'], ['future-unknown', 'Needs attention'],
+    ['waiting_ci', 'QA & CI'], ['tracker', 'Implementation'], ['delivered', 'Awaiting merge'],
+    ['blocked', 'Blocked'], ['waiting_plan', 'Blocked'], ['future-unknown', 'Blocked'],
   ])('places %s in the %s lane without inventing progress', (phase, lane) => {
     expect(laneFor({ ...mockRun, phase })).toBe(lane)
   })
@@ -76,7 +77,7 @@ describe('workflow board and controls', () => {
     expect(within(review).getAllByRole('button', { name: /Failed/ })).toHaveLength(11)
     await userEvent.setup().click(within(review).getByRole('button', { name: /old-3$/ }))
     expect(select).toHaveBeenLastCalledWith('old-3')
-    expect(screen.getByRole('region', { name: 'Failed column' }).querySelectorAll('.task-card')).toHaveLength(0)
+    expect(screen.getByRole('region', { name: 'Blocked column' }).querySelectorAll('.task-card')).toHaveLength(0)
   })
 
   it('links to the observed owner when its row has not loaded, without borrowing an old failure', async () => {
@@ -84,7 +85,7 @@ describe('workflow board and controls', () => {
     const run = { ...mockRun, phase: 'blocked', outcome: 'blocked', execution_state: 'blocked', feature: { issue: 'https://github.com/o/r/issues/1',
       run_id: 'newer-run', status: 'Merged', version: 4, pull_requests: [], mirror: { state: 'pending' } } }
     render(<RunBoard runs={[run]} archived={false} onSelect={select} onToggle={vi.fn()} onRefresh={vi.fn()} />)
-    const lane = screen.getByRole('region', { name: 'Merged column' })
+    const lane = screen.getByRole('region', { name: 'Done column' })
     expect(lane.textContent).toContain('Open current run · details not loaded')
     expect(within(lane).getByRole('button', { name: /Fixture workflow/ }).textContent).not.toContain('Failed')
     await userEvent.setup().click(within(lane).getByRole('button', { name: /Fixture workflow/ }))
@@ -96,8 +97,8 @@ describe('workflow board and controls', () => {
       issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id, status: 'Merged', version: 4, pull_requests: [],
     } }
     render(<RunBoard runs={[run]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
-    const lane = screen.getByRole('region', { name: 'Merged column' })
-    expect(lane.querySelector('.task-card__status')?.textContent).toBe('Merged')
+    const lane = screen.getByRole('region', { name: 'Done column' })
+    expect(lane.querySelector('.task-card__status')?.textContent).toBe('Done')
     expect(lane.textContent).toContain('Last attempt: Failed')
   })
 
@@ -105,22 +106,22 @@ describe('workflow board and controls', () => {
     const feature = { issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id,
       status, version: 5, pull_requests: [] }
     const run = { ...mockRun, phase: 'blocked', outcome: 'blocked', execution_state: 'blocked', feature }
-    expect(laneFor(run)).toBe(status === 'Done' ? 'Done' : 'Needs attention')
+    expect(laneFor(run)).toBe(status === 'Done' ? 'Done' : 'QA & CI')
   })
 
-  it('keeps terminal failure distinct from waiting for a decision and an unknown blocked phase', () => {
+  it('keeps failed attempts in history while blocked work shares one column', () => {
     const feature = { issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id, status: 'In review', version: 1, pull_requests: [] }
-    expect(laneFor({ ...mockRun, feature, outcome: 'blocked', execution_state: 'blocked' })).toBe('Failed')
-    expect(laneFor({ ...mockRun, feature, phase: 'waiting_plan', execution_state: 'waiting_plan' })).toBe('Needs attention')
-    expect(laneFor({ ...mockRun, phase: 'blocked', outcome: null })).toBe('Needs attention')
-    expect(laneFor({ ...mockRun, phase: 'cancelled', outcome: 'cancelled', execution_state: 'cancelled' })).toBe('Needs attention')
+    expect(laneFor({ ...mockRun, feature, outcome: 'blocked', execution_state: 'blocked' })).toBe('Blocked')
+    expect(laneFor({ ...mockRun, feature, phase: 'waiting_plan', execution_state: 'waiting_plan' })).toBe('Blocked')
+    expect(laneFor({ ...mockRun, phase: 'blocked', outcome: null })).toBe('Blocked')
+    expect(laneFor({ ...mockRun, phase: 'cancelled', outcome: 'cancelled', execution_state: 'cancelled' })).toBe('Backlog')
   })
 
   it('shows required revision approval as waiting for a decision', () => {
     const run = { ...mockRun, phase: 'waiting_plan_revision', execution_state: 'waiting', outcome: null,
       feature: { issue: 'https://github.com/o/r/issues/1', run_id: mockRun.id, status: 'Planning', version: 2, pull_requests: [] } }
     render(<RunBoard runs={[run]} archived={false} onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
-    const lane = screen.getByRole('region', { name: 'Needs attention column' })
+    const lane = screen.getByRole('region', { name: 'Blocked column' })
     expect(lane.querySelectorAll('.task-card')).toHaveLength(1)
     expect(lane.textContent).toContain('Waiting for decision')
     expect(screen.getByRole('region', { name: 'Planning column' }).querySelectorAll('.task-card')).toHaveLength(0)
@@ -140,16 +141,16 @@ describe('workflow board and controls', () => {
   it('keeps archived attempts individually accessible with their own outcomes', () => {
     const feature = { issue: 'https://github.com/o/r/issues/1', run_id: 'active-not-archived', status: 'In review', version: 12, pull_requests: [] }
     render(<RunBoard runs={['one', 'two'].map(id => ({ ...mockRun, id, outcome: 'blocked', feature, archived: true }))} archived onSelect={vi.fn()} onToggle={vi.fn()} onRefresh={vi.fn()} />)
-    const failed = screen.getByRole('region', { name: 'Failed column' })
-    expect(within(failed).getAllByRole('button', { name: /Failed attempt/ })).toHaveLength(2)
+    const failed = screen.getByRole('region', { name: 'Blocked column' })
+    expect(within(failed).getAllByRole('button', { name: /Failed/ })).toHaveLength(2)
     expect(screen.queryByText(/Open current run/)).toBeNull()
   })
 
   it.each([
     ['Queued', 'Queued'], ['Planning', 'Planning'], ['In progress', 'Implementation'],
-    ['In review', 'Review'], ['Validating', 'QA & CI'], ['Merging', 'Tracking'],
-    ['Awaiting merge', 'Awaiting merge'], ['Merged', 'Merged'], ['Blocked', 'Needs attention'],
-    ['Cancelled', 'Needs attention'], ['PR closed', 'Needs attention'], ['Needs validation', 'Needs attention'],
+    ['In review', 'Review'], ['Validating', 'QA & CI'], ['Merging', 'Implementation'],
+    ['Awaiting merge', 'Awaiting merge'], ['Merged', 'Done'], ['Blocked', 'Blocked'],
+    ['Cancelled', 'Blocked'], ['PR closed', 'Backlog'], ['Needs validation', 'QA & CI'],
   ])('places the current %s feature ahead of an older delivered run', (status, lane) => {
     expect(laneFor({ ...mockRun, phase: 'delivered', feature: {
       issue: 'https://github.com/o/r/issues/1', run_id: 'newer-run', status, version: 1, pull_requests: [],

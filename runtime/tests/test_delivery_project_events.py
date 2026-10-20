@@ -136,13 +136,13 @@ def test_service_waits_for_events_and_configured_deadlines_without_polling(servi
         def wait(self, timeout):
             waits.append(timeout)
             if len(waits) == 1:
-                assert remote.writes == ['In progress']
+                assert remote.writes == ['In Progress']
                 assert timeout == interval
                 # A new local event interrupts the daily wait immediately.
                 store.project(request['run_id'], phase='blocked', execution_state='blocked',
                               event_type='blocked', message='committed', outcome='blocked')
                 return True
-            assert remote.writes == ['In progress', 'Blocked']
+            assert remote.writes == ['In Progress', 'Blocked']
             assert len(remote.reads) == 1
             assert timeout == interval
             raise StopTest
@@ -239,7 +239,7 @@ def test_head_change_invalidates_review_even_if_local_candidate_has_changed(serv
         db.execute('UPDATE delivery_runs SET candidate_json=?',
                    (json.dumps({'head': remote.head}),))
     feature = ProjectSynchronizer([store], remote).tick()[request['issue_url']]
-    assert feature['status'] == 'Needs validation'
+    assert feature['status'] == 'Validating'
     assert store.detail(request['run_id'])['pull_request'] == receipt
 
 
@@ -332,7 +332,7 @@ def test_same_pr_new_validated_publication_refreshes_immediately_and_replays_onc
     assert restarted.tick()[request['issue_url']]['status'] == 'Awaiting merge'
     assert len(remote.reads) == 2
     stamp += timedelta(seconds=1)
-    assert restarted.tick()[request['issue_url']]['status'] == 'Needs validation'
+    assert restarted.tick()[request['issue_url']]['status'] == 'Validating'
     assert len(remote.reads) == 3
 
 

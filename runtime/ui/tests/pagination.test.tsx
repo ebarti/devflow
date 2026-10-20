@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
@@ -7,6 +7,7 @@ import { mockRun, mockService } from './fixtures'
 import { subscribeRun } from '../src/stream'
 
 vi.mock('../src/stream', () => ({ subscribeRun: vi.fn(() => () => {}) }))
+beforeEach(() => { vi.spyOn(api, 'getProjectBoard').mockResolvedValue({ items: [], projects: [] }) })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); window.history.replaceState(null, '', '/') })
 
 it('loads older rows explicitly and refreshes only the recent page', async () => {

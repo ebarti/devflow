@@ -534,6 +534,13 @@ def create_app(config_path: Path) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @app.get("/api/project-board")
+    async def project_board(request: Request) -> dict[str, Any]:
+        _host(request)
+        from .delivery_project_board import read
+
+        return await asyncio.to_thread(read, service.store)
+
     @app.get("/api/statistics")
     async def statistics(request: Request) -> dict[str, Any]:
         _host(request)

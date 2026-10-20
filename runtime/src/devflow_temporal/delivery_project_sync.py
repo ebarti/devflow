@@ -66,13 +66,92 @@ class GitHub:
                 "base": value["baseRefOid"], "merged_at": value["mergedAt"]}
 
     def issue(self, url: str) -> dict:
-        value = self.command("issue", "view", url, "--json", "url,state,stateReason,closedAt")
+        value = self.command("issue", "view", url, "--json",
+                             "url,state,stateReason,closedAt,labels")
         if issue_key(value["url"]) != issue_key(url) or value["state"] not in {"OPEN", "CLOSED"}:
             raise ValueError("issue readback differs from the admitted issue")
         return {"url": url, "state": value["state"], "state_reason": value["stateReason"],
-                "closed_at": value["closedAt"]}
+                "closed_at": value["closedAt"],
+                "labels": [item["name"] for item in value.get("labels", [])]}
+
+    def project_board(self, url: str) -> dict:
+        parsed = urlsplit(url)
+        parts = parsed.path.strip("/").split("/")
+        if (parsed.scheme != "https" or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or len(parts) != 4
+                or parts[0] not in {"users", "orgs"} or parts[2] != "projects"
+                or not parts[3].isdigit()):
+            raise ValueError("invalid configured Project URL")
+        query = """query($owner:String!,$number:Int!,$cursor:String){
+          OWNER(login:$owner){projectV2(number:$number){id closed
+            field(name:"Status"){... on ProjectV2SingleSelectField{id options{id name}}}
+            items(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id
+              status:fieldValueByName(name:"Status"){
+                ... on ProjectV2ItemFieldSingleSelectValue{name}}
+              priority:fieldValueByName(name:"Priority"){
+                ... on ProjectV2ItemFieldSingleSelectValue{name}}
+              content{__typename
+                ... on Issue{url title number state stateReason repository{nameWithOwner}
+                  labels(first:100){nodes{name}}}
+                ... on PullRequest{url title number state mergedAt repository{nameWithOwner}
+                  labels(first:100){nodes{name}}}
+              }
+            }}
+          }}
+        }"""
+        owner_type = "user" if parts[0] == "users" else "organization"
+        cursor, items = None, []
+        while True:
+            result = self.graphql(parsed.netloc, query.replace("OWNER", owner_type),
+                                  owner=parts[1], number=int(parts[3]), cursor=cursor)
+            project = (result.get(owner_type) or {}).get("projectV2")
+            if not project or project["closed"] or not project.get("field"):
+                raise ValueError("configured Project is missing, closed or lacks Status")
+            for node in project["items"]["nodes"]:
+                content = node.get("content") or {}
+                repo = (content.get("repository") or {}).get("nameWithOwner")
+                if not repo:
+                    continue  # A Project draft does not identify an admitted repository.
+                items.append({"id": node["id"], "url": content["url"],
+                              "title": content["title"], "number": content["number"],
+                              "repository": repo, "type": content["__typename"],
+                              "state": content["state"],
+                              "state_reason": content.get("stateReason"),
+                              "status": (node.get("status") or {}).get("name"),
+                              "priority": (node.get("priority") or {}).get("name"),
+                              "labels": [item["name"] for item in
+                                         content["labels"]["nodes"]]})
+            page = project["items"]["pageInfo"]
+            if not page["hasNextPage"]:
+                return {"id": project["id"], "url": url, "field": project["field"],
+                        "items": items}
+            if not page["endCursor"] or page["endCursor"] == cursor:
+                raise ValueError("Project pagination did not advance")
+            cursor = page["endCursor"]
+
+    def project_item_status(self, project: dict, item: dict, status: str) -> None:
+        field = project["field"]
+        option = next((value for value in field["options"]
+                       if value["name"].casefold() == status.casefold()), None)
+        if not option:
+            raise ValueError(f"Project lacks the configured {status} status")
+        observed = self.graphql(urlsplit(project["url"]).netloc, """query($item:ID!){
+          node(id:$item){... on ProjectV2Item{project{id}
+            fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}}}}
+          """, item=item["id"])["node"]
+        if (not observed or observed["project"]["id"] != project["id"]
+                or (observed.get("fieldValueByName") or {}).get("name") != item.get("status")):
+            raise Superseded("Project item changed during backlog reconciliation")
+        self.graphql(urlsplit(project["url"]).netloc, """mutation($project:ID!,$item:ID!,
+          $field:ID!,$option:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,
+          itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}""",
+          project=project["id"], item=item["id"], field=field["id"], option=option["id"])
 
     def mirror(self, feature: dict, fence: Callable[[], None]) -> dict:
+        from .delivery_features import STATUSES
+
+        if feature["status"] not in STATUSES:
+            raise ValueError("unsupported current work status")
         project_url = feature["binding"]["project"]
         assignee = feature["binding"]["assignee"]
         if not project_url or not assignee:
@@ -203,6 +282,8 @@ class ProjectSynchronizer:
                      "next_attempt_at", "state='consistent'"),
                     ("issue_interval_seconds", self.project_interval, "delivery_issue_observations",
                      "next_check_at", "1=1"),
+                    ("board_interval_seconds", self.project_interval, "delivery_project_boards",
+                     "next_check_at", "1=1"),
                 ):
                     saved = db.execute("SELECT value FROM delivery_sync_settings WHERE key=?",
                                        (key,)).fetchone()
@@ -267,6 +348,8 @@ class ProjectSynchronizer:
                 for row in db.execute("SELECT next_check_at FROM delivery_pr_observations"):
                     deadlines.append(datetime.fromisoformat(row[0]))
                 for row in db.execute("SELECT next_check_at FROM delivery_issue_observations"):
+                    deadlines.append(datetime.fromisoformat(row[0]))
+                for row in db.execute("SELECT next_check_at FROM delivery_project_boards"):
                     deadlines.append(datetime.fromisoformat(row[0]))
         for issue, (store, feature) in self.selected().items():
             with store._connect() as db:
@@ -426,10 +509,12 @@ class ProjectSynchronizer:
             with store._connect() as db:
                 prior = db.execute("SELECT * FROM delivery_issue_observations WHERE url=?",
                                    (issue,)).fetchone()
-            if prior and prior["next_check_at"] > stamp.isoformat():
+            if (prior and prior["next_check_at"] > stamp.isoformat()
+                    and "labels" in json.loads(prior["observation_json"] or "{}")):
                 continue
             try:
                 observed, error = self.github.issue(issue), None
+                observed.setdefault("labels", [])
             except Exception as exc:
                 observed, error = None, str(exc)[:1000]
             next_check = stamp + timedelta(seconds=15 if error else self.project_interval)
@@ -498,6 +583,9 @@ class ProjectSynchronizer:
             except (BlockingIOError, Superseded):
                 # The existing owner finishes first; the next local tick retries.
                 continue
+        from .delivery_project_board import refresh
+
+        refresh(self)
         return results
 
     def project(self, store: DeliveryStore, feature: dict) -> dict | None:

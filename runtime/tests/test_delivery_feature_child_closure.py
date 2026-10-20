@@ -74,8 +74,8 @@ def test_an_early_child_chunk_merge_cannot_close_that_child_or_the_parent(servic
 @pytest.mark.parametrize(
     "merged,api_status,ui_status,parent_status",
     [
-        ({20}, "Partially merged", "Queued", "Partially merged"),
-        ({20, 21, 22}, "Merged", "Merged", "Merged"),
+        ({20}, "In Progress", "Queued", "In Progress"),
+        ({20, 21, 22}, "Done", "Done", "Done"),
     ],
 )
 def test_child_status_uses_all_required_pr_merges_not_parent_or_worker_proofs(
@@ -135,7 +135,7 @@ def test_child_completed_outside_cancelled_attempt_uses_issue_observation(servic
         transition(db, store.config, spec["run_id"])
     feature = store.feature(spec["run_id"])
     api = next(stream for stream in feature["workstreams"] if stream["id"] == "api")
-    assert api["status"] == "Merged"
+    assert api["status"] == "Done"
     assert len(api["pull_requests"]) == 1  # Do not manufacture the other chunk's PR.
     with store._connect() as db:
         row = db.execute("SELECT outcome,pr_json FROM delivery_runs WHERE run_id=?",
@@ -147,7 +147,7 @@ def test_child_completed_outside_cancelled_attempt_uses_issue_observation(servic
         transition(db, store.config, spec["run_id"])
     api = next(stream for stream in store.feature(spec["run_id"])["workstreams"]
                if stream["id"] == "api")
-    assert api["status"] == "Partially merged"
+    assert api["status"] == "In Progress"
 
 
 @pytest.mark.parametrize(
