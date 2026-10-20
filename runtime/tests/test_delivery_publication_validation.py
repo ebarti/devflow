@@ -8,7 +8,7 @@ import pytest
 from test_delivery_store import _git, submit_historical_admission
 from test_delivery_store import service as service
 
-from devflow_temporal.contracts import canonical_json
+from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_project_sync import GitHub
 from devflow_temporal.delivery_publication_validation import KIND, readback
@@ -189,6 +189,57 @@ def test_checkout_restoration_preserves_and_renews_resource_ownership(publicatio
         write_private(resources.manifest, manifest)
     with pytest.raises(ValueError, match="outside the restored checkout"):
         preserve_validation_resources(root, seal)
+
+
+@pytest.mark.parametrize("download_failure", [True, False])
+def test_validation_download_stop_can_recheck_without_a_product_repair(
+    publication, monkeypatch, download_failure,
+):
+    store, _broker, payload, original_state, remote, *_ = publication
+    store.continue_repair("run-1", payload)
+    spec = store.effective_spec("run-1")
+    candidate = DeliveryBroker(store, spec).candidate()
+    with store._connect() as db:
+        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
+    state = deepcopy(original_state)
+    state.update(revision=10, phase="blocked", execution_state="blocked", outcome="blocked",
+                 error="repair limit exhausted", candidate=candidate,
+                 pull_request=recovery["publication"])
+    state["roles"].extend({"role": role, "status": "pass", "candidate": candidate,
+                           "session_id": role + "-passed", "iteration": 0, "findings": []}
+                          for role in ("review", "verify"))
+    state["checks"] = {key: {"state": "passed", "candidate_id": candidate["id"]}
+                       for key in ("prepublish", "review", "qa")}
+    state["checks"]["local"] = {"state": "failed", "candidate_id": candidate["id"],
+        "source_unchanged": True, "results": [{"passed": False, "cleanup": "confirmed",
+            "argv": ["python", "-m", "pytest"], "diagnostic": (
+                "Failed starting test server: Temp download file x not complete after 20 seconds"
+                if download_failure else "AssertionError: wrong profile value")}]}
+    store.project("run-1", phase="blocked", execution_state="blocked", event_type="blocked",
+                  message=state["error"], error=state["error"], candidate=candidate,
+                  pull_request=state["pull_request"], checks=state["checks"],
+                  protocol_revision=10, outcome="blocked", cleanup="confirmed")
+    with store._connect() as db:
+        store.state.release_work(db, spec["work_id"], "external:devflow:run-1")
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda *_a, **_kw: {
+        "workflow_id": "closed-validation", "request_digest": spec["request_digest"],
+        "recovery_digest": digest(recovery), "result": state})
+    monkeypatch.setattr(DeliveryBroker, "_existing_pr", lambda *_: deepcopy(remote))
+    monkeypatch.setattr("devflow_temporal.delivery_gate_retry._stopped_cleanup", lambda _: {})
+    command = {"continuation_kind": "published_gate_retry", "command_id": "retry-download",
+        "expected_revision": 10, "expected_iteration": 0,
+        "expected_candidate_id": candidate["id"], "expected_pr_head": candidate["head"],
+        "expected_pr_number": 7, "additional_iterations": 0}
+    if not download_failure:
+        with pytest.raises(ValueError):
+            store.continue_repair("run-1", command)
+        return
+    result = store.continue_repair("run-1", command)
+    assert result["additional_iterations"] == 0
+    assert store.effective_spec("run-1")["policy"] == spec["policy"]
+    assert DeliveryBroker(store, store.effective_spec("run-1")).candidate() == candidate
+    with store._connect() as db:
+        assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
 
 
 @pytest.mark.parametrize("drift", ["hold_issue", "hold_pr", "closed_pr", "head", "code",

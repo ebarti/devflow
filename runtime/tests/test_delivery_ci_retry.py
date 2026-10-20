@@ -110,3 +110,44 @@ def test_ci_workflow_observes_only_ci_then_normal_finalization(waiting_ci, monke
     assert not any(name in calls for name in (
         'delivery_role', 'delivery_checks', 'delivery_precheck', 'delivery_publish'))
     assert ('project:delivered' in calls) == ci_passes
+
+
+@pytest.mark.parametrize('local_passes', [True, False])
+def test_download_recovery_preserves_acceptance_and_requires_real_local_pass(
+    waiting_ci, monkeypatch, local_passes,
+):
+    store, _, old, _, request = waiting_ci
+    store.continue_repair('run-1', request)
+    spec = store.effective_spec('run-1')
+    with store._connect() as db:
+        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs').fetchone()[0])
+    recovery['seal']['local_download_retry'] = True
+    flow, calls = DeliveryWorkflow(), []
+
+    async def execute(name, body, **_kw):
+        calls.append(name)
+        if name == 'delivery_checks':
+            assert body['candidate'] == old['candidate']
+            return {'state': 'passed' if local_passes else 'failed',
+                    'candidate_id': body['candidate']['id']}
+        if name == 'delivery_ci':
+            return {'state': 'passed', 'head': old['candidate']['head']}
+        return {'state': 'consistent'}
+
+    async def project(*_args):
+        pass
+
+    async def stop(_spec, reason):
+        flow.state.update(outcome='blocked', error=reason)
+        return flow.state
+
+    monkeypatch.setattr(flow, '_activity', execute)
+    monkeypatch.setattr(flow, '_project', project)
+    monkeypatch.setattr(flow, '_stop', stop)
+    result = asyncio.run(flow._resume_published_gates(spec, recovery))
+    assert result['roles'] == old['roles']
+    assert result['outcome'] == ('delivered' if local_passes else 'blocked')
+    assert 'delivery_checks' in calls
+    assert ('delivery_ci' in calls) == local_passes
+    assert not any(name in calls for name in (
+        'delivery_role', 'delivery_publish', 'delivery_precheck'))

@@ -1782,6 +1782,8 @@ class DeliveryWorkflow:
         )
 
     async def _resume_published_gates(self, spec, recovery):
+        if recovery.get('seal', {}).get('local_download_retry') is True:
+            return await self._resume_ci(spec, recovery, recheck_local=True)
         if recovery.get('kind') == 'published_ci_retry':
             return await self._resume_ci(spec, recovery)
         published = recovery.get("kind") in {
@@ -1827,7 +1829,7 @@ class DeliveryWorkflow:
             resume_prechecks=True, published_checkpoint=published,
         )
 
-    async def _resume_ci(self, spec, recovery):
+    async def _resume_ci(self, spec, recovery, *, recheck_local=False):
         if (recovery.get('execution_spec') != spec
                 or recovery.get('command', {}).get('additional_iterations') != 0):
             raise ValueError('CI continuation changed its zero-repair authority')
@@ -1847,6 +1849,18 @@ class DeliveryWorkflow:
             self.state['tracker'] = tracker
             if not _tracking_ready(spec, tracker):
                 return await self._stop(spec, 'CI continuation tracker readback remains pending')
+            if recheck_local:
+                self.state.update(phase='checks')
+                self.state['revision'] += 1
+                await self._project(spec, 'checks_retry_started',
+                                    'Rechecking local tests after test-server preparation failed')
+                local = await self._activity('delivery_checks', {
+                    'spec': spec, 'iteration': self.state['iteration'],
+                    'candidate': self.state['candidate']}, hours=1)
+                self.state['checks']['local'] = local
+                if local.get('state') != 'passed':
+                    return await self._stop(spec, 'local tests did not pass after setup recovery')
+                self.state.update(phase='waiting_ci')
             self.state['revision'] += 1
             await self._project(spec, 'ci_retry_started',
                                 'Observing required CI on the independently passed candidate')

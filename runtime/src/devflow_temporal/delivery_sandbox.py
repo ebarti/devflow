@@ -11,6 +11,7 @@ import shlex
 import stat
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -260,6 +261,39 @@ def _native_env(
     if short_temp:
         env.update({"TMP": str(scratch), "TEMP": str(scratch)})
     return env
+
+
+def _seed_temporal_test_server(checkout: Path, check: dict, scratch: Path) -> None:
+    """Reuse the matching SDK cache inside this check's private temporary root."""
+    if check.get("kind") != "test" or "pytest" not in check.get("argv", []):
+        return
+    lock = checkout / check.get("cwd", ".") / "uv.lock"
+    if not lock.is_file() or lock.is_symlink():
+        return
+    packages = tomllib.loads(lock.read_text()).get("package", [])
+    version = next((p.get("version") for p in packages if p.get("name") == "temporalio"), None)
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        return
+    name = "temporal-test-server-sdk-python-" + version
+    source, destination = Path(tempfile.gettempdir()) / name, scratch / name
+    if os.path.lexists(destination) or not os.path.lexists(source):
+        return
+    info = source.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o022 or not info.st_mode & 0o111
+            or not 0 < info.st_size <= 128 * 1024 * 1024):
+        return
+    data = source.read_bytes()
+    after = source.lstat()
+    if any(getattr(after, key) != getattr(info, key) for key in (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")):
+        raise ValueError("cached Temporal test server changed during preparation")
+    fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o700)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+    _write_once(scratch / "temporal-test-server-source.json", json.dumps({
+        "source": str(source), "path": str(destination), "sha256": hashlib.sha256(data).hexdigest(),
+    }, sort_keys=True).encode())
 
 
 def _native_environment_version(
@@ -708,6 +742,7 @@ def prepare_native_check(
         }
     )
     if trusted_local(spec) and check.get("kind") == "test":
+        _seed_temporal_test_server(checkout, check, scratch)
         artifacts = RunResources(spec).check_artifacts(
             evidence_dir / check["id"] / "pytest-artifacts")
         # pytest replaces its basetemp directory. Its fixture child may change
