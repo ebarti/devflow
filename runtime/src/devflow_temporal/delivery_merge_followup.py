@@ -188,6 +188,37 @@ def _executed_specs(store, spec):
         recovery = recovery.get("original_recovery")
 
 
+def _publication_matches(store, spec, current, observed):
+    """A sealed gate renewal may rebind runtime policy, never published source."""
+    if current == observed:
+        return True
+    with store._connect() as db:
+        row = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                         (spec["run_id"],)).fetchone()
+    recovery = json.loads(row[0]) if row and row[0] else None
+    if recovery and recovery.get("kind") in {
+        "published_gate_retry", "published_check_prelaunch_retry", "published_ci_retry",
+        "published_controller_retry",
+    }:
+        from .delivery_gate_retry import effective_spec
+
+        if (effective_spec(store, recovery["original_spec"], recovery) != spec
+                or recovery["publication"] != current
+                or recovery["candidate"] != current.get("candidate")):
+            return False
+        previous = recovery["seal"]["publication"]
+        old_candidate = previous.get("candidate", {})
+        if (current["candidate"].get("policy_digest") != spec["policy_digest"]
+                or old_candidate.get("policy_digest")
+                != recovery["seal"]["original_spec"]["policy_digest"]
+                or {**current, "candidate": {
+                    **current["candidate"], "policy_digest": old_candidate.get("policy_digest")
+                }} != previous):
+            return False
+        return previous == observed
+    return False
+
+
 def evidence(store, spec):
     """Qualify actual native source/gates without granting permission to merge."""
     if (
@@ -241,7 +272,8 @@ def evidence(store, spec):
             or cleanup.get("process_cleanup") != "observed-native-confirmed"
             or cleanup.get("resource_cleanup") != "confirmed"):
         raise MergeCleanupPending("predecessor process/root custody is unconfirmed")
-    matching = [item for item in publications if json.loads(item["observed_json"] or "null") == pr]
+    matching = [item for item in publications if _publication_matches(
+        store, spec, pr, json.loads(item["observed_json"] or "null"))]
     if not matching:
         raise ValueError("merge has no authenticated completed publication")
     publication = json.loads(matching[-1]["request_json"])

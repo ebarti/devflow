@@ -21,6 +21,61 @@ from devflow_temporal.delivery_resources import write_private
 from devflow_temporal.supervisor import DeliverySupervisor
 
 
+@pytest.mark.parametrize("rotations", [1, 2])
+@pytest.mark.parametrize("drift", [None, "head", "content", "unsealed"])
+def test_sealed_runtime_policy_renewal_keeps_original_publication_custody(
+    delivered, rotations, drift,
+):
+    from pathlib import Path
+
+    from devflow_temporal.delivery_gate_retry import gate_namespace
+
+    d = delivered
+    spec = copy.deepcopy(d.spec)
+    with d.store._connect() as db:
+        pr = json.loads(db.execute("SELECT pr_json FROM delivery_runs").fetchone()[0])
+    original_publication = copy.deepcopy(pr)
+    recovery = None
+    for generation in range(1, rotations + 1):
+        previous_spec, previous_pr = copy.deepcopy(spec), copy.deepcopy(pr)
+        spec["policy"]["native_preparation"] = {"runtime_payload_sha256": str(generation) * 64}
+        spec["policy_digest"] = digest(spec["policy"])
+        spec.update(gate_retry_generation=generation, gate_retry_stage="published")
+        candidate = {**pr["candidate"], "policy_digest": spec["policy_digest"]}
+        pr = {**pr, "candidate": candidate}
+        recovery = {"kind": "published_gate_retry", "original_spec": d.spec,
+                    "execution_spec": copy.deepcopy(spec), "original_recovery": recovery,
+                    "command": {"additional_iterations": 0}, "candidate": candidate,
+                    "publication": copy.deepcopy(pr),
+                    "seal": {"original_spec": previous_spec, "publication": previous_pr}}
+        root = Path(spec["state_dir"]) / gate_namespace(generation, "published")
+        write_private(root / "admission.json", recovery)
+    with d.store._connect() as db:
+        db.execute("INSERT INTO delivery_gate_admissions VALUES ('run-1','renew-policy',?)",
+                   (canonical_json(recovery),))
+        db.execute("UPDATE delivery_runs SET recovery_json=?,candidate_json=?,pr_json=?",
+                   tuple(canonical_json(v) for v in (recovery, candidate, pr)))
+    if drift == "head":
+        pr["head"] = "f" * 40
+    elif drift == "content":
+        pr["candidate"] = {**pr["candidate"], "content_sha256": "changed"}
+    elif drift == "unsealed":
+        recovery["seal"]["original_spec"]["policy_digest"] = "f" * 64
+    with d.store._connect() as db:
+        db.execute("UPDATE delivery_runs SET pr_json=?,recovery_json=?",
+                   (canonical_json(pr), canonical_json(recovery)))
+    # A second generic gate assessment is not an admitted historical path.
+    if drift or rotations > 1:
+        with pytest.raises(ValueError):
+            followup.preflight(d.store, "run-1")
+    else:
+        assert followup.preflight(d.store, "run-1")["phase"] == "available"
+        with d.store._connect() as db:
+            saved = json.loads(db.execute("SELECT observed_json FROM delivery_effects "
+                                         "WHERE kind='publish'").fetchone()[0])
+        assert saved == original_publication
+
+
 @pytest.fixture
 def delivered(service, monkeypatch):
     store, request = service
