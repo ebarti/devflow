@@ -125,6 +125,72 @@ def test_validation_preserves_pr_scope_checkpoint_and_original_attempt(publicati
     assert DeliveryBroker(store, effective).publication_effect_key(0) != "publish:run-1:0"
 
 
+def test_validation_restores_a_cleaned_checkout_from_its_retained_commit(publication):
+    store, broker, payload, *_ = publication
+    _git(broker.source, "worktree", "remove", str(broker.checkout))
+    assert not broker.checkout.exists()
+    assert store.repair_admission_preflight("run-1", payload)["preflight"]
+    assert not broker.checkout.exists()
+    store.continue_repair("run-1", payload)
+    assert _git(broker.checkout, "rev-parse", "HEAD") == payload["expected_pr_head"]
+    assert _git(broker.checkout, "branch", "--show-current") == broker.spec["branch"]
+
+
+def test_validation_refuses_restoration_after_retained_branch_changes(publication):
+    store, broker, payload, *_ = publication
+    _git(broker.source, "worktree", "remove", str(broker.checkout))
+    _git(broker.source, "update-ref", "refs/heads/" + broker.spec["branch"],
+         broker.spec["base_sha"])
+    with pytest.raises(ValueError, match="retained local branch"):
+        store.continue_repair("run-1", payload)
+    assert not broker.checkout.exists()
+
+
+def test_checkout_restoration_preserves_and_renews_resource_ownership(publication, tmp_path):
+    from devflow_temporal.delivery_publication_validation import (
+        _checkpoint,
+        preserve_validation_resources,
+        restore_checkout,
+    )
+    from devflow_temporal.delivery_resources import (
+        RunResources,
+        _identity,
+        read_private,
+        write_private,
+    )
+
+    store, broker, payload, *_ = publication
+    seal = _checkpoint(store, "run-1", payload)
+    spec = seal["original_spec"]
+    spec["resource_cleanup_version"] = 1
+    resources = RunResources(spec)
+    identity = _identity(broker.checkout)
+    _git(broker.source, "worktree", "remove", str(broker.checkout))
+    resources.register(broker.checkout, "checkout")
+    with resources.locked() as manifest:
+        manifest["roots"][str(broker.checkout)].update(
+            identity=identity, state="created", receipt={"state": "retained"})
+        manifest["finalization"] = {"resource_cleanup": "confirmed"}
+        write_private(resources.manifest, manifest)
+    write_private(resources.root / "finalization.json", {"state": "confirmed"})
+    before = resources.manifest.read_bytes()
+    root = tmp_path / "restoration"
+    restore_checkout(store, seal, root)
+    assert (root / "predecessor-resources/manifest.json").read_bytes() == before
+    entry = read_private(resources.manifest)["roots"][str(broker.checkout)]
+    assert entry["identity"] == _identity(broker.checkout)
+    assert entry["generation"] == 1 and "receipt" not in entry
+    assert (root / "checkout-restoration.json").exists()
+    preserve_validation_resources(root, seal)
+    restore_checkout(store, seal, root)
+    assert read_private(resources.manifest)["roots"][str(broker.checkout)] == entry
+    with resources.locked() as manifest:
+        manifest["finalization"]["unrelated_change"] = True
+        write_private(resources.manifest, manifest)
+    with pytest.raises(ValueError, match="outside the restored checkout"):
+        preserve_validation_resources(root, seal)
+
+
 @pytest.mark.parametrize("drift", ["hold_issue", "hold_pr", "closed_pr", "head", "code",
                                   "ancestry", "revision", "candidate", "budget", "dirty"])
 def test_validation_rejects_wrong_authority_before_admission(publication, drift):

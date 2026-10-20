@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from copy import deepcopy
 from pathlib import Path
@@ -11,7 +12,13 @@ from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, work_binding
-from .delivery_resources import private_directory, read_private
+from .delivery_resources import (
+    RunResources,
+    _identity,
+    private_directory,
+    read_private,
+    write_private,
+)
 from .delivery_source_scope import outside_scope
 
 KIND = "published_head_validation"
@@ -126,6 +133,64 @@ def _checkpoint(store, run_id, payload):
             "session_id": implementation["session_id"]}
 
 
+def restore_checkout(store, seal, root):
+    """Recreate only an absent, settled run checkout at its retained local commit."""
+    spec = seal["original_spec"]
+    broker = DeliveryBroker(store, spec)
+    if os.path.lexists(broker.checkout):
+        return
+    private_directory(broker.checkout.parent)
+    if (broker.source.resolve() != broker.source
+            or _git(broker.source, "remote", "get-url", "origin") != spec["origin_url"]):
+        raise ValueError("validation source repository changed")
+    branch = spec.get("local_branch", spec["branch"])
+    if _git(broker.source, "rev-parse", "refs/heads/" + branch) != seal["candidate"]["head"]:
+        raise ValueError("retained local branch differs from the completed candidate")
+    preserve_resources(root, spec)
+    resources = RunResources(spec) if spec.get("resource_cleanup_version") == 1 else None
+    if resources:
+        with resources.locked() as manifest:
+            old = manifest["roots"].get(str(broker.checkout), {})
+            if (old.get("kind") != "checkout" or os.path.lexists(broker.checkout)
+                    or manifest.get("finalization", {}).get("resource_cleanup") != "confirmed"):
+                raise ValueError("checkout restoration lacks settled resource ownership")
+            _immutable(root / "checkout-restoration.json", {
+                "path": str(broker.checkout), "head": seal["candidate"]["head"],
+                "predecessor": deepcopy(old), "checkpoint_digest": digest(seal)})
+            old.update(identity=None, state="allocated", generation=old.get("generation", 0) + 1)
+            old.pop("receipt", None)
+            write_private(resources.manifest, manifest)
+    _git(broker.source, "worktree", "add", str(broker.checkout), branch)
+    if resources:
+        resources.created(broker.checkout)
+    if broker.candidate() != seal["candidate"]:
+        raise ValueError("restored checkout differs from the completed candidate")
+
+
+def preserve_validation_resources(root, seal):
+    spec = seal["original_spec"]
+    restoration = root / "checkout-restoration.json"
+    if not restoration.exists():
+        preserve_resources(root, spec)
+        return
+    saved = read_private(restoration)
+    old = read_private(root / "predecessor-resources/manifest.json")
+    resources = RunResources(spec, read_only=True)
+    current = read_private(resources.manifest)
+    entry = current["roots"][spec["checkout"]]
+    if (saved["checkpoint_digest"] != digest(seal) or saved["path"] != spec["checkout"]
+            or saved["head"] != seal["candidate"]["head"]
+            or old["roots"][spec["checkout"]] != saved["predecessor"]
+            or entry.get("identity") != _identity(Path(spec["checkout"]))
+            or entry.get("generation") != saved["predecessor"].get("generation", 0) + 1
+            or resources.root.joinpath("finalization.json").read_bytes()
+            != root.joinpath("predecessor-resources/finalization.json").read_bytes()):
+        raise ValueError("checkout restoration changed its predecessor evidence")
+    current["roots"][spec["checkout"]] = saved["predecessor"]
+    if current != old:
+        raise ValueError("resources changed outside the restored checkout")
+
+
 def admit(store, run_id, payload, *, preflight=False):
     fields = {"continuation_kind", "command_id", "expected_revision",
               "expected_projection_revision", "expected_candidate_id", "expected_pr_number",
@@ -171,6 +236,7 @@ def admit(store, run_id, payload, *, preflight=False):
         execution["role_home_generation"] = "publication-" + payload["expected_pr_head"]
         # Admission owns fresh evidence namespaces; the frozen product policy is unchanged.
         execution["publication_validation_head"] = payload["expected_pr_head"]
+        restore_checkout(store, seal, root)
         broker = DeliveryBroker(store, original)
         local_head = _git(broker.checkout, "rev-parse", "HEAD")
         retained = root / "predecessor.json"
@@ -190,7 +256,7 @@ def admit(store, run_id, payload, *, preflight=False):
                                      "files")
         if digest(_checkpoint(store, run_id, payload)) != digest(seal):
             raise ValueError("publication checkpoint changed during native preparation")
-        preserve_resources(root, original)
+        preserve_validation_resources(root, seal)
         _immutable(retained, seal)
         _git(broker.checkout, "merge", "--ff-only", "--no-edit", payload["expected_pr_head"])
         candidate = DeliveryBroker(store, execution).candidate()
