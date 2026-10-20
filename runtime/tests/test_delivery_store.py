@@ -87,6 +87,7 @@ def service(tmp_path: Path) -> tuple[DeliveryStore, dict]:
         "helpers_dir": str(root / "skills" / "devflow" / "scripts"),
         "codex_bin": "/usr/bin/false",
         "provider": "fake",
+        "execution_registry": str(tmp_path / "execution-ownership" / "registry.sqlite3"),
         "repositories": {
             "fixture": {
                 "source_path": str(source),
