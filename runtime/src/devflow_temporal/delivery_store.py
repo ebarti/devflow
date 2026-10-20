@@ -1422,6 +1422,11 @@ class DeliveryStore:
             from .delivery_investigation_adjudication import admit
 
             return admit(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'published_head_validation'):
+            from .delivery_publication_validation import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
         if isinstance(supplied, dict) and 'continuation_kind' in supplied:
             raise ValueError("unsupported repair continuation kind")
         from .delivery_preparation import require_native_execution
@@ -3025,6 +3030,7 @@ class DeliveryStore:
         """Read the sole native scope amendment without restoring retired execution."""
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+            "published_head_validation",
             "accepted_technical_successor", "investigation_assessment_adjudication",
             "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
@@ -3054,6 +3060,10 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            if recovery and recovery.get('kind') == 'published_head_validation':
+                from .delivery_publication_validation import effective_spec
+
+                return effective_spec(self, recovery)
             if recovery and recovery.get('kind') == 'stopped_delivery_resume':
                 from .delivery_stopped_resume import effective_spec
 
@@ -3096,6 +3106,7 @@ class DeliveryStore:
 
             while recovery and recovery.get("kind") in {
                 "terminal_tracker_recovery", "published_metadata_recovery",
+                "published_head_validation",
                 "investigation_gates_only", "accepted_technical_successor",
                 "investigation_assessment_adjudication", "stopped_resource_closure",
             }:
@@ -3115,6 +3126,7 @@ class DeliveryStore:
                 recovery = recovery["original_recovery"]
                 while recovery and recovery.get("kind") in {
                     "terminal_tracker_recovery", "published_metadata_recovery",
+                    "published_head_validation",
                     "investigation_gates_only", "accepted_technical_successor",
                     "investigation_assessment_adjudication", "stopped_resource_closure",
                 }:
@@ -3863,6 +3875,7 @@ class DeliveryStore:
         technical = False
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+            "published_head_validation",
             "accepted_technical_successor", "investigation_assessment_adjudication",
             "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
@@ -3986,6 +3999,7 @@ class DeliveryStore:
         technical_successor = None
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+            "published_head_validation",
             "accepted_technical_successor", "investigation_assessment_adjudication",
             "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):

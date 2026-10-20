@@ -473,6 +473,17 @@ def _context(
     return store, broker
 
 
+@activity.defn(name="delivery_publication_validation_readback")
+async def delivery_publication_validation_readback(request):
+    from .delivery_publication_validation import readback
+
+    def execute():
+        store, _broker = _context(request["spec"])
+        return readback(store, request["spec"], request["recovery"])
+
+    return await asyncio.to_thread(execute)
+
+
 @activity.defn(name="delivery_resource_closure_readback")
 async def delivery_resource_closure_readback(request: dict[str, Any]) -> dict[str, Any]:
     def execute():
@@ -1481,6 +1492,7 @@ async def delivery_terminal_preflight(request):
 
 
 DELIVERY_ACTIVITIES = [
+    delivery_publication_validation_readback,
     delivery_terminal_preflight,
     delivery_terminal_tracker,
     delivery_merge,

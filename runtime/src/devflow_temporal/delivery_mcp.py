@@ -220,7 +220,14 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=write)
     async def continue_repair(run_id: str, request_json: str) -> dict:
-        """Admit the existing one-time stopped-run repair with its exact command identity."""
+        """Continue bounded repair or validate an existing PR's documentation update.
+
+        For published_head_validation, provide command_id, expected_revision
+        (protocol), expected_projection_revision, expected_candidate_id,
+        expected_pr_number, expected_pr_head and additional_iterations=0.
+        The current head must be an in-scope documentation-only fast-forward.
+        Existing acceptance is rerun on the same PR; owner holds refuse admission.
+        """
         return await forward_write("continue_repair", run_id, json.loads(request_json))
 
     return server

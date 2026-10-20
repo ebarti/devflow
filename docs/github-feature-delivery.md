@@ -138,6 +138,19 @@ evidence without requesting a merge. Keep the entire command stable when its
 response is uncertain. The HTTP boundary is `POST /api/runs/RUN/merge` with the
 normal local session and CSRF protection.
 
+When a later documentation cleanup changes an existing ordinary PR's commit,
+`continue_repair` accepts `continuation_kind: "published_head_validation"` with
+`command_id`, the observed `expected_revision` (protocol) and
+`expected_projection_revision`, `expected_candidate_id`, `expected_pr_number`,
+the current `expected_pr_head`, and `additional_iterations: 0`. The read-only
+repair admission preflight accepts the same payload. Admission requires a
+settled predecessor, the original accepted scope, a documentation-only
+fast-forward, the same open PR and target branch, and no owner hold. The original
+implementation session confirms the current checkpoint, followed by fresh
+checks, independent review, QA and required CI. The PR number and repair ceiling
+stay fixed. Earlier receipts remain preserved, and readiness returns only after
+the current commit passes. This command does not authorize merging.
+
 This follow-up keeps the same issue, run, PR, accepted implementation, independent
 reviews, repair count and original publication-only authorization. A separate
 durable merge command owns its Temporal workflow and claim. It mechanically

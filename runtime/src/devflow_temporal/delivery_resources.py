@@ -171,8 +171,24 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
                 while recovery and recovery.get('kind') in {
                     'terminal_tracker_recovery', 'repair_continuation',
                     'investigation_assessment_adjudication', 'stopped_resource_closure',
-                    'stopped_delivery_resume',
+                    'stopped_delivery_resume', 'published_head_validation',
                 }:
+                    if recovery.get('kind') == 'published_head_validation':
+                        from .delivery_publication_validation import custody
+                        from .delivery_publication_validation import (
+                            namespace as validation_namespace,
+                        )
+
+                        custody(db, recovery)
+                        if (first and canonical_json(recovery['execution_spec'])
+                                != canonical_json(spec)):
+                            raise ValueError('publication validation execution authority changed')
+                        admitted = validation_namespace(recovery)
+                        roots.add(state / admitted / 'evidence')
+                        bind(state / admitted / 'evidence', recovery['execution_spec'])
+                        if first:
+                            namespace = admitted
+                        first = False
                     if recovery.get('kind') == 'stopped_delivery_resume':
                         from .delivery_feature_revision_recovery import retained_recovery
                         from .delivery_stopped_resume import custody
