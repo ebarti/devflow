@@ -155,7 +155,7 @@ async def test_lost_plan_write_settles_before_public_successor_is_admitted(
         assert row["phase"] == "waiting_feature_readback" and row["outcome"] is None
         assert row["execution_state"] == "waiting" and events == 1
         assert json.loads(row["checks_json"])["feature_readback"]["state"] == "pending"
-        assert feature["status"] == "Waiting for GitHub"
+        assert feature["status"] == "In Progress"
         assert registry(spec).current("I_feature")["state"] == "draining"
         controller.cancel_requested = cancel_during_readback
 
