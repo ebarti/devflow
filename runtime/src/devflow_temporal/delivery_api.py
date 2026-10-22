@@ -259,6 +259,18 @@ class DeliveryService:
                 continue
             await _dispatch_start(self, client, item, spec)
 
+    async def dispatch_merges_once(self):
+        from .delivery_merge_followup import dispatch
+
+        def pending_requests():
+            with self.store._connect() as db:
+                return db.execute("SELECT 1 FROM delivery_merge_requests "
+                                  "WHERE dispatched=0 AND phase='queued'").fetchone() is not None
+
+        pending = await asyncio.to_thread(pending_requests)
+        if pending:
+            await dispatch(self, await self.healthy_client())
+
     async def dispatch_loop(self) -> None:
         self._retry_stopped = threading.Event()
         self._retry_task = None
@@ -271,6 +283,12 @@ class DeliveryService:
 
     async def _dispatch_loop(self) -> None:
         while True:
+            try:
+                await self.dispatch_merges_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Merge dispatch pending: %s", exc)
             try:
                 await self.dispatch_once()
             except asyncio.CancelledError:
@@ -452,10 +470,14 @@ def create_app(config_path: Path) -> FastAPI:
             service.temporal_status = "disconnected"
         def active_attempts() -> int:
             with service.store._connect() as db:
-                return db.execute(
+                roles = db.execute(
                     """SELECT COUNT(*) FROM delivery_attempts
                        WHERE state IN ('starting','running','unknown')"""
                 ).fetchone()[0]
+                merges = db.execute("SELECT COUNT(*) FROM delivery_merge_requests WHERE "
+                                    "phase IN ('queued','merging','waiting_ci','waiting_tracker',"
+                                    "'unknown')").fetchone()[0]
+                return roles + merges
 
         active = await asyncio.to_thread(active_attempts)
         from .delivery_dashboard import runtime_identity
@@ -512,12 +534,29 @@ def create_app(config_path: Path) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @app.get("/api/project-board")
+    async def project_board(request: Request) -> dict[str, Any]:
+        _host(request)
+        from .delivery_project_board import read
+
+        return await asyncio.to_thread(read, service.store)
+
     @app.get("/api/statistics")
     async def statistics(request: Request) -> dict[str, Any]:
         _host(request)
         from .delivery_dashboard import statistics_for
 
         return await asyncio.to_thread(statistics_for, service.store)
+
+    @app.post("/api/statistics/reset")
+    async def statistics_reset(request: Request) -> dict[str, Any]:
+        _mutation(request)
+        from .delivery_dashboard import reset_statistics
+
+        try:
+            return await asyncio.to_thread(reset_statistics, service.store, await request.json())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     async def dashboard_command(request: Request, run_id: str, kind: str):
         _mutation(request)
@@ -544,6 +583,22 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(service.store.submit, await request.json())
         except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except TRANSPORT_FAILURES as exc:
+            raise HTTPException(503, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/issue-context")
+    async def refresh_issue_context(request: Request, run_id: str) -> dict[str, Any]:
+        _mutation(request)
+        from .delivery_issue_context import refresh
+
+        try:
+            context = await asyncio.to_thread(refresh, service.store, run_id, await request.json())
+            return {"run_id": run_id, "context_sha256": digest(context),
+                    "fetched_at": context["fetched_at"], "issue_url": context["issue"]["url"],
+                    "evidence_count": len(context["evidence"]),
+                    "unavailable": context["unavailable"]}
+        except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         except TRANSPORT_FAILURES as exc:
             raise HTTPException(503, str(exc)) from exc
@@ -584,6 +639,28 @@ def create_app(config_path: Path) -> FastAPI:
             )
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/merge-preflight")
+    async def merge_preflight(request: Request, run_id: str):
+        _host(request)
+        from .delivery_merge_followup import preflight
+
+        try:
+            return await asyncio.to_thread(preflight, service.store, run_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/merge")
+    async def merge_run(request: Request, run_id: str):
+        _mutation(request)
+        from .delivery_merge_followup import admit
+
+        try:
+            return await asyncio.to_thread(admit, service.store, run_id, await request.json())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except TRANSPORT_FAILURES as exc:
+            raise HTTPException(503, str(exc)) from exc
 
 
     @app.get("/api/runs/{run_id}/gates-only-preflight")

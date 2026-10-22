@@ -8,7 +8,7 @@ import { Settings } from './Settings'
 import { RunBoard } from './RunBoard'
 import { Statistics } from './Statistics'
 import { subscribeRun } from './stream'
-import type { RepositoryAccess, RunDetail, RunSummary, ServiceInfo } from './model'
+import type { ProjectBoard, RepositoryAccess, RunDetail, RunSummary, ServiceInfo } from './model'
 
 type Page = 'runs' | 'new' | 'settings' | 'statistics'
 type Connection = 'connecting' | 'connected' | 'disconnected'
@@ -39,6 +39,8 @@ export function App() {
   const [showArchived, setShowArchived] = useState(false)
   const listRequest = useRef(0)
   const [runs, setRuns] = useState<RunSummary[]>([])
+  const [projectBoard, setProjectBoard] = useState<ProjectBoard>({ items: [], projects: [] })
+  const [projectError, setProjectError] = useState('')
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [olderLoading, setOlderLoading] = useState(false)
   const [olderError, setOlderError] = useState('')
@@ -76,8 +78,19 @@ export function App() {
   const refreshRuns = useCallback(async () => {
     const requestId = ++listRequest.current
     try {
-      const page = await api.listRunsPage(showArchived)
+      const [runResult, projectResult] = await Promise.allSettled([
+        api.listRunsPage(showArchived),
+        showArchived ? Promise.resolve(null) : api.getProjectBoard(),
+      ])
       if (requestId !== listRequest.current) return
+      if (projectResult.status === 'fulfilled' && projectResult.value) {
+        setProjectBoard(projectResult.value)
+        setProjectError('')
+      } else if (projectResult.status === 'rejected') {
+        setProjectError(projectResult.reason instanceof Error ? projectResult.reason.message : 'Could not load Project work items.')
+      }
+      if (runResult.status === 'rejected') throw runResult.reason
+      const page = runResult.value
       // Once paging starts, keep observations that leave the recent page.
       setRuns(current => olderLoaded.current ? retainRows(page.runs, current) : page.runs)
       if (!olderLoaded.current) setNextCursor(page.next_cursor)
@@ -266,7 +279,7 @@ export function App() {
         {connection === 'connecting' && detail ? <div className="connection-banner" role="status">Reconnecting · showing last observed state from {time(lastGoodAt)}.</div> : null}
         {detailLoading && !detail ? <div className="empty-state"><h2>Loading run…</h2><p>Reading the local service projection.</p></div> : null}
         {!detailLoading && !detail && location.id ? <div className="empty-state"><h2>Run unavailable</h2><p>{detailError || 'The service has not returned this run.'}</p><button className="outline-button" onClick={() => void refreshCurrent()}>Retry</button></div> : null}
-        {!location.id ? <>{runsError ? <p className="inline-alert" role="alert">Run board is stale. {runsError}</p> : null}{runsLoading ? <p>Loading tasks…</p> : <RunBoard runs={allRuns} archived={showArchived} onSelect={id => navigate('runs', id)} onToggle={toggleArchive} onRefresh={() => void refreshRuns()} />}{pagingNotice ? <p role="status">{pagingNotice}</p> : null}{olderError ? <p role="alert">{olderError}</p> : null}{nextCursor ? <button className="outline-button" disabled={olderLoading} onClick={() => void loadOlder()}>{olderLoading ? 'Loading older tasks…' : 'Load older tasks'}</button> : null}</> : null}
+        {!location.id ? <>{runsError ? <p className="inline-alert" role="alert">Run board is stale. {runsError}</p> : null}{projectError && !showArchived ? <p className="inline-alert" role="alert">Project work items could not refresh. Showing the last observation. {projectError}</p> : null}{runsLoading ? <p>Loading tasks…</p> : <RunBoard runs={allRuns} projectBoard={projectBoard} archived={showArchived} onSelect={id => navigate('runs', id)} onToggle={toggleArchive} onRefresh={() => void refreshRuns()} />}{pagingNotice ? <p role="status">{pagingNotice}</p> : null}{olderError ? <p role="alert">{olderError}</p> : null}{nextCursor ? <button className="outline-button" disabled={olderLoading} onClick={() => void loadOlder()}>{olderLoading ? 'Loading older tasks…' : 'Load older tasks'}</button> : null}</> : null}
         {detail ? <RunDetails key={detail.id} run={detail} onRefresh={refreshCurrent} /> : null}
       </> : null}
     </main>

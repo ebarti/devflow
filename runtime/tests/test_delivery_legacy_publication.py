@@ -42,7 +42,7 @@ def test_explicit_binding_reconciles_known_pr_without_changing_legacy_runs(servi
     stamp += timedelta(minutes=1)
     restarted = ProjectSynchronizer([store], remote, clock=lambda: stamp)
     result = restarted.tick()[request["issue_url"]]
-    assert result["run_id"] == retry["run_id"] and result["status"] == "Merged"
+    assert result["run_id"] == retry["run_id"] and result["status"] == "Done"
     assert result["mirror"]["state"] == "consistent"
     assert result["legacy_publication_binding"]["run_id"] == request["run_id"]
     # New explicit custody triggers readback before the daily deadline.
@@ -84,7 +84,7 @@ def test_changed_or_resumed_reference_invalidates_bridge_on_next_tick(service, c
     remote.state = "MERGED"
     sync = ProjectSynchronizer([store], remote)
     bind(sync, request["run_id"])
-    assert sync.tick()[request["issue_url"]]["status"] == "Merged"
+    assert sync.tick()[request["issue_url"]]["status"] == "Done"
     # Simulate a historical writer that predates this tracking bridge.
     with store._connect() as db:
         if change == "receipt":
@@ -145,7 +145,7 @@ def test_later_attempt_does_not_inherit_explicit_tracking_bridge(service):
     remote.state = "MERGED"
     sync = ProjectSynchronizer([store], remote)
     bind(sync, request["run_id"])
-    assert sync.tick()[request["issue_url"]]["status"] == "Merged"
+    assert sync.tick()[request["issue_url"]]["status"] == "Done"
     with store._connect() as db:
         store.state.release_work(db, retry["work_id"], "external:devflow:" + retry["run_id"])
     third = {**request, "run_id": "run-3", "work_id": "work-3", "command_id": "command-3"}

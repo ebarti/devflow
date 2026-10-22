@@ -476,7 +476,7 @@ def retained(tmp_path, monkeypatch):
     monkeypatch.setattr(resources.subprocess, 'run',
                         lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=''))
     monkeypatch.setattr(resources.RunResources, '_retain_source',
-                        lambda *_args: 'private synthetic retained gate')
+                        lambda *_args, **_kwargs: 'private synthetic retained gate')
     owner.finalize('blocked')
     return spec, owner, gate
 

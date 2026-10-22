@@ -1,4 +1,4 @@
-import type { NewRunRequest, RepositoryAccess, RunDetail, RunSummary, ServiceInfo, Statistics, Usage } from './model'
+import type { NewRunRequest, ProjectBoard, RepositoryAccess, RunDetail, RunSummary, ServiceInfo, Statistics, Usage } from './model'
 
 /** The only HTTP path/contract adapter. No credentials are persisted or put in URLs. */
 export class ApiError extends Error {
@@ -89,6 +89,7 @@ async function command<T>(path: string, body: object): Promise<T> {
 
 export const api = {
   session,
+  getProjectBoard: (): Promise<ProjectBoard> => request('/api/project-board'),
   listRuns: async (archived = false): Promise<RunSummary[]> => (await api.listRunsPage(archived)).runs,
   listRunsPage: async (archived = false, cursor?: string): Promise<{ runs: RunSummary[]; next_cursor: string | null }> => {
     const params = new URLSearchParams()
@@ -99,6 +100,7 @@ export const api = {
     return { ...page, next_cursor: page.next_cursor ?? null }
   },
   getStatistics: (): Promise<Statistics> => request('/api/statistics'),
+  resetStatistics: (body: { command_id: string }): Promise<Statistics> => command('/api/statistics/reset', body),
   archive: async (runId: string, body: { command_id: string; expected_revision: number; archived: boolean }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/archive`, body)
   },
@@ -138,6 +140,8 @@ export const api = {
     command('/api/runs', body),
   continueFeature: async (runId: string, body: { command_id: string; expected_revision: number }): Promise<{ run_id: string; phase: string }> =>
     command(`/api/runs/${encodeURIComponent(runId)}/continue-feature`, body),
+  merge: async (runId: string, body: { command_id: string; expected_revision: number; candidate_id: string; head: string; pr_number: number; answer: 'merge' }): Promise<{ run_id: string; phase: string; command_id: string }> =>
+    command(`/api/runs/${encodeURIComponent(runId)}/merge`, body),
   reviseFeaturePlan: async (runId: string, body: { command_id: string; expected_revision: number; reason: string }): Promise<{ run_id: string; phase: string; revision_phase: string }> =>
     command(`/api/runs/${encodeURIComponent(runId)}/revise-feature-plan`, body),
   answer: async (runId: string, body: { command_id: string; expected_revision: number; decision_id: string; decision_revision: number; candidate_revision: number; answer: string; response?: string }): Promise<void> => {

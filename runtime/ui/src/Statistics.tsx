@@ -12,13 +12,27 @@ export function Statistics() {
   const [data, setData] = useState<StatisticsData | null>(null)
   const [error, setError] = useState('')
   const [refresh, setRefresh] = useState(0)
+  const [resetCommand, setResetCommand] = useState<string | null>(null)
+  const [resetting, setResetting] = useState(false)
   useEffect(() => {
     let alive = true
     void api.getStatistics().then(next => { if (alive) { setData(next); setError('') } }).catch(cause => { if (alive) setError(cause instanceof Error ? cause.message : 'Could not load statistics.') })
     return () => { alive = false }
   }, [refresh])
+  async function reset() {
+    if (resetting) return
+    const commandId = resetCommand ?? crypto.randomUUID()
+    setResetCommand(commandId); setResetting(true)
+    try {
+      setData(await api.resetStatistics({ command_id: commandId }))
+      setResetCommand(null); setError(''); setRefresh(n => n + 1)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Statistics reset could not be confirmed.')
+    } finally { setResetting(false) }
+  }
   return <section className="statistics-page" aria-labelledby="statistics-title">
-    <div className="board-toolbar"><div><h2 id="statistics-title">Delivery efficiency</h2><p>Compare observed outcomes across tagged releases and local revisions.</p></div><button className="outline-button" onClick={() => setRefresh(n => n + 1)}>Refresh statistics</button></div>
+    <div className="board-toolbar"><div><h2 id="statistics-title">Delivery efficiency</h2><p>Compare observed outcomes across tagged releases and local revisions.</p></div><button className="outline-button" disabled={resetting} onClick={() => setRefresh(n => n + 1)}>Refresh statistics</button><button className="outline-button" disabled={!data || resetting} onClick={() => void reset()}>{resetting ? 'Resetting…' : 'Reset statistics'}</button></div>
+    {data?.reset_at ? <p role="status">Statistics since {new Date(data.reset_at).toLocaleString()}. Earlier run history is retained.</p> : null}
     {error ? <p className="inline-alert" role="alert">{error}{data ? ' · showing the last observed sample' : ''}</p> : null}
     {!data && !error ? <p>Loading statistics…</p> : null}
     {data ? <><div className="metric-grid"><div><span>Recorded runs</span><strong>{data.total_runs}</strong><small>Includes archived tasks and failures</small></div><div><span>Delivered</span><strong>{data.cohorts.reduce((n, c) => n + c.delivered, 0)}</strong><small>Reached the authorized endpoint</small></div><div><span>Delivered without repairs</span><strong>{data.cohorts.reduce((n, c) => n + c.first_pass_delivered, 0)}</strong><small>No recovery or superseded predecessor</small></div><div><span>Blocked</span><strong>{data.cohorts.reduce((n, c) => n + c.blocked, 0)}</strong><small>Retained in the success-rate denominator</small></div></div>

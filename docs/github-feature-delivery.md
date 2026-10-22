@@ -16,7 +16,7 @@ The final chunk also carries the whole feature's acceptance criteria.
 | GitHub | Parent and sub-issues, hierarchy, scope, acceptance, accepted chunk plan, owning stack ID, exact PR membership, branches, PR heads and actual merge state |
 | Shared local execution registry | One coordinator claim per GitHub issue node ID, ownership generation, worker assignments, immutable input snapshots, checkpoints, effect intents and receipts, cumulative repairs and learning flag |
 | Runtime database | Immutable admitted requests, workflow IDs and revisions, original role sessions and evidence, candidate/gate receipts, durable start outbox, derived status events and cached Project readbacks |
-| Independent synchronizer | Event consumption, Project updates, retry receipts and the daily PR/Project drift schedule |
+| Independent synchronizer | Event consumption, Project updates, retry receipts and the configured issue/PR/Project reconciliation schedule |
 
 Version 2 publishes a compact `devflow-delivery:v2` index on the parent and
 readable, immutable detailed plan comments on each exact child issue. The parent
@@ -127,15 +127,50 @@ request includes `command_id`, `expected_revision` (the protocol revision),
 An explicitly admitted `authorized_endpoint: "merged"` authorizes that transition
 up front; ordinary publication does not.
 
+An ordinary issue-level run that already delivered an unmerged PR has a
+**Merge PR #…** button on its run page. Clicking it is an explicit merge
+instruction; no pending feature decision is required. The equivalent MCP tool is
+`merge_run`. Read `get_run` and send `command_id`, `expected_revision` from
+`protocol_revision`, `candidate_id`, `head` and `pr_number` from `merge`, and
+`answer: "merge"`. The CLI equivalent is `devflow-delivery --config CONFIG merge
+--id RUN --request FILE`; `merge-preflight --id RUN` checks retained native
+evidence without requesting a merge. Keep the entire command stable when its
+response is uncertain. The HTTP boundary is `POST /api/runs/RUN/merge` with the
+normal local session and CSRF protection.
+
+When a later documentation cleanup changes an existing ordinary PR's commit,
+`continue_repair` accepts `continuation_kind: "published_head_validation"` with
+`command_id`, the observed `expected_revision` (protocol) and
+`expected_projection_revision`, `expected_candidate_id`, `expected_pr_number`,
+the current `expected_pr_head`, and `additional_iterations: 0`. The read-only
+repair admission preflight accepts the same payload. Admission requires a
+settled predecessor, the original accepted scope, a documentation-only
+fast-forward, the same open PR and target branch, and no owner hold. The original
+implementation session confirms the current checkpoint, followed by fresh
+checks, independent review, QA and required CI. The PR number and repair ceiling
+stay fixed. Earlier receipts remain preserved, and readiness returns only after
+the current commit passes. This command does not authorize merging.
+
+This follow-up keeps the same issue, run, PR, accepted implementation, independent
+reviews, repair count and original publication-only authorization. A separate
+durable merge command owns its Temporal workflow and claim. It mechanically
+reconciles a later main into the PR and waits for required CI on the combined
+tree, without replaying implementation/review workers. Conflicting upstream
+changes are reported for a user decision. The run's `merge` field and event
+timestamps distinguish requested, merging, waiting for CI, uncertain,
+decision-required and confirmed merge states. A lost update or merge response
+is observed under its existing effect identity, never blindly submitted again.
+
 The merge boundary rereads the recorded stack and PR IDs, verifies the exact
 native evidence and required GitHub checks, and requires strict trunk protection
 without bypass actors. It uses `gh stack merge <number> --yes --squash` once for a
 stack, or a head-bound `gh pr merge` for one chunk. Unknown submission results are
-read back without blind replay. A changed head or target requiring new integration
-cannot reuse previous proof. Only confirmed merges whose trees match the verified
+read back without blind replay. Unowned source changes cannot reuse previous
+proof. Mechanical target reconciliation retains original source evidence and
+requires fresh current-target CI. Only confirmed merges whose trees match the verified
 chunks and are incorporated into the target close the issues. An incomplete
-feature with merged PRs is **Partially merged**, never **Merged**. Each child is
-**Merged** only when every required chunk has a confirmed merge observation.
+feature with only some merged PRs remains **In Progress**, never **Done**. Each child is
+**Done** only when its required delivery has confirmed merge evidence.
 Closure intents identify that child's required chunks and exact merge receipts.
 
 Every published PR records its chunk, workstream, exact child issue and parent,

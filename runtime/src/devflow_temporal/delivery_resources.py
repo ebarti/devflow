@@ -171,8 +171,24 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
                 while recovery and recovery.get('kind') in {
                     'terminal_tracker_recovery', 'repair_continuation',
                     'investigation_assessment_adjudication', 'stopped_resource_closure',
-                    'stopped_delivery_resume',
+                    'stopped_delivery_resume', 'published_head_validation',
                 }:
+                    if recovery.get('kind') == 'published_head_validation':
+                        from .delivery_publication_validation import custody
+                        from .delivery_publication_validation import (
+                            namespace as validation_namespace,
+                        )
+
+                        custody(db, recovery)
+                        if (first and canonical_json(recovery['execution_spec'])
+                                != canonical_json(spec)):
+                            raise ValueError('publication validation execution authority changed')
+                        admitted = validation_namespace(recovery)
+                        roots.add(state / admitted / 'evidence')
+                        bind(state / admitted / 'evidence', recovery['execution_spec'])
+                        if first:
+                            namespace = admitted
+                        first = False
                     if recovery.get('kind') == 'stopped_delivery_resume':
                         from .delivery_feature_revision_recovery import retained_recovery
                         from .delivery_stopped_resume import custody
@@ -402,6 +418,27 @@ def projected_cleanup(spec: dict, checks: dict, recorded: str, *, terminal: bool
         return "unknown"
 
 
+def retained_worktrees(spec: dict) -> dict:
+    """Cheap directory readback; process settlement remains a separate proof."""
+    try:
+        registry = RunResources(spec, read_only=True)
+        with registry.locked(read_only=True) as manifest:
+            roots = []
+            for raw, entry in manifest["roots"].items():
+                if entry["kind"] not in {"checkout", "gate"}:
+                    continue
+                path = Path(raw)
+                registry._allowed(path, entry["kind"], finalizing=True)
+                _ancestors(path, allow_missing=True)
+                if os.path.lexists(path):
+                    if _identity(path) != entry["identity"]:
+                        raise ValueError("retained worktree identity changed")
+                    roots.append({"path": raw, "reason": entry.get("receipt", {}).get("reason")})
+            return {"state": "observed", "count": len(roots), "roots": roots}
+    except (OSError, ValueError, KeyError):
+        return {"state": "unavailable", "count": None, "roots": []}
+
+
 class RunResources:
     def __init__(self, spec: dict, *, read_only: bool = False) -> None:
         self.spec = spec
@@ -456,6 +493,14 @@ class RunResources:
         finally:
             os.close(descriptor)
 
+    def _admitted_gate_roots(self):
+        observed = getattr(self, "_observation_gate_roots", None)
+        if observed is None:
+            observed = _gate_roots(self.spec)
+            if getattr(self, "_observing_gate_roots", False):
+                self._observation_gate_roots = observed
+        return observed
+
     def _allowed(self, path: Path, kind: str, *, finalizing: bool = False) -> None:
         installed = Path(__file__).resolve().parents[3]
         resolved = path.resolve()
@@ -467,7 +512,7 @@ class RunResources:
             valid = path == self._execution_scratch_root()
         if kind == "check-artifacts":
             valid = False
-            for root in _gate_roots(self.spec)[1]:
+            for root in self._admitted_gate_roots()[1]:
                 if not path.is_relative_to(root):
                     continue
                 relative = path.relative_to(root)
@@ -480,7 +525,7 @@ class RunResources:
             valid = path == Path(self.spec["checkout"])
         elif kind == "gate":
             valid = False
-            for root in _gate_roots(self.spec)[1]:
+            for root in self._admitted_gate_roots()[1]:
                 if not path.is_relative_to(root / 'gates'):
                     continue
                 relative = path.relative_to(root / 'gates')
@@ -1338,7 +1383,13 @@ class RunResources:
                             for name in ('native', 'native-retry')}]
                         receipt = self._dispose_check_artifacts(path, entry, manifest, journals)
                     elif entry["kind"] in {"checkout", "gate"}:
-                        reason = self._retain_source(path, entry["kind"], outcome)
+                        discarded, preserved = [], {}
+                        reason = self._retain_source(path, entry["kind"], outcome,
+                                                     discarded=discarded, preserved=preserved)
+                        if discarded:
+                            receipt["discarded_caches"] = discarded
+                        if preserved:
+                            receipt["source_preservation"] = preserved
                         if reason:
                             receipt.update(state="retained", reason=reason)
                         else:
@@ -1407,7 +1458,100 @@ class RunResources:
                 "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
             }
 
-    def _retain_source(self, path: Path, kind: str, outcome: str) -> str | None:
+    def _discard_worktree_caches(self, path: Path) -> list[str]:
+        """Only well-known ignored build/cache directories inside owned source."""
+        ignored = subprocess.check_output(
+            ["git", "--no-optional-locks", "-C", str(path), "ls-files", "--others",
+             "--ignored", "--exclude-standard", "-z"], timeout=30).decode().split("\0")
+        caches = set()
+        for raw in filter(None, ignored):
+            parts = Path(raw).parts
+            if not parts or Path(raw).is_absolute() or ".." in parts:
+                raise ValueError("ignored worktree path escaped its root")
+            if parts[:3] == ("docs", ".vitepress", "dist"):
+                caches.add(path / "docs/.vitepress/dist")
+            for index, name in enumerate(parts[:-1]):
+                if name in {".pytest_cache", ".ruff_cache", "__pycache__"}:
+                    caches.add(path.joinpath(*parts[:index + 1]))
+                    break
+        discarded = []
+        for cache in sorted(caches, key=lambda item: (len(item.parts), str(item))):
+            if any(cache.is_relative_to(Path(parent)) for parent in discarded):
+                continue
+            _ancestors(cache)
+            identity = _identity(cache)
+            tracked = subprocess.check_output(
+                ["git", "--no-optional-locks", "-C", str(path), "ls-files", "-z", "--",
+                 cache.relative_to(path).as_posix()], timeout=30)
+            if tracked:
+                continue  # An unusually named source directory is still source.
+            remove_directory(cache, identity)
+            discarded.append(str(cache))
+        return discarded
+
+    def prune_retained(self, *, expected_receipt_sha256: str | None = None) -> dict:
+        """Revisit settled source without rewriting historical cleanup receipts.
+
+        This is an explicit maintenance operation. It uses the same ownership,
+        actor and source-preservation checks as finalization and records a new
+        receipt alongside the immutable run evidence.
+        """
+        from datetime import UTC, datetime
+
+        from .delivery_metadata_recovery import _immutable
+
+        with self.locked() as manifest, ExitStack() as leases:
+            proof = _observe_locked_resources(self.spec, self, manifest, leases)
+            if (expected_receipt_sha256 is not None
+                    and proof["finalization_sha256"] != expected_receipt_sha256):
+                raise ValueError("recorded finalization changed before retained pruning")
+            originals = {name: read_private(self.root / name, raw=True)
+                         for name in ("manifest.json", "finalization.json")}
+            outcome = json.loads(originals["finalization.json"])["outcome"]
+            roots = []
+            for raw, entry in sorted(manifest["roots"].items(),
+                                     key=lambda item: -len(Path(item[0]).parts)):
+                if (entry["kind"] not in {"checkout", "gate"}
+                        or entry.get("receipt", {}).get("state") != "retained"):
+                    continue
+                path = Path(raw)
+                receipt = {"path": raw, "kind": entry["kind"]}
+                if not os.path.lexists(path):
+                    receipt["state"] = "already_absent"
+                else:
+                    self._allowed(path, entry["kind"], finalizing=True)
+                    if _identity(path) != entry["identity"]:
+                        raise ValueError("retained worktree ownership changed")
+                    discarded, preserved = [], {}
+                    reason = self._retain_source(path, entry["kind"], outcome,
+                                                 discarded=discarded, preserved=preserved)
+                    receipt["discarded_caches"] = discarded
+                    if preserved:
+                        receipt["source_preservation"] = preserved
+                    if reason:
+                        receipt.update(state="retained", reason=reason)
+                    else:
+                        subprocess.run(["git", "-C", self.spec["source_path"], "worktree",
+                                        "remove", str(path)], check=True, capture_output=True,
+                                       timeout=30)
+                        if os.path.lexists(path):
+                            raise ValueError("retained worktree remains after Git removal")
+                        receipt["state"] = "removed"
+                roots.append(receipt)
+            if any(read_private(self.root / name, raw=True) != raw
+                   for name, raw in originals.items()):
+                raise ValueError("historical cleanup evidence changed during pruning")
+            result = {"schema": "devflow-retained-pruning-v1", "run_id": self.spec["run_id"],
+                      "observed_at": datetime.now(UTC).isoformat(), "original": proof,
+                      "roots": roots, "sessions_and_durable_evidence": "retained"}
+            folder = self.root / "pruning"
+            private_directory(folder)
+            receipt_path = folder / (digest(result) + ".json")
+            _immutable(receipt_path, result)
+            return {**result, "receipt": str(receipt_path)}
+
+    def _retain_source(self, path: Path, kind: str, outcome: str, *,
+                       discarded: list | None = None, preserved: dict | None = None) -> str | None:
         def git(*args):
             return subprocess.check_output(
                 ["git", "--no-optional-locks", "-C", str(path), *args], text=True, timeout=30
@@ -1417,8 +1561,6 @@ class RunResources:
             raise ValueError("registered worktree root changed")
         if git("status", "--porcelain", "--untracked-files=all"):
             return "dirty or untracked candidate source is preserved"
-        if git("ls-files", "--others", "--ignored", "--exclude-standard"):
-            return "ignored worktree data requires explicit preservation"
         if Path("/usr/sbin/lsof").is_file():
             observed = subprocess.run(
                 ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(path)],
@@ -1435,6 +1577,11 @@ class RunResources:
                 for line in observed.stdout.splitlines()
             ):
                 return "a live process still uses the candidate worktree"
+        removed = self._discard_worktree_caches(path)
+        if discarded is not None:
+            discarded.extend(removed)
+        if git("ls-files", "--others", "--ignored", "--exclude-standard"):
+            return "ignored worktree data requires explicit preservation"
         if kind == "gate":
             recorded = read_private(self.manifest)['roots'][str(path)].get('head')
             head = git('rev-parse', 'HEAD')
@@ -1465,8 +1612,17 @@ class RunResources:
             text=True,
             timeout=30,
         )
-        if not remote.strip() or remote.split()[0] != head:
+        if not remote.strip():
             return "unpushed or unconfirmed candidate source is preserved"
+        remote_head = remote.split()[0]
+        if remote_head != head and subprocess.run(
+            ["git", "-C", str(path), "merge-base", "--is-ancestor", head, remote_head],
+            capture_output=True, timeout=30,
+        ).returncode != 0:
+            return "unpushed or unconfirmed candidate source is preserved"
+        if preserved is not None:
+            preserved.update(head=head, remote_head=remote_head, branch=self.spec["branch"],
+                             state="published_ancestor" if head != remote_head else "published")
         if outcome != "delivered":
             return "published source remains available for recovery"
         return None
@@ -1487,9 +1643,15 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
     # Finalizers publish intermediate manifests under this same exclusive lease.
     # Authenticate one complete generation, including the returned raw-byte hashes.
     with registry.locked(read_only=True) as manifest, ExitStack() as role_leases:
-        return _observe_locked_resources(spec, registry, manifest, role_leases,
-                                         unknown_allowed=unknown_allowed,
-                                         freshly_completed=freshly_completed, attempts=attempts)
+        registry._observing_gate_roots = True
+        registry._observation_gate_roots = None
+        result = _observe_locked_resources(spec, registry, manifest, role_leases,
+                                           unknown_allowed=unknown_allowed,
+                                           freshly_completed=freshly_completed, attempts=attempts)
+        if (registry._observation_gate_roots is not None
+                and _gate_roots(spec) != registry._observation_gate_roots):
+            raise ValueError("resource execution authority changed during observation")
+        return result
 
 
 def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_allowed=False,

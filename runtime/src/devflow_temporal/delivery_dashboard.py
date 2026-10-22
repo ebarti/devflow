@@ -68,6 +68,8 @@ def initialize(db):
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_steering_launches (
         job_key TEXT PRIMARY KEY REFERENCES delivery_attempts(job_key),
         run_id TEXT NOT NULL, role TEXT NOT NULL, notes_json TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_statistics_resets (
+        command_id TEXT PRIMARY KEY, cutoff_rowid INTEGER NOT NULL, reset_at TEXT NOT NULL)""")
 
 
 def presentation(db, run_id):
@@ -135,6 +137,11 @@ def mutate(store, run_id, kind, payload):
         if row["revision"] != payload["expected_revision"]:
             raise ValueError("run state changed; refresh before sending this command")
         if kind == "archive":
+            from .delivery_merge_followup import ACTIVE, current
+
+            merge = current(db, run_id)
+            if merge and merge["phase"] in ACTIVE:
+                raise ValueError("only stopped tasks can be archived; merge is still active")
             active = db.execute(
                 "SELECT 1 FROM delivery_attempts WHERE run_id=? "
                 "AND (state!='finished' OR cleanup='unknown') LIMIT 1",
@@ -262,12 +269,36 @@ def _number(value):
     return type(value) in {int, float} and math.isfinite(value) and value >= 0
 
 
-def statistics_for(store):
-    """All durable runs, including archives and failures; no UI-list truncation."""
+def reset_statistics(store, payload):
+    """Start a new reporting sample without changing any execution evidence."""
+    from .delivery_store import _now
+
+    if (not isinstance(payload, dict) or set(payload) != {"command_id"}
+            or not isinstance(payload["command_id"], str)
+            or not 0 < len(payload["command_id"].strip()) <= 200):
+        raise ValueError("statistics reset requires a command ID")
     with store._connect() as db:
-        all_runs = [dict(row) for row in db.execute("SELECT * FROM delivery_runs")]
+        db.execute("BEGIN IMMEDIATE")
+        if not db.execute("SELECT 1 FROM delivery_statistics_resets WHERE command_id=?",
+                          (payload["command_id"],)).fetchone():
+            cutoff = db.execute("SELECT COALESCE(MAX(rowid),0) FROM delivery_runs").fetchone()[0]
+            db.execute("INSERT INTO delivery_statistics_resets VALUES (?,?,?)",
+                       (payload["command_id"], cutoff, _now()))
+    return statistics_for(store)
+
+
+def statistics_for(store):
+    """The current reporting sample, including its archives and failures."""
+    with store._connect() as db:
+        reset = db.execute(
+            "SELECT cutoff_rowid,reset_at FROM delivery_statistics_resets "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        all_runs = [dict(row) for row in db.execute("SELECT rowid AS statistics_rowid,* "
+                                                   "FROM delivery_runs")]
         runs = [row for row in all_runs
-                if not json.loads(row["request_json"]).get("feature_worker")]
+                if (not json.loads(row["request_json"]).get("feature_worker")
+                    and (not reset or row["statistics_rowid"] > reset[0]))]
         identities = {
             row[0]: json.loads(row[1])
             for row in db.execute(
@@ -376,13 +407,16 @@ def statistics_for(store):
         )
     return {
         "total_runs": len(runs),
+        "reset_at": reset[1] if reset else None,
         "cohorts": cohorts,
         "definitions": "Success rate = delivered / all terminal runs "
         "(including blocked, cancelled and unknown outcomes). "
         "First pass = delivered at iteration zero without recovery or superseding another run. "
         "Duration = admission to last workflow observation, including waits. "
         "Tokens and costs cover only observed role attempts; missing values are unknown. "
-        "Archived tasks remain included. Historical unrecorded identities stay unknown. "
+        "Archived tasks remain included within the current reporting sample. "
+        "A reset excludes earlier admissions from reporting and preserves their history. "
+        "Historical unrecorded identities stay unknown. "
         "Simulated providers are separate cohorts, not evidence of native delivery. "
         "Cohort differences describe the sample and do not establish causation.",
     }

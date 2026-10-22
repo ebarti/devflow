@@ -1521,6 +1521,8 @@ class DeliveryWorkflow:
                 return await self._resume_published_gates(spec, recovery)
             if recovery.get("kind") == "terminal_tracker_recovery":
                 return await self._resume_terminal_tracker(spec, recovery)
+            if recovery.get("kind") == "published_head_validation":
+                return await self._resume_publication_validation(spec, recovery)
             if recovery.get("kind") == "published_metadata_recovery":
                 return await self._resume_metadata(spec, recovery)
             if recovery.get("kind") == "investigation_gates_only":
@@ -1780,6 +1782,8 @@ class DeliveryWorkflow:
         )
 
     async def _resume_published_gates(self, spec, recovery):
+        if recovery.get('seal', {}).get('local_download_retry') is True:
+            return await self._resume_ci(spec, recovery, recheck_local=True)
         if recovery.get('kind') == 'published_ci_retry':
             return await self._resume_ci(spec, recovery)
         published = recovery.get("kind") in {
@@ -1825,7 +1829,7 @@ class DeliveryWorkflow:
             resume_prechecks=True, published_checkpoint=published,
         )
 
-    async def _resume_ci(self, spec, recovery):
+    async def _resume_ci(self, spec, recovery, *, recheck_local=False):
         if (recovery.get('execution_spec') != spec
                 or recovery.get('command', {}).get('additional_iterations') != 0):
             raise ValueError('CI continuation changed its zero-repair authority')
@@ -1845,6 +1849,18 @@ class DeliveryWorkflow:
             self.state['tracker'] = tracker
             if not _tracking_ready(spec, tracker):
                 return await self._stop(spec, 'CI continuation tracker readback remains pending')
+            if recheck_local:
+                self.state.update(phase='checks')
+                self.state['revision'] += 1
+                await self._project(spec, 'checks_retry_started',
+                                    'Rechecking local tests after test-server preparation failed')
+                local = await self._activity('delivery_checks', {
+                    'spec': spec, 'iteration': self.state['iteration'],
+                    'candidate': self.state['candidate']}, hours=1)
+                self.state['checks']['local'] = local
+                if local.get('state') != 'passed':
+                    return await self._stop(spec, 'local tests did not pass after setup recovery')
+                self.state.update(phase='waiting_ci')
             self.state['revision'] += 1
             await self._project(spec, 'ci_retry_started',
                                 'Observing required CI on the independently passed candidate')
@@ -1878,6 +1894,45 @@ class DeliveryWorkflow:
         await self._project(spec, 'delivered',
                             'Passed independent candidate delivered after fresh required CI')
         return self.state
+
+    async def _resume_publication_validation(self, spec, recovery):
+        if (recovery.get("execution_spec") != spec
+                or recovery.get("command", {}).get("additional_iterations") != 0):
+            raise ValueError("publication validation changed its bounded authority")
+        self.state = deepcopy(recovery["state"])
+        self.state.update(phase="checks", execution_state="running", outcome=None, error=None,
+                          cleanup="none", checks={}, findings=[], candidate=recovery["candidate"],
+                          pull_request=recovery["publication"])
+        try:
+            await self._activity("delivery_publication_validation_readback", {
+                "spec": spec, "recovery": recovery,
+            })
+            tracker = await self._activity("delivery_tracker_start", {
+                "spec": spec, "repair_continuation": True,
+            })
+            self.state["tracker"] = tracker
+            if not _tracking_ready(spec, tracker):
+                return await self._stop(spec, "publication validation tracker readback conflicts")
+        except Exception as exc:
+            return await self._stop(spec, "publication validation admission failed: "
+                                    + type(exc).__name__, cause=exc)
+        self.state["candidate_revision"] += 1
+        self.state["revision"] += 1
+        await self._project(spec, "publication_validation_started",
+                            "Validating the updated documentation in the existing PR")
+        return await self._run_iterations(
+            spec, start_iteration=self.state["iteration"],
+            prior_implementer_session=recovery["session_id"],
+            repair_findings=[
+                "Revalidate this existing PR after its documentation cleanup. Production "
+                "source is unchanged. Review the current checkout against the accepted plan "
+                "and the retained evidence. Do not reimplement completed work or add execution "
+                "history to product docs. Establish the current implementation checkpoint; "
+                "make only a necessary in-scope correction if a real defect remains. The "
+                "controller retains the same PR and runs independent acceptance."
+            ], continuation=None, recovery=None,
+            authorized_max_iteration=self.state["iteration"],
+        )
 
     async def _resume_metadata(self, spec, recovery):
         self.state = deepcopy(recovery["state"])

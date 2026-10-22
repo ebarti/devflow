@@ -1,4 +1,4 @@
-"""Event-driven Project projector with daily PR and drift reconciliation.
+"""Event-driven Project projector with current GitHub issue/PR reconciliation.
 
 Run with --config pointing to {"version":1,"owners":["/absolute/service.json",...]}.
 This process has no workflow client, agent dispatch, merge, or product-repair authority.
@@ -30,6 +30,7 @@ from .delivery_store import DeliveryStore, _private_directory
 
 logger = logging.getLogger(__name__)
 DAY = 24 * 60 * 60
+DEFAULT_INTERVAL = 300
 
 
 class Superseded(RuntimeError):
@@ -64,7 +65,93 @@ class GitHub:
         return {"url": url, "state": value["state"], "head": value["headRefOid"],
                 "base": value["baseRefOid"], "merged_at": value["mergedAt"]}
 
+    def issue(self, url: str) -> dict:
+        value = self.command("issue", "view", url, "--json",
+                             "url,state,stateReason,closedAt,labels")
+        if issue_key(value["url"]) != issue_key(url) or value["state"] not in {"OPEN", "CLOSED"}:
+            raise ValueError("issue readback differs from the admitted issue")
+        return {"url": url, "state": value["state"], "state_reason": value["stateReason"],
+                "closed_at": value["closedAt"],
+                "labels": [item["name"] for item in value.get("labels", [])]}
+
+    def project_board(self, url: str) -> dict:
+        parsed = urlsplit(url)
+        parts = parsed.path.strip("/").split("/")
+        if (parsed.scheme != "https" or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or len(parts) != 4
+                or parts[0] not in {"users", "orgs"} or parts[2] != "projects"
+                or not parts[3].isdigit()):
+            raise ValueError("invalid configured Project URL")
+        query = """query($owner:String!,$number:Int!,$cursor:String){
+          OWNER(login:$owner){projectV2(number:$number){id closed
+            field(name:"Status"){... on ProjectV2SingleSelectField{id options{id name}}}
+            items(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id
+              status:fieldValueByName(name:"Status"){
+                ... on ProjectV2ItemFieldSingleSelectValue{name}}
+              priority:fieldValueByName(name:"Priority"){
+                ... on ProjectV2ItemFieldSingleSelectValue{name}}
+              content{__typename
+                ... on Issue{url title number state stateReason repository{nameWithOwner}
+                  labels(first:100){nodes{name}}}
+                ... on PullRequest{url title number state mergedAt repository{nameWithOwner}
+                  labels(first:100){nodes{name}}}
+              }
+            }}
+          }}
+        }"""
+        owner_type = "user" if parts[0] == "users" else "organization"
+        cursor, items = None, []
+        while True:
+            result = self.graphql(parsed.netloc, query.replace("OWNER", owner_type),
+                                  owner=parts[1], number=int(parts[3]), cursor=cursor)
+            project = (result.get(owner_type) or {}).get("projectV2")
+            if not project or project["closed"] or not project.get("field"):
+                raise ValueError("configured Project is missing, closed or lacks Status")
+            for node in project["items"]["nodes"]:
+                content = node.get("content") or {}
+                repo = (content.get("repository") or {}).get("nameWithOwner")
+                if not repo:
+                    continue  # A Project draft does not identify an admitted repository.
+                items.append({"id": node["id"], "url": content["url"],
+                              "title": content["title"], "number": content["number"],
+                              "repository": repo, "type": content["__typename"],
+                              "state": content["state"],
+                              "state_reason": content.get("stateReason"),
+                              "status": (node.get("status") or {}).get("name"),
+                              "priority": (node.get("priority") or {}).get("name"),
+                              "labels": [item["name"] for item in
+                                         content["labels"]["nodes"]]})
+            page = project["items"]["pageInfo"]
+            if not page["hasNextPage"]:
+                return {"id": project["id"], "url": url, "field": project["field"],
+                        "items": items}
+            if not page["endCursor"] or page["endCursor"] == cursor:
+                raise ValueError("Project pagination did not advance")
+            cursor = page["endCursor"]
+
+    def project_item_status(self, project: dict, item: dict, status: str) -> None:
+        field = project["field"]
+        option = next((value for value in field["options"]
+                       if value["name"].casefold() == status.casefold()), None)
+        if not option:
+            raise ValueError(f"Project lacks the configured {status} status")
+        observed = self.graphql(urlsplit(project["url"]).netloc, """query($item:ID!){
+          node(id:$item){... on ProjectV2Item{project{id}
+            fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}}}}
+          """, item=item["id"])["node"]
+        if (not observed or observed["project"]["id"] != project["id"]
+                or (observed.get("fieldValueByName") or {}).get("name") != item.get("status")):
+            raise Superseded("Project item changed during backlog reconciliation")
+        self.graphql(urlsplit(project["url"]).netloc, """mutation($project:ID!,$item:ID!,
+          $field:ID!,$option:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,
+          itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}""",
+          project=project["id"], item=item["id"], field=field["id"], option=option["id"])
+
     def mirror(self, feature: dict, fence: Callable[[], None]) -> dict:
+        from .delivery_features import STATUSES
+
+        if feature["status"] not in STATUSES:
+            raise ValueError("unsupported current work status")
         project_url = feature["binding"]["project"]
         assignee = feature["binding"]["assignee"]
         if not project_url or not assignee:
@@ -89,7 +176,7 @@ class GitHub:
             raise ValueError("Project is missing, closed, or lacks a single-select Status field")
         field = project["field"]
         option = next((item for item in field["options"]
-                       if item["name"] == feature["status"]), None)
+                       if item["name"].casefold() == feature["status"].casefold()), None)
         if option is None:
             # GitHub replaces this entire list. IDs preserve existing item values.
             options = [{key: item[key] for key in ("id", "name", "color", "description")}
@@ -142,7 +229,8 @@ class GitHub:
         def matches(observed):
             return (observed and observed["project"]["id"] == project["id"]
                     and (observed.get("fieldValueByName") or {}).get("optionId") == option["id"]
-                    and observed["fieldValueByName"]["name"] == feature["status"])
+                    and observed["fieldValueByName"]["name"].casefold()
+                    == feature["status"].casefold())
 
         if not matches(readback()):
             fence()
@@ -164,8 +252,9 @@ class GitHub:
 
 
 class ProjectSynchronizer:
-    def __init__(self, stores: list[DeliveryStore], github=None, *, interval: int = DAY,
-                 project_interval: int = DAY, clock=None):
+    def __init__(self, stores: list[DeliveryStore], github=None, *,
+                 interval: int = DEFAULT_INTERVAL,
+                 project_interval: int = DEFAULT_INTERVAL, clock=None):
         if not stores or len({str(store.config.tracking_db) for store in stores}) != len(stores):
             raise ValueError("synchronizer needs distinct, explicitly configured runtime owners")
         for value in (interval, project_interval):
@@ -191,11 +280,15 @@ class ProjectSynchronizer:
                      "next_check_at", "1=1"),
                     ("project_interval_seconds", self.project_interval, "delivery_project_outbox",
                      "next_attempt_at", "state='consistent'"),
+                    ("issue_interval_seconds", self.project_interval, "delivery_issue_observations",
+                     "next_check_at", "1=1"),
+                    ("board_interval_seconds", self.project_interval, "delivery_project_boards",
+                     "next_check_at", "1=1"),
                 ):
                     saved = db.execute("SELECT value FROM delivery_sync_settings WHERE key=?",
                                        (key,)).fetchone()
                     if not saved or saved[0] != interval:
-                        error = "error" if table == "delivery_pr_observations" else "NULL"
+                        error = "NULL" if table == "delivery_project_outbox" else "error"
                         rows = db.execute(f"SELECT rowid,{column},checked_at,{error} "
                                           f"FROM {table} WHERE {condition}").fetchall()
                         for row in rows:
@@ -253,6 +346,10 @@ class ProjectSynchronizer:
                 if db.execute("SELECT 1 FROM delivery_pr_refresh_requests LIMIT 1").fetchone():
                     deadlines.append(stamp)
                 for row in db.execute("SELECT next_check_at FROM delivery_pr_observations"):
+                    deadlines.append(datetime.fromisoformat(row[0]))
+                for row in db.execute("SELECT next_check_at FROM delivery_issue_observations"):
+                    deadlines.append(datetime.fromisoformat(row[0]))
+                for row in db.execute("SELECT next_check_at FROM delivery_project_boards"):
                     deadlines.append(datetime.fromisoformat(row[0]))
         for issue, (store, feature) in self.selected().items():
             with store._connect() as db:
@@ -405,6 +502,35 @@ class ProjectSynchronizer:
                        ("issue", "run_id", "source", "version", "status", "binding",
                         "legacy_tracking")})
 
+    def observe_issues(self) -> None:
+        """Observe only admitted issues, without changing immutable attempt state."""
+        stamp = self.clock()
+        for issue, (store, feature) in self.selected().items():
+            with store._connect() as db:
+                prior = db.execute("SELECT * FROM delivery_issue_observations WHERE url=?",
+                                   (issue,)).fetchone()
+            if (prior and prior["next_check_at"] > stamp.isoformat()
+                    and "labels" in json.loads(prior["observation_json"] or "{}")):
+                continue
+            try:
+                observed, error = self.github.issue(issue), None
+                observed.setdefault("labels", [])
+            except Exception as exc:
+                observed, error = None, str(exc)[:1000]
+            next_check = stamp + timedelta(seconds=15 if error else self.project_interval)
+            with store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("""INSERT INTO delivery_issue_observations VALUES (?,?,?,?,?)
+                    ON CONFLICT(url) DO UPDATE SET observation_json=
+                    COALESCE(excluded.observation_json,delivery_issue_observations.observation_json),
+                    checked_at=COALESCE(excluded.checked_at,delivery_issue_observations.checked_at),
+                    next_check_at=excluded.next_check_at,error=excluded.error""",
+                    (issue, canonical_json(observed) if observed else None,
+                     stamp.isoformat() if observed else None,
+                     next_check.isoformat(),
+                     error))
+                transition(db, store.config, feature["run_id"])
+
     @contextmanager
     def handoff(self, issue: str):
         """Serialize selected ownership with every participating legacy writer."""
@@ -446,6 +572,7 @@ class ProjectSynchronizer:
     def tick(self) -> dict:
         self.configure_schedule()
         self.observe_prs()
+        self.observe_issues()
         results = {}
         for issue, (store, feature) in self.selected().items():
             try:
@@ -456,6 +583,9 @@ class ProjectSynchronizer:
             except (BlockingIOError, Superseded):
                 # The existing owner finishes first; the next local tick retries.
                 continue
+        from .delivery_project_board import refresh
+
+        refresh(self)
         return results
 
     def project(self, store: DeliveryStore, feature: dict) -> dict | None:
@@ -504,6 +634,9 @@ class ProjectSynchronizer:
                 if feature.get("legacy_tracking"):
                     raise ValueError("historical workflow retains its frozen tracking contract "
                                      "until it stops")
+                if (feature.get("issue_observation") or {}).get("error"):
+                    raise ValueError("GitHub issue readback failed: "
+                                     + feature["issue_observation"]["error"])
                 receipt = self.github.mirror(feature, fence)
                 fence()
                 state, error = "consistent", None
@@ -584,8 +717,8 @@ def main() -> None:
         raise ValueError("invalid Project synchronizer configuration")
     stores = [DeliveryStore(DeliveryConfig.load(Path(path))) for path in config["owners"]]
     synchronizer = ProjectSynchronizer(
-        stores, interval=config.get("pr_interval_seconds", DAY),
-        project_interval=config.get("project_interval_seconds", DAY))
+        stores, interval=config.get("pr_interval_seconds", DEFAULT_INTERVAL),
+        project_interval=config.get("project_interval_seconds", DEFAULT_INTERVAL))
     logging.basicConfig(level=logging.INFO)
     if args.refresh_pr:
         print(canonical_json(synchronizer.request_pr_refresh(args.refresh_pr)))

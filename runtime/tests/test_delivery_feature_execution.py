@@ -299,9 +299,9 @@ def test_partial_stack_merge_cannot_mark_unfinished_feature_merged():
         "outcome": None,
     }
     observed = [{"observation": {"state": "MERGED"}}]
-    assert _status(row, observed) == "Partially merged"
+    assert _status(row, observed) == "In Progress"
     row["pr_json"] = json.dumps({"scope_complete": True})
-    assert _status(row, observed) == "Merged"
+    assert _status(row, observed) == "Done"
 
 
 def test_public_continuation_replays_the_same_command_and_retains_ownership(service, monkeypatch):

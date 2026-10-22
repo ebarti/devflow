@@ -64,10 +64,13 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         return SimpleNamespace(
             service=lambda: policy,
             reconcile_tracker=lambda run_id, request: {"run_id": run_id, **request},
+            refresh_issue_context=lambda run_id, request: {"run_id": run_id, **request},
             gates_only_preflight=lambda run_id: {"run_id": run_id},
             admit_gates_only=lambda run_id, request: {"run_id": run_id, **request},
             repair_admission_preflight=lambda run_id, request: {"run_id": run_id, **request},
             continue_repair=lambda run_id, request: {"run_id": run_id, **request},
+            merge=lambda run_id, request: {"run_id": run_id, **request},
+            merge_preflight=lambda run_id: {"run_id": run_id},
         )
 
     monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda path: client(path, "write"))
@@ -83,9 +86,12 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "get_run",
             "read_evidence",
             "answer_decision",
+            "refresh_issue_context",
             "continue_feature",
             "revise_feature_plan",
             "merge_feature",
+            "merge_run",
+            "merge_preflight",
             "cancel_run",
             "disable_delivery_limits",
             "reconcile_tracker",
@@ -100,6 +106,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "get_run",
             "read_evidence",
             "gates_only_preflight",
+            "merge_preflight",
             "repair_admission_preflight",
         ):
             assert tools[name].annotations.readOnlyHint is True
@@ -109,9 +116,11 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "start_service",
             "submit_run",
             "answer_decision",
+            "refresh_issue_context",
             "continue_feature",
             "revise_feature_plan",
             "merge_feature",
+            "merge_run",
             "cancel_run",
             "disable_delivery_limits",
             "reconcile_tracker",
@@ -141,6 +150,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "expected_revision": 13,
         }
         for name in (
+            "refresh_issue_context",
             "admit_gates_only",
             "repair_admission_preflight",
             "continue_repair",
@@ -156,7 +166,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         result = await session.call_tool("gates_only_preflight", {"run_id": "same-run"})
         assert not result.isError and json.loads(result.content[0].text) == {"run_id": "same-run"}
         assert seen == [(factory, config) for factory in (
-            "read", "write", "write", "read", "write", "read",
+            "read", "write", "write", "write", "read", "write", "read",
         )]
 
 
@@ -165,6 +175,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
     ('start_service', 'service'), ('submit_run', 'submit'),
     ('answer_decision', 'decision'), ('continue_feature', 'continue_feature'),
     ('revise_feature_plan', 'revise_feature_plan'), ('merge_feature', 'decision'),
+    ('merge_run', 'merge'),
     ('cancel_run', 'cancel'), ('reconcile_tracker', 'reconcile_tracker'),
     ('admit_gates_only', 'admit_gates_only'), ('continue_repair', 'continue_repair'),
 ])

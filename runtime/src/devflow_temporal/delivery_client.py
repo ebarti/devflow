@@ -92,6 +92,18 @@ class DeliveryClient:
     def decision(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/decision", payload)
 
+    def refresh_issue_context(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/issue-context",
+                             payload, timeout=600)
+
+    def merge(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._request("POST", "/api/runs/" + quote(run_id, safe="") + "/merge", payload,
+                             timeout=180)
+
+    def merge_preflight(self, run_id: str) -> dict:
+        return self._request("GET", "/api/runs/" + quote(run_id, safe="") + "/merge-preflight",
+                             timeout=120)
+
     def revise_feature_plan(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
             "POST", "/api/runs/" + quote(run_id, safe="") + "/revise-feature-plan", payload,

@@ -455,12 +455,18 @@ class DeliveryStore:
             from .delivery_dashboard import initialize
 
             initialize(db)
+            from .delivery_issue_context import initialize as initialize_issue_context
+
+            initialize_issue_context(db)
             from .delivery_settings import initialize as initialize_settings
 
             initialize_settings(db)
             from .delivery_features import initialize as initialize_features
 
             initialize_features(db)
+            from .delivery_merge_followup import initialize as initialize_merges
+
+            initialize_merges(db)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -1414,6 +1420,11 @@ class DeliveryStore:
         if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'investigation_assessment_adjudication'):
             from .delivery_investigation_adjudication import admit
+
+            return admit(self, run_id, supplied, preflight=preflight)
+        if (isinstance(supplied, dict)
+                and supplied.get('continuation_kind') == 'published_head_validation'):
+            from .delivery_publication_validation import admit
 
             return admit(self, run_id, supplied, preflight=preflight)
         if isinstance(supplied, dict) and 'continuation_kind' in supplied:
@@ -3019,6 +3030,7 @@ class DeliveryStore:
         """Read the sole native scope amendment without restoring retired execution."""
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+            "published_head_validation",
             "accepted_technical_successor", "investigation_assessment_adjudication",
             "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
@@ -3048,6 +3060,10 @@ class DeliveryStore:
             if row["accepted_plan_text"] is not None:
                 original["accepted_plan"] = row["accepted_plan_text"]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+            if recovery and recovery.get('kind') == 'published_head_validation':
+                from .delivery_publication_validation import effective_spec
+
+                return effective_spec(self, recovery)
             if recovery and recovery.get('kind') == 'stopped_delivery_resume':
                 from .delivery_stopped_resume import effective_spec
 
@@ -3090,6 +3106,7 @@ class DeliveryStore:
 
             while recovery and recovery.get("kind") in {
                 "terminal_tracker_recovery", "published_metadata_recovery",
+                "published_head_validation",
                 "investigation_gates_only", "accepted_technical_successor",
                 "investigation_assessment_adjudication", "stopped_resource_closure",
             }:
@@ -3109,6 +3126,7 @@ class DeliveryStore:
                 recovery = recovery["original_recovery"]
                 while recovery and recovery.get("kind") in {
                     "terminal_tracker_recovery", "published_metadata_recovery",
+                    "published_head_validation",
                     "investigation_gates_only", "accepted_technical_successor",
                     "investigation_assessment_adjudication", "stopped_resource_closure",
                 }:
@@ -3857,6 +3875,7 @@ class DeliveryStore:
         technical = False
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+            "published_head_validation",
             "accepted_technical_successor", "investigation_assessment_adjudication",
             "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
@@ -3883,6 +3902,9 @@ class DeliveryStore:
                 "SELECT COUNT(*),COALESCE(SUM(state!='finished'),0) FROM delivery_attempts "
                 "WHERE run_id=? AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
             ).fetchone()
+            from .delivery_merge_followup import action as merge_action
+
+            merge = merge_action(db, row, spec)
         execution_readback = self._historical_execution_readback(row, spec, unfinished=unfinished)
         if execution_readback:
             effective = self.spec(row["run_id"])
@@ -3899,7 +3921,9 @@ class DeliveryStore:
             "id": row["run_id"],
             "run_id": row["run_id"],
             "work_id": row["work_id"],
-            "title": spec["goal"].splitlines()[0][:120],
+            "title": self._display_title(spec),
+            "goal": spec["goal"],
+            "merge": merge,
             "issue": row["issue_url"],
             "issue_url": row["issue_url"],
             "repository": row["repository_key"],
@@ -3920,6 +3944,15 @@ class DeliveryStore:
             "cleanup_recorded": row["cleanup"],
             **({"execution_readback": execution_readback} if execution_readback else {}),
         }
+
+    @staticmethod
+    def _display_title(spec):
+        summary = spec.get("publication_summary") or spec["goal"].splitlines()[0]
+        summary = re.sub(r"^[a-z]+(?:\([^\n)]+\))?!?:\s+", "", summary)
+        issue = spec.get("issue_url", "").rsplit("/", 1)[-1]
+        repository = spec.get("github_repo", "").rsplit("/", 1)[-1]
+        prefix = f"{repository} #{issue} · " if repository and issue.isdecimal() else ""
+        return prefix + summary[:1].upper() + summary[1:200 - len(prefix)]
 
     def detail(self, run_id: str) -> dict[str, Any]:
         from .delivery_features import projection_failures
@@ -3966,6 +3999,7 @@ class DeliveryStore:
         technical_successor = None
         while recovery and (recovery.get("kind") in {
             "terminal_tracker_recovery", "published_metadata_recovery", "investigation_gates_only",
+            "published_head_validation",
             "accepted_technical_successor", "investigation_assessment_adjudication",
             "stopped_resource_closure",
         } or (recovery.get("kind") == "repair_continuation" and recovery.get("title_constraint"))):
@@ -4113,7 +4147,7 @@ class DeliveryStore:
             }
             for name, label, completion in gate_specs
         ]
-        from .delivery_resources import projected_cleanup
+        from .delivery_resources import projected_cleanup, retained_worktrees
 
         cleanup = projected_cleanup(
             spec, checks, row["cleanup"], terminal=(not own_unconfirmed
@@ -4123,6 +4157,7 @@ class DeliveryStore:
         )
         return {
             **compact,
+            "retained_worktrees": retained_worktrees(spec),
             "run": compact,
             "phase_gates": gates,
             "roles": roles,
@@ -4229,6 +4264,13 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        context_root = root / "issue-context"
+        if context_root.is_dir() and not context_root.is_symlink():
+            for path in sorted(context_root.glob("*.json")):
+                if path.is_file() and not path.is_symlink():
+                    indexed.append({"id": "issue-context-" + path.stem,
+                                    "label": "GitHub issue body and linked evidence",
+                                    "path": path, "limit": 4 * 1024 * 1024})
         merge_root = root / "merge"
         if merge_root.is_dir() and not merge_root.is_symlink():
             for path in sorted(merge_root.glob("*.json")):

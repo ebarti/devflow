@@ -36,6 +36,7 @@ from .delivery_client import client as api_client
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
 from .delivery_execution_config import transport_digest
+from .delivery_merge_workflow import MergeWorkflow
 from .delivery_store import DeliveryStore, _private_directory
 from .delivery_temporal_retention import ensure_namespace_retention
 from .delivery_workflow import DeliveryWorkflow
@@ -737,7 +738,7 @@ async def worker(
     async with Worker(
         client,
         task_queue=config.queue,
-        workflows=[DeliveryWorkflow],
+        workflows=[DeliveryWorkflow, MergeWorkflow],
         activities=DELIVERY_ACTIVITIES,
         interceptors=[DatabaseContentionInterceptor()],
         workflow_failure_exception_types=[ValueError, KeyError, TypeError],
@@ -801,7 +802,10 @@ _COMMANDS = (
     "run",
     "evidence",
     "decision",
+    "merge",
+    "merge-preflight",
     "cancel",
+    "refresh-issue-context",
     "disable-limits",
     "reconcile-tracker",
     "recover-publication",
@@ -852,7 +856,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
     if deployment is not None and args.command not in {"start", "worker"}:
         parser.error("worker deployment options apply only to start or worker")
-    read_commands = {
+    read_commands = {"merge-preflight",
         "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
     }
     if args.command in read_commands | {"status", "token", "disable-limits"}:
@@ -898,7 +902,10 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "run",
         "evidence",
         "decision",
+        "merge",
+        "merge-preflight",
         "cancel",
+        "refresh-issue-context",
         "disable-limits",
         "reconcile-tracker",
         "recover-publication",
@@ -915,7 +922,9 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         if args.command in {
             "submit",
             "decision",
+            "merge",
             "cancel",
+            "refresh-issue-context",
             "disable-limits",
             "reconcile-tracker",
             "recover-publication",
@@ -934,7 +943,10 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "run",
                 "evidence",
                 "decision",
+                "merge",
+                "merge-preflight",
                 "cancel",
+                "refresh-issue-context",
                 "disable-limits",
                 "reconcile-tracker",
                 "recover-publication",
@@ -969,7 +981,10 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "run": lambda: caller.status(args.id),
                 "evidence": lambda: caller.evidence(args.id, args.evidence_id),
                 "decision": lambda: caller.decision(args.id, request),
+                "merge": lambda: caller.merge(args.id, request),
+                "merge-preflight": lambda: caller.merge_preflight(args.id),
                 "cancel": lambda: caller.cancel(args.id, request),
+                "refresh-issue-context": lambda: caller.refresh_issue_context(args.id, request),
                 "disable-limits": lambda: caller.disable_delivery_limits(args.id, request),
                 "reconcile-tracker": lambda: caller.reconcile_tracker(args.id, request),
                 "recover-publication": lambda: caller.recover_publication(args.id, request),

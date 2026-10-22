@@ -25,7 +25,7 @@ def build_server(config_path: Path) -> FastMCP:
             "without a replacement stack. revise_feature_plan requests a recorded correction "
             "of a demonstrated planning defect within the same feature authority "
             "and repair budget. "
-            "Use merge_feature only on an explicit merge instruction. "
+            "Use merge_run or merge_feature only on an explicit merge instruction. "
             "Use status/evidence on request; dashboard SSE supplies progress. "
             "Preserve the original goal. Detailed or multi-sentence goals require a separate "
             "publication_summary describing the actual change: a single line, at most 120 "
@@ -104,6 +104,15 @@ def build_server(config_path: Path) -> FastMCP:
         return await forward_write("decision", run_id, json.loads(request_json))
 
     @server.tool(annotations=write)
+    async def refresh_issue_context(run_id: str, request_json: str) -> dict:
+        """Fetch the linked issue, acceptance and evidence without changing run authority.
+
+        Supply a stable command_id. Normal new intake turns fetch automatically;
+        this command supplies context to existing runs without replaying roles.
+        """
+        return await forward_write("refresh_issue_context", run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
     async def continue_feature(run_id: str, request_json: str) -> dict:
         """Continue a stopped feature's exact plan and stack under a successor run.
 
@@ -149,6 +158,24 @@ def build_server(config_path: Path) -> FastMCP:
             raise ValueError("merge_feature requires the explicit merge decision")
         return await forward_write("decision", run_id, request)
 
+    @server.tool(annotations=read)
+    def merge_preflight(run_id: str) -> dict:
+        """Check a delivered ordinary run's native merge evidence without granting a merge."""
+        return read_only_client(config_path).merge_preflight(run_id)
+
+    @server.tool(annotations=write)
+    async def merge_run(run_id: str, request_json: str) -> dict:
+        """Merge an ordinary delivered PR only on explicit user instruction.
+
+        Read get_run. Supply command_id, expected_revision=protocol_revision,
+        candidate_id, head and pr_number from merge, plus answer='merge'. This
+        keeps the original run/PR and source evidence, reconciles current main,
+        waits for current-target CI and records merge/issue/tracker readback.
+        It does not need a feature merge decision. Keep the entire request
+        stable after uncertainty; read status before retrying.
+        """
+        return await forward_write("merge", run_id, json.loads(request_json))
+
     @server.tool(annotations=ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
     ))
@@ -193,7 +220,14 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=write)
     async def continue_repair(run_id: str, request_json: str) -> dict:
-        """Admit the existing one-time stopped-run repair with its exact command identity."""
+        """Continue bounded repair or validate an existing PR's documentation update.
+
+        For published_head_validation, provide command_id, expected_revision
+        (protocol), expected_projection_revision, expected_candidate_id,
+        expected_pr_number, expected_pr_head and additional_iterations=0.
+        The current head must be an in-scope documentation-only fast-forward.
+        Existing acceptance is rerun on the same PR; owner holds refuse admission.
+        """
         return await forward_write("continue_repair", run_id, json.loads(request_json))
 
     return server

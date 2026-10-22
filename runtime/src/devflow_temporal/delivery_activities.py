@@ -473,6 +473,17 @@ def _context(
     return store, broker
 
 
+@activity.defn(name="delivery_publication_validation_readback")
+async def delivery_publication_validation_readback(request):
+    from .delivery_publication_validation import readback
+
+    def execute():
+        store, _broker = _context(request["spec"])
+        return readback(store, request["spec"], request["recovery"])
+
+    return await asyncio.to_thread(execute)
+
+
 @activity.defn(name="delivery_resource_closure_readback")
 async def delivery_resource_closure_readback(request: dict[str, Any]) -> dict[str, Any]:
     def execute():
@@ -590,6 +601,9 @@ async def _run_intake(request: dict[str, Any]) -> dict[str, Any]:
     candidate = request["candidate"]
     if await asyncio.to_thread(broker.candidate) != candidate:
         raise ValueError("intake checkout changed before investigation")
+    from .delivery_issue_context import prepare_intake
+
+    request = await asyncio.to_thread(prepare_intake, store, request)
     result = await get_supervisor(store).run(
         {**request, "role": "intake", "workspace": str(broker.checkout)}
     )
@@ -1410,6 +1424,61 @@ async def delivery_merge(request):
         cancelled.set()
 
 
+@activity.defn(name="delivery_merge_followup")
+async def delivery_merge_followup(request):
+    from threading import Event
+
+    from .delivery_merge_followup import step
+
+    store, _ = await asyncio.to_thread(_context, request["spec"])
+    cancelled = Event()
+    try:
+        return await _with_heartbeat(asyncio.to_thread(
+            step, store, request["spec"], request["merge_authorization"], cancelled),
+            request, "merge")
+    finally:
+        cancelled.set()
+
+
+@activity.defn(name="delivery_merge_followup_failed")
+async def delivery_merge_followup_failed(request):
+    from .delivery_merge_followup import failed
+
+    store, _ = await asyncio.to_thread(_context, request["spec"])
+    return await asyncio.to_thread(failed, store, request["spec"],
+                                  request["merge_authorization"], request["reason"])
+
+
+@activity.defn(name="delivery_resolve_merge_conflicts")
+async def delivery_resolve_merge_conflicts(request):
+    from .delivery_merge_followup import failed
+    from .delivery_merge_resolution import resolve
+
+    store, _ = await asyncio.to_thread(_context, request["spec"])
+    try:
+        return await _with_heartbeat(
+            resolve(store, request["spec"], request["merge_authorization"], request["conflict"]),
+            request, "merge_resolution",
+        )
+    except Exception as exc:
+        if isinstance(exc, (OSError, RuntimeError)):
+            with store._connect() as db:
+                pending = db.execute(
+                    "SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='merge_reconcile' "
+                    "AND state!='complete'", (request["spec"]["run_id"],),
+                ).fetchone()
+            if pending:
+                from .delivery_merge_followup import record
+
+                result = {"state": "pending", "reason": "resolved_target_update_readback"}
+                await asyncio.to_thread(record, store, request["spec"], "unknown", result,
+                                        f"{type(exc).__name__}: {str(exc)[:500]}")
+                return result
+        return await asyncio.to_thread(failed, store, request["spec"],
+                                      request["merge_authorization"],
+                                      f"{type(exc).__name__}: {str(exc)[:500]}")
+
+
 @activity.defn(name="delivery_terminal_preflight")
 async def delivery_terminal_preflight(request):
     def execute():
@@ -1423,9 +1492,13 @@ async def delivery_terminal_preflight(request):
 
 
 DELIVERY_ACTIVITIES = [
+    delivery_publication_validation_readback,
     delivery_terminal_preflight,
     delivery_terminal_tracker,
     delivery_merge,
+    delivery_merge_followup,
+    delivery_merge_followup_failed,
+    delivery_resolve_merge_conflicts,
     delivery_project,
     delivery_prepare,
     delivery_baseline_checks,

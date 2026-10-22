@@ -1626,26 +1626,31 @@ class DeliveryBroker:
                                  "remote_confirmed": remote_confirmed}), key),
             )
 
+    def publication_effect_key(self, iteration: int) -> str:
+        key = f"publish:{self.spec['run_id']}:{iteration}"
+        head = self.spec.get("publication_validation_head")
+        return key + ":validate:" + head if head else key
+
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
         # Only this invocation's confirmed pre-mutation failure can release uncertainty.
         # Any retained original effect may belong to an earlier lost completion.
         if self.spec.get("publication_readback_version") == 1:
             with self.store._connect() as db:
                 prior = db.execute("SELECT 1 FROM delivery_effects WHERE effect_key=?",
-                                   (f"publish:{self.spec['run_id']}:{iteration}",)).fetchone()
+                                   (self.publication_effect_key(iteration),)).fetchone()
                 if prior is not None:
                     # Adopting a retained row re-stamps it, so the invocation that
                     # inserted it can no longer discard it from a timed-out thread.
                     db.execute(
                         "UPDATE delivery_effects SET updated_at=? "
                         "WHERE effect_key=? AND state='pending'",
-                        (_now(), f"publish:{self.spec['run_id']}:{iteration}"),
+                        (_now(), self.publication_effect_key(iteration)),
                     )
             self.publication_may_have_effect = prior is not None
         self.validate_candidate_scope()
         publication_branch = self._publication_base_ref()
         self._validate_publication_commits()
-        key = f"publish:{self.spec['run_id']}:{iteration}"
+        key = self.publication_effect_key(iteration)
         before = self.candidate()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
         done = self._effect(key, "publish", request)
@@ -1795,7 +1800,7 @@ class DeliveryBroker:
     def publication_effect_inserted(self, iteration: int) -> bool:
         """Whether this broker inserted the publish effect row of ``iteration``."""
         return (self.inserted_effect is not None
-                and self.inserted_effect[0] == f"publish:{self.spec['run_id']}:{iteration}")
+                and self.inserted_effect[0] == self.publication_effect_key(iteration))
 
     def discard_unused_publication(self, iteration: int) -> None:
         """Forget the pending effect of an invocation confirmed to precede any mutation.
@@ -1835,7 +1840,7 @@ class DeliveryBroker:
         opens the PR for a pushed head that has none, so a publication whose
         PR creation failed converges instead of waiting for nothing.
         """
-        key = f"publish:{self.spec['run_id']}:{iteration}"
+        key = self.publication_effect_key(iteration)
         self._validate_publication_commits()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
         with self.store._connect() as db:

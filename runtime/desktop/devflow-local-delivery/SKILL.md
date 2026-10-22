@@ -15,6 +15,23 @@ For a demonstrated planning defect in a stopped feature, read `feature_plan` in 
 
 When the user instructs Devflow to merge a ready feature, read its pending `merge` decision. Call `merge_feature` with the observed `protocol_revision` as `expected_revision`, that decision's ID, revision and candidate revision, a new command ID, and `answer: "merge"`. The instruction authorizes that complete recorded stack revision. Keep the complete request stable after an uncertain response. Do not use an external merge command as a fallback. The runtime submits one gh-stack merge (or one ordinary PR merge for a single chunk), confirms the result, then closes each child only after all of its required chunks actually merged and the parent only after the complete accepted feature merged. PRs carry explicit parent/child references and chunk ownership; early chunks do not use closing links that would close a child prematurely. Published or queued-for-merge does not mean merged.
 
+For a delivered ordinary issue-level run, use its **Merge PR #…** dashboard button
+or `merge_run`, only after an explicit user merge instruction. A feature decision
+is not required. Read `get_run`; copy `protocol_revision` as `expected_revision`
+and `candidate_id`, `head`, `pr_number` from `merge`. Add a new `command_id` and
+`answer: "merge"`. `merge_preflight` is read-only and does not authorize a merge.
+The runtime retains the original delivery, source evidence, issue and PR;
+mechanically reconciles current main and waits for the combined candidate's CI.
+Textual conflicts run a scoped resolver and independent review on an isolated
+checkout. Both parents' behavior must be preserved; only incompatible product
+requirements produce a user question. A historical generic conflict stop exposes
+**Continue merge reconciliation**; submit a new command with the same observed
+candidate fields to continue under its original grant. It reports conflicting
+directions for user input. Keep the exact request stable
+after uncertainty, and read the run before retrying. Its `merge.phase` and
+`merge.result` distinguish a pending request from a confirmed merge. Never submit
+a replacement run or merge outside this supported boundary as a fallback.
+
 Feature repair limits default to ten product cycles shared across continuations and plan corrections. Five cycles set a passive learning flag for a later prompt retrospective. The controller does not need external supervision to count cycles, and no retrospective is part of delivery. Background PR and Project drift checks run every 24 hours; normal Project updates follow execution events.
 
 CLI mutations and MCP write tools automatically start a stopped configured service and recover a partial owned stack before sending the request. Read-only status, run, evidence and preflight calls require an already running API and report unavailable if it is stopped; they never start or recover the service or activate pending work. `start_service` is an explicit MCP write using the server's configured paths and the same bounded startup; it may activate pending work. Use it only as part of a user-authorized delivery, answer, plan change, cancellation or other run mutation. If a prerequisite read for that mutation reports transport unavailable, call `start_service` once and repeat the required reads before writing. Status/evidence requests and callbacks alone do not authorize startup. A healthy service keeps its existing processes. Startup is bounded and reports configured log paths on failure; use those diagnostics without asking the user to start the service manually. HTTP authentication or conflict errors do not restart the service, and a failed or uncertain mutation response is never automatically replayed.

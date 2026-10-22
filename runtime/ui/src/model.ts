@@ -1,5 +1,24 @@
 export type GateState = string | null
 
+export interface ProjectItem {
+  id: string
+  url: string
+  title: string
+  number: number
+  repository: string
+  type: string
+  state: string
+  status: string
+  priority?: string | null
+  labels: string[]
+  checked_at?: string | null
+}
+
+export interface ProjectBoard {
+  items: ProjectItem[]
+  projects: { url: string; checked_at: string | null; error: string | null; state: string }[]
+}
+
 export interface Usage {
   input_tokens?: number | null
   cached_input_tokens?: number | null
@@ -20,11 +39,27 @@ export interface FeatureState {
   status: string
   version: number
   mirror?: { state: string; last_error?: string | null; checked_at?: string | null }
+  issue_observation?: { checked_at?: string | null; error?: string | null;
+    observation?: { state: string; state_reason: string; closed_at: string | null; labels?: string[] } | null } | null
   pull_requests: { url: string; checked_at?: string | null; error?: string | null;
     observation?: { state: string; head: string; base: string; merged_at?: string | null } | null }[]
 }
 
 export interface RunSummary {
+  merge?: {
+    available: boolean
+    resume?: boolean
+    phase: string
+    candidate_id?: string | null
+    head?: string | null
+    pr_number?: number | null
+    command_id?: string | null
+    updated_at?: string | null
+    error?: string | null
+    result?: { state: string; reason?: string; merged_commit?: string; merged_at?: string; head?: string;
+      conflicts?: string[]; decision?: { question: string; feature_requirement: string;
+        main_requirement: string; why_incompatible: string; files: string[] } | null } | null
+  } | null
   feature?: FeatureState | null
   archived?: boolean
   runtime_identity?: RuntimeIdentity | null
@@ -172,7 +207,9 @@ export interface RunDetail extends RunSummary {
   } | null
   queued?: boolean | null
   cleanup?: string | null
+  retained_worktrees?: { state: string; count: number | null; roots: Array<{ path: string; reason?: string | null }> }
   candidate?: {
+    id?: string | null
     base?: string | null
     base_sha?: string | null
     head?: string | null
@@ -260,7 +297,7 @@ export interface Cohort extends RuntimeIdentity {
   roles: Record<string, { attempts: number; observed_tokens: number; token_observations: number }>
 }
 
-export interface Statistics { total_runs: number; cohorts: Cohort[]; definitions: string }
+export interface Statistics { total_runs: number; reset_at?: string | null; cohorts: Cohort[]; definitions: string }
 
 export interface NewRunRequest {
   command_id: string

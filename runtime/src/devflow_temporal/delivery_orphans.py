@@ -334,6 +334,12 @@ def _retain_build_cleanup(store, row, completed, receipt):
 
 
 def _reconcile(store, original, spec, closed):
+    with store._connect() as db:
+        if db.execute("SELECT 1 FROM delivery_merge_requests WHERE run_id=?",
+                      (spec["run_id"],)).fetchone():
+            # The historical delivery is closed. Its later merge owns a separate
+            # execution, native attempts and current resource-custody observations.
+            return
     current = _unchanged(store, original)
     completed_build = _completed_build_cleanup(store, current, spec, closed)
     with store._connect() as db:

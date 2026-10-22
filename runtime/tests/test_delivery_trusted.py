@@ -289,8 +289,7 @@ def test_legacy_terminal_tracker_uses_actual_helper_ack_before_release(
     reconciliation.loader.exec_module(module)
     selected = {'host': 'github.com', 'url': repository['project_url'], 'id': 'project',
                 'field': 'field', 'option': 'option',
-                'status': 'Needs validation' if mapped else (
-                    'Blocked' if status == 'blocked' else 'In review')}
+                'status': 'Blocked' if status == 'blocked' else 'Awaiting merge'}
     item = {'id': 'item', 'project': {'id': 'project'},
             'fieldValueByName': {'optionId': 'option', 'name': selected['status']}}
     def select_project(_url, requested):

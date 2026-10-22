@@ -582,7 +582,8 @@ def snapshot(store, run_id, kind=KIND):
     history = previous
     ci_observations = transient_generations = 0
     published_after_recovery = bool(not unpublished and previous and previous.get('kind') in {
-        PREPUBLICATION_KIND, 'pending_publication_retry', 'repair_continuation'})
+        PREPUBLICATION_KIND, 'pending_publication_retry', 'repair_continuation',
+        'published_head_validation'})
     if previous and previous.get('kind') == 'repair_continuation' and not previous.get(
             'finalized_checkpoint'):
         published_after_recovery = False
@@ -636,6 +637,24 @@ def snapshot(store, run_id, kind=KIND):
                    and any(r.get('passed') is False and r.get('cleanup') == 'confirmed'
                            for r in precheck.get('results', []))) if unpublished else bool(
                                failed or failed_browser)
+    local = state.get('checks', {}).get('local', {})
+    download_failures = [r for r in local.get('results', []) if r.get('passed') is False]
+    latest_acceptance = [next((r for r in reversed(roles) if r.get('role') == role), {})
+                         for role in ('review', 'verify')]
+    local_download_retry = bool(
+        kind == KIND and previous and previous.get('kind') == 'published_head_validation'
+            and state_checks == row_checks and local.get('state') == 'failed'
+            and local.get('candidate_id') == candidate['id']
+            and local.get('source_unchanged') is True and download_failures
+            and all(r.get('status') == 'pass'
+                    and r.get('candidate', {}).get('id') == candidate['id']
+                    for r in latest_acceptance)
+            and all(r.get('cleanup') == 'confirmed' and 'pytest' in r.get('argv', [])
+                    and 'Failed starting test server: Temp download file' in r.get('diagnostic', '')
+                    and 'not complete after' in r.get('diagnostic', '')
+                    for r in download_failures))
+    if local_download_retry:
+        failed_gate = True
     prelaunch_observation = None
     browser_observation = None
     report_observation = None
@@ -818,6 +837,7 @@ def snapshot(store, run_id, kind=KIND):
             'work_binding': binding,
             'previous_digest': digest(previous) if previous else None,
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,
+            **({'local_download_retry': True} if local_download_retry else {}),
             **({'report_observation': report_observation} if report_observation else {}),
             **({'verification_observation': verification_observation}
                if verification_observation else {}),
