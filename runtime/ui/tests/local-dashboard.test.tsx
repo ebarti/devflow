@@ -12,6 +12,40 @@ beforeEach(() => { vi.spyOn(api, 'getProjectBoard').mockResolvedValue({ items: [
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState(null, '', '/') })
 
 describe('tokenless local dashboard', () => {
+  it('clears the board disconnect banner when automatic polling recovers', async () => {
+    let poll: () => void = () => {}
+    const interval = window.setInterval.bind(window)
+    vi.spyOn(window, 'setInterval').mockImplementation(((handler: () => void, delay: number) => {
+      if (delay === 5000) { poll = handler; return 1 }
+      return interval(handler, delay)
+    }) as typeof window.setInterval)
+    const list = vi.spyOn(api, 'listRunsPage')
+      .mockRejectedValueOnce(new Error('Merge projection failed'))
+      .mockResolvedValue({ runs: [mockRun], next_cursor: null })
+    vi.spyOn(api, 'getService').mockResolvedValue(mockService)
+    render(<App />)
+    await screen.findByText('Disconnected · showing last observed state')
+    await act(async () => { poll() })
+    await screen.findByRole('button', { name: /Fixture workflow/ })
+    await waitFor(() => expect(screen.queryByText('Disconnected · showing last observed state')).toBeNull())
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('Connected')).toBeTruthy()
+  })
+
+  it.each(['runs', 'service'])('retries board and service reads after a failed %s read', async failed => {
+    const list = vi.spyOn(api, 'listRunsPage').mockResolvedValue({ runs: [mockRun], next_cursor: null })
+    const service = vi.spyOn(api, 'getService').mockResolvedValue(mockService)
+    if (failed === 'runs') list.mockRejectedValueOnce(new Error('Merge projection failed'))
+    else service.mockRejectedValueOnce(new Error('Service read failed'))
+    render(<App />)
+    await screen.findByText('Disconnected · showing last observed state')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry' }))
+    await screen.findByRole('button', { name: /Fixture workflow/ })
+    await waitFor(() => expect(screen.queryByText('Disconnected · showing last observed state')).toBeNull())
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(service).toHaveBeenCalledTimes(2)
+  })
+
   it.each(['', 'devflow_session=expired'])('reads a direct run visit with cookie %j without login', async cookie => {
     document.cookie = cookie
     window.history.replaceState(null, '', `/runs/${mockRun.id}`)

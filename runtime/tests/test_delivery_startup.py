@@ -817,6 +817,85 @@ def test_lifecycle_identity_is_zone_independent_and_accepts_legacy_manifests(mon
         child.wait()
 
 
+@pytest.mark.parametrize("operation", ["observe", "stop"])
+def test_external_controller_recognizes_exited_children_without_reaping_them(operation):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True)
+    try:
+        receipt = {"pid": child.pid, "identity": control._process_identity(child.pid)}
+        assert receipt["identity"]
+        if operation == "observe":
+            os.kill(child.pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                state = subprocess.run(["ps", "-p", str(child.pid), "-o", "stat="],
+                                       capture_output=True, text=True, check=True).stdout.strip()
+                if state.startswith("Z"):
+                    break
+                time.sleep(0.01)
+            assert state.startswith("Z")
+        observer = subprocess.run([
+            sys.executable, "-B", "-c",
+            "import json,sys; from devflow_temporal import delivery_control as c; "
+            "p=json.loads(sys.argv[1]); "
+            "print(json.dumps(c._owned(p) if sys.argv[2]=='observe' else c._terminate('api',p)))",
+            json.dumps(receipt), operation,
+        ], capture_output=True, text=True, timeout=12)
+        assert observer.returncode == 0, observer.stderr
+        assert json.loads(observer.stdout) == (False if operation == "observe" else "stopped")
+        # Only this parent can reap the target; the controller merely observed its exit.
+        assert child.wait(timeout=5) == -signal.SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+def test_unknown_process_state_does_not_disown_a_matching_lifecycle_member(monkeypatch):
+    monkeypatch.setattr(control, "_local_identity", lambda *_args, **_kwargs: "matching-start")
+    monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
+    monkeypatch.setattr(control.subprocess, "run",
+                        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""))
+    assert control._owned({"pid": 7017, "identity": "matching-start"})
+
+
+def test_external_stop_still_kills_live_descendants_of_a_zombie_leader(tmp_path):
+    ready = tmp_path / "descendant-ready"
+    descendant = (
+        "import os,signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    parent = subprocess.Popen([
+        sys.executable, "-c",
+        "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',sys.argv[1]]); "
+        "time.sleep(60)", descendant,
+    ], start_new_session=True)
+    try:
+        receipt = {"pid": parent.pid, "identity": control._process_identity(parent.pid)}
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        observer = subprocess.run([
+            sys.executable, "-B", "-c",
+            "import json,sys; from devflow_temporal import delivery_control as c; "
+            "print(c._terminate('api',json.loads(sys.argv[1])))", json.dumps(receipt),
+        ], capture_output=True, text=True, timeout=12)
+        assert observer.returncode == 0, observer.stderr
+        assert observer.stdout.strip() == "stopped"
+        assert parent.wait(timeout=5) == -signal.SIGTERM
+        state = subprocess.run(["ps", "-p", ready.read_text(), "-o", "stat="],
+                               capture_output=True, text=True, check=False)
+        assert state.returncode != 0 or state.stdout.strip().startswith("Z")
+    finally:
+        try:
+            os.killpg(parent.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        parent.wait()
+
+
 def test_adjudication_binds_service_members_recorded_in_canonical_form(monkeypatch):
     """The controller binding reads real lstart output on a non-UTC host."""
     from devflow_temporal.delivery_investigation_adjudication import _service_member

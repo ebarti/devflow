@@ -195,7 +195,25 @@ def _lifecycle_lock(config: DeliveryConfig, deadline: float):
 
 def _process_identity(pid: int) -> str | None:
     """A member's start identity, independent of the controller's locale and zone."""
-    return _local_identity(pid, canonical=True)
+    identity = _local_identity(pid, canonical=True)
+    if identity is None:
+        return None
+    # A different launcher may own the exited child and not have reaped it yet.
+    # Its start time still matches. Retain ownership if its group has live children.
+    state = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "stat="],
+        capture_output=True, text=True, check=False, timeout=5,
+    )
+    if state.returncode != 0 or not state.stdout.strip().startswith("Z"):
+        return identity
+    groups = subprocess.run(
+        ["ps", "-eo", "pgid=,stat="], capture_output=True, text=True, check=False, timeout=5,
+    )
+    if groups.returncode != 0:
+        return identity
+    states = [parts[1] for line in groups.stdout.splitlines()
+              if len(parts := line.split()) == 2 and parts[0] == str(pid)]
+    return identity if not states or any(not state.startswith("Z") for state in states) else None
 
 
 def _owned(process: dict) -> bool:

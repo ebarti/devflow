@@ -276,6 +276,39 @@ def test_explicit_merge_admission_is_durable_exact_and_does_not_rewrite_delivery
     assert d.store.effective_spec("run-1")["authorized_endpoint"] == "published_unmerged"
 
 
+@pytest.mark.parametrize("result", [None, "null", "[]", "true", "0", '"pending"'])
+def test_absent_or_nonobject_merge_result_does_not_offer_continuation(result):
+    assert followup._continuable({"phase": "merging", "result_json": result}) is False
+
+
+@pytest.mark.asyncio
+async def test_public_reads_remain_available_during_resultless_merge_progress(delivered):
+    d = delivered
+    admitted = followup.admit(d.store, "run-1", d.command)
+    app = create_app(d.store.config.path)
+    app.state.delivery.store = d.store
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=d.store.config.dashboard_url,
+    ) as client:
+        for phase in ("queued", "merging", "resolving_conflicts", "waiting_ci",
+                      "waiting_tracker", "waiting_cleanup"):
+            if phase != "queued":
+                followup.record(d.store, d.spec, phase)
+            listed = await client.get("/api/runs")
+            detail = await client.get("/api/runs/run-1")
+            assert listed.status_code == detail.status_code == 200
+            for run in (listed.json()["runs"][0], detail.json()["run"]):
+                assert run["merge"]["phase"] == phase
+                assert run["merge"]["result"] is None
+                assert run["merge"]["available"] is False
+                assert run["merge"]["resume"] is False
+    with d.store._connect() as db:
+        saved = followup.current(db, "run-1")
+        assert saved["workflow_id"] == admitted["workflow_id"]
+        assert saved["command_id"] == d.command["command_id"]
+        assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == d.before
+
+
 def test_conflict_continuation_retains_original_grant_and_is_idempotent(delivered):
     d = delivered
     original = followup.admit(d.store, "run-1", d.command)

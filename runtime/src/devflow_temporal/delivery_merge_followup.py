@@ -61,7 +61,10 @@ def current(db, run_id):
 def _continuable(saved):
     if saved is None:
         return False
-    reason = json.loads(saved["result_json"] or "{}").get("reason")
+    result = json.loads(saved["result_json"] or "null")
+    if not isinstance(result, dict):
+        return False
+    reason = result.get("reason")
     return ((saved["phase"] == "decision_required" and reason == "conflicting_upstream_changes")
             or (saved["phase"] == "unknown" and reason
                 == "RuntimeError: merge resolution native cleanup remains unconfirmed")
