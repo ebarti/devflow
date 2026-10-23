@@ -225,7 +225,10 @@ export function App() {
   }, [location.page, location.id, detailRetry, refreshRuns, reconcileDetail])
 
   const refreshCurrent = useCallback(async () => {
-    if (!location.id) return
+    if (!location.id) {
+      await Promise.all([refreshRuns(), refreshService()])
+      return
+    }
     if (connection === 'disconnected') {
       // Re-enter the owning read/subscribe effect after an initial read failure.
       setDetailRetry(current => current + 1)
@@ -238,10 +241,13 @@ export function App() {
       setConnection('disconnected')
       setStaleSince(current => current ?? new Date().toISOString())
     }
-  }, [location.id, connection, loadDetail, refreshRuns])
+  }, [location.id, connection, loadDetail, refreshRuns, refreshService])
 
-  const serviceConnected = location.page === 'runs' && location.id ? connection === 'connected' : !runsError && !serviceError && !runsLoading && !serviceLoading
-  const serviceLabel = serviceConnected ? 'Connected' : runsLoading || serviceLoading || connection === 'connecting' ? 'Connecting' : 'Disconnected'
+  const detailPage = location.page === 'runs' && Boolean(location.id)
+  const disconnected = detailPage ? connection === 'disconnected' || Boolean(detailError) : Boolean(runsError || serviceError)
+  const connectionError = detailPage ? detailError || runsError : runsError || serviceError
+  const serviceConnected = detailPage ? connection === 'connected' : !runsError && !serviceError && !runsLoading && !serviceLoading
+  const serviceLabel = serviceConnected ? 'Connected' : runsLoading || serviceLoading || detailPage && connection === 'connecting' ? 'Connecting' : 'Disconnected'
 
   return <div className={`app-shell${location.page !== 'runs' || !location.id ? ' app-shell--wide' : ''}`}>
     <aside className="nav-rail" aria-label="Main navigation">
@@ -275,8 +281,8 @@ export function App() {
       {location.page === 'settings' ? <Settings service={service} loading={serviceLoading} error={serviceError} onRefresh={() => void refreshService()} onRepositoryAccessSaved={access => setService(current => current ? { ...current, repository_access: latestRepositoryAccess(current.repository_access, access) } : current)} /> : null}
       {location.page === 'new' ? serviceLoading && !service ? <p className="empty-section">Loading admission policy…</p> : <NewRun service={service} onCreated={id => { void refreshRuns(); navigate('runs', id) }} onBack={() => navigate('runs', allRuns[0]?.id || allRuns[0]?.run_id || null)} /> : null}
       {location.page === 'runs' ? <>
-        {connection === 'disconnected' || detailError ? <div className="connection-banner connection-banner--bad" role="alert"><div><strong>Disconnected · showing last observed state</strong><span>{detailError || runsError || `Connection lost ${time(staleSince)}.`} {lastGoodAt ? `Last successful read ${time(lastGoodAt)}.` : ''}</span></div><button onClick={() => void refreshCurrent()}>Retry</button></div> : null}
-        {connection === 'connecting' && detail ? <div className="connection-banner" role="status">Reconnecting · showing last observed state from {time(lastGoodAt)}.</div> : null}
+        {disconnected ? <div className="connection-banner connection-banner--bad" role="alert"><div><strong>Disconnected · showing last observed state</strong><span>{connectionError || `Connection lost ${time(staleSince)}.`} {lastGoodAt ? `Last successful read ${time(lastGoodAt)}.` : ''}</span></div><button onClick={() => void refreshCurrent()}>Retry</button></div> : null}
+        {detailPage && connection === 'connecting' && detail ? <div className="connection-banner" role="status">Reconnecting · showing last observed state from {time(lastGoodAt)}.</div> : null}
         {detailLoading && !detail ? <div className="empty-state"><h2>Loading run…</h2><p>Reading the local service projection.</p></div> : null}
         {!detailLoading && !detail && location.id ? <div className="empty-state"><h2>Run unavailable</h2><p>{detailError || 'The service has not returned this run.'}</p><button className="outline-button" onClick={() => void refreshCurrent()}>Retry</button></div> : null}
         {!location.id ? <>{runsError ? <p className="inline-alert" role="alert">Run board is stale. {runsError}</p> : null}{projectError && !showArchived ? <p className="inline-alert" role="alert">Project work items could not refresh. Showing the last observation. {projectError}</p> : null}{runsLoading ? <p>Loading tasks…</p> : <RunBoard runs={allRuns} projectBoard={projectBoard} archived={showArchived} onSelect={id => navigate('runs', id)} onToggle={toggleArchive} onRefresh={() => void refreshRuns()} />}{pagingNotice ? <p role="status">{pagingNotice}</p> : null}{olderError ? <p role="alert">{olderError}</p> : null}{nextCursor ? <button className="outline-button" disabled={olderLoading} onClick={() => void loadOlder()}>{olderLoading ? 'Loading older tasks…' : 'Load older tasks'}</button> : null}</> : null}
