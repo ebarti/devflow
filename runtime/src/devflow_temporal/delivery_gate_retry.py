@@ -1468,6 +1468,9 @@ def prepare_runtime(spec, root, command_digest, seal_digest, *, handoff=None):
     binary = Path(distribution('openai-codex-cli-bin').locate_file('codex_cli_bin/bin/codex'))
     if hashlib.sha256(binary.read_bytes()).hexdigest() != spec['policy']['codex_bin_sha256']:
         raise ValueError('continuation cannot change the frozen CLI executable')
+    from .delivery_runtime_location import require_preparation_location
+
+    require_preparation_location(spec, binary.resolve())
     execution = deepcopy(spec)
     execution['policy']['codex_bin'] = str(binary.resolve())
     with _lock(root / 'runtime-preparation'):

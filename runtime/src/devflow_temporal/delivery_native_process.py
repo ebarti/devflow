@@ -407,6 +407,9 @@ class NativeProcess:
             if self.journal.exists() or self.journal.is_symlink():
                 reattaching = True
                 return self._run(monitor_lock=lock)
+            from .delivery_runtime_location import require_execution_location
+
+            require_execution_location(self.spec)
             descriptor = os.open(
                 self.folder / "monitor.log", os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
                 0o600,
@@ -516,6 +519,9 @@ class NativeProcess:
                     "reason": receipt["reason"],
                     "journal": str(self.journal),
                 }
+            from .delivery_runtime_location import require_execution_location
+
+            require_execution_location(self.spec)
             for port in self.ports:
                 if listeners(port):
                     raise ValueError("native fixture port belongs to another process")

@@ -525,6 +525,9 @@ def ensure_service_running(
     unless_stopped: bool = False,
 ) -> dict:
     """Have the stack running; ``unless_stopped`` (supervised) honours an owner's stop."""
+    from .delivery_runtime_location import require_ready
+
+    require_ready(config)
     deadline = _deadline(config)
     try:
         _ports(config)
@@ -839,6 +842,9 @@ _COMMANDS = (
     "reconcile-attempt",
     "filesystem-custody-preflight",
     "adopt-filesystem-custody",
+    "runtime-location-preflight",
+    "adopt-runtime-location",
+    "rollback-runtime-location",
 )
 
 
@@ -876,11 +882,28 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
     if deployment is not None and args.command not in {"start", "worker"}:
         parser.error("worker deployment options apply only to start or worker")
+    if args.command in {
+        "runtime-location-preflight", "adopt-runtime-location", "rollback-runtime-location"
+    }:
+        if args.request is None:
+            parser.error("--request is required for explicit installation location recovery")
+        from . import delivery_runtime_installation as installation
+        from .delivery_runtime_location import private_bytes
+
+        config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
+        supplied = json.loads(private_bytes(args.request))
+        operation = {
+            "runtime-location-preflight": installation.preflight,
+            "adopt-runtime-location": installation.apply,
+            "rollback-runtime-location": installation.rollback,
+        }[args.command]
+        print(json.dumps(operation(config, supplied), sort_keys=True, indent=2))
+        return
     read_commands = {"merge-preflight",
         "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
         "filesystem-custody-preflight",
     }
-    if args.command in read_commands | {"status", "token", "disable-limits"}:
+    if args.command in read_commands | {"status", "token", "disable-limits", "stop"}:
         config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
     else:
         config = _config(args.config)

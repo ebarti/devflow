@@ -414,7 +414,7 @@ def verify_native_spec(spec: dict) -> None:
 
 
 def bind_native_spec(spec: dict, identity: dict, path: Path, *, reused: bool,
-                     measured: str | None = None) -> dict:
+                     measured: str | None = None, historical_parent: dict | None = None) -> dict:
     effective = deepcopy(spec)
     effective["policy"].update(
         native_identity=identity,
@@ -435,7 +435,17 @@ def bind_native_spec(spec: dict, identity: dict, path: Path, *, reused: bool,
         # Reused proofs and records sealed before this key stay byte-identical.
         **({"measured_policy_digest": measured} if measured else {}),
     }
-    verify_native_spec(effective)
+    if historical_parent is not None:
+        from .delivery_native_renewal import _old_proof
+        from .delivery_runtime_location import historical_proof
+
+        if (not historical_proof(historical_parent)
+                or identity != historical_parent['policy']['native_identity']
+                or str(path) != historical_parent['preparation']['environment']['path']):
+            raise PreparationError('historical rebinding lost its acknowledged original proof')
+        _old_proof(effective)
+    else:
+        verify_native_spec(effective)
     return effective
 
 

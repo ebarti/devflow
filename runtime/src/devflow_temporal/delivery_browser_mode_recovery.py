@@ -372,15 +372,9 @@ def proposal(seal, command, *, historical_sources=None):
         config_digest=digest(config.raw),
         **{MARKER: digest({"run_id": original["run_id"], **command})},
     )
-    from .delivery_native_preparation import bind_native_spec, verify_native_spec
+    from .delivery_runtime_location import bind_provenance
 
-    verify_native_spec(original)
-    execution = bind_native_spec(
-        execution,
-        original["policy"]["native_identity"],
-        Path(original["preparation"]["environment"]["path"]),
-        reused=True,
-    )
+    execution = bind_provenance(execution, original, preserve_measurement=False)
     return execution, {
         "original_recipe_sha256": digest(qa),
         "effective_recipe_sha256": digest(expected),
@@ -392,6 +386,9 @@ def proposal(seal, command, *, historical_sources=None):
 
 
 def _transition(expected, actual):
+    from .delivery_runtime_location import policy_for_comparison
+
+    actual_policy = policy_for_comparison(expected, actual)
     derived = {
         "policy",
         "policy_digest",
@@ -404,7 +401,7 @@ def _transition(expected, actual):
         actual.get("role_home_generation", "") != expected.get("role_home_generation", "")
         or {k: v for k, v in actual.items() if k not in derived}
         != {k: v for k, v in expected.items() if k not in derived}
-        or {k: v for k, v in actual["policy"].items() if k not in MEASURED}
+        or {k: v for k, v in actual_policy.items() if k not in MEASURED}
         != {k: v for k, v in expected["policy"].items() if k not in MEASURED}
     ):
         raise ValueError("browser amendment changed frozen execution authority")

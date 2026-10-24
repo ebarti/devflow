@@ -104,9 +104,14 @@ def live_owner(spec, *, db=None):
         live = DeliveryConfig._from_raw(frozen.path, json.loads(raw))
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise ValueError("canonical live operational owner is unavailable or changed") from exc
-    if transport_binding(live) != transport_binding(frozen) or {
+    same = {
         k: v for k, v in live.raw.items() if k != "capacity"
-    } != {k: v for k, v in frozen.raw.items() if k != "capacity"}:
+    } == {k: v for k, v in frozen.raw.items() if k != "capacity"}
+    if not same:
+        from .delivery_runtime_location import compatible_owner
+
+        same = compatible_owner(spec, frozen, live)
+    if transport_binding(live) != transport_binding(frozen) or not same:
         raise ValueError("live operational owner changed noncapacity execution authority")
     capacity = live.raw.get("capacity", 2)
     if type(capacity) is not int or capacity < 1:

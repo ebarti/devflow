@@ -778,14 +778,7 @@ def scope_amended_spec(
     if "continuation" in original:
         effective["continuation"] = original["continuation"]
     if original.get("preparation_version") == 1:
-        from .delivery_native_preparation import bind_native_spec
-        from .delivery_preparation import verify_prepared_spec
+        from .delivery_runtime_location import bind_provenance
 
-        verify_prepared_spec(original)
-        proof_path = Path(original["preparation"]["environment"]["path"])
-        effective = bind_native_spec(
-            effective, original["policy"]["native_identity"], proof_path, reused=True,
-            measured=original["preparation"].get("measured_policy_digest"),
-        )
-        verify_prepared_spec(effective)
+        effective = bind_provenance(effective, original)
     return effective

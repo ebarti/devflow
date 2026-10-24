@@ -72,7 +72,8 @@ def _existing_bytes(path, root):
             info = os.fstat(fd)
             if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
                 raise ValueError("native renewal proof ancestry is not private and owned")
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptors[-1])
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=descriptors[-1])
         descriptors.append(fd)
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()

@@ -1,0 +1,709 @@
+"""Owned subprocess harness for the public permanent-installation contract."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
+from importlib.metadata import distribution
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import devflow_temporal
+
+SOURCE = Path(devflow_temporal.__file__).resolve().parents[3]
+sys.path.insert(0, str(SOURCE / "runtime/tests"))
+
+from devflow_temporal.contracts import canonical_json, digest  # noqa: E402
+from devflow_temporal.delivery_broker import DeliveryBroker  # noqa: E402
+from devflow_temporal.delivery_config import DeliveryConfig  # noqa: E402
+from devflow_temporal.delivery_resources import (  # noqa: E402
+    RunResources,
+    read_private,
+    write_private,
+)
+from devflow_temporal.delivery_store import DeliveryStore  # noqa: E402
+
+
+def git(root, *args):
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+
+def ports():
+    with socket.socket() as one, socket.socket() as two:
+        one.bind(("127.0.0.1", 0))
+        two.bind(("127.0.0.1", 0))
+        return one.getsockname()[1], two.getsockname()[1]
+
+
+def fixture_service(root):
+    from test_delivery_store import service
+
+    store, request = service.__wrapped__(root)
+    home = Path.home()
+    compat = root / "compat/devflow"
+    compat.mkdir(parents=True)
+    (compat / "scripts").symlink_to(SOURCE / "skills/devflow/scripts")
+    retained = root / "durable-references"
+    retained.mkdir()
+    (compat / "references").symlink_to(retained)
+    logical = home / ".agents/skills/devflow"
+    logical.parent.mkdir(parents=True, exist_ok=True)
+    logical.unlink(missing_ok=True)
+    logical.symlink_to(compat)
+    raw = copy.deepcopy(store.config.raw)
+    raw.update(
+        helpers_dir=str(logical / "scripts"),
+        capacity=6,
+        temporal_address=os.environ["DEVFLOW_TEST_LOCATION_TEMPORAL_ADDRESS"],
+    )
+    store.config.path.write_text(json.dumps(raw))
+    store.config.path.chmod(0o600)
+    return DeliveryStore(DeliveryConfig.load(store.config.path)), request
+
+
+async def seal_closed(store, spec, state, *, stale=None):
+    from temporalio.api.common.v1 import Memo, Payloads, WorkflowType
+    from temporalio.api.history.v1 import (
+        HistoryEvent,
+        WorkflowExecutionCompletedEventAttributes,
+        WorkflowExecutionStartedEventAttributes,
+    )
+    from temporalio.client import WorkflowHistory
+
+    from devflow_temporal.delivery_closures import closure_facts, seal
+    from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+
+    events = [
+        HistoryEvent(
+            event_id=1,
+            workflow_execution_started_event_attributes=WorkflowExecutionStartedEventAttributes(
+                workflow_type=WorkflowType(name="DevflowDeliveryWorkflow"),
+                workflow_id="delivery-" + spec["run_id"],
+                original_execution_run_id="owned-closed-" + spec["run_id"],
+                input=Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([spec, None])),
+                memo=Memo(
+                    fields={
+                        "request_digest": (
+                            await DELIVERY_DATA_CONVERTER.encode([spec["request_digest"]])
+                        )[0]
+                    }
+                ),
+            ),
+        )
+    ]
+    if stale:
+        from temporalio.api.common.v1 import ActivityType
+        from temporalio.api.history.v1 import (
+            ActivityTaskFailedEventAttributes,
+            ActivityTaskScheduledEventAttributes,
+        )
+
+        projection, state = stale
+        events.extend(HistoryEvent(event_id=index) for index in range(2, 10))
+        events.append(
+            HistoryEvent(
+                event_id=10,
+                activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
+                    activity_type=ActivityType(name="delivery_project"),
+                    input=Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([projection])),
+                ),
+            )
+        )
+        events.append(HistoryEvent(event_id=11))
+        events.append(
+            HistoryEvent(
+                event_id=12,
+                activity_task_failed_event_attributes=ActivityTaskFailedEventAttributes(
+                    scheduled_event_id=10
+                ),
+            )
+        )
+    end = HistoryEvent(
+        event_id=len(events) + 1,
+        workflow_execution_completed_event_attributes=WorkflowExecutionCompletedEventAttributes(
+            result=Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([state]))
+        ),
+    )
+    end.event_time.FromDatetime(datetime.now(UTC) + timedelta(seconds=1))
+    events.append(end)
+    history = WorkflowHistory("delivery-" + spec["run_id"], events)
+    facts = await closure_facts(history)
+    seal(store, history, facts, run_id=spec["run_id"], source="temporal")
+
+
+HOST_CLI = """#!/usr/bin/env python3
+import json,os,pathlib,shutil,sys
+home=pathlib.Path(os.environ['CODEX_HOME']);path=home/'public-inventory.json'
+value=json.loads(path.read_text());args=sys.argv[1:]
+plugin={'pluginId':'devflow@devflow-local','enabled':True}
+if args==['mcp','list','--json']: print('[]')
+elif args==['plugin','list','--json']:
+ print(json.dumps({'installed':[plugin] if value['installed'] else []}))
+elif args==['plugin','marketplace','list']:
+ print('MARKETPLACE ROOT\\ndevflow-local '+value['marketplace'] if value['marketplace'] else
+       'No plugin marketplaces in scope.')
+else:
+ value['calls'].append(args)
+ if value.get('hold'):
+  path.write_text(json.dumps(value));sys.exit(0)
+ if args[:2]==['plugin','remove']: value['installed']=False
+ elif args[:3]==['plugin','marketplace','remove']: value['marketplace']=None
+ elif args[:3]==['plugin','marketplace','add']: value['marketplace']=args[3]
+ elif args[:2]==['plugin','add']:
+  cache=home/'plugins/cache/devflow-local/devflow/0.1.0'
+  if cache.exists():shutil.rmtree(cache)
+  shutil.copytree(pathlib.Path(value['marketplace'])/'plugins/devflow',cache)
+  value['installed']=True
+ else: raise RuntimeError(args)
+ path.write_text(json.dumps(value));path.chmod(0o600)
+ print('{}' if args[-1]=='--json' else 'ok')
+"""
+
+
+def registrations(root, config):
+    home = Path.home()
+    source = SOURCE / "runtime/desktop"
+    sys.path.insert(0, str(source))
+    import package_plugin
+
+    old_market = root / "original-marketplace"
+    files = package_plugin.package_files(SOURCE / "runtime", config.path, "codex")
+    for name, raw in files.items():
+        path = old_market / "plugins/devflow" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        path.chmod(0o600)
+    catalog = old_market / ".agents/plugins/marketplace.json"
+    catalog.parent.mkdir(parents=True)
+    catalog.write_bytes(
+        package_plugin.json_bytes(
+            {
+                "name": "devflow-local",
+                "interface": {"displayName": "Devflow Local"},
+                "plugins": [package_plugin.ENTRY],
+            }
+        )
+    )
+    codex = home / ".codex"
+    codex.mkdir(parents=True, exist_ok=True)
+    (codex / "config.toml").write_text("")
+    cache = codex / "plugins/cache/devflow-local/devflow/0.1.0"
+    if cache.exists():
+        shutil.rmtree(cache)
+    shutil.copytree(old_market / "plugins/devflow", cache)
+    write_private(
+        codex / "public-inventory.json",
+        {"installed": True, "marketplace": str(old_market), "calls": []},
+    )
+    cli = root / "public-host-cli"
+    cli.write_text(HOST_CLI)
+    cli.chmod(0o755)
+    from shlex import quote
+
+    for name in ("devflow", "devflow-delivery", "devflow-delivery-mcp"):
+        path = home / ".local/share/devflow/delivery-launchers/owned/entries" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = "devflow-delivery" if name == "devflow" else name
+        path.write_text(
+            "#!/bin/sh\n# Canonical delivery entry; devflow aliases devflow-delivery.\nexec "
+            + quote(str(SOURCE / "runtime/.venv/bin" / entry))
+            + " --config "
+            + quote(str(config.path))
+            + ' "$@"\n'
+        )
+        path.chmod(0o755)
+        link = home / ".local/bin" / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.unlink(missing_ok=True)
+        link.symlink_to(path)
+    return cli
+
+
+def auxiliary(store):
+    """Second real admission proves a multi-run ACK rather than a one-row stub."""
+    from test_delivery_blocked_scope import prepared_spec
+
+    from devflow_temporal.delivery_native_preparation import bind_native_spec, native_identity
+
+    request = {
+        "command_id": "second-command",
+        "run_id": "run-2",
+        "work_id": "work-2",
+        "issue_url": "https://github.com/example/fixture/issues/4",
+        "repository_key": "fixture",
+        "goal": "Owned second stopped delivery",
+        "accepted_plan": "Retain the original source.",
+        "base_ref": "HEAD",
+        "branch": "feat/second",
+        "authorized_endpoint": "published_unmerged",
+    }
+    store.submit(request)
+    store.mark_start("run-2", accepted=True)
+    spec = store.effective_spec("run-2")
+    DeliveryBroker(store, spec).prepare()
+    identity = native_identity(spec)
+    proof = (
+        Path(spec["state_dir"]).parents[1] / "preparation-native" / digest(identity) / "proof.json"
+    )
+    spec = (
+        bind_native_spec(spec, identity, proof, reused=True)
+        if proof.exists()
+        else prepared_spec(spec)
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE delivery_runs SET request_json=? WHERE run_id='run-2'", (canonical_json(spec),)
+        )
+    receipt = RunResources(spec).finalize("blocked")
+    state = {
+        "run_id": "run-2",
+        "phase": "blocked",
+        "execution_state": "blocked",
+        "outcome": "blocked",
+        "revision": 1,
+        "iteration": 0,
+        "candidate": None,
+        "pull_request": None,
+        "roles": [],
+        "cleanup": "confirmed",
+        "tracker": None,
+        "checks": {"resource_cleanup": receipt},
+        "error": "Owned stopped fixture",
+        "usage": {},
+    }
+    store.project(
+        "run-2",
+        phase="blocked",
+        execution_state="blocked",
+        outcome="blocked",
+        event_type="blocked",
+        message=state["error"],
+        protocol_revision=1,
+        cleanup="confirmed",
+        checks=state["checks"],
+        error=state["error"],
+    )
+    asyncio.run(seal_closed(store, spec, state))
+
+
+def seed(root, kind):
+    from test_delivery_amendment_capacity import cut_operational_capacity
+    from test_delivery_temporal_prerequisites import temporal_case
+
+    root.mkdir(parents=True)
+    patch = pytest.MonkeyPatch()
+    # The synthetic browser command uses the retained stable base interpreter;
+    # it must not accidentally freeze the disposable fixture's venv shebang.
+    saved = sys.executable
+    sys.executable = str(Path(saved).resolve())
+    try:
+        case = temporal_case(
+            fixture_service(root),
+            patch,
+            minimum=3,
+            amendment="browser" if kind == "browser" else "scope",
+            ports=ports(),
+        )
+    finally:
+        sys.executable = saved
+    cut_operational_capacity(case)
+    if kind.startswith("stale"):
+        from test_delivery_blocked_scope import rewrite_assessment, rewrite_observation
+
+        raw = copy.deepcopy(case.raw)
+        raw.update(status="pass", findings=[], summary="Owned finished implementation")
+        rewrite_assessment(case, raw)
+        observation = read_private(case.folder / "native-thread-observation.json")
+        for name in (observation["turns"][-1]["items"], observation["turns"][-1]["turn"]["items"]):
+            name[0]["text"] = json.dumps(
+                {key: raw[key] for key in ("status", "summary", "findings")}
+            )
+        rewrite_observation(case, observation)
+        case.state["candidate"] = case.partial
+        if kind == "stale1169":
+            git(case.broker.checkout, "add", case.api)
+            git(case.broker.checkout, "commit", "-qm", "Owned finished published implementation")
+            git(case.broker.checkout, "push", "origin", "HEAD:refs/heads/" + case.spec["branch"])
+            current = case.broker.candidate()
+            case.partial = current
+            case.state["candidate"] = current
+            case.state["roles"][-1]["candidate"] = current
+            case.journal["provider_session"]["output_candidate"] = {
+                key: current[key] for key in ("id", "head", "content_sha256")
+            }
+            write_private(case.folder / "native-process.json", case.journal)
+            case.publication.update(head=current["head"], candidate=current)
+            case.state["pull_request"] = case.publication
+        case.state["checks"]["local"] = {
+            "state": "failed",
+            "cleanup": "confirmed",
+            "candidate_id": case.state["candidate"]["id"],
+            "source_unchanged": True,
+            "results": [
+                {
+                    "id": case.check["id"],
+                    "passed": False,
+                    "timed_out": True,
+                    "exit_code": None,
+                    "cleanup": "confirmed",
+                    "junit": {"exists": False},
+                }
+            ],
+        }
+    case.store.config.path.chmod(0o600)
+    auxiliary(case.store)
+    stale = None
+    if kind.startswith("stale"):
+        from test_delivery_controller_failure_boundary import _projection_error
+
+        from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+        case.command = {
+            key: value
+            for key, value in case.command.items()
+            if key not in {"added_paths", "amended_config_path", "amended_config_sha256"}
+        }
+        controller = DeliveryWorkflow()
+        controller.controller_failure_boundary = True
+        controller.state = copy.deepcopy(case.state)
+        controller.state.update(
+            revision=46 if kind == "stale1169" else 37,
+            cleanup="unknown",
+            phase="blocked",
+            execution_state="blocked",
+            outcome="blocked",
+            error="terminal tracker synchronization conflicted",
+        )
+        controller.state["checks"]["resource_cleanup"] = {
+            "state": "unknown",
+            "process_cleanup": "unknown",
+            "resource_cleanup": "unknown",
+            "reason": "ValueError",
+        }
+        requests = []
+
+        async def failed(_name, request, **_kwargs):
+            requests.append(copy.deepcopy(request))
+            raise _projection_error()
+
+        controller._activity = failed
+        asyncio.run(controller._project(case.spec, "tracker_deadline", controller.state["error"]))
+        case.state = controller.state
+        case.command["expected_revision"] = case.state["revision"]
+        case.command.update(
+            expected_candidate_id=case.partial["id"], expected_candidate_head=case.partial["head"]
+        )
+        with case.store._connect() as db:
+            db.execute(
+                "UPDATE delivery_runs SET phase=?,execution_state='running',outcome=NULL,"
+                "protocol_revision=?,cleanup='unknown',error=NULL WHERE run_id='run-1'",
+                ("checks" if kind == "stale1169" else "repair", case.state["revision"] - 1),
+            )
+        stale = requests[-1], case.state
+    asyncio.run(seal_closed(case.store, case.spec, case.state, stale=stale))
+    cli = registrations(root, case.store.config)
+    write_private(case.store.config.state_root / "service-stopped.json", {"command": "stop"})
+    data = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(case).items()
+        if key not in {"store", "broker"}
+    }
+    data.update(owner=str(case.store.config.path), old_root=str(SOURCE), cli=str(cli), kind=kind)
+    write_private(root / "case.json", data)
+    for name in ("state.py", "schema.sql"):
+        target = root / "loaded-old-projector" / name
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes((SOURCE / "skills/devflow/scripts" / name).read_bytes())
+    patch.undo()
+
+
+def control(config, operation, request=None, *, success=True):
+    argv = [
+        sys.executable,
+        "-I",
+        "-m",
+        "devflow_temporal.delivery_control",
+        "--config",
+        str(config.path),
+        operation,
+    ]
+    if request:
+        argv += ["--request", str(request)]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+    if success:
+        assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-6000:]
+        return json.loads(result.stdout)
+    assert result.returncode != 0, "An unacknowledged/changed installation was accepted"
+    return result.stderr
+
+
+def restored(root):
+    value = read_private(root / "case.json")
+    for key in (
+        "folder",
+        "home",
+        "owner_path",
+        "private_path",
+        "old_browser",
+        "old_report",
+        "provenance_path",
+    ):
+        if key in value:
+            value[key] = Path(value[key])
+    return SimpleNamespace(**value)
+
+
+def original_rows(config):
+    import sqlite3
+
+    with sqlite3.connect(config.tracking_db) as db:
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute("SELECT * FROM delivery_runs ORDER BY run_id")]
+
+
+def scoped_external_boundaries(case, patch):
+    patch.setattr(
+        DeliveryBroker,
+        "_existing_pr",
+        lambda *_: {
+            "number": 12,
+            "headRefOid": case.publication["head"],
+            "url": case.publication["url"],
+        },
+    )
+
+
+def exercise(root, kind):
+    from test_delivery_temporal_prerequisites import native_check_ready
+
+    from devflow_temporal import delivery_native_preparation as native
+    from devflow_temporal import delivery_runtime_location as location
+    from devflow_temporal.delivery_activities import _context, delivery_repair_preflight
+    from devflow_temporal.delivery_closures import sealed_closure
+    from devflow_temporal.delivery_resources import _gate_roots
+    from devflow_temporal.payload import payload_digest
+    from devflow_temporal.supervisor import get_supervisor
+
+    case = restored(root)
+    config = DeliveryConfig.load(Path(case.owner))
+    assert not Path(case.old_root).exists()
+    assert SOURCE == Path.home() / ".local/share/devflow/developer-workflow"
+    assert Path(sys.prefix) == SOURCE / "runtime/.venv"
+    patch = pytest.MonkeyPatch()
+    scoped_external_boundaries(case, patch)
+    # Old measurements are still impossible to launch under the strict owner.
+    with pytest.raises((ValueError, OSError)):
+        native.verify_native_spec(case.spec)
+    with pytest.raises(ValueError, match="helper is missing"):
+        DeliveryStore(config)
+    control(config, "stop")  # Supported lifecycle remains reachable without old helpers.
+    binary = Path(distribution("openai-codex-cli-bin").locate_file("codex_cli_bin/bin/codex"))
+    before = config.path.read_bytes()
+    after = copy.deepcopy(config.raw)
+    after["codex_bin"] = str(binary)
+    proposal = config.state_root / "operator-inputs/permanent-owner.json"
+    write_private(proposal, after)
+    supplied = {
+        "command_id": "owned-permanent-" + kind,
+        "owner_before_sha256": hashlib.sha256(before).hexdigest(),
+        "owner_after_path": str(proposal),
+        "owner_after_sha256": hashlib.sha256(proposal.read_bytes()).hexdigest(),
+        "destination": {
+            "root": str(SOURCE),
+            "revision": git(SOURCE, "rev-parse", "HEAD"),
+            "tree": git(SOURCE, "rev-parse", "HEAD^{tree}"),
+            "payload_sha256": payload_digest(SOURCE / "runtime/src/devflow_temporal"),
+        },
+        "runs": ["run-1", "run-2"],
+        "host_home": str(Path.home()),
+        "host_cli": case.cli,
+        "host_cli_sha256": hashlib.sha256(Path(case.cli).read_bytes()).hexdigest(),
+        "baseline_revision": "1ebfc71ea5522ee74dbf6cd820f01649e3197bca",
+        "answer": location.ANSWER,
+    }
+    request = config.state_root / "operator-inputs/permanent-request.json"
+    write_private(request, supplied)
+    rows = original_rows(config)
+    preflight = control(config, "runtime-location-preflight", request)
+    assert original_rows(config) == rows and config.path.read_bytes() == before
+    assert (
+        preflight["authority"]["destination"]["identity"]["python_sha256"]
+        == (case.spec["policy"]["native_identity"]["python_sha256"])
+    )
+    supplied["expected_evidence_sha256"] = preflight["expected_evidence_sha256"]
+    write_private(request, supplied)
+    # The old ProjectSync module can write unrelated tracker data even while the
+    # new controller sees the pending fence; it has never learned this fence.
+    import threading
+    import time
+
+    errors, compatible = [], []
+    stop = threading.Event()
+
+    def old_projector():
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "owned_old_projector", root / "loaded-old-projector/state.py"
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            pending = config.state_root / "runtime-installations/pending.json"
+            for _ in range(3000):
+                if stop.is_set():
+                    return
+                if pending.exists():
+                    with module.connect(config.tracking_db) as db:
+                        count = db.execute(
+                            "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.PENDING,)
+                        ).fetchone()[0]
+                        if count == 2:
+                            with pytest.raises(ValueError, match="installation is incomplete"):
+                                DeliveryStore(config)
+                            module.record(
+                                db,
+                                "work",
+                                {
+                                    "id": "old-project-sync-only",
+                                    "title": "Owned tracker observation",
+                                },
+                            )
+                            module.update(
+                                db,
+                                "work",
+                                {
+                                    "id": "old-project-sync-only",
+                                    "title": "Owned refreshed tracker observation",
+                                },
+                                "owned-refresh",
+                            )
+                            assert module.metrics(db)
+                            compatible.append(True)
+                            return
+                time.sleep(0.01)
+            raise AssertionError("The old projector did not observe the pending cohort")
+        except BaseException as exc:
+            errors.append(repr(exc))
+
+    thread = threading.Thread(target=old_projector)
+    thread.start()
+    try:
+        result = control(config, "adopt-runtime-location", request)
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+    assert compatible and not errors, errors
+    assert result["state"] == "acknowledged" and original_rows(config) == rows
+    assert location._acknowledged(DeliveryConfig.load(config.path))
+    control(config, "adopt-runtime-location", request)
+    case.store = DeliveryStore(DeliveryConfig.load(config.path))
+    case.broker = DeliveryBroker(case.store, case.spec)
+    assert location.historical_proof(case.spec)
+    with pytest.raises((ValueError, OSError)):
+        native.verify_native_spec(case.spec)
+    if kind.startswith("stale"):
+        from temporalio.client import Client
+
+        from devflow_temporal.delivery_closed_projection import reconcile_completed_projections
+        from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+        from devflow_temporal.delivery_orphans import reconcile_attempt
+
+        async def maintenance():
+            client = await Client.connect(
+                config.temporal_address, data_converter=DELIVERY_DATA_CONVERTER
+            )
+            return await reconcile_completed_projections(case.store, client)
+
+        observed = asyncio.run(maintenance())
+        assert any(
+            item["run_id"] == "run-1" and item["state"] == "reconciled" for item in observed
+        ), observed
+        reconciled = case.store.detail("run-1")
+        assert reconciled["phase"] == "blocked" and reconciled["cleanup"] == "unknown"
+        assert reconciled["checks"] == case.state["checks"]
+        assert (
+            reconcile_attempt(case.store, run_id="run-1", role="cleanup", iteration=3)["cleanup"]
+            == "confirmed"
+        )
+        case.command["expected_revision"] = case.store.detail("run-1")["protocol_revision"]
+        assert case.store.detail("run-1")["checks"]["local"]["state"] == "failed"
+        original = asyncio.run(sealed_closure(case.store, "delivery-run-1"))
+        assert original["result"] == case.state and original["result"]["cleanup"] == "unknown"
+    outcome = case.store.repair_admission_preflight("run-1", case.command)
+    assert outcome["authorized_through_iteration"] == 4
+    response = case.store.continue_repair("run-1", case.command)
+    assert case.store.continue_repair("run-1", case.command) == response
+    current = case.store.effective_spec("run-1")
+    with case.store._connect() as db:
+        recovery = json.loads(
+            db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
+        )
+    assert (
+        recovery["maximum_iteration"] == 4 and recovery["session_id"] == case.result["session_id"]
+    )
+    assert current["policy"]["capacity"] == 6
+    assert current["policy"]["codex_bin"] == str(binary)
+    native.verify_native_spec(current)
+    owner, broker = _context(current)
+    assert get_supervisor(owner).capacity == 2
+    bindings = {}
+    _gate_roots(current, execution_specs=bindings)
+    assert current in bindings.values() and case.spec in bindings.values()
+    assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery})) == {
+        "state": "confirmed"
+    }
+    # The actual launch owner consumes the current candidate, claim, manifest,
+    # recipe, independent pinned tool receipt and fresh installed native proof.
+    broker = native_check_ready(case, current)
+    from devflow_temporal.delivery_sandbox import prepare_native_check
+    from devflow_temporal.delivery_temporal_prerequisites import check_launch
+
+    evidence = broker.evidence_dir / "checks/4"
+    try:
+        _profile, environment = prepare_native_check(current, broker.checkout, evidence, case.check)
+        process = SimpleNamespace(
+            spec=current,
+            folder=evidence / case.check["id"] / "native",
+            argv=case.check["argv"],
+            cwd=broker.checkout,
+            environment=environment,
+            timeout=2700,
+        )
+        check_launch(process)
+    finally:
+        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
+    control(DeliveryConfig.load(config.path), "rollback-runtime-location", request, success=False)
+    assert case.store.continue_repair("run-1", case.command) == response
+    print(
+        json.dumps(
+            {
+                "old_runtime_absent": True,
+                "ack_row_unchanged": True,
+                "cohort_size": 2,
+                "strict_bundle": True,
+                "finite_maximum": 4,
+                "native_preparation": "actual",
+                "capacity": 2,
+                "frozen_capacity": 6,
+                "kind": kind,
+                "source": str(SOURCE),
+            }
+        )
+    )
+    patch.undo()
+
+
+if __name__ == "__main__":
+    phase, raw_root, scenario = sys.argv[1:]
+    selected = seed if phase == "seed" else exercise
+    selected(Path(raw_root), scenario)

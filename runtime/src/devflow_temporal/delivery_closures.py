@@ -195,7 +195,7 @@ def _private_root(store) -> Path:
 def _read_sealed(root: Path, sha256: str) -> bytes:
     path = root / f"{sha256}.json.xz"
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise ValueError("sealed closure history is a symlink") from exc

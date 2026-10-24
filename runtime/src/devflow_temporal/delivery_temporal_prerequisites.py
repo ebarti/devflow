@@ -359,6 +359,9 @@ def proposal(seal, command, *, historical=False, execution=None):
 
 
 def _transition(expected, actual):
+    from .delivery_runtime_location import policy_for_comparison
+
+    actual_policy = policy_for_comparison(expected, actual)
     derived = {
         "policy",
         "policy_digest",
@@ -370,7 +373,7 @@ def _transition(expected, actual):
     }
     if {k: v for k, v in actual.items() if k not in derived} != {
         k: v for k, v in expected.items() if k not in derived
-    } or {k: v for k, v in actual["policy"].items() if k not in MEASURED} != {
+    } or {k: v for k, v in actual_policy.items() if k not in MEASURED} != {
         k: v for k, v in expected["policy"].items() if k not in MEASURED
     }:
         raise ValueError("Temporal prerequisite changed frozen execution authority")

@@ -85,11 +85,14 @@ def _private_directory(path: Path) -> None:
 
 class DeliveryStore:
     def __init__(self, config: DeliveryConfig, *, read_only: bool = False) -> None:
+        from .delivery_runtime_location import helper_path, require_ready
+
         self.config = config
         self.read_only = read_only
         if not read_only:
+            require_ready(config)
             _private_directory(config.state_root)
-        helper = config.helpers_dir / "state.py"
+        helper = helper_path(config, read_only=read_only)
         if not helper.is_file():
             raise ValueError("configured Devflow state helper is missing")
         module_spec = importlib.util.spec_from_file_location("devflow_delivery_state", helper)
@@ -479,6 +482,9 @@ class DeliveryStore:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA query_only=ON")
         else:
+            from .delivery_runtime_location import require_not_pending
+
+            require_not_pending(self.config)
             db = self.state.connect(self.config.tracking_db)
         db.execute("PRAGMA foreign_keys=ON")
         feature_event = False

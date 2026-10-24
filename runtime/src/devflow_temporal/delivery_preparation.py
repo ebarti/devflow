@@ -143,6 +143,9 @@ def verify_prepared_spec(spec: dict) -> None:
     require_native_execution(spec)
     if spec.get("provider") == "fake":
         return
+    from .delivery_runtime_location import require_execution_location
+
+    require_execution_location(spec)
     from .delivery_native_preparation import verify_native_spec
     verify_native_spec(spec)
 
