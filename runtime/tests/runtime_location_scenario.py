@@ -66,6 +66,7 @@ def fixture_service(root):
         helpers_dir=str(logical / "scripts"),
         capacity=6,
         temporal_address=os.environ["DEVFLOW_TEST_LOCATION_TEMPORAL_ADDRESS"],
+        execution_registry=str(home / ".local/state/devflow/execution-ownership/registry.sqlite3"),
     )
     store.config.path.write_text(json.dumps(raw))
     store.config.path.chmod(0o600)
@@ -414,11 +415,12 @@ def seed(root, kind):
     asyncio.run(seal_closed(case.store, case.spec, case.state, stale=stale))
     cli = registrations(root, case.store.config)
     write_private(case.store.config.state_root / "service-stopped.json", {"command": "stop"})
-    data = {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(case).items()
-        if key not in {"store", "broker"}
-    }
+    data = json.loads(
+        json.dumps(
+            {key: value for key, value in vars(case).items() if key not in {"store", "broker"}},
+            default=str,
+        )
+    )
     data.update(owner=str(case.store.config.path), old_root=str(SOURCE), cli=str(cli), kind=kind)
     write_private(root / "case.json", data)
     for name in ("state.py", "schema.sql"):
