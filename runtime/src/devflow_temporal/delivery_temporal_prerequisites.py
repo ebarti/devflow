@@ -17,7 +17,7 @@ from copy import deepcopy
 from pathlib import Path
 from threading import RLock
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 from .delivery_resources import private_directory, read_private
 
 FIELD = "temporal_test_prerequisites"
@@ -510,6 +510,109 @@ def _copy(source, target, pinned):
         stage.unlink(missing_ok=True)
 
 
+def _preparation_authority(spec, checkout, evidence, check, registry, manifest):
+    """Derive a subject and generation from the admitted resource owner, not a receipt."""
+    from .candidate import candidate_for
+    from .delivery_broker import _git
+    from .delivery_execution_config import load_execution_config
+    from .delivery_native_guard import validate_native_turn
+    from .delivery_resources import _gate_evidence_root, _gate_path, _identity, same_object
+    from .delivery_sandbox import _native_check_key
+    from .delivery_store import DeliveryStore
+
+    root = _gate_evidence_root(spec)
+    relative = evidence.relative_to(root)
+    if (
+        len(relative.parts) != 2
+        or relative.parts[0] != "checks"
+        or not relative.parts[1].isdecimal()
+        or str(int(relative.parts[1])) != relative.parts[1]
+    ):
+        raise ValueError("Temporal preparation left its exact admitted check evidence")
+    iteration = int(relative.parts[1])
+    store = DeliveryStore(load_execution_config(spec), read_only=True)
+    validate_native_turn(spec, "verify", iteration, store)
+    with store._connect() as db:
+        current = db.execute(
+            "SELECT candidate_json,iteration FROM delivery_runs WHERE run_id=?",
+            (spec["run_id"],),
+        ).fetchone()
+    expected = (
+        json.loads(current["candidate_json"]) if current and current["candidate_json"] else None
+    )
+    if (
+        not isinstance(expected, dict)
+        or current["iteration"] != iteration
+        or expected.get("policy_digest") != spec["policy_digest"]
+        or expected.get("base_sha") != spec["base_sha"]
+    ):
+        raise ValueError("Temporal preparation has no current admitted check candidate")
+    if checkout not in {Path(spec["checkout"]), _gate_path(spec, "verify", iteration)}:
+        raise ValueError("Temporal preparation has no admitted check subject")
+    entry = manifest["roots"].get(str(checkout), {})
+    if (
+        entry.get("kind") not in {"checkout", "gate"}
+        or not entry.get("identity")
+        or entry.get("receipt", {}).get("state") in {"removed", "already_absent"}
+        or not same_object(spec, checkout, entry["identity"])
+    ):
+        raise ValueError("Temporal preparation subject has no current registered custody")
+    registry._allowed(checkout, entry["kind"])
+    if _git(checkout, "rev-parse", "--show-toplevel") != str(checkout):
+        raise ValueError("Temporal preparation subject is not its exact Git root")
+    candidate = candidate_for(checkout)
+    if any(expected.get(key) != value for key, value in candidate.items()):
+        raise ValueError("Temporal preparation subject differs from the current run candidate")
+    if entry.get("head", candidate["head"]) != candidate["head"]:
+        raise ValueError("Temporal preparation gate head changed")
+    key = _native_check_key(spec, evidence, check["id"])
+    home = Path(spec["state_dir"]) / "transient/checks" / key
+    recipe = read_private(home / "codex/native-environment.json")
+    if type(recipe.get("version")) is not int or recipe["version"] not in (1, 2, 3):
+        raise ValueError("Temporal preparation lost its owned environment recipe")
+    short = recipe["version"] >= 2
+    parent = registry._execution_scratch_root() if short else Path(spec["state_dir"]) / "transient"
+    scratch = parent / digest(["checks", key])[:16] if short else home / "tmp"
+    parent_entry = manifest["roots"].get(str(parent), {})
+    kind = "execution-scratch" if short else "transient"
+    if (
+        parent_entry.get("kind") != kind
+        or not parent_entry.get("identity")
+        or parent_entry.get("receipt", {}).get("state") in {"removed", "already_absent"}
+        or not same_object(spec, parent, parent_entry["identity"])
+    ):
+        raise ValueError("Temporal preparation scratch has no registered owner generation")
+    registry._allowed(parent, kind)
+    if (
+        stat.S_IMODE(parent.lstat().st_mode) != 0o700
+        or scratch.resolve(strict=True) != scratch
+        or stat.S_IMODE(scratch.lstat().st_mode) != 0o700
+    ):
+        raise ValueError("Temporal preparation scratch ancestry or mode changed")
+    return {
+        "key": key,
+        "evidence": str(evidence),
+        "check_sha256": digest(check),
+        "subject": {
+            "path": str(checkout),
+            "kind": entry["kind"],
+            "identity": entry["identity"],
+            "generation": entry.get("generation", 0),
+            "candidate": candidate,
+            "admitted_candidate": expected,
+        },
+        "environment_recipe": recipe,
+        "scratch": str(scratch),
+        "scratch_identity": _identity(scratch),
+        "scratch_owner": {
+            "path": str(parent),
+            "kind": kind,
+            "identity": parent_entry["identity"],
+            "generation": parent_entry.get("generation", 0),
+        },
+    }
+
+
 def prepare_check(spec, checkout, evidence, check, scratch):
     if spec.get(MARKER) is None:
         return {}
@@ -521,39 +624,65 @@ def prepare_check(spec, checkout, evidence, check, scratch):
         or _project(spec, proof["declaration"]["python_project"], checkout) != proof["metadata"]
     ):
         raise ValueError("Temporal prerequisite native check or metadata changed")
-    directory = scratch / "temporal-tools"
-    private_directory(directory)
-    environment, copied = {}, {}
-    for key, pinned in TOOLS.items():
-        target = directory / pinned["filename"]
-        copied[key] = _copy(proof["tools"][key]["binary"]["path"], target, pinned)
-        environment[pinned["environment"]] = str(target)
-    from .delivery_metadata_recovery import _immutable
+    from .delivery_resources import RunResources, write_private
 
-    request = {
-        "run_id": spec["run_id"],
-        "preparation": spec[MARKER],
-        "policy_digest": spec["policy_digest"],
-        "check_sha256": digest(check),
-        "checkout": str(checkout),
-        "scratch": str(scratch),
-        "environment": environment,
-        "tools": copied,
-        "scratch_identity": {
-            "device": scratch.stat().st_dev,
-            "inode": scratch.stat().st_ino,
-            "uid": scratch.stat().st_uid,
-        },
-        "tool_identities": {
-            key: {
-                "device": Path(item["path"]).stat().st_dev,
-                "inode": Path(item["path"]).stat().st_ino,
-            }
-            for key, item in copied.items()
-        },
-    }
-    private_directory(evidence / check["id"])
-    _immutable(evidence / check["id"] / "temporal-prerequisites.json", request)
+    registry = RunResources(spec)
+    with registry.locked() as manifest:
+        authority = _preparation_authority(spec, checkout, evidence, check, registry, manifest)
+        if scratch != Path(authority["scratch"]):
+            raise ValueError("Temporal preparation received a foreign scratch path")
+        directory = scratch / "temporal-tools"
+        private_directory(directory)
+        environment, copied = {}, {}
+        for key, pinned in TOOLS.items():
+            target = directory / pinned["filename"]
+            copied[key] = _copy(proof["tools"][key]["binary"]["path"], target, pinned)
+            environment[pinned["environment"]] = str(target)
+        from .delivery_metadata_recovery import _immutable
+
+        request = {
+            "run_id": spec["run_id"],
+            "preparation": spec[MARKER],
+            "policy_digest": spec["policy_digest"],
+            "check_sha256": digest(check),
+            "checkout": str(checkout),
+            "scratch": str(scratch),
+            "environment": environment,
+            "tools": copied,
+            "scratch_identity": {
+                "device": scratch.stat().st_dev,
+                "inode": scratch.stat().st_ino,
+                "uid": scratch.stat().st_uid,
+            },
+            "tool_identities": {
+                key: {
+                    "device": Path(item["path"]).stat().st_dev,
+                    "inode": Path(item["path"]).stat().st_ino,
+                }
+                for key, item in copied.items()
+            },
+        }
+        private_directory(evidence / check["id"])
+        path = evidence / check["id"] / "temporal-prerequisites.json"
+        expected_raw = (canonical_json(request) + "\n").encode()
+        expected_sha256 = hashlib.sha256(expected_raw).hexdigest()
+        if os.path.lexists(path):
+            _reference(str(path), expected_sha256, private=True)
+        _immutable(path, request)
+        if _preparation_authority(spec, checkout, evidence, check, registry, manifest) != authority:
+            raise ValueError("Temporal preparation subject changed during its owned copy")
+        _reference(str(path), expected_sha256, private=True)
+        seal = {
+            "authority": authority,
+            "receipt": str(path),
+            "receipt_sha256": expected_sha256,
+            "preparation": spec[MARKER],
+        }
+        prior = manifest.setdefault("temporal_test_preparations", {}).get(authority["key"])
+        if prior is not None and prior != seal:
+            raise ValueError("Temporal preparation conflicts with its owner generation")
+        manifest["temporal_test_preparations"][authority["key"]] = seal
+        write_private(registry.manifest, manifest)
     return environment
 
 
@@ -570,12 +699,44 @@ def check_launch(process):
         raise ValueError("Temporal native launch has an undeclared tool environment")
     proof = launch_authority(process.spec)
     check = proof["check"]
-    path = process.folder.parent / "temporal-prerequisites.json"
-    recorded = read_private(path)
+    from .delivery_resources import RunResources
+    from .delivery_sandbox import _native_check_key
+
+    registry = RunResources(process.spec, read_only=True)
+    evidence = process.folder.parent.parent
+    key = _native_check_key(process.spec, evidence, check["id"])
+    with registry.locked(read_only=True) as manifest:
+        seal = manifest.get("temporal_test_preparations", {}).get(key)
+        if not isinstance(seal, dict) or seal.get("preparation") != process.spec[MARKER]:
+            raise ValueError("Temporal preparation has no acknowledged resource owner")
+        checkout = Path(seal["authority"]["subject"]["path"])
+        authority = _preparation_authority(
+            process.spec, checkout, evidence, check, registry, manifest
+        )
+        if authority != seal.get("authority"):
+            raise ValueError("Temporal preparation owner subject or generation changed")
+        path = evidence / check["id"] / "temporal-prerequisites.json"
+        if seal.get("receipt") != str(path):
+            raise ValueError("Temporal preparation owner receipt left its exact check")
+        recorded = json.loads(_reference(str(path), seal["receipt_sha256"], private=True))
+        _check_owned_launch(process, proof, recorded, authority)
+        if (
+            _preparation_authority(process.spec, checkout, evidence, check, registry, manifest)
+            != authority
+        ):
+            raise ValueError("Temporal preparation subject changed during launch observation")
+
+
+def _check_owned_launch(process, proof, recorded, authority):
+    keys = {tool["environment"] for tool in TOOLS.values()}
+    check = proof["check"]
     environment = {key: process.environment[key] for key in keys}
-    checkout = Path(recorded["checkout"])
+    checkout = Path(authority["subject"]["path"])
     if (
         recorded.get("run_id") != process.spec["run_id"]
+        or recorded.get("checkout") != str(checkout)
+        or recorded.get("scratch") != authority["scratch"]
+        or recorded.get("scratch_identity") != authority["scratch_identity"]
         or recorded.get("preparation") != process.spec[MARKER]
         or recorded.get("policy_digest") != process.spec["policy_digest"]
         or recorded.get("check_sha256") != proof["check_sha256"]

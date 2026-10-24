@@ -222,6 +222,22 @@ def admitted(case):
     return response, current, recovery
 
 
+def native_check_ready(case, current):
+    """Project the owned fixture's synthetic implementation/publication boundary."""
+    broker = DeliveryBroker(case.store, current)
+    case.store.project(
+        "run-1",
+        phase="checks",
+        execution_state="running",
+        event_type="fixture_native_check_ready",
+        message="Owned synthetic implementation and publication boundary completed",
+        candidate=broker.candidate(),
+        iteration=4,
+        cleanup="none",
+    )
+    return broker
+
+
 def test_public_declaration_retains_frozen_check_source_session_and_allowance(stopped_temporal):
     case = stopped_temporal
     original = (case.folder / "request.json").read_bytes()
@@ -429,7 +445,7 @@ def test_exact_node_wrapper_uses_both_explicit_paths_in_cold_native_temp(
     # Commit only the owned fixture's retained source so a gate checkout is real.
     _git(case.broker.checkout, "add", case.api)
     _git(case.broker.checkout, "commit", "-qm", "Retain owned native SDK probe candidate")
-    broker = DeliveryBroker(case.store, current)
+    broker = native_check_ready(case, current)
     owned_sdk_environment(broker)
     restore_native_observers(monkeypatch)
     # Ambient variables and the undocumented host cache cannot supply authority.
@@ -471,14 +487,29 @@ def test_exact_node_wrapper_uses_both_explicit_paths_in_cold_native_temp(
 
 
 @pytest.mark.parametrize(
-    "defect", ["env", "missing_env", "argv", "metadata", "tool", "mode", "replaced", "receipt"]
+    "defect",
+    [
+        "env",
+        "missing_env",
+        "argv",
+        "metadata",
+        "tool",
+        "mode",
+        "replaced",
+        "receipt",
+        "scratch_generation",
+        "foreign_checkout",
+        "candidate",
+        "scratch_parent_mode",
+        "owner_missing",
+    ],
 )
 def test_real_native_launch_refuses_binding_and_owned_copy_drift(
     stopped_temporal, monkeypatch, defect
 ):
     case = stopped_temporal
     _response, current, _recovery = admitted(case)
-    broker = DeliveryBroker(case.store, current)
+    broker = native_check_ready(case, current)
     evidence = broker.evidence_dir / "checks/4"
     _profile, environment = prepare_native_check(current, broker.checkout, evidence, case.check)
     from devflow_temporal.delivery_native_process import NativeProcess
@@ -493,7 +524,41 @@ def test_real_native_launch_refuses_binding_and_owned_copy_drift(
     )
     receipt_path = process.folder.parent / "temporal-prerequisites.json"
     receipt = read_private(receipt_path)
-    if defect == "env":
+    if defect == "scratch_generation":
+        import shutil
+
+        scratch = Path(environment["TMPDIR"])
+        saved = scratch.with_name(scratch.name + "-owned-before-replacement")
+        scratch.rename(saved)
+        shutil.copytree(saved, scratch)
+        receipt["scratch_identity"] = {
+            "device": scratch.stat().st_dev,
+            "inode": scratch.stat().st_ino,
+            "uid": scratch.stat().st_uid,
+        }
+        for key, item in receipt["tools"].items():
+            info = Path(item["path"]).stat()
+            receipt["tool_identities"][key] = {"device": info.st_dev, "inode": info.st_ino}
+        write_private(receipt_path, receipt)
+    elif defect == "foreign_checkout":
+        foreign = case.store.config.state_root / "unregistered-foreign-checkout"
+        for name in ("pyproject.toml", "uv.lock"):
+            target = foreign / "workers/automation" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((broker.checkout / "workers/automation" / name).read_bytes())
+        receipt["checkout"] = str(foreign)
+        process.cwd = foreign
+        write_private(receipt_path, receipt)
+    elif defect == "candidate":
+        (broker.checkout / case.api).write_text("Changed after owned check preparation\n")
+    elif defect == "scratch_parent_mode":
+        Path(environment["TMPDIR"]).parent.chmod(0o755)
+    elif defect == "owner_missing":
+        manifest_path = Path(current["state_dir"]) / "resources/manifest.json"
+        manifest = read_private(manifest_path)
+        manifest.pop("temporal_test_preparations")
+        write_private(manifest_path, manifest)
+    elif defect == "env":
         process.environment["JOBCTRL_TEMPORAL_CLI_PATH"] = "/foreign/temporal"
     elif defect == "missing_env":
         for tool in tools.TOOLS.values():
@@ -524,6 +589,56 @@ def test_real_native_launch_refuses_binding_and_owned_copy_drift(
         with pytest.raises(CheckPreparationFailure):
             broker._run_native_check(process)
     finally:
+        if defect == "scratch_parent_mode":
+            Path(environment["TMPDIR"]).parent.chmod(0o700)
+        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
+
+
+@pytest.mark.parametrize("defect", ["unrecorded_candidate", "iteration", "copy_race"])
+def test_preparation_never_adopts_an_unrecorded_or_changed_current_candidate(
+    stopped_temporal, monkeypatch, defect
+):
+    case = stopped_temporal
+    _response, current, _recovery = admitted(case)
+    broker = native_check_ready(case, current)
+    evidence = broker.evidence_dir / "checks/4"
+    if defect == "unrecorded_candidate":
+        (broker.checkout / case.api).write_text("Not projected as the current candidate\n")
+    elif defect == "iteration":
+        case.store.project(
+            "run-1",
+            phase="checks",
+            execution_state="running",
+            event_type="fixture_stale_check_iteration",
+            message="Owned stale iteration probe",
+            iteration=3,
+        )
+    else:
+        original = tools._copy
+        changed = False
+
+        def race(*args, **kwargs):
+            nonlocal changed
+            result = original(*args, **kwargs)
+            if not changed:
+                changed = True
+                case.store.project(
+                    "run-1",
+                    phase="checks",
+                    execution_state="running",
+                    event_type="fixture_candidate_race",
+                    message="Owned projection race probe",
+                    candidate={**broker.candidate(), "id": "0" * 64},
+                )
+            return result
+
+        monkeypatch.setattr(tools, "_copy", race)
+    try:
+        with pytest.raises(ValueError, match="current (run|admitted check) candidate"):
+            prepare_native_check(current, broker.checkout, evidence, case.check)
+        manifest = read_private(Path(current["state_dir"]) / "resources/manifest.json")
+        assert not manifest.get("temporal_test_preparations")
+    finally:
         assert RunResources(current).finalize("blocked")["state"] == "confirmed"
 
 
@@ -550,7 +665,7 @@ def test_combined_prerequisites_share_one_original_finite_admission(service, mon
     }
     assert_owner_pair(case, current, recovery)
     assert case.store.continue_repair("run-1", case.command) == response
-    evidence = DeliveryBroker(case.store, current).evidence_dir / "checks/4"
+    evidence = native_check_ready(case, current).evidence_dir / "checks/4"
     try:
         _profile, environment = prepare_native_check(
             current, case.broker.checkout, evidence, case.check
@@ -671,3 +786,49 @@ def test_cached_byte_observation_rechecks_current_fd_and_name(tmp_path, monkeypa
     else:
         with pytest.raises(ValueError):
             tools._hash(str(path), expected, maximum=1024, executable=True)
+
+
+def test_complete_receipt_is_inert_until_owner_seal_and_exact_replay_succeeds(
+    stopped_temporal, monkeypatch
+):
+    import devflow_temporal.delivery_resources as resources
+
+    case = stopped_temporal
+    _response, current, _recovery = admitted(case)
+    broker = native_check_ready(case, current)
+    evidence = broker.evidence_dir / "checks/4"
+    manifest_path = Path(current["state_dir"]) / "resources/manifest.json"
+    original = resources.write_private
+
+    def crash_before_owner_ack(path, value):
+        if path == manifest_path and value.get("temporal_test_preparations"):
+            raise RuntimeError("controlled crash after receipt fsync before owner seal")
+        return original(path, value)
+
+    monkeypatch.setattr(resources, "write_private", crash_before_owner_ack)
+    try:
+        with pytest.raises(RuntimeError, match="controlled crash"):
+            prepare_native_check(current, broker.checkout, evidence, case.check)
+        path = evidence / case.check["id"] / "temporal-prerequisites.json"
+        before = path.read_bytes()
+        receipt = read_private(path)
+        process = SimpleNamespace(
+            spec=current,
+            folder=path.parent / "native",
+            cwd=broker.checkout,
+            argv=case.check["argv"],
+            timeout=2700,
+            environment={**receipt["environment"], "TMPDIR": receipt["scratch"]},
+        )
+        with pytest.raises(ValueError, match="acknowledged resource owner"):
+            tools.check_launch(process)
+        monkeypatch.setattr(resources, "write_private", original)
+        _profile, environment = prepare_native_check(current, broker.checkout, evidence, case.check)
+        assert path.read_bytes() == before
+        process.environment = environment
+        tools.check_launch(process)
+        manifest = read_private(manifest_path)
+        assert len(manifest["temporal_test_preparations"]) == 1
+    finally:
+        monkeypatch.setattr(resources, "write_private", original)
+        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
