@@ -310,6 +310,13 @@ def require_execution_location(spec):
     """Fresh admitted runs own their new path; old cohort launches need active adoption."""
     if spec.get("provider") != "codex":
         return
+    if not spec.get("preparation"):
+        # The existing native measurement owner removes the predecessor's
+        # preparation/identity, measures the actual imported bundle, and runs
+        # its fresh probe in a separate (unadmitted) preparation directory.
+        # prepare_runtime already checks the original location grant before
+        # entering that owner. A stored prepared proof never takes this path.
+        return
     from .delivery_execution_config import load_execution_config
 
     require_not_pending(load_execution_config(spec))
@@ -419,6 +426,23 @@ def require_not_pending(config):
         return
     pending = config.state_root / "runtime-installations/pending.json"
     if not os.path.lexists(pending):
+        folder = pending.parent
+        if (
+            not folder.exists()
+            or os.path.lexists(folder / "current.json")
+            or not config.tracking_db.exists()
+        ):
+            return
+        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
+            db.execute("PRAGMA query_only=ON")
+            values = db.execute(
+                "SELECT payload_json FROM delivery_events WHERE type=? ORDER BY sequence DESC",
+                (PENDING,),
+            )
+            if any(Path(json.loads(row[0])["receipt"]).is_relative_to(folder) for row in values):
+                raise ValueError(
+                    "runtime installation is incomplete; replay its public apply or rollback"
+                )
         return
     reference = json.loads(private_bytes(pending))
     if _acknowledged(config, reference=reference) is None:
