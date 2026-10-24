@@ -808,6 +808,18 @@ def custody(db, recovery, *, retained_memo=None):
     from .delivery_browser_mode_recovery import custody as browser_custody
 
     browser_custody(db, spec, recovery)
+    if details.get('operational_capacity') is not None:
+        if spec['policy']['capacity'] != details['predecessor_spec']['policy']['capacity']:
+            raise ValueError('amended execution changed frozen policy capacity')
+        from .delivery_amendment_capacity import acknowledge
+
+        if acknowledge(details['predecessor_spec'], load_execution_config(spec), db=db) != (
+                details['operational_capacity']):
+            raise ValueError('amended operational owner acknowledgement changed')
+    elif ((SCOPE_FIELDS <= details['command'].keys() or BROWSER_FIELDS <= details['command'].keys())
+            and not spec.get('feature_worker')
+            and spec['policy']['capacity'] != load_execution_config(spec).raw.get('capacity', 2)):
+        raise ValueError('amended scheduling capacity lacks its independent owner receipt')
     return spec
 
 
@@ -1231,6 +1243,12 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         from .delivery_browser_mode_recovery import proposal
 
         amended, browser_amendment = proposal(seal, command)
+    capacity_receipt = None
+    if (not seal['predecessor_spec'].get('feature_worker')
+            and (SCOPE_FIELDS <= command.keys() or BROWSER_FIELDS <= command.keys())):
+        from .delivery_amendment_capacity import acknowledge
+
+        capacity_receipt = acknowledge(seal['predecessor_spec'], load_execution_config(amended))
     scope_finding = None
     if SCOPE_FIELDS <= command.keys() and not seal['predecessor_spec'].get('feature_worker'):
         latest = next((r for r in reversed(seal['state'].get('roles', []))
@@ -1286,6 +1304,12 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         if scope_finding is not None:
             if completed_blocked_finding(seal) != scope_finding:
                 raise ValueError('blocked scope finding changed during runtime preparation')
+        if capacity_receipt is not None:
+            if execution['policy']['capacity'] != seal['predecessor_spec']['policy']['capacity']:
+                raise ValueError('amendment preparation changed frozen policy capacity')
+            if acknowledge(seal['predecessor_spec'], load_execution_config(execution)) != (
+                    capacity_receipt):
+                raise ValueError('operational owner changed during amendment preparation')
         execution.pop('repair_allowance', None)
         if authority:
             if worker_allowance(spec, seal['state']['iteration'],
@@ -1322,6 +1346,7 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'predecessor_result_digest': digest(seal['state']),
                     **({'blocked_scope_finding': scope_finding} if scope_finding else {}),
                     **({'browser_qa_amendment': browser_amendment} if browser_amendment else {}),
+                    **({'operational_capacity': capacity_receipt} if capacity_receipt else {}),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
                     **({'ci_findings': ci_findings} if ci_findings else {}),

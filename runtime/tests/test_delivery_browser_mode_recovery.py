@@ -849,3 +849,35 @@ async def test_public_browser_amendment_real_preparation_worker_native_gate_and_
             await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(
                 await handle.fetch_history()
             )
+            # Delivered cleanup can retire the candidate; historical authority
+            # remains readable without claiming that absent source is launchable.
+            assert not Path(current["checkout"]).exists()
+            assert store.effective_spec("run-1") == current
+            with pytest.raises(ValueError):
+                mode.launch_authority(current, Path(current["checkout"]))
+
+
+@pytest.mark.parametrize("defect", ["missing", "receipt", "path", "identity", "recreated"])
+def test_historical_fixture_custody_requires_exact_ended_root(stopped_browser, defect):
+    case = stopped_browser
+    _response, current, recovery = admitted(case)
+    manifest_path = Path(current["state_dir"]) / "resources/manifest.json"
+    manifest = read_private(manifest_path)
+    checkout = Path(current["checkout"])
+    # Retire only this fixture's owned worktree, using its actual Git owner.
+    _git(Path(current["source_path"]), "worktree", "remove", "--force", str(checkout))
+    entry = manifest["roots"][str(checkout)]
+    entry["receipt"] = {"path": str(checkout), "kind": "checkout", "state": "removed"}
+    if defect == "missing":
+        entry.pop("receipt")
+    elif defect == "receipt":
+        entry["receipt"]["state"] = "retained"
+    elif defect == "path":
+        entry["receipt"]["path"] += "-foreign"
+    elif defect == "identity":
+        entry["identity"] = None
+    else:
+        checkout.mkdir()
+    write_private(manifest_path, manifest)
+    with pytest.raises(ValueError):
+        case.store.effective_spec("run-1")

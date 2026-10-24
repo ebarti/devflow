@@ -1184,7 +1184,14 @@ def get_supervisor(store: DeliveryStore) -> DeliverySupervisor:
     key = (str(store.config.tracking_db.resolve()), str(store.config.state_root.resolve()))
     from .delivery_execution_config import operational_config
 
-    capacity = int(operational_config(store.config).raw.get("capacity", 2))
+    execution = getattr(store, 'operational_execution', None)
+    if execution and not (execution.get('feature_worker') or execution.get('feature_delivery')):
+        from .delivery_amendment_capacity import supervisor_config
+
+        configuration = supervisor_config(store, execution)
+    else:
+        configuration = operational_config(store.config)
+    capacity = int(configuration.raw.get("capacity", 2))
     if key not in _SUPERVISORS:
         _SUPERVISORS[key] = DeliverySupervisor(store, capacity=capacity)
     else:

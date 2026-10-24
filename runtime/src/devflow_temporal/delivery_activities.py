@@ -458,6 +458,7 @@ def _context(
         and store.submitted_spec(spec["run_id"]) == spec
     ):
         raise ValueError("Temporal input no longer matches the durable submitted run")
+    store.operational_execution = spec
     broker = DeliveryBroker(store, spec)
     if spec.get("feature_delivery"):
         from .delivery_feature_execution import require_execution

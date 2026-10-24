@@ -647,6 +647,12 @@ def scope_amendment_config(
     amended = DeliveryConfig.load(path)
     repository_key = original["repository_key"]
     old_raw, new_raw = deepcopy(original_config.raw), deepcopy(amended.raw)
+    from .delivery_amendment_capacity import acknowledge
+
+    if old_raw.get("capacity", 2) != new_raw.get("capacity", 2):
+        acknowledge(original, amended)
+    old_raw.pop("capacity", None)
+    new_raw.pop("capacity", None)
     old_repository = old_raw["repositories"][repository_key]
     new_repository = new_raw["repositories"][repository_key]
     from .delivery_source_scope import amended_scope, authority
@@ -701,6 +707,7 @@ def scope_amended_spec(
         effective["policy"]["provider_max_attempts"] = original["policy"]["provider_max_attempts"]
     else:
         effective["policy"].pop("provider_max_attempts", None)
+    effective["policy"]["capacity"] = original["policy"]["capacity"]
     effective["policy_digest"] = digest(effective["policy"])
     if "projection_retry_version" in original:
         effective["projection_retry_version"] = original["projection_retry_version"]

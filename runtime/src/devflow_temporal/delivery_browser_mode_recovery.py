@@ -303,7 +303,7 @@ def _failed_history(seal):
     return {**_failed_browser(spec, seal["state"]), "history": histories}
 
 
-def proposal(seal, command):
+def proposal(seal, command, *, historical_sources=None):
     original = seal["predecessor_spec"]
     if FIELD not in command:
         return original, None
@@ -350,10 +350,19 @@ def proposal(seal, command):
             "browser amendment changed its frozen recipe beyond the one environment value"
         )
     after["repositories"][repository]["browser_qa"] = qa
+    from .delivery_amendment_capacity import acknowledge
+
+    acknowledge(original, config)
+    before.pop("capacity", None)
+    after.pop("capacity", None)
     if before != after:
         raise ValueError("browser amendment changed unrelated configuration authority")
     failed = _failed_history(seal)
-    sources = fixture_sources(Path(original["checkout"]))
+    sources = (
+        fixture_sources(Path(original["checkout"]))
+        if historical_sources is None
+        else historical_sources
+    )
     execution = deepcopy(original)
     execution["policy"]["browser_qa"] = expected
     execution["implementation_role_home_generation"] = seal["session_custody"]["generation"]
@@ -460,7 +469,8 @@ def custody(db, spec, recovery):
             )
             if observed != recorded:
                 raise ValueError("browser amendment original attempt or effect changed")
-    expected, proof = proposal(details, details["command"])
+    sources = _fixture_custody(spec, details)
+    expected, proof = proposal(details, details["command"], historical_sources=sources)
     if (
         details.get(FIELD) != proof
         or spec["policy"]["browser_qa"] != expected["policy"]["browser_qa"]
@@ -474,6 +484,37 @@ def custody(db, spec, recovery):
     if details["maximum_iteration"] > details["predecessor_spec"]["policy"]["max_repairs"]:
         raise ValueError("browser amendment exceeded the original finite ceiling")
     return proof
+
+
+def _fixture_custody(spec, details):
+    """Keep ended source custody readable; a removed root cannot authorize a launch."""
+    checkout = Path(details["predecessor_spec"]["checkout"])
+    recorded = details[FIELD]["fixture_sources"]
+    if os.path.lexists(checkout):
+        observed = fixture_sources(checkout)
+        if observed != recorded:
+            raise ValueError("browser amendment owned fixture sources changed")
+        return observed
+    # Finalization may remove a published candidate before its projection is
+    # acknowledged. Its exact ended-custody receipt preserves historical reads
+    # and finalizer replay, while launch/readback still require the real source.
+    # These are the immutable admission's original hashes, not current bytes.
+    from .delivery_resources import same_object
+
+    manifest = read_private(Path(spec["state_dir"]) / "resources/manifest.json")
+    entry = manifest.get("roots", {}).get(str(checkout), {})
+    receipt = entry.get("receipt", {})
+    if (
+        manifest.get("run_id") != spec["run_id"]
+        or not same_object(spec, Path(spec["state_dir"]), manifest.get("state_identity"))
+        or entry.get("kind") != "checkout"
+        or not entry.get("identity")
+        or receipt.get("path") != str(checkout)
+        or receipt.get("kind") != "checkout"
+        or receipt.get("state") not in {"removed", "already_absent"}
+    ):
+        raise ValueError("browser amendment source disappeared without its owning cleanup")
+    return recorded
 
 
 def launch_authority(spec, checkout=None):
