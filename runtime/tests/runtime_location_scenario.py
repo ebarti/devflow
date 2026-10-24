@@ -363,6 +363,36 @@ def seed(root, kind):
                 }
             ],
         }
+    # Real native journals retain the stopped monitor in the final owned set.
+    # The older role-only fixture did not need the finalizer's exact PID
+    # inventory; this owner scenario deliberately exercises that real reader.
+    registry = RunResources(case.spec)
+    for raw in read_private(registry.manifest)["processes"]:
+        journal = read_private(Path(raw))
+        monitor = journal.get("monitor")
+        if monitor:
+            journal["owned"][str(monitor["pid"])] = monitor
+            write_private(Path(raw), journal)
+    case.journal = read_private(case.folder / "native-process.json")
+    finalization = registry.finalize("blocked")
+    assert finalization["state"] == "confirmed"
+    case.state["checks"]["resource_cleanup"] = finalization
+    case.store.project(
+        "run-1",
+        phase="blocked",
+        execution_state="blocked",
+        outcome="blocked",
+        event_type="blocked",
+        message=case.state["error"],
+        candidate=case.state["candidate"],
+        pull_request=case.publication,
+        checks=case.state["checks"],
+        iteration=3,
+        protocol_revision=40,
+        cleanup="confirmed",
+        error=case.state["error"],
+        tracker=case.state["tracker"],
+    )
     case.store.config.path.chmod(0o600)
     stale = None
     if kind.startswith("stale"):
