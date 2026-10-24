@@ -315,7 +315,9 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
              **({'closure': 'published'} if published else
                 {'closure': closure} if closure else {}),
              **({'unpublished_checkpoint': closure_checkpoint} if closure_checkpoint else {}),
-             **({'quarantined_implementation': quarantined} if quarantined else {})}
+             **({('quarantined_cleanup' if closure_checkpoint
+                  and closure_checkpoint.get('quarantined_cleanup') else
+                  'quarantined_implementation'): quarantined} if quarantined else {})}
         if closure_checkpoint is not None:
             payload['key'] = digest(payload)
         store._event(db, spec['run_id'], row['revision'] + 1, 'resource_cleanup_reconciled',

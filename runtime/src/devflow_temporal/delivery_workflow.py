@@ -20,7 +20,7 @@ from . import delivery_limits
 from .contracts import digest
 from .delivery_baseline_contract import preparation_failure as _preparation_failure
 from .delivery_baseline_contract import repairable_baseline
-from .delivery_budget_contract import fixed_budget_allows
+from .delivery_budget_contract import continuation_maximum, fixed_budget_allows
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_publication import stopped_at_publication
 from .delivery_questions import valid_blocking_questions
@@ -2137,8 +2137,9 @@ class DeliveryWorkflow:
 
     async def _resume_stopped(self, spec, recovery):
         if (recovery['execution_spec'] != spec
-                or recovery['maximum_iteration'] != (recovery['state']['iteration']
-                    + recovery['command']['additional_iterations'])):
+                or recovery['maximum_iteration'] != continuation_maximum(
+                    recovery['state']['iteration'], recovery['command']['additional_iterations'],
+                    recovery.get('pending_repair'))):
             raise ValueError('stopped resume changed its finite command authority')
         self.state = deepcopy(recovery['state'])
         self.state.update(phase='repair_preflight', execution_state='running', outcome=None,

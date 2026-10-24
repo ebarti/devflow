@@ -89,8 +89,9 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
                     with store._connect() as db:
                         attempts = [dict(item) for item in db.execute(
                             'SELECT * FROM delivery_attempts WHERE run_id=?', (run_id,))]
-                    arguments = ({'quarantined': checkpoint['quarantined_implementation']}
-                                 if checkpoint.get('quarantined_implementation') else {})
+                    quarantine = (checkpoint.get('quarantined_implementation')
+                                  or checkpoint.get('quarantined_cleanup'))
+                    arguments = {'quarantined': quarantine} if quarantine else {}
                     fresh = observe_completed_resources(spec, attempts, **arguments)
                     final = observe_finalized_resources(spec, **arguments)
                     if (fresh['journal_sha256'] != record['native_observation']['journal_sha256']
@@ -104,6 +105,7 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
             raise ValueError('cleanup reconciliation tracker changed before closure')
         updated = _close_cleanup(store, row, spec, closed, lambda: False, published=published,
             **({'closure': 'unpublished', 'closure_checkpoint': checkpoint,
-                'quarantined': checkpoint.get('quarantined_implementation')}
+                'quarantined': (checkpoint.get('quarantined_implementation')
+                                or checkpoint.get('quarantined_cleanup'))}
                if checkpoint else {}))
         return {**outcome, 'cleanup': updated['cleanup'], 'changed': True}

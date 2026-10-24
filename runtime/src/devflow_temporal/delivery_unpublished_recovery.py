@@ -108,7 +108,7 @@ def cleanup_checkpoint(store, row, spec, closed):
     """Post-intake custody is required before an unpublished claim can be released."""
     from .delivery_broker import DeliveryBroker
     from .delivery_policy_recovery import _rows, work_binding
-    from .delivery_stopped_resume import _implementation_receipt
+    from .delivery_stopped_resume import _implementation_receipt, pending_repair
 
     state = closed['result']
     current, attempts, effects, _claim = _rows(store, spec['run_id'])
@@ -125,8 +125,17 @@ def cleanup_checkpoint(store, row, spec, closed):
     matches = [item for item in attempts if item['role'] == 'implement'
                and item['iteration'] == latest.get('iteration')]
     candidate = DeliveryBroker(store, spec).candidate()
-    quarantine = quarantined_implementation(spec, state, attempts, candidate)
-    if not quarantine and (len(matches) != 1
+    previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    history = quarantine_history(previous)
+    with store._connect() as db:
+        pending = pending_repair({'predecessor_spec': spec, 'state': state,
+            'attempts': attempts, 'effects': effects, 'candidate': candidate,
+            'original_recovery': previous, 'session_id': None}, db=db)
+    retained = pending and pending.get('kind') == 'unstarted_preflight'
+    quarantine = None if retained else quarantined_implementation(spec, state, attempts, candidate)
+    if retained and digest(latest) not in {proof['closed_role_sha256'] for proof in history}:
+        raise ValueError('unstarted preflight has no exact historical unknown-role receipt')
+    if not (quarantine or retained) and (len(matches) != 1
             or matches[0]['state'] != 'finished' or matches[0]['cleanup'] != 'confirmed'
             or latest.get('cleanup') != 'confirmed'
             or not _implementation_receipt(spec, latest, matches[0])
@@ -140,7 +149,10 @@ def cleanup_checkpoint(store, row, spec, closed):
             raise ValueError('unpublished cleanup lost its current issue or own claim')
     return {'work_binding': binding, 'candidate': candidate,
             'attempts_sha256': digest(attempts), 'effects_sha256': digest(effects),
-            **({'quarantined_implementation': quarantine} if quarantine else {})}
+            **({'quarantined_implementation': quarantine} if quarantine else {}),
+            **({'historical_quarantines': history,
+                'quarantined_cleanup': teardown_checkpoint(history),
+                'pending_preflight': pending} if retained else {})}
 
 
 def quarantine_history(previous):

@@ -24,3 +24,14 @@ def fixed_budget_allows(spec, iteration, iterations, *, pending=False):
             and (iterations in allowed or (iterations == 0 and pending))
             and type(maximum) is int and maximum >= 0
             and iteration + iterations <= maximum)
+
+
+def continuation_maximum(iteration, additional, pending=None):
+    """A pre-role preflight retry retains its exact existing finite ceiling."""
+    if pending and pending.get('kind') == 'unstarted_preflight':
+        maximum = pending.get('maximum_iteration')
+        if (additional != 0 or type(maximum) is not int
+                or pending.get('iteration') != iteration + 1 or maximum < iteration + 1):
+            return None
+        return maximum
+    return iteration + additional

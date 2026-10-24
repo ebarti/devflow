@@ -10,7 +10,7 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_baseline_contract import preparation_failure, repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
-from .delivery_budget_contract import fixed_budget_allows
+from .delivery_budget_contract import continuation_maximum, fixed_budget_allows
 from .delivery_config import scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
 from .delivery_gate_retry import prepare_runtime, transient_stop
@@ -216,6 +216,45 @@ def sealed_ci_findings(seal):
     return _ci_diagnostics(ci, seal['predecessor_spec'], state.get('pull_request'))
 
 
+def _unstarted_preflight(seal, previous, db):
+    """The admitted quarantined continuation closed before entering its new turn."""
+    inherited = previous.get('pending_repair') or {}
+    if not (previous.get('quarantined_implementation')
+            or inherited.get('kind') == 'unstarted_preflight'):
+        return None
+    spec, state, before = seal['predecessor_spec'], seal['state'], previous['state']
+    failure = state.get('checks', {}).get('failure') or {}
+    if (spec.get('provider') != 'codex' or spec.get('feature_worker')
+            or spec.get('retry_budget_version') != 1
+            or state.get('phase') != state.get('outcome') or state.get('phase') != 'blocked'
+            or state.get('execution_state') != 'blocked'
+            or state.get('cleanup') not in {'unknown', 'confirmed'}
+            or state.get('error') != 'repair authority preflight failed: ActivityError'
+            or failure != {'classification': 'terminal', 'stage': 'repair_preflight',
+                           'reason': state['error']}):
+        return None
+    ignored = {'failure', 'controller_failure', 'resource_cleanup', 'terminal_tracker_checkpoint'}
+    if (custody(db, seal['original_recovery']) != spec
+            or previous['execution_spec'] != spec or state['iteration'] != before['iteration']
+            or state.get('roles') != before.get('roles')
+            or state.get('usage') != before.get('usage')
+            or seal['attempts'] != previous['attempts'] or seal['effects'] != previous['effects']
+            or seal.get('session_id') is not None or previous.get('session_id') is not None
+            or seal['candidate'] != state.get('candidate')
+            or seal['candidate'] != previous['execution_candidate']
+            or state.get('pull_request') is not None
+            or any(a['iteration'] > state['iteration'] for a in seal['attempts'])
+            or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed'
+                   for a in seal['attempts'])
+            or any(e['state'] != 'complete' or e['observed_json'] is None for e in seal['effects'])
+            or {k: v for k, v in state.get('checks', {}).items() if k not in ignored}
+            != {k: v for k, v in before.get('checks', {}).items() if k not in ignored}):
+        raise ValueError('unstarted preflight lost its exact admission or unchanged inventory')
+    return {'kind': 'unstarted_preflight', 'iteration': state['iteration'] + 1,
+            'findings': [], 'maximum_iteration': previous['maximum_iteration'],
+            'predecessor_admission_sha256': digest(seal['original_recovery'])}
+
+
 def pending_repair(seal, *, db=None):
     """Recover unexecuted work from the sealed admission that requested it."""
     from .delivery_feature_revision_recovery import retained_recovery
@@ -224,6 +263,10 @@ def pending_repair(seal, *, db=None):
     if (previous.get('kind') != KIND
             or seal['predecessor_spec'].get('feature_worker', {}).get('kind') == 'build'):
         return None
+    if db is not None:
+        preflight = _unstarted_preflight(seal, previous, db)
+        if preflight is not None:
+            return preflight
     if not seal.get('session_custody', {}).get('missing_rollout'):
         if db is None or not _unstarted_repair(seal, previous, db):
             return None
@@ -618,14 +661,23 @@ def executed_specs(store, spec):
         recovery = details.get('original_recovery')
 
 
-def observed_native_cleanup(spec, *, read_only=False, quarantined=None):
+def observed_native_cleanup(spec, *, read_only=False, quarantined=None, resource_spec=None):
     """Preflight and readback observe closure without controlling any process."""
     if spec['provider'] == 'fake':
         return digest({'provider': 'fake'})
     if quarantined:
-        from .delivery_resources import observe_finalized_resources
+        from .delivery_resources import _gate_roots, observe_finalized_resources
 
-        return digest(observe_finalized_resources(spec, quarantined=quarantined))
+        current = resource_spec or spec
+        bindings = {}
+        authority = _gate_roots(current, execution_specs=bindings)
+        if spec not in bindings.values():
+            raise ValueError('historical cleanup lost its admitted execution')
+        observed = observe_finalized_resources(current, quarantined=quarantined)
+        after = {}
+        if (_gate_roots(current, execution_specs=after) != authority or after != bindings):
+            raise ValueError('historical cleanup resource authority changed during observation')
+        return digest(observed)
     return digest(_stopped_cleanup(spec, read_only=True) if read_only else _stopped_cleanup(spec))
 
 
@@ -666,8 +718,9 @@ def custody(db, recovery, *, retained_memo=None):
             or json.loads(command[1]).get('admission_sha256') != digest(recovery)
             or canonical_json(read_private(path)) != canonical_json(recovery)
             or recovery['predecessor_result_digest'] != digest(details['state'])
-            or recovery['maximum_iteration'] != (recovery['state']['iteration']
-                                                 + recovery['command']['additional_iterations'])):
+            or recovery['maximum_iteration'] != continuation_maximum(
+                recovery['state']['iteration'], recovery['command']['additional_iterations'],
+                recovery.get('pending_repair'))):
         raise ValueError('stopped resume lost its immutable command authority')
     if (('pending_repair' in recovery
              and pending_repair(details, db=db) != recovery['pending_repair'])
@@ -871,8 +924,11 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
+    retained_unknown = (latest is not None and pending
+        and pending.get('kind') == 'unstarted_preflight'
+        and digest(latest) in {p['closed_role_sha256'] for p in historical_quarantines})
     if latest and latest.get('status') != 'pass':
-        if ((latest.get('cleanup') != 'confirmed' and not quarantined)
+        if ((latest.get('cleanup') != 'confirmed' and not (quarantined or retained_unknown))
                 or (latest.get('candidate') != candidate
                     and not _historical_candidate(
                         broker, state, candidate, latest, recovery, pending))):
@@ -889,11 +945,11 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
                                    and a['iteration'] == latest['iteration'] for a in attempts))
         # A closed Temporal activity authenticates controller-only preparation failures.
         # Every provider or supervisor prelaunch receipt must also match its durable attempt.
-        if len(matches) != 1 and not no_provider and not quarantined:
+        if len(matches) != 1 and not no_provider and not (quarantined or retained_unknown):
             raise ValueError('blocked implementation lacks its exact supervisor receipt')
         if latest.get('session_id') is None and not no_provider and (
                 latest.get('finish_reason') != 'prelaunch'
-                and not (missing_rollout or input_rejection or quarantined)):
+                and not (missing_rollout or input_rejection or quarantined or retained_unknown)):
             raise ValueError('blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
         raise ValueError('stopped candidate changed after its sealed checkpoint')
@@ -1023,11 +1079,6 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     )
 
     history = quarantine_history(previous)
-    quarantined = quarantined_implementation(spec, state, attempts, broker.candidate())
-    teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
-    if quarantined and (previous or not reconciled
-            or reconciled.get('quarantined_implementation') != quarantined):
-        raise ValueError('interrupted implementation lacks its separate owned cleanup closure')
     session_custody = implementation_custody(spec, state, attempts, retained_recovery(previous))
     implementations = [role for role in state.get('roles', []) if role.get('role') == 'implement']
     sessions = {role['session_id'] for role in implementations if role.get('session_id')}
@@ -1037,6 +1088,13 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
                     **({'session_custody': session_custody} if session_custody else {})}
     with store._connect() as db:
         pending = pending_repair(pending_seal, db=db)
+    retained = pending and pending.get('kind') == 'unstarted_preflight'
+    quarantined = (None if retained else
+                   quarantined_implementation(spec, state, attempts, broker.candidate()))
+    teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
+    if quarantined and (previous or not reconciled
+            or reconciled.get('quarantined_implementation') != quarantined):
+        raise ValueError('interrupted implementation lacks its separate owned cleanup closure')
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
         input_rejection=(session_custody or {}).get('input_rejection'),
@@ -1124,7 +1182,10 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                          'or an interrupted iteration')
     if seal.get('quarantined_implementation') and command['additional_iterations'] == 0:
         raise ValueError('unknown implementation requires a separately authorized new iteration')
-    maximum = seal['state']['iteration'] + command['additional_iterations']
+    maximum = continuation_maximum(seal['state']['iteration'],
+                                   command['additional_iterations'], pending)
+    if maximum is None:
+        raise ValueError('unstarted preflight retains only its existing finite ceiling')
     credit = None
     if _revision is not None:
         from .delivery_feature_execution import registry
@@ -1324,8 +1385,9 @@ def readback(store, spec, recovery):
                 or spec.get('implementation_role_home_generation') is not None):
             raise ValueError('quarantined implementation changed before its new finite turn')
     teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
-    if observed_native_cleanup(predecessor, **(
-            {'quarantined': teardown} if teardown else {})) != details['cleanup_digest']:
+    cleanup = observed_native_cleanup(predecessor, **(
+        {'quarantined': teardown, 'resource_spec': spec} if teardown else {}))
+    if cleanup != details['cleanup_digest']:
         raise ValueError('stopped predecessor process ownership changed')
     broker = DeliveryBroker(store, spec)
     if broker.candidate() != recovery['execution_candidate']:
