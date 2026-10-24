@@ -1040,6 +1040,10 @@ def apply(config, supplied):
                 "this installation location was rolled back; apply cannot reactivate it"
             )
         if active:
+            if not same_destination(
+                receipt["destination"], destination(receipt["runs"][0]["original_spec"])
+            ):
+                raise ValueError("acknowledged installation object changed before replay")
             validate(receipt["registrations"], after=True, objects=receipt["installed_objects"])
             _pointer(config.state_root / "runtime-installations/current.json", reference)
             pending_path = config.state_root / "runtime-installations/pending.json"

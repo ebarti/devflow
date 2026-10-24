@@ -104,9 +104,9 @@ def live_owner(spec, *, db=None):
         live = DeliveryConfig._from_raw(frozen.path, json.loads(raw))
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise ValueError("canonical live operational owner is unavailable or changed") from exc
-    same = {
-        k: v for k, v in live.raw.items() if k != "capacity"
-    } == {k: v for k, v in frozen.raw.items() if k != "capacity"}
+    same = {k: v for k, v in live.raw.items() if k != "capacity"} == {
+        k: v for k, v in frozen.raw.items() if k != "capacity"
+    }
     if not same:
         from .delivery_runtime_location import compatible_owner
 
@@ -145,6 +145,11 @@ def supervisor_config(store, spec):
     """A private execution file cannot appoint itself scheduling owner."""
     _original, owner = submitted_owner(spec)
     if Path(spec["config_path"]) == owner.path:
+        if (owner.state_root / "runtime-installations/current.json").exists():
+            # Frozen original-owner executions retain their old policy path and
+            # capacity. An acknowledged installation delta must still schedule
+            # against the independently authenticated live operational owner.
+            return live_owner(spec)[0]
         return operational_config(store.config)
     frozen = load_execution_config(spec)
     if store.config.path != frozen.path or digest(store.config.raw) != spec["config_digest"]:

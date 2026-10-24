@@ -231,27 +231,28 @@ def registrations(root, config):
     return cli
 
 
-def auxiliary(store):
+def auxiliary(store, index):
     """Second real admission proves a multi-run ACK rather than a one-row stub."""
     from test_delivery_blocked_scope import prepared_spec
 
     from devflow_temporal.delivery_native_preparation import bind_native_spec, native_identity
 
+    run_id = "run-" + str(index)
     request = {
-        "command_id": "second-command",
-        "run_id": "run-2",
-        "work_id": "work-2",
-        "issue_url": "https://github.com/example/fixture/issues/4",
+        "command_id": "retained-command-" + str(index),
+        "run_id": run_id,
+        "work_id": "work-" + str(index),
+        "issue_url": "https://github.com/example/fixture/issues/" + str(index + 2),
         "repository_key": "fixture",
         "goal": "Owned second stopped delivery",
         "accepted_plan": "Retain the original source.",
         "base_ref": "HEAD",
-        "branch": "feat/second",
+        "branch": "feat/retained-" + str(index),
         "authorized_endpoint": "published_unmerged",
     }
     store.submit(request)
-    store.mark_start("run-2", accepted=True)
-    spec = store.effective_spec("run-2")
+    store.mark_start(run_id, accepted=True)
+    spec = store.effective_spec(run_id)
     DeliveryBroker(store, spec).prepare()
     identity = native_identity(spec)
     proof = (
@@ -264,11 +265,11 @@ def auxiliary(store):
     )
     with store._connect() as db:
         db.execute(
-            "UPDATE delivery_runs SET request_json=? WHERE run_id='run-2'", (canonical_json(spec),)
+            "UPDATE delivery_runs SET request_json=? WHERE run_id=?", (canonical_json(spec), run_id)
         )
     receipt = RunResources(spec).finalize("blocked")
     state = {
-        "run_id": "run-2",
+        "run_id": run_id,
         "phase": "blocked",
         "execution_state": "blocked",
         "outcome": "blocked",
@@ -284,7 +285,7 @@ def auxiliary(store):
         "usage": {},
     }
     store.project(
-        "run-2",
+        run_id,
         phase="blocked",
         execution_state="blocked",
         outcome="blocked",
@@ -318,7 +319,8 @@ def seed(root, kind):
         )
     finally:
         sys.executable = saved
-    auxiliary(case.store)
+    for index in range(2, 7):
+        auxiliary(case.store, index)
     cut_operational_capacity(case)
     if kind.startswith("stale"):
         from test_delivery_blocked_scope import rewrite_assessment, rewrite_observation
@@ -547,6 +549,116 @@ def scoped_external_boundaries(case, patch):
     patch.setattr(delivery_automatic_retry, "_tracker_sync", tracker)
 
 
+def crash_apply(root, kind):
+    """Kill an owned public invocation at exact durable/effect boundaries."""
+    import argparse
+
+    from devflow_temporal import delivery_control
+    from devflow_temporal import delivery_runtime_installation as installation
+    from devflow_temporal import delivery_runtime_registrations as registrations
+
+    case = restored(root)
+    if kind == "swap":
+        original = registrations._exchange
+
+        def exchange(left, right):
+            original(left, right)
+            if Path(right).name == "devflow":
+                os._exit(71)
+
+        registrations._exchange = exchange
+    else:
+        original = installation._pointer
+
+        def pointer(path, value, **kwargs):
+            if path.name == "current.json":
+                os._exit(72)
+            return original(path, value, **kwargs)
+
+        installation._pointer = pointer
+    delivery_control._run(
+        argparse.Namespace(
+            config=case.owner,
+            command="adopt-runtime-location",
+            request=Path(case.owner).parent
+            / "service-state/operator-inputs/permanent-request.json",
+        ),
+        argparse.ArgumentParser(),
+    )
+
+
+def cohort_faults(root, config, request, rows):
+    import sqlite3
+
+    from devflow_temporal import delivery_runtime_location as location
+
+    with sqlite3.connect(config.tracking_db) as db:
+        db.execute(
+            "CREATE TRIGGER owned_partial_intent BEFORE INSERT ON delivery_commands "
+            "WHEN NEW.run_id='run-6' AND NEW.command_id LIKE 'runtime-location-intent-%' "
+            "BEGIN SELECT RAISE(ABORT,'Owned cohort crash'); END"
+        )
+    control(config, "adopt-runtime-location", request, success=False)
+    assert original_rows(config) == rows
+    with sqlite3.connect(config.tracking_db) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE type IN (?,?)",
+                (location.PENDING, location.KIND),
+            ).fetchone()[0]
+            == 0
+        )
+        db.execute("DROP TRIGGER owned_partial_intent")
+    with pytest.raises(ValueError, match="installation is incomplete"):
+        DeliveryStore(config)
+    # The exact immutable receipt and six-row pending transaction survive a
+    # process death immediately after the first actual atomic file exchange.
+    for mode, code in (("swap", 71), ("ack", 72)):
+        result = subprocess.run(
+            [sys.executable, "-I", __file__, "crash", str(root), mode],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == code, result.stdout[-1000:] + result.stderr[-5000:]
+        assert original_rows(config) == rows
+        pending = config.state_root / "runtime-installations/pending.json"
+        assert pending.is_file()
+        with sqlite3.connect(config.tracking_db) as db:
+            assert (
+                db.execute(
+                    "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.PENDING,)
+                ).fetchone()[0]
+                == 6
+            )
+            assert db.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.KIND,)
+            ).fetchone()[0] == (6 if mode == "ack" else 0)
+        if mode == "swap":
+            pending.unlink()  # File loss cannot erase the durable pending fence.
+        with pytest.raises(ValueError, match="installation is incomplete"):
+            DeliveryStore(DeliveryConfig.load(config.path))
+
+
+def reject_partial_membership(config):
+    import sqlite3
+
+    from devflow_temporal import delivery_runtime_location as location
+
+    receipt = location._acknowledged(config)
+    key = location.command_id(receipt, "run-6")
+    with sqlite3.connect(config.tracking_db) as db:
+        saved = db.execute("SELECT * FROM delivery_commands WHERE command_id=?", (key,)).fetchone()
+        db.execute("DELETE FROM delivery_commands WHERE command_id=?", (key,))
+    try:
+        assert location._acknowledged(config) is None
+        with pytest.raises(ValueError, match="not completely acknowledged"):
+            DeliveryStore(config)
+    finally:
+        with sqlite3.connect(config.tracking_db) as db:
+            db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)", saved)
+
+
 def exercise(root, kind):
     from test_delivery_temporal_prerequisites import native_check_ready
 
@@ -588,7 +700,7 @@ def exercise(root, kind):
             "tree": git(SOURCE, "rev-parse", "HEAD^{tree}"),
             "payload_sha256": payload_digest(SOURCE / "runtime/src/devflow_temporal"),
         },
-        "runs": ["run-1", "run-2"],
+        "runs": ["run-" + str(index) for index in range(1, 7)],
         "host_home": str(Path.home()),
         "host_cli": case.cli,
         "host_cli_sha256": hashlib.sha256(Path(case.cli).read_bytes()).hexdigest(),
@@ -606,6 +718,8 @@ def exercise(root, kind):
     )
     supplied["expected_evidence_sha256"] = preflight["expected_evidence_sha256"]
     write_private(request, supplied)
+    if kind == "scope":
+        cohort_faults(root, config, request, rows)
     # The old ProjectSync module can write unrelated tracker data even while the
     # new controller sees the pending fence; it has never learned this fence.
     import threading
@@ -631,7 +745,7 @@ def exercise(root, kind):
                         count = db.execute(
                             "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.PENDING,)
                         ).fetchone()[0]
-                        if count == 2:
+                        if count == 6:
                             with pytest.raises(ValueError, match="installation is incomplete"):
                                 DeliveryStore(config)
                             module.record(
@@ -669,6 +783,7 @@ def exercise(root, kind):
     assert compatible and not errors, errors
     assert result["state"] == "acknowledged" and original_rows(config) == rows
     assert location._acknowledged(DeliveryConfig.load(config.path))
+    reject_partial_membership(DeliveryConfig.load(config.path))
     control(config, "adopt-runtime-location", request)
     case.store = DeliveryStore(DeliveryConfig.load(config.path))
     case.broker = DeliveryBroker(case.store, case.spec)
@@ -753,7 +868,7 @@ def exercise(root, kind):
             {
                 "old_runtime_absent": True,
                 "ack_row_unchanged": True,
-                "cohort_size": 2,
+                "cohort_size": 6,
                 "strict_bundle": True,
                 "finite_maximum": 4,
                 "native_preparation": "actual",
@@ -769,5 +884,5 @@ def exercise(root, kind):
 
 if __name__ == "__main__":
     phase, raw_root, scenario = sys.argv[1:]
-    selected = seed if phase == "seed" else exercise
+    selected = {"seed": seed, "exercise": exercise, "crash": crash_apply}[phase]
     selected(Path(raw_root), scenario)

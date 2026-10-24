@@ -19,6 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 BASE = "1ebfc71ea5522ee74dbf6cd820f01649e3197bca"
 SCENARIO = Path(__file__).with_name("runtime_location_scenario.py")
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS installation")
 
 
 def command(argv, *, cwd=None, env=None, timeout=180):
@@ -35,6 +36,16 @@ def installed_pair(tmp_path_factory):
         "Commit the isolated candidate before testing actual installed-source authority"
     )
     root = tmp_path_factory.mktemp("location")
+    python = Path(
+        os.environ.get(
+            "DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON",
+            str(
+                Path.home()
+                / ".local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12"
+            ),
+        )
+    )
+    assert python.is_file(), "provide the original frozen native interpreter for this owner test"
     home = root / "home"
     old = home / ".codex/worktrees/owned/developer-workflow"
     new = home / ".local/share/devflow/developer-workflow"
@@ -60,11 +71,11 @@ def installed_pair(tmp_path_factory):
         command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", ROOT, target])
         command(["git", "-C", target, "checkout", "--quiet", "--detach", revision])
         command(
-            ["uv", "sync", "--frozen", "--offline", "--python", Path(sys.executable).resolve()],
+            ["uv", "sync", "--frozen", "--offline", "--python", python],
             cwd=target / "runtime",
             env=environment,
         )
-    return root, old, new, environment
+    return root, old, new, environment, python
 
 
 @pytest.mark.asyncio
@@ -72,13 +83,13 @@ def installed_pair(tmp_path_factory):
 async def test_public_permanent_location_owner_and_continuation(installed_pair, kind):
     from temporal_test_server import local_temporal
 
-    root, old_template, new, environment = installed_pair
+    root, old_template, new, environment, python = installed_pair
     # Each retained run has a distinct original managed location and owner. The
     # fixed permanent runtime stays the same; no live or host directory is used.
     old = root / "home/.codex/worktrees" / kind / "developer-workflow"
     command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", old_template, old])
     command(
-        ["uv", "sync", "--frozen", "--offline", "--python", Path(sys.executable).resolve()],
+        ["uv", "sync", "--frozen", "--offline", "--python", python],
         cwd=old / "runtime",
         env=environment,
     )
@@ -101,7 +112,7 @@ async def test_public_permanent_location_owner_and_continuation(installed_pair, 
     result = json.loads(output.splitlines()[-1])
     assert result["old_runtime_absent"] is True
     assert result["ack_row_unchanged"] is True
-    assert result["cohort_size"] == 2
+    assert result["cohort_size"] == 6
     assert result["strict_bundle"] is True
     assert result["finite_maximum"] == 4
     assert result["native_preparation"] == "actual"

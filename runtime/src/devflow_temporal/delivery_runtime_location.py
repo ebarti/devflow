@@ -327,7 +327,9 @@ def require_execution_location(spec):
     owner = _owner_config(spec)
     historical = _acknowledged(owner, historical=True)
     if historical is None:
-        return
+        raise ValueError("installed location cohort is not completely acknowledged")
+    if _acknowledged(owner) is None:
+        raise ValueError("installed location permission was rolled back")
     item = next((value for value in historical["runs"] if value["run_id"] == spec["run_id"]), None)
     if item is None:
         return  # A new registration has its own strict current native proof.
@@ -405,6 +407,11 @@ def helper_path(config, *, read_only=False):
     if receipt is None and read_only:
         receipt = _acknowledged(config, historical=True)
     if receipt is None:
+        if (
+            os.path.lexists(config.state_root / "runtime-installations/current.json")
+            and _acknowledged(config, historical=True) is None
+        ):
+            raise ValueError("installed helper cohort is not completely acknowledged")
         return config.helpers_dir / "state.py"
     if str(config.helpers_dir) != receipt["helpers_dir"]:
         raise ValueError("installation helper registration differs from original authority")
@@ -463,6 +470,8 @@ def require_ready(config):
     value = json.loads(private_bytes(pending)) if has_pending else None
     receipt = _acknowledged(config)
     if receipt is None and not has_pending:
+        if _acknowledged(config, historical=True) is None:
+            raise ValueError("installed runtime cohort is not completely acknowledged")
         return  # Rollback restored old registrations, not a healthy absent runtime.
     if receipt is None or (value and receipt["command"]["command_id"] != value["command_id"]):
         raise ValueError("runtime installation is incomplete; replay its public apply or rollback")
@@ -470,7 +479,21 @@ def require_ready(config):
     if has_pending and hashlib.sha256(raw).hexdigest() != receipt["owner_after_sha256"]:
         raise ValueError("acknowledged runtime owner configuration is not installed")
     if str(config.path) == receipt["owner_path"] and digest(config.raw) != digest(json.loads(raw)):
-        raise ValueError("operational installation configuration changed during bootstrap")
+        from .delivery_config import DeliveryConfig
+
+        live = DeliveryConfig._from_raw(config.path, json.loads(raw))
+        previous = next(
+            (
+                spec
+                for item in receipt["runs"]
+                for spec in item["historical_specs"]
+                if spec["config_path"] == str(config.path)
+                and spec["config_digest"] == digest(config.raw)
+            ),
+            None,
+        )
+        if previous is None or not compatible_owner(previous, config, live):
+            raise ValueError("operational installation configuration changed during bootstrap")
     validate_destination(
         receipt["destination"], receipt["runs"][0]["original_spec"], strict_source=False
     )
