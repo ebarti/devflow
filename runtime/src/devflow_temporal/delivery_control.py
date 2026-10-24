@@ -878,6 +878,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         parser.error("worker deployment options apply only to start or worker")
     read_commands = {"merge-preflight",
         "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
+        "filesystem-custody-preflight",
     }
     if args.command in read_commands | {"status", "token", "disable-limits"}:
         config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))

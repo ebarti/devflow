@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -456,30 +457,62 @@ def preflight(store, run_id):
         }
 
 
+def _publish_exclusive(stage, path):
+    """Atomically rename without replacement and without a two-hard-link window."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = libc.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        result = rename(os.fsencode(stage), os.fsencode(path), 0x00000004)  # RENAME_EXCL
+    elif sys.platform == "linux" and hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        result = rename(-100, os.fsencode(stage), -100, os.fsencode(path), 1)  # NOREPLACE
+    else:
+        raise ValueError("atomic exclusive custody publication is unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), str(path))
+        raise OSError(error, os.strerror(error), str(path))
+
+
 def _immutable(path, raw):
     from .delivery_resources import private_directory, read_private
 
     private_directory(path.parent)
     descriptor, name = tempfile.mkstemp(prefix=".custody-", dir=path.parent)
     stage = Path(name)
+    staged_identity = _raw(os.fstat(descriptor))
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
+        if _raw(stage.lstat()) != staged_identity:
+            raise ValueError("filesystem custody staging object changed before publication")
         try:
-            os.link(stage, path, follow_symlinks=False)
+            _publish_exclusive(stage, path)
         except FileExistsError:
             if read_private(path, raw=True) != raw:
                 raise ValueError("filesystem custody immutable receipt conflicts") from None
-        stage.unlink()
+        if read_private(path, raw=True) != raw:
+            raise ValueError("filesystem custody published object changed")
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
     finally:
-        if stage.exists():
+        if os.path.lexists(stage):
+            if _raw(stage.lstat()) != staged_identity:
+                raise ValueError("filesystem custody staging object changed before removal")
             stage.unlink()
 
 

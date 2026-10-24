@@ -7,6 +7,8 @@ import fcntl
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -368,14 +370,16 @@ def test_adopted_identity_cannot_bypass_boot_or_volume_fence_when_old_device_is_
 
 def test_incomplete_archive_publication_has_no_final_path_and_retry_is_safe(tmp_path, monkeypatch):
     path = tmp_path / "archive/original.json"
-    link = os.link
+    publish = custody._publish_exclusive
     monkeypatch.setattr(
-        os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("lost before atomic publication"))
+        custody,
+        "_publish_exclusive",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("lost before atomic publication")),
     )
     with pytest.raises(OSError, match="atomic publication"):
         custody._immutable(path, b'{"complete": true}\n')
     assert not path.exists()
-    monkeypatch.setattr(os, "link", link)
+    monkeypatch.setattr(custody, "_publish_exclusive", publish)
     custody._immutable(path, b'{"complete": true}\n')
     assert path.read_bytes() == b'{"complete": true}\n'
 
@@ -431,11 +435,83 @@ def test_public_preflight_store_cannot_publish_configuration_or_write_database(r
 
     case = reboot
     before = case.config.tracking_db.read_bytes()
-    monkeypatch.setattr(delivery_store, 'preserve_execution_config',
-                        lambda *a: pytest.fail('read-only snapshot publication'))
+    monkeypatch.setattr(
+        delivery_store,
+        "preserve_execution_config",
+        lambda *a: pytest.fail("read-only snapshot publication"),
+    )
     reader = DeliveryStore(case.config, read_only=True)
     with reader._connect() as db:
-        assert db.execute('SELECT run_id FROM delivery_runs').fetchone()[0] == case.spec['run_id']
-        with pytest.raises(sqlite3.OperationalError, match='readonly'):
+        assert db.execute("SELECT run_id FROM delivery_runs").fetchone()[0] == case.spec["run_id"]
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
             db.execute("UPDATE delivery_runs SET phase='blocked'")
+    assert case.config.tracking_db.read_bytes() == before
+
+
+def test_process_loss_after_atomic_publication_leaves_single_link_and_exact_retry(tmp_path):
+    path = tmp_path / "archive/original.json"
+    script = """
+import os, sys
+from pathlib import Path
+from devflow_temporal import delivery_filesystem_custody as custody
+publish = custody._publish_exclusive
+
+def lose_after_publish(stage, path):
+    publish(stage, path)
+    os._exit(71)
+
+custody._publish_exclusive = lose_after_publish
+custody._immutable(Path(sys.argv[1]), b'{"complete": true}\\n')
+"""
+    result = subprocess.run([sys.executable, "-I", "-c", script, str(path)], timeout=10)
+    assert result.returncode == 71
+    assert path.stat().st_nlink == 1
+    raw = b'{"complete": true}\n'
+    assert path.read_bytes() == raw
+    custody._immutable(path, raw)
+    assert read_private(path, raw=True) == raw
+    assert not list(path.parent.glob(".custody-*"))
+
+
+def test_actual_cli_preflight_bootstrap_never_constructs_a_writable_store(
+    reboot,
+    monkeypatch,
+    capsys,
+):
+    from devflow_temporal import delivery_control, delivery_store
+
+    case = reboot
+    before = case.config.tracking_db.read_bytes()
+    monkeypatch.setattr(
+        delivery_store,
+        "_private_directory",
+        lambda *a: pytest.fail("writable store initialization"),
+    )
+    monkeypatch.setattr(
+        delivery_store,
+        "preserve_execution_config",
+        lambda *a: pytest.fail("configuration publication"),
+    )
+
+    def observe(reader, run_id):
+        assert reader.read_only is True
+        with reader._connect() as db:
+            assert db.execute("PRAGMA query_only").fetchone()[0] == 1
+            assert db.execute("SELECT run_id FROM delivery_runs").fetchone()[0] == run_id
+        return {"run_id": run_id, "observed": True}
+
+    monkeypatch.setattr(custody, "preflight", observe)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "devflow-delivery",
+            "--config",
+            str(case.config.path),
+            "filesystem-custody-preflight",
+            "--id",
+            case.spec["run_id"],
+        ],
+    )
+    delivery_control.main()
+    assert json.loads(capsys.readouterr().out)["observed"] is True
     assert case.config.tracking_db.read_bytes() == before
