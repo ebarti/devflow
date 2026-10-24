@@ -245,16 +245,26 @@ def _tracker_closed(spec, tracker):
     return tracker.get('state') == 'consistent' and tracker.get('pending') is False
 
 
-def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
+def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
+                   closure=None, quarantined=None, closure_checkpoint=None):
     """Keep historical failure immutable; record separately authenticated later cleanup.
 
     A published run keeps its branch and PR; only its native cleanup and claim
     are closed here, so its same-run continuations can be admitted.
     """
+    def checkpoint():
+        if closure_checkpoint is not None:
+            from .delivery_unpublished_recovery import cleanup_checkpoint
+
+            if cleanup_checkpoint(store, row, spec, closed) != closure_checkpoint:
+                raise ValueError('unpublished closure checkpoint changed')
+
+    checkpoint()
     attempts = _current(store, row, spec, stopped, published=published)
     execution = (store.effective_spec(spec['run_id']) if row['recovery_json']
                  else store.intake_execution_spec(spec['run_id']))
-    before = observe_completed_resources(execution, attempts)
+    observation_args = {"quarantined": quarantined} if quarantined else {}
+    before = observe_completed_resources(execution, attempts, **observation_args)
     if not published:
         unpublished(store, spec)
     if _current(store, row, spec, stopped, published=published) != attempts:
@@ -262,7 +272,7 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
     _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped,
                       published=published)
     receipt = RunResources(execution, read_only=True).finalize('blocked')
-    observed = observe_finalized_resources(execution)
+    observed = observe_finalized_resources(execution, **observation_args)
     if (not (receipt.get('state') == receipt.get('resource_cleanup') == 'confirmed')
             or receipt.get('process_cleanup') != 'observed-native-confirmed'
             or observed['finalization_sha256'] != receipt.get('receipt_sha256')
@@ -274,10 +284,12 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
         unpublished(store, spec)
     if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original attempts changed during publication readback')
+    checkpoint()
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
     if not _tracker_closed(execution, tracker):
         raise ValueError('terminal tracker closure remains unacknowledged')
+    checkpoint()
     checks = json.loads(row['checks_json'])
     with store._connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -289,15 +301,26 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
                     'SELECT * FROM delivery_attempts WHERE run_id=?',
                     (spec['run_id'],))] != attempts):
             raise ValueError('predecessor changed after terminal tracker acknowledgement')
+        if closure_checkpoint is not None:
+            from .delivery_policy_recovery import work_binding
+
+            if work_binding(store, spec, db) != closure_checkpoint['work_binding']:
+                raise ValueError('unpublished frozen work authority changed')
         # The old checks remain in the existing append-only event transaction.
-        store._event(db, spec['run_id'], row['revision'] + 1, 'resource_cleanup_reconciled',
-            'Owner retry maintenance independently confirmed later cleanup and claim closure',
-            {'original_checks': checks, 'closed_workflow': {
-                key: value for key, value in closed.items()
-                if key != 'result'}, 'original_result_digest': digest(closed['result']),
+        payload = {'original_checks': checks, 'closed_workflow': {
+                key: value for key, value in closed.items() if key != 'result'},
+             'original_result_digest': digest(closed['result']),
              'resource_cleanup': receipt, 'tracker': tracker,
              'original_attempts': attempts, 'native_observation': observed,
-             **({'closure': 'published'} if published else {})})
+             **({'closure': 'published'} if published else
+                {'closure': closure} if closure else {}),
+             **({'unpublished_checkpoint': closure_checkpoint} if closure_checkpoint else {}),
+             **({'quarantined_implementation': quarantined} if quarantined else {})}
+        if closure_checkpoint is not None:
+            payload['key'] = digest(payload)
+        store._event(db, spec['run_id'], row['revision'] + 1, 'resource_cleanup_reconciled',
+            'Owner retry maintenance independently confirmed later cleanup and claim closure',
+            payload)
         db.execute('UPDATE delivery_runs SET checks_json=?,cleanup=?,tracker_json=?,revision=? '
                    'WHERE run_id=?', (json.dumps({**checks, 'resource_cleanup': receipt}),
                     'confirmed', json.dumps(tracker), row['revision'] + 1, spec['run_id']))

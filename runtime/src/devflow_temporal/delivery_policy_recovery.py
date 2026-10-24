@@ -334,6 +334,32 @@ def _published_cleanup_chain(store, row, state, closed):
     return None
 
 
+
+def _unpublished_cleanup_binding(store, row, state, closed, record):
+    """A local custody closure binds one accepted unpublished Temporal execution."""
+    if not closed or closed.get('result') != state or row['pr_json'] is not None:
+        return False
+    keys = ('workflow_id', 'execution_run_id', 'closed_at', 'request_digest', 'recovery_digest')
+    receipt = record.get('resource_cleanup') or {}
+    if (record.get('closure') != 'unpublished'
+            or not all(closed.get(key) for key in keys[:-1])
+            or record.get('closed_workflow') != {key: closed.get(key) for key in keys}
+            or record.get('original_result_digest') != digest(state)
+            or record.get('key') != digest({k: v for k, v in record.items() if k != 'key'})
+            or receipt.get('state') != receipt.get('resource_cleanup')
+            or receipt.get('state') != 'confirmed'
+            or receipt.get('process_cleanup') != 'observed-native-confirmed'):
+        return False
+    from .delivery_unpublished_recovery import cleanup_checkpoint
+
+    with store._connect() as db:
+        if store.state.claim_for(db, row['work_id']) is not None:
+            return False
+    checkpoint = cleanup_checkpoint(store, row, store.effective_spec(row['run_id']), closed)
+    return (record.get('unpublished_checkpoint') == checkpoint
+            and record.get('quarantined_implementation')
+                == checkpoint.get('quarantined_implementation'))
+
 def reconciled_cleanup(store, row, state, *, closed=None):
     """The maintenance record that later confirmed this closed result's cleanup, if any.
 
@@ -354,7 +380,8 @@ def reconciled_cleanup(store, row, state, *, closed=None):
     direct = next((item for item in records
                  if ((item.get('closure') == 'published'
                       and item.get('original_result_digest') == digest(state))
-                     or (build and completed_cleanup_binding(item, closed, state)))
+                     or (build and completed_cleanup_binding(item, closed, state))
+                     or _unpublished_cleanup_binding(store, row, state, closed, item))
                  and item.get('resource_cleanup') == checks.get('resource_cleanup')
                  and item.get('tracker') == json.loads(row['tracker_json'] or '{}')), None)
     return direct or _published_cleanup_chain(store, row, state, closed)

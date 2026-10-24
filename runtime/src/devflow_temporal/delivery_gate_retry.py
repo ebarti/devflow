@@ -538,7 +538,7 @@ def snapshot(store, run_id, kind=KIND):
     browser_artifact_retry = kind == KIND and browser_artifact_possible(store, spec, row)
     attribution_retry = kind == KIND and eligible_stop(spec, state) and not browser_artifact_retry
     failure = state.get('checks', {}).get('failure') or {}
-    reconciled = reconciled_cleanup(store, row, state)
+    reconciled = reconciled_cleanup(store, row, state, closed=closed)
     state_checks, row_checks = closed_checks(row, state, reconciled)
     # A recorded gate verdict stands: a transport or controller stop after it is
     # never a fresh assessment of the same head.

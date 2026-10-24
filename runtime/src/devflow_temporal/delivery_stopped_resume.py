@@ -544,9 +544,12 @@ def interrupted_resume(seal):
         seal.get('cleanup_reconciliation'), seal.get('closed'), state))
     preparation = _interrupted_preparation(seal)
     assessments = _unlaunched_assessments(seal)
-    if ((not spec.get('feature_worker') and not assessments)
+    from .delivery_unpublished_recovery import interrupted_prepublication
+
+    prepublication = interrupted_prepublication(seal)
+    if ((not spec.get('feature_worker') and not assessments and not prepublication)
             or (state.get('phase') != 'cancelled' and not cleanup and not preparation
-                and not assessments)
+                and not assessments and not prepublication)
             or any(isinstance(check, dict) and check.get('state') == 'failed'
                    and name != preparation and not (assessments and name in {'review', 'qa'})
                    for name, check in state.get('checks', {}).items())):
@@ -615,10 +618,14 @@ def executed_specs(store, spec):
         recovery = details.get('original_recovery')
 
 
-def observed_native_cleanup(spec, *, read_only=False):
+def observed_native_cleanup(spec, *, read_only=False, quarantined=None):
     """Preflight and readback observe closure without controlling any process."""
     if spec['provider'] == 'fake':
         return digest({'provider': 'fake'})
+    if quarantined:
+        from .delivery_resources import observe_finalized_resources
+
+        return digest(observe_finalized_resources(spec, quarantined=quarantined))
     return digest(_stopped_cleanup(spec, read_only=True) if read_only else _stopped_cleanup(spec))
 
 
@@ -670,6 +677,22 @@ def custody(db, recovery, *, retained_memo=None):
         raise ValueError('stopped resume changed its unstarted repair authority')
     if not admission_identity_consistent(details):
         raise ValueError('stopped resume changed its admission identity')
+    from .delivery_unpublished_recovery import quarantine_history
+
+    if details.get('historical_quarantines', []) != quarantine_history(
+            details.get('original_recovery')):
+        raise ValueError('stopped resume changed its historical teardown custody')
+    quarantined = details.get('quarantined_implementation')
+    if quarantined:
+        from .delivery_unpublished_recovery import quarantined_implementation
+
+        if (details['command']['additional_iterations'] <= 0
+                or details.get('session_id') is not None or interrupted
+                or quarantined_implementation(details['predecessor_spec'], details['state'],
+                    details['attempts'], details['candidate']) != quarantined
+                or spec.get('role_home_generation') != 'stopped-resume-' + details['command_digest']
+                or spec.get('implementation_role_home_generation') is not None):
+            raise ValueError('quarantined implementation lost its new finite turn authority')
     if interrupted:
         reconciliation = details.get('cleanup_reconciliation')
         if reconciliation is not None and not any(json.loads(item[0]) == reconciliation
@@ -844,12 +867,12 @@ def _implementation_receipt(spec, role, attempt):
 
 
 def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection=None,
-               recovery=None, pending=None):
+               recovery=None, pending=None, quarantined=None, historical_quarantines=()):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
     if latest and latest.get('status') != 'pass':
-        if (latest.get('cleanup') != 'confirmed'
+        if ((latest.get('cleanup') != 'confirmed' and not quarantined)
                 or (latest.get('candidate') != candidate
                     and not _historical_candidate(
                         broker, state, candidate, latest, recovery, pending))):
@@ -866,15 +889,17 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
                                    and a['iteration'] == latest['iteration'] for a in attempts))
         # A closed Temporal activity authenticates controller-only preparation failures.
         # Every provider or supervisor prelaunch receipt must also match its durable attempt.
-        if len(matches) != 1 and not no_provider:
+        if len(matches) != 1 and not no_provider and not quarantined:
             raise ValueError('blocked implementation lacks its exact supervisor receipt')
         if latest.get('session_id') is None and not no_provider and (
                 latest.get('finish_reason') != 'prelaunch'
-                and not (missing_rollout or input_rejection)):
+                and not (missing_rollout or input_rejection or quarantined)):
             raise ValueError('blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
         raise ValueError('stopped candidate changed after its sealed checkpoint')
-    if (any(r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown'
+    if (any((r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown')
+            and not (quarantined and r is latest)
+            and digest(r) not in {p['closed_role_sha256'] for p in historical_quarantines}
             for r in state.get('roles', []))
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)):
         raise ValueError('stopped role ownership is unknown')
@@ -991,7 +1016,18 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
         broker.validate_candidate_scope()
     from .delivery_feature_revision_recovery import retained_recovery
     from .delivery_session_custody import implementation_custody
+    from .delivery_unpublished_recovery import (
+        quarantine_history,
+        quarantined_implementation,
+        teardown_checkpoint,
+    )
 
+    history = quarantine_history(previous)
+    quarantined = quarantined_implementation(spec, state, attempts, broker.candidate())
+    teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
+    if quarantined and (previous or not reconciled
+            or reconciled.get('quarantined_implementation') != quarantined):
+        raise ValueError('interrupted implementation lacks its separate owned cleanup closure')
     session_custody = implementation_custody(spec, state, attempts, retained_recovery(previous))
     implementations = [role for role in state.get('roles', []) if role.get('role') == 'implement']
     sessions = {role['session_id'] for role in implementations if role.get('session_id')}
@@ -1004,7 +1040,7 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
         input_rejection=(session_custody or {}).get('input_rejection'),
-        recovery=previous, pending=pending)
+        recovery=previous, pending=pending, quarantined=quarantined, historical_quarantines=history)
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
@@ -1022,10 +1058,13 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     return {'predecessor_spec': spec, 'row': row, 'attempts': attempts, 'effects': effects,
             'closed': closed, 'state': state, 'candidate': candidate, 'session_id': session,
             'publication': publication, 'original_recovery': previous,
-            **({'cleanup_reconciliation': reconciled}
-               if cleanup_only_build(spec, state) and reconciled else {}),
+            **({'cleanup_reconciliation': reconciled} if reconciled else {}),
+            **({'quarantined_implementation': quarantined} if quarantined else {}),
+            **({'historical_quarantines': history} if history else {}),
             'cleanup_digest': (observed_native_cleanup(spec, read_only=True) if review_subject
-                               else observed_native_cleanup(spec)), 'work_binding': binding,
+                               else observed_native_cleanup(spec, **(
+                                   {"quarantined": teardown} if teardown else {}))),
+            'work_binding': binding,
             **({'session_custody': session_custody} if session_custody else {})}
 
 
@@ -1083,6 +1122,8 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     if command['additional_iterations'] == 0 and not (pending or gate_only or interrupted):
         raise ValueError('zero additional iterations require an authenticated pending repair '
                          'or an interrupted iteration')
+    if seal.get('quarantined_implementation') and command['additional_iterations'] == 0:
+        raise ValueError('unknown implementation requires a separately authorized new iteration')
     maximum = seal['state']['iteration'] + command['additional_iterations']
     credit = None
     if _revision is not None:
@@ -1150,6 +1191,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             execution.pop('role_home_generation')
         if seal.get('session_custody'):
             execution['implementation_role_home_generation'] = seal['session_custody']['generation']
+        if seal.get('quarantined_implementation'):
+            # No old provider session is known. A new finite turn gets an isolated
+            # home and starts a new session; the original unknown turn stays sealed.
+            execution['role_home_generation'] = 'stopped-resume-' + command_digest
+            execution.pop('implementation_role_home_generation', None)
         # Admission identities belong to one admission; a predecessor's never carry over.
         for field in ('gate_admission', 'implement_admission'):
             execution.pop(field, None)
@@ -1261,7 +1307,25 @@ def readback(store, spec, recovery):
     if (not store.owns_execution(spec)
             or digest(load_execution_config(spec).raw) != spec['config_digest']):
         raise ValueError('stopped service configuration or owner changed')
-    if observed_native_cleanup(predecessor) != details['cleanup_digest']:
+    from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
+
+    history = quarantine_history(details.get('original_recovery'))
+    if details.get('historical_quarantines', []) != history:
+        raise ValueError('historical provider teardown changed before resume')
+    quarantined = details.get('quarantined_implementation')
+    if quarantined:
+        from .delivery_unpublished_recovery import quarantined_implementation
+
+        if (quarantined_implementation(predecessor, details['state'], details['attempts'],
+                                      details['candidate']) != quarantined
+                or recovery['session_id'] is not None
+                or spec.get('role_home_generation')
+                    != 'stopped-resume-' + recovery['command_digest']
+                or spec.get('implementation_role_home_generation') is not None):
+            raise ValueError('quarantined implementation changed before its new finite turn')
+    teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
+    if observed_native_cleanup(predecessor, **(
+            {'quarantined': teardown} if teardown else {})) != details['cleanup_digest']:
         raise ValueError('stopped predecessor process ownership changed')
     broker = DeliveryBroker(store, spec)
     if broker.candidate() != recovery['execution_candidate']:

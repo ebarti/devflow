@@ -1637,17 +1637,19 @@ class RunResources:
         return None
 
 
-def observe_finalized_resources(spec, *, unknown_allowed=False):
+def observe_finalized_resources(spec, *, unknown_allowed=False, quarantined=None):
     """Fresh read-only actor, port, lease and inode observation, never teardown."""
-    return _observe_resources(spec, unknown_allowed=unknown_allowed)
+    return _observe_resources(spec, unknown_allowed=unknown_allowed, quarantined=quarantined)
 
 
-def observe_completed_resources(spec, attempts):
+def observe_completed_resources(spec, attempts, *, quarantined=None):
     """Authenticate later blocked-run completion without changing historical finalization."""
-    return _observe_resources(spec, freshly_completed=True, attempts=attempts)
+    return _observe_resources(spec, freshly_completed=True, attempts=attempts,
+                              quarantined=quarantined)
 
 
-def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, attempts=()):
+def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, attempts=(),
+                       quarantined=None):
     registry = RunResources(spec, read_only=True)
     # Finalizers publish intermediate manifests under this same exclusive lease.
     # Authenticate one complete generation, including the returned raw-byte hashes.
@@ -1656,7 +1658,8 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
         registry._observation_gate_roots = None
         result = _observe_locked_resources(spec, registry, manifest, role_leases,
                                            unknown_allowed=unknown_allowed,
-                                           freshly_completed=freshly_completed, attempts=attempts)
+                                           freshly_completed=freshly_completed, attempts=attempts,
+                                           quarantined=quarantined)
         if (registry._observation_gate_roots is not None
                 and _gate_roots(spec) != registry._observation_gate_roots):
             raise ValueError("resource execution authority changed during observation")
@@ -1664,7 +1667,7 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
 
 
 def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_allowed=False,
-                              freshly_completed=False, attempts=()):
+                              freshly_completed=False, attempts=(), quarantined=None):
     state = Path(spec["state_dir"])
     _ancestors(state / "resources/manifest.json")
     manifest_path, final_path = (
@@ -1689,8 +1692,16 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         ))
     ):
         raise ValueError("predecessor process/root custody is unconfirmed")
-    from .delivery_native_process import listeners, lost_monitor_without_provider, process_table
+    from .delivery_native_process import (
+        interrupted_cleanup_proven,
+        listeners,
+        lost_monitor_without_provider,
+        process_table,
+    )
 
+    quarantine = (quarantined or {}).get("journal_sha256", {})
+    if not set(quarantine).issubset(manifest["processes"]):
+        raise ValueError("quarantined provider journal is no longer registered")
     table = process_table()
     journals, roots = {}, {}
     receipts = {item["journal"]: item for item in finalization.get("processes", [])}
@@ -1710,16 +1721,27 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         if not path.is_relative_to(state) or path.resolve(strict=True) != path:
             raise ValueError("predecessor journal escaped its original root")
         _ancestors(path)
-        value = read_private(path)
+        journal_bytes = read_private(path, raw=True)
+        value = json.loads(journal_bytes)
+        journal_sha256 = hashlib.sha256(journal_bytes).hexdigest()
         receipt = receipts[raw]
         # A lost monitor never completes monitoring. Only a role monitor lost
         # before GO or a lost gate monitor may substitute its bound teardown
         # proof (with the live actor and port checks below); a role attempt
         # whose provider ran keeps its unknown outcome.
         role_attempt = path.parent.parent == state / "attempts"
+        # This exception proves teardown only. The provider outcome and its
+        # unfinished monitoring remain unknown in every original record.
+        quarantined_role = (raw in quarantine
+            and journal_sha256 == quarantine[raw]
+            and role_attempt and interrupted_cleanup_proven(value)
+            and value.get("result", {}).get("provider_outcome") == "unknown")
+        if raw in quarantine and not quarantined_role:
+            raise ValueError("quarantined provider teardown binding changed")
         if not freshly_completed and (
             (receipt.get("monitoring_complete") is not True
-             and not lost_monitor_without_provider(value, role_attempt=role_attempt))
+             and not lost_monitor_without_provider(value, role_attempt=role_attempt)
+             and not quarantined_role)
             or receipt.get("owned_ports_clear") is not True
             or sorted(receipt.get("observed_pids", [])) != sorted(map(int, value.get("owned", {})))
         ):
@@ -1813,7 +1835,8 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         if (
             value.get("phase") != "finished"
             or (value.get("monitoring_complete") is not True
-                and not lost_monitor_without_provider(value, role_attempt=role_attempt))
+                and not lost_monitor_without_provider(value, role_attempt=role_attempt)
+                and not quarantined_role)
             or any(
                 table.get(int(pid), {}).get("identity") == actor["identity"]
                 and not table[int(pid)]["stat"].startswith("Z")
@@ -1822,7 +1845,9 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
             or any(listeners(port) for port in value.get("ports", []))
         ):
             raise ValueError("predecessor still has a live actor or port")
-        journals[raw] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if raw in quarantine and read_private(path, raw=True) != journal_bytes:
+            raise ValueError("quarantined provider journal changed during observation")
+        journals[raw] = journal_sha256
     for raw, entry in manifest["roots"].items():
         path = Path(raw)
         registry._allowed(path, entry["kind"], finalizing=True)
