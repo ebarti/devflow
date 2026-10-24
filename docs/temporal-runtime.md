@@ -139,6 +139,42 @@ For an ordinary published run stopped with `browser QA child cleanup is unknown`
 
 For an ordinary published run whose native roles have finished but whose resource cleanup remains unknown, `reconcile-attempt --id RUN --role cleanup --iteration N` authenticates the exact closed workflow and re-observes its native resources before closing its claim. It preserves the failed product verdict, dirty source, branch and PR. Pending effects, changed execution identity or live owned processes prevent closure. This observation grants no continuation or extra repair budget. Workspace dependency cleanup uses the declaration recorded when the runtime acquired custody, so permitted package script edits do not invalidate deletion of those same owned folders; replacement folders and symlinks remain protected.
 
+After a macOS reboot, legacy native/resource records may retain the same inode and
+owner while their mount device number changes. The local public CLI exposes
+`filesystem-custody-preflight --id RUN` and `adopt-filesystem-custody --id RUN --request FILE`,
+both with an explicit `--config CONFIG`; neither starts a service. Preflight returns
+`expected_revision` (the local projection revision), `expected_evidence_sha256`,
+the exact affected objects and current workflow identity. An explicitly authorized
+operator sends those two observed fields with a fresh stable `command_id` and
+`answer: "adopt_current_filesystem"`. Keep the complete request unchanged after an
+uncertain response.
+
+This grants current-object custody only. Legacy records have no historical volume
+UUID, so the receipt explicitly leaves historical volume continuity unproven. It
+archives original bytes and commits one immutable exact-path identity overlay in
+the existing command/event transaction. An unacknowledged file grants nothing.
+The grant requires only device-number drift, unchanged inode/owner, canonical
+owned paths, original registration kind/generation/source authority, acquired
+resource/attempt/native leases, stopped recorded PID/start identities and clear
+ports. Fresh source, evidence, run/attempt/claim and uncertain-effect checks fence
+publication. Current filesystem UUID and boot UUID must remain identical when
+the grant is consumed; replacing a path, changing generation or inspection failure
+cannot inherit it. New resource allocations still record real current identities.
+Original policy, plan, claims, provider verdicts, repair ceilings and external effects
+are untouched.
+
+An open ordinary workflow is eligible only with durably quarantined unknown
+attempts and no starting/running attempts or uncertain external effects. Adoption
+itself neither completes nor repeats an attempt. Follow it with the existing
+`reconcile-attempt --job-key KEY` for the exact quarantined attempt; its original
+waiting activity can consume the independently observed cleanup and stop normally.
+A lost provider monitor remains `recovery_unknown` with an unknown provider outcome,
+never a fabricated pass or recovered session. Cancellation is not a prerequisite.
+Read the resulting run and use only an admissible existing continuation; this
+operation grants no provider retry. For a closed published run whose roles are
+finished, the existing `reconcile-attempt --id RUN --role cleanup --iteration N`
+continues to own finalization and claim closure, including default workflow IDs.
+
 A confirmed removed dependency directory can bind a newly tracked declaration when the runtime recreates that directory. Renewal requires the old path to remain absent and its removal receipt to exist; live or replaced folders retain their original custody checks. A fixed-budget ordinary run that stopped before any provider attempt can continue its exact unstarted iteration with `additional_iterations: 0` after preflight authenticates unchanged source, session, effects and admission. An actual provider attempt makes the turn consumed, and this path cannot increase the original repair ceiling.
 
 An owner scope amendment also supports versioned directory scopes. It grants only the one or two named exact files. A protected prefix can be removed to expose such a file only when no pre-existing allowed root or file would acquire access under that prefix. Every other execution setting stays frozen.

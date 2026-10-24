@@ -837,6 +837,8 @@ _COMMANDS = (
     "amend-scope",
     "import-closure",
     "reconcile-attempt",
+    "filesystem-custody-preflight",
+    "adopt-filesystem-custody",
 )
 
 
@@ -897,6 +899,22 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("import-closure requires --id, --workflow-id and --history")
         print(json.dumps(_import_closure(config, args.id, args.workflow_id, args.history),
                          indent=2, sort_keys=True))
+        return
+    if args.command in {"filesystem-custody-preflight", "adopt-filesystem-custody"}:
+        from .delivery_filesystem_custody import adopt, preflight
+
+        if not args.id:
+            parser.error("--id is required for filesystem custody commands")
+        if args.command == "adopt-filesystem-custody" and not args.request:
+            parser.error("--request is required for explicit filesystem adoption")
+        try:
+            store = DeliveryStore(
+                config, read_only=args.command == "filesystem-custody-preflight")
+            result = (preflight(store, args.id) if args.command == "filesystem-custody-preflight"
+                      else adopt(store, args.id, json.loads(args.request.read_text())))
+        except (ValueError, OSError, RuntimeError) as exc:
+            parser.exit(1, f"devflow-delivery: {exc}\n")
+        print(json.dumps(result, sort_keys=True, indent=2))
         return
     if args.command == "reconcile-attempt":
         from .delivery_orphans import reconcile_attempt

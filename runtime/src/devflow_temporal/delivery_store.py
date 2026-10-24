@@ -84,9 +84,11 @@ def _private_directory(path: Path) -> None:
 
 
 class DeliveryStore:
-    def __init__(self, config: DeliveryConfig) -> None:
+    def __init__(self, config: DeliveryConfig, *, read_only: bool = False) -> None:
         self.config = config
-        _private_directory(config.state_root)
+        self.read_only = read_only
+        if not read_only:
+            _private_directory(config.state_root)
         helper = config.helpers_dir / "state.py"
         if not helper.is_file():
             raise ValueError("configured Devflow state helper is missing")
@@ -96,6 +98,8 @@ class DeliveryStore:
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         self.state = module
+        if read_only:
+            return  # Public custody preflight never migrates or republishes evidence.
         try:
             preserve_execution_config(config)
         except (OSError, ValueError) as exc:
@@ -470,7 +474,12 @@ class DeliveryStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = self.state.connect(self.config.tracking_db)
+        if getattr(self, "read_only", False):
+            db = sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+        else:
+            db = self.state.connect(self.config.tracking_db)
         db.execute("PRAGMA foreign_keys=ON")
         feature_event = False
 

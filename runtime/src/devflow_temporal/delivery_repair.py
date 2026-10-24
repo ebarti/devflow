@@ -279,7 +279,7 @@ def confirmed_native_cleanup(spec: dict[str, Any]) -> str:
     journals = {}
     for raw_path in manifest["processes"]:
         path = Path(raw_path)
-        if reconcile_process(path)["cleanup"] != "observed-native-confirmed":
+        if reconcile_process(path, spec=spec)["cleanup"] != "observed-native-confirmed":
             raise ValueError("native process teardown is unknown")
         journals[raw_path] = digest(read_private(path))
     if manifest.get("finalization", {}).get("resource_cleanup") != "confirmed":

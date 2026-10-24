@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from temporalio.client import WorkflowExecutionStatus
 
 from .contracts import digest
+from .delivery_filesystem_custody import matches
 from .delivery_native_process import (
     launch_binding as _launch_binding,
 )
@@ -27,7 +28,7 @@ from .delivery_native_process import (
 from .delivery_native_process import (
     prelaunch_journal as _prelaunch_journal,
 )
-from .delivery_resources import RunResources, _ancestors, _gate_roots, _identity, read_private
+from .delivery_resources import RunResources, _ancestors, _gate_roots, read_private
 from .supervisor import DeliverySupervisor, get_supervisor
 
 _LOG = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ def _complete_attempt(store, spec, row, on_observed=None):
                 or metadata.get('role') != row['role']
                 or metadata.get('iteration') != row['iteration']):
             raise ValueError('original completed native result binding changed')
-    receipt = reconcile_process(journal_path)
+    receipt = reconcile_process(journal_path, spec=spec)
     if receipt['cleanup'] != 'observed-native-confirmed':
         raise ValueError('original native cleanup remains unknown')
     journal = read_private(journal_path)
@@ -173,8 +174,9 @@ def _completed_role_execution(path, journal, execution_specs, request, row, *,
             if recorded is not None and (
                     not isinstance(recorded, dict)
                     or set(recorded) != {'native-monitor.lock', 'native-process.lock'}
-                    or recorded.get(name) != {'device': info.st_dev, 'inode': info.st_ino,
-                                             'uid': info.st_uid}):
+                    or not matches(execution, lock_path, recorded.get(name), current={
+                        'device': info.st_dev, 'inode': info.st_ino, 'uid': info.st_uid},
+                        directory=False)):
                 raise ValueError('registered historical role recorded lifecycle lock changed')
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             current = lock_path.lstat()
@@ -254,7 +256,7 @@ def _observe_registered_process(spec, path, *, retained_memo=None):
                 and not observed[pid]['stat'].startswith('Z') for pid, identity in owned.items())
                 or any(listeners(port) for port in journal.get('ports', []))):
             raise ValueError('registered native processes or ports remain active')
-        receipt = reconcile_process(path)
+        receipt = reconcile_process(path, spec=spec)
         if receipt['cleanup'] != 'observed-native-confirmed':
             raise ValueError('registered native cleanup remains unknown')
         return receipt
@@ -447,7 +449,8 @@ def _disposable_work(manifest, row):
         path = Path(raw)
         try:
             _ancestors(path)
-            return path.resolve(strict=True) == path and _identity(path) == entry.get('identity')
+            return path.resolve(strict=True) == path and matches(
+                json.loads(row.get('request_json') or 'null'), path, entry.get('identity'))
         except (OSError, ValueError):
             return False
 

@@ -27,12 +27,13 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
                 or type(iteration) is not int or row['iteration'] != iteration
                 or row['cleanup'] not in {'unknown', 'confirmed'}):
             raise ValueError('cleanup reconciliation requires an owned closed published run')
-        closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
+        workflow_id = row['workflow_id'] or 'delivery-' + run_id
+        closed = store._completed_temporal_result(run_id, workflow_id=workflow_id)
         state = closed['result']
         recovery = json.loads(row['recovery_json']) if row['recovery_json'] else None
         checks = json.loads(row['checks_json'] or '{}')
         if (
-            closed["workflow_id"] != row["workflow_id"]
+            closed["workflow_id"] != workflow_id
             or not closed["execution_run_id"]
             or not closed["closed_at"]
             or closed["request_digest"] != row["request_digest"]

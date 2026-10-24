@@ -1140,7 +1140,7 @@ class DeliveryBroker:
             raise CheckSuperseded("native check superseded before reconciliation")
         self.native_cleanup_confirmed = False
         self.native_journals += (journal,)
-        result = reconcile_process(journal)
+        result = reconcile_process(journal, spec=self.spec)
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
         return result
 
