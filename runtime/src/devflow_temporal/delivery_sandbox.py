@@ -790,6 +790,13 @@ def prepare_browser_qa(
     if not trusted_local(spec) and not Path("/usr/bin/sandbox-exec").is_file():
         raise ValueError("required macOS sandbox-exec is unavailable")
     checkout = checkout.resolve(strict=True)
+    if (qa.get('env', {}).get('JOBCTRL_E2E_ISOLATED') == '0'
+            or spec.get('browser_qa_admission') is not None):
+        from .delivery_browser_mode_recovery import launch_authority
+
+        if qa != spec['policy'].get('browser_qa'):
+            raise ValueError('browser launch recipe differs from its acknowledged amendment')
+        launch_authority(spec, checkout)
     state_root = Path(spec["state_dir"]).parent.parent.resolve(strict=True)
     scratch = scratch.resolve(strict=True)
     if scratch.parent != Path("/private/tmp") or not scratch.name.startswith("dfqa-"):

@@ -84,7 +84,7 @@ def prepared_spec(spec):
     return preparation.bind_native_spec(spec, identity, cached, reused=True)
 
 
-def scope_case(service, monkeypatch):
+def scope_case(service, monkeypatch, *, browser_qa=None, extra_sources=None):
     owner, submitted = service
     source = owner.config.path.parent / "source"
     api = "apps/api/src/approval.ts"
@@ -92,6 +92,10 @@ def scope_case(service, monkeypatch):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("Original tracked source\n")
+    for name, content in (extra_sources or {}).items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
     _git(source, "add", ".")
     _git(source, "commit", "-qm", "Track caller and API fixtures")
     config = copy.deepcopy(owner.config.raw)
@@ -117,6 +121,8 @@ def scope_case(service, monkeypatch):
             "protected_paths": [".git", ".github", ".agents", ".codex"],
         },
     )
+    if browser_qa is not None:
+        repository["browser_qa"] = browser_qa
     owner.config.path.write_text(json.dumps(config))
     store = DeliveryStore(DeliveryConfig.load(owner.config.path))
     store.submit(submitted)

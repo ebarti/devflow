@@ -10,6 +10,7 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_baseline_contract import preparation_failure, repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_browser_mode_recovery import FIELDS as BROWSER_FIELDS
 from .delivery_budget_contract import continuation_maximum, fixed_budget_allows
 from .delivery_config import scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
@@ -804,6 +805,9 @@ def custody(db, recovery, *, retained_memo=None):
         if (spec['policy']['allowed_paths'] != allowed
                 or spec['config_digest'] != digest(amended.raw)):
             raise ValueError('stopped scope resume changed its sealed file authority')
+    from .delivery_browser_mode_recovery import custody as browser_custody
+
+    browser_custody(db, spec, recovery)
     return spec
 
 
@@ -1152,7 +1156,8 @@ def _unpublished_remote(broker):
 def admit(store, run_id, command, *, preflight=False, _revision=None):
     original = store.submitted_spec(run_id)
     allowed = range(0, 102) if original.get('feature_worker') else (0, 1, 2)
-    if (not isinstance(command, dict) or set(command) not in (FIELDS, FIELDS | SCOPE_FIELDS)
+    if (not isinstance(command, dict) or set(command) not in (
+            FIELDS, FIELDS | SCOPE_FIELDS, FIELDS | BROWSER_FIELDS)
             or command.get('continuation_kind') != KIND
             or not isinstance(command.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', command['command_id'])
@@ -1221,6 +1226,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                                         pending=bool(pending or gate_only or interrupted))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
+    browser_amendment = None
+    if BROWSER_FIELDS <= command.keys():
+        from .delivery_browser_mode_recovery import proposal
+
+        amended, browser_amendment = proposal(seal, command)
     scope_finding = None
     if SCOPE_FIELDS <= command.keys() and not seal['predecessor_spec'].get('feature_worker'):
         latest = next((r for r in reversed(seal['state'].get('roles', []))
@@ -1239,7 +1249,10 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         return {'run_id': run_id, 'preflight': True, 'candidate': seal['candidate'],
                 'authorized_through_iteration': maximum, 'implementation_authority': True,
                 **({'added_paths': command['added_paths']}
-                   if amended is not seal['predecessor_spec'] else {})}
+                   if SCOPE_FIELDS <= command.keys() else {}),
+                **({'browser_qa_amendment': {key: browser_amendment[key] for key in (
+                    'original_recipe_sha256', 'effective_recipe_sha256')}}
+                   if browser_amendment else {})}
     spec = seal['predecessor_spec']
     root = Path(spec['state_dir']) / 'stopped-resumes' / command_digest
     with _lock(Path(spec['state_dir']) / 'stopped-resumes' / 'controller.lock'):
@@ -1261,6 +1274,13 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         if _revision is not None:
             if validate_revision_recovery(store, seal['predecessor_spec'], _revision) != amended:
                 raise ValueError('adopted worker derivation changed during runtime preparation')
+        elif browser_amendment is not None:
+            from .delivery_browser_mode_recovery import _transition
+
+            checked, proof = proposal(seal, command)
+            if checked != amended or proof != browser_amendment:
+                raise ValueError('browser amendment evidence changed during runtime preparation')
+            _transition(amended, execution)
         elif scope_spec(store, seal, command) != amended:
             raise ValueError('stopped scope configuration changed during runtime preparation')
         if scope_finding is not None:
@@ -1301,6 +1321,7 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'maximum_iteration': maximum,
                     'predecessor_result_digest': digest(seal['state']),
                     **({'blocked_scope_finding': scope_finding} if scope_finding else {}),
+                    **({'browser_qa_amendment': browser_amendment} if browser_amendment else {}),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
                     **({'ci_findings': ci_findings} if ci_findings else {}),

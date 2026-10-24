@@ -126,6 +126,12 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any], *,
     qa = spec["policy"].get("browser_qa")
     if not qa or broker.candidate() != candidate:
         raise ValueError("native browser QA needs its admitted exact candidate and configuration")
+    amended_mode = (qa.get('env', {}).get('JOBCTRL_E2E_ISOLATED') == '0'
+                    or spec.get('browser_qa_admission') is not None)
+    if amended_mode:
+        from .delivery_browser_mode_recovery import launch_authority
+
+        launch_authority(spec)
     key = f"browser_qa:{spec['run_id']}:{iteration}" + broker.effect_namespace
     request = {
         "iteration": iteration,
@@ -269,6 +275,14 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any], *,
         # Supervision already established cleanup above. A rejected evidence
         # set fails this gate; it cannot erase the completed process result.
         evidence_failures.append(f"browser artifact collection failed: {exc}")
+    mode_receipt = None
+    if amended_mode:
+        from .delivery_browser_mode_recovery import passed_cases
+
+        try:
+            mode_receipt = passed_cases(spec, checkout, artifacts)
+        except (ValueError, OSError) as exc:
+            evidence_failures.append(f'browser amendment case evidence failed: {exc}')
     selector_receipts = None
     selector_failure = None
     if selector_sources:
@@ -301,6 +315,7 @@ def run_browser_qa(broker: Any, iteration: int, candidate: dict[str, Any], *,
         "exit_code": process["exit_code"],
         "test_count": count,
         **({"selectors": selector_receipts} if selector_receipts is not None else {}),
+        **({"browser_qa_amendment": mode_receipt} if mode_receipt is not None else {}),
         **({"evidence_failure": "; ".join(evidence_failures)} if evidence_failures else {}),
         "rejected_output": rejected,
         "rejection_causes": causes,
