@@ -139,6 +139,18 @@ For an ordinary published run stopped with `browser QA child cleanup is unknown`
 
 For an ordinary published run whose native roles have finished but whose resource cleanup remains unknown, `reconcile-attempt --id RUN --role cleanup --iteration N` authenticates the exact closed workflow and re-observes its native resources before closing its claim. It preserves the failed product verdict, dirty source, branch and PR. Pending effects, changed execution identity or live owned processes prevent closure. This observation grants no continuation or extra repair budget. Workspace dependency cleanup uses the declaration recorded when the runtime acquired custody, so permitted package script edits do not invalidate deletion of those same owned folders; replacement folders and symlinks remain protected.
 
+A terminal finalizer exception records structured unknown cleanup without a receipt
+path or hash. Later owner maintenance and the same public cleanup command preserve
+that exact closed result. They archive the freshly authenticated current resource
+bytes under `resources/cleanup-observations/<original-result-digest>/`, with an
+`observed_resources` inventory and `producer_receipt_source: not_recorded`. These
+are later observations; they do not reconstruct an original finalization receipt
+or claim the file was historically absent. Replay authenticates the first saved
+observation after canonical cleanup files advance. Partial/malformed declarations
+are refused, and every declared hash retains its exact validation. Fresh cleanup
+and acknowledged claim release still leave the original failure, CI verdict,
+candidate, PR, policy and repair budget intact.
+
 After a macOS reboot, legacy native/resource records may retain the same inode and
 owner while their mount device number changes. The local public CLI exposes
 `filesystem-custody-preflight --id RUN` and `adopt-filesystem-custody --id RUN --request FILE`,

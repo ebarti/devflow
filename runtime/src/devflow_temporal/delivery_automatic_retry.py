@@ -118,8 +118,25 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
     root = Path(execution['state_dir']) / 'resources'
     original = closed['result']['checks']
     binding = digest(closed['result'])
+    producer = original.get('resource_cleanup')
+    if not isinstance(producer, dict):
+        raise ValueError('original cleanup producer is malformed')
+    unrecorded = 'receipt_sha256' not in producer
+    if unrecorded:
+        # The workflow's finalizer-exception placeholder deliberately has no
+        # receipt. It cannot supply original file bytes or a historical hash.
+        if ('receipt' in producer or any(producer.get(key) != 'unknown' for key in (
+                'state', 'process_cleanup', 'resource_cleanup'))):
+            raise ValueError('original cleanup receipt binding is incomplete')
+    elif (not isinstance(producer['receipt_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', producer['receipt_sha256'])
+            or ('receipt' in producer and producer['receipt'] != str(root / 'finalization.json'))):
+        raise ValueError('original cleanup receipt binding is malformed')
+    inventory_key = 'observed_resources' if unrecorded else 'predecessor_resources'
     archive = root / 'predecessor-resources'
-    if row['recovery_json'] is not None:
+    if unrecorded:
+        archive = root / 'cleanup-observations' / binding
+    elif row['recovery_json'] is not None:
         archive = archive / binding
     with store._connect() as db:
         records = [json.loads(item[0]) for item in db.execute(
@@ -128,15 +145,22 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
     prior = next((item for item in records
                   if item.get('original_result_digest') == binding
                   and item.get('original_checks') == original
-                  and 'predecessor_resources' in item), None)
-    saved = prior['predecessor_resources'] if prior else None
+                  and inventory_key in item), None)
+    if unrecorded and prior is not None and prior.get('producer_receipt_source') != 'not_recorded':
+        raise ValueError('unrecorded original cleanup observation lost its provenance')
+    saved = prior[inventory_key] if prior else None
     superseding = prior.get('superseding_finalization') if prior else None
-    expected = {'manifest.json': before['manifest_sha256'],
-                'finalization.json': original['resource_cleanup']['receipt_sha256']}
+    expected = {'manifest.json': before['manifest_sha256']}
+    if unrecorded:
+        # Replay authenticates the first saved observation, even if ordinary
+        # finalization subsequently replaced the canonical latest files.
+        expected['observed-finalization.json'] = (saved.get('observed-finalization.json')
+            if saved is not None else before['finalization_sha256'])
+    else:
+        expected['finalization.json'] = producer['receipt_sha256']
     if saved is None:
         historical = None
-        if before['finalization_sha256'] != expected['finalization.json']:
-            producer = original['resource_cleanup']
+        if not unrecorded and before['finalization_sha256'] != expected['finalization.json']:
             current = json.loads(row['checks_json']).get('resource_cleanup') or {}
             body = {k: v for k, v in producer.items() if k not in {'receipt', 'receipt_sha256'}}
             historical = (json.dumps(body, sort_keys=True, indent=2) + '\n').encode()
@@ -149,7 +173,8 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         with RunResources(execution, read_only=True).locked():
             current_bytes = {}
             for name, sha in expected.items():
-                raw = read_private(root / name, raw=True)
+                source = 'finalization.json' if name == 'observed-finalization.json' else name
+                raw = read_private(root / source, raw=True)
                 expected_hash = superseding if name == 'finalization.json' and historical else sha
                 if hashlib.sha256(raw).hexdigest() != expected_hash:
                     raise ValueError('original resource bytes changed before archive')
@@ -173,13 +198,13 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         read_private(path)
         if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
             raise ValueError('archived original resource bytes changed')
-    if saved.get('finalization.json') != expected['finalization.json']:
+    if not unrecorded and saved.get('finalization.json') != expected['finalization.json']:
         raise ValueError('archived finalization differs from the original closed result')
     if superseding is not None:
         raw = read_private(archive / 'observed-finalization.json', raw=True)
         if hashlib.sha256(raw).hexdigest() != superseding:
             raise ValueError('archived later finalization changed')
-    if any('predecessor_resources' in item and item.get('original_result_digest') == binding
+    if any(inventory_key in item and item.get('original_result_digest') == binding
            and item.get('original_checks') == original for item in records):
         return
     with store._connect() as db:
@@ -197,13 +222,16 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
             "AND type='resource_cleanup_reconciled'", (spec['run_id'],))]
         if any(item.get('original_result_digest') == binding
                and item.get('original_checks') == original
-               and item.get('predecessor_resources') == saved for item in existing):
+               and item.get(inventory_key) == saved for item in existing):
             return
         # This observes preservation, not completed cleanup or permission to retry.
         store._event(db, spec['run_id'], row['revision'], 'resource_cleanup_reconciled',
-            'Original cleanup bytes retained before refreshing the latest observation',
+            ('Original cleanup receipt was not recorded; later observed bytes retained'
+             if unrecorded else
+             'Original cleanup bytes retained before refreshing the latest observation'),
             {'original_checks': original, 'original_result_digest': binding,
-             'predecessor_resources': saved,
+             inventory_key: saved,
+             **({'producer_receipt_source': 'not_recorded'} if unrecorded else {}),
              **({'superseding_finalization': superseding,
                  'producer_receipt_source': 'closed_workflow'} if superseding else {})})
 
