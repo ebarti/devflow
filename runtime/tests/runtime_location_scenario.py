@@ -366,6 +366,7 @@ def seed(root, kind):
     case.store.config.path.chmod(0o600)
     stale = None
     if kind.startswith("stale"):
+        from temporalio import workflow
         from test_delivery_controller_failure_boundary import _projection_error
 
         from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -379,7 +380,7 @@ def seed(root, kind):
         controller.controller_failure_boundary = True
         controller.state = copy.deepcopy(case.state)
         controller.state.update(
-            revision=46 if kind == "stale1169" else 37,
+            revision=47 if kind == "stale1169" else 38,
             cleanup="unknown",
             phase="blocked",
             execution_state="blocked",
@@ -394,18 +395,28 @@ def seed(root, kind):
         }
         requests = []
 
-        async def failed(_name, request, **_kwargs):
+        async def failed(name, request, **_kwargs):
+            if name == "delivery_finalize_resources":
+                raise ValueError("Owned unavailable aggregate finalization")
+            if name == "delivery_terminal_tracker":
+                return {"state": "conflicted", "retryable": False}
+            assert name == "delivery_project"
             requests.append(copy.deepcopy(request))
             raise _projection_error()
 
+        patch.setattr(workflow, "patched", lambda *_: True)
+        patch.setattr(workflow, "now", lambda: datetime.now(UTC))
         controller._activity = failed
-        asyncio.run(controller._project(case.spec, "tracker_deadline", controller.state["error"]))
+        asyncio.run(controller._project(case.spec, "blocked", controller.state["error"]))
         case.state = controller.state
         case.command["expected_revision"] = case.state["revision"]
         case.command.update(
             expected_candidate_id=case.partial["id"], expected_candidate_head=case.partial["head"]
         )
         with case.store._connect() as db:
+            case.store.state.claim_work(
+                db, case.spec["work_id"], "external:devflow:run-1", "Owned retained terminal claim"
+            )
             db.execute(
                 "UPDATE delivery_runs SET phase=?,execution_state='running',outcome=NULL,"
                 "protocol_revision=?,cleanup='unknown',error=NULL WHERE run_id='run-1'",
@@ -486,6 +497,24 @@ def scoped_external_boundaries(case, patch):
             "url": case.publication["url"],
         },
     )
+    from devflow_temporal import delivery_automatic_retry
+
+    def tracker(spec, status, *, release=False, **_kwargs):
+        with case.store._connect() as db:
+            if release:
+                case.store.state.release_work(
+                    db, spec["work_id"], "external:devflow:" + spec["run_id"]
+                )
+        return {
+            "state": "recorded" if spec.get("project_sync_version") == 1 else "consistent",
+            "pending": False,
+            "scope": "local",
+            "project_sync": "asynchronous",
+            "status": status,
+            "claim_released": release,
+        }
+
+    patch.setattr(delivery_automatic_retry, "_tracker_sync", tracker)
 
 
 def exercise(root, kind):
