@@ -156,7 +156,9 @@ the existing command/event transaction. An unacknowledged file grants nothing.
 The grant requires only device-number drift, unchanged inode/owner, canonical
 owned paths, original registration kind/generation/source authority, acquired
 resource/attempt/native leases, stopped recorded PID/start identities and clear
-ports. Fresh source, evidence, run/attempt/claim and uncertain-effect checks fence
+ports. An extant path whose prior receipt records removal is recreated and cannot
+be adopted; an absent root is skipped, and a new generation uses its own current
+identity. Fresh source, evidence, run/attempt/claim and uncertain-effect checks fence
 publication. Current filesystem UUID and boot UUID must remain identical when
 the grant is consumed; replacing a path, changing generation or inspection failure
 cannot inherit it. New resource allocations still record real current identities.

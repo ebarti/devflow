@@ -207,6 +207,8 @@ def identity_for(spec, path, current, expected):
             root.get("kind") == registration["kind"]
             and root.get("generation", 0) == registration["generation"]
             and root.get("identity") == entry["original"]
+            and root.get("state") not in {"removed", "already_absent"}
+            and root.get("receipt", {}).get("state") not in {"removed", "already_absent"}
             and {key: root.get(key) for key in SOURCE_FIELDS} == registration["source"]
         )
     if not valid:
@@ -371,6 +373,10 @@ def _collect(store, run_id, leases):
         path = Path(raw)
         if not path.exists() and not path.is_symlink():
             continue  # Absence is observed, never adopted as a recreated resource.
+        if entry.get("state") in {"removed", "already_absent"} or entry.get("receipt", {}).get(
+            "state"
+        ) in {"removed", "already_absent"}:
+            raise ValueError("filesystem custody cannot adopt a recreated ended-custody root")
         if entry.get("identity") is None:
             raise ValueError("filesystem custody cannot adopt an unproven generated root")
         adopt(

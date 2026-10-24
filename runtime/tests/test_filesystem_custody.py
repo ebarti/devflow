@@ -6,6 +6,7 @@ import copy
 import fcntl
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -515,3 +516,79 @@ def test_actual_cli_preflight_bootstrap_never_constructs_a_writable_store(
     delivery_control.main()
     assert json.loads(capsys.readouterr().out)["observed"] is True
     assert case.config.tracking_db.read_bytes() == before
+
+
+@pytest.mark.parametrize("removed_state", ["removed", "already_absent"])
+def test_preflight_rejects_extant_roots_whose_original_custody_ended(reboot, removed_state):
+    case = reboot
+    root = Path(case.spec["state_dir"]) / "transient"
+    manifest = read_private(case.resources.manifest)
+    entry = manifest["roots"][str(root)]
+    entry["state"] = "removed"
+    entry["receipt"] = {"path": str(root), "kind": entry["kind"], "state": removed_state}
+    write_private(case.resources.manifest, manifest)
+    before = case.resources.manifest.read_bytes()
+    with pytest.raises(ValueError, match="recreated ended-custody root"):
+        custody.preflight(case.store, case.spec["run_id"])
+    assert case.resources.manifest.read_bytes() == before
+    assert not (Path(case.spec["state_dir"]) / "filesystem-custody").exists()
+
+
+@pytest.mark.parametrize("removed_state", ["removed", "already_absent"])
+def test_preflight_does_not_adopt_a_legitimately_absent_removed_root(reboot, removed_state):
+    case = reboot
+    root = Path(case.spec["state_dir"]) / "transient"
+    manifest = read_private(case.resources.manifest)
+    entry = manifest["roots"][str(root)]
+    entry["state"] = "removed"
+    entry["receipt"] = {"path": str(root), "kind": entry["kind"], "state": removed_state}
+    shutil.rmtree(root)  # Owned synthetic scratch only.
+    write_private(case.resources.manifest, manifest)
+    plan = custody.preflight(case.store, case.spec["run_id"])
+    assert str(root) not in plan["objects"]
+    assert not root.exists()
+
+
+def test_preflight_rejects_ended_root_state_even_without_a_removal_receipt(reboot):
+    case = reboot
+    root = Path(case.spec["state_dir"]) / "transient"
+    manifest = read_private(case.resources.manifest)
+    manifest["roots"][str(root)]["state"] = "removed"
+    write_private(case.resources.manifest, manifest)
+    with pytest.raises(ValueError, match="recreated ended-custody root"):
+        custody.preflight(case.store, case.spec["run_id"])
+
+
+def test_new_created_generation_uses_current_identity_without_inheriting_prior_adoption(reboot):
+    case = reboot
+    root = Path(case.spec["state_dir"]) / "transient"
+    manifest = read_private(case.resources.manifest)
+    entry = manifest["roots"][str(root)]
+    old_identity = copy.deepcopy(entry["identity"])
+    shutil.rmtree(root)  # Owned synthetic scratch only.
+    root.mkdir(mode=0o700)
+    current = _identity(root)
+    entry.update(state="created", identity=current, generation=entry.get("generation", 0) + 1)
+    entry.pop("receipt", None)
+    write_private(case.resources.manifest, manifest)
+    plan = custody.preflight(case.store, case.spec["run_id"])
+    assert str(root) not in plan["objects"]
+    adopt(case)
+    assert custody.matches(case.spec, root, current)
+    assert not custody.matches(case.spec, root, old_identity)
+
+
+@pytest.mark.parametrize("removed_state", ["removed", "already_absent"])
+def test_an_acknowledged_grant_cannot_extend_a_resource_after_its_custody_ends(
+    reboot, removed_state
+):
+    case = reboot
+    adopt(case)
+    root = Path(case.spec["state_dir"]) / "transient"
+    manifest = read_private(case.resources.manifest)
+    entry = manifest["roots"][str(root)]
+    old_identity = copy.deepcopy(entry["identity"])
+    entry["state"] = "removed"
+    entry["receipt"] = {"path": str(root), "kind": entry["kind"], "state": removed_state}
+    write_private(case.resources.manifest, manifest)
+    assert not custody.matches(case.spec, root, old_identity)
