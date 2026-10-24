@@ -516,6 +516,7 @@ def _preparation_authority(spec, checkout, evidence, check, registry, manifest):
     from .delivery_broker import _git
     from .delivery_execution_config import load_execution_config
     from .delivery_native_guard import validate_native_turn
+    from .delivery_policy_recovery import work_binding
     from .delivery_resources import _gate_evidence_root, _gate_path, _identity, same_object
     from .delivery_sandbox import _native_check_key
     from .delivery_store import DeliveryStore
@@ -533,10 +534,16 @@ def _preparation_authority(spec, checkout, evidence, check, registry, manifest):
     store = DeliveryStore(load_execution_config(spec), read_only=True)
     validate_native_turn(spec, "verify", iteration, store)
     with store._connect() as db:
+        db.execute("BEGIN")
         current = db.execute(
             "SELECT candidate_json,iteration FROM delivery_runs WHERE run_id=?",
             (spec["run_id"],),
         ).fetchone()
+        claim = store.state.claim_for(db, spec["work_id"])
+        if not claim or claim["owner"] != "external:devflow:" + spec["run_id"]:
+            raise ValueError("Temporal preparation lost its current own work claim")
+        binding = work_binding(store, spec, db)
+        claim_identity = {key: claim[key] for key in ("resource", "work_id", "owner", "claimed_at")}
     expected = (
         json.loads(current["candidate_json"]) if current and current["candidate_json"] else None
     )
@@ -593,6 +600,8 @@ def _preparation_authority(spec, checkout, evidence, check, registry, manifest):
         "key": key,
         "evidence": str(evidence),
         "check_sha256": digest(check),
+        "work_binding": binding,
+        "claim": claim_identity,
         "subject": {
             "path": str(checkout),
             "kind": entry["kind"],
@@ -645,6 +654,7 @@ def prepare_check(spec, checkout, evidence, check, scratch):
             "preparation": spec[MARKER],
             "policy_digest": spec["policy_digest"],
             "check_sha256": digest(check),
+            "owner_authority": authority,
             "checkout": str(checkout),
             "scratch": str(scratch),
             "environment": environment,
@@ -740,6 +750,7 @@ def _check_owned_launch(process, proof, recorded, authority):
         or recorded.get("preparation") != process.spec[MARKER]
         or recorded.get("policy_digest") != process.spec["policy_digest"]
         or recorded.get("check_sha256") != proof["check_sha256"]
+        or recorded.get("owner_authority") != authority
         or environment != recorded.get("environment")
         or process.folder.name not in {"native", "native-retry"}
         or process.folder.parent.name != check["id"]

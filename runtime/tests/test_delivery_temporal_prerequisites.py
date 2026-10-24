@@ -642,6 +642,146 @@ def test_preparation_never_adopts_an_unrecorded_or_changed_current_candidate(
         assert RunResources(current).finalize("blocked")["state"] == "confirmed"
 
 
+@pytest.mark.parametrize("stage", ["copy", "launch"])
+@pytest.mark.parametrize("defect", ["missing", "foreign", "issue", "repository", "reclaimed"])
+def test_current_work_custody_is_rechecked_after_tool_observation(
+    stopped_temporal, monkeypatch, stage, defect
+):
+    from devflow_temporal.delivery_native_process import NativeProcess
+
+    case = stopped_temporal
+    _response, current, _recovery = admitted(case)
+    broker = native_check_ready(case, current)
+    evidence = broker.evidence_dir / "checks/4"
+    owner = "external:devflow:" + current["run_id"]
+    with case.store._connect() as db:
+        original_work = case.store.state.row(db, "works", current["work_id"])
+    changed = False
+
+    def change_custody():
+        nonlocal changed
+        if changed:
+            return
+        changed = True
+        with case.store._connect() as db:
+            case.store.state.release_work(db, current["work_id"], owner)
+            if defect in {"issue", "repository"}:
+                case.store.state.update(
+                    db,
+                    "work",
+                    {
+                        "id": current["work_id"],
+                        **(
+                            {"issue": "https://github.com/example/fixture/issues/999"}
+                            if defect == "issue"
+                            else {"repository": "github.com/other/repository"}
+                        ),
+                    },
+                    "owned-custody-race-" + defect,
+                )
+            if defect != "missing":
+                case.store.state.claim_work(
+                    db,
+                    current["work_id"],
+                    "external:other-owner" if defect == "foreign" else owner,
+                    "Owned concurrent custody probe",
+                )
+
+    try:
+        if stage == "copy":
+            original = tools._copy
+
+            def change_after_tools(*args, **kwargs):
+                result = original(*args, **kwargs)
+                change_custody()
+                return result
+
+            monkeypatch.setattr(tools, "_copy", change_after_tools)
+            with pytest.raises(ValueError):
+                prepare_native_check(current, broker.checkout, evidence, case.check)
+            manifest = read_private(RunResources(current).manifest)
+            assert not manifest.get("temporal_test_preparations")
+        else:
+            _profile, environment = prepare_native_check(
+                current, broker.checkout, evidence, case.check
+            )
+            process = NativeProcess(
+                current,
+                evidence / case.check["id"] / "native",
+                argv=case.check["argv"],
+                cwd=broker.checkout,
+                environment=environment,
+                timeout=2700,
+            )
+            tools.check_launch(process)  # The large fixed assets are already warm.
+            original = tools._check_owned_launch
+
+            def change_after_tools(*args, **kwargs):
+                result = original(*args, **kwargs)
+                change_custody()
+                return result
+
+            monkeypatch.setattr(tools, "_check_owned_launch", change_after_tools)
+            monkeypatch.setattr(process, "run", lambda: pytest.fail("native payload must not run"))
+            expected = "work issue/repository" if defect in {"issue", "repository"} else None
+            with pytest.raises(CheckPreparationFailure, match=expected):
+                broker._run_native_check(process)
+        assert changed
+    finally:
+        # Restore only this owned fixture through its public state owners so
+        # the real resource finalizer can prove teardown. Never rewrite history.
+        with case.store._connect() as db:
+            claim = case.store.state.claim_for(db, current["work_id"])
+            if claim:
+                case.store.state.release_work(db, current["work_id"], claim["owner"])
+            case.store.state.update(
+                db,
+                "work",
+                {
+                    "id": current["work_id"],
+                    **{key: original_work[key] for key in ("issue", "repository")},
+                },
+                "owned-custody-race-restored",
+            )
+            case.store.state.claim_work(db, current["work_id"], owner, "Owned fixture teardown")
+        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
+
+
+def test_current_claim_metadata_refresh_keeps_the_same_owner_generation(
+    stopped_temporal, monkeypatch
+):
+    case = stopped_temporal
+    _response, current, _recovery = admitted(case)
+    broker = native_check_ready(case, current)
+    evidence = broker.evidence_dir / "checks/4"
+    _profile, environment = prepare_native_check(current, broker.checkout, evidence, case.check)
+    process = SimpleNamespace(
+        spec=current,
+        folder=evidence / case.check["id"] / "native",
+        environment=environment,
+        argv=case.check["argv"],
+        cwd=broker.checkout,
+        timeout=2700,
+    )
+    original = tools._check_owned_launch
+
+    def refresh(*args, **kwargs):
+        result = original(*args, **kwargs)
+        with case.store._connect() as db:
+            saved = case.store.state.claim_for(db, current["work_id"])
+            observed = case.store.state.claim_work(
+                db, current["work_id"], saved["owner"], "Owned same-claim metadata refresh"
+            )
+            assert observed["claim"]["claimed_at"] == saved["claimed_at"]
+        return result
+
+    monkeypatch.setattr(tools, "_check_owned_launch", refresh)
+    try:
+        tools.check_launch(process)
+    finally:
+        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
+
+
 @pytest.mark.parametrize("kind", ["scope", "browser"])
 def test_combined_prerequisites_share_one_original_finite_admission(service, monkeypatch, kind):
     case = temporal_case(frozen_six(service), monkeypatch, amendment=kind)
@@ -788,8 +928,9 @@ def test_cached_byte_observation_rechecks_current_fd_and_name(tmp_path, monkeypa
             tools._hash(str(path), expected, maximum=1024, executable=True)
 
 
+@pytest.mark.parametrize("changed_claim", [False, True])
 def test_complete_receipt_is_inert_until_owner_seal_and_exact_replay_succeeds(
-    stopped_temporal, monkeypatch
+    stopped_temporal, monkeypatch, changed_claim
 ):
     import devflow_temporal.delivery_resources as resources
 
@@ -823,6 +964,16 @@ def test_complete_receipt_is_inert_until_owner_seal_and_exact_replay_succeeds(
         with pytest.raises(ValueError, match="acknowledged resource owner"):
             tools.check_launch(process)
         monkeypatch.setattr(resources, "write_private", original)
+        if changed_claim:
+            with case.store._connect() as db:
+                owner = "external:devflow:" + current["run_id"]
+                case.store.state.release_work(db, current["work_id"], owner)
+                case.store.state.claim_work(db, current["work_id"], owner, "New owned generation")
+            with pytest.raises(ValueError):
+                prepare_native_check(current, broker.checkout, evidence, case.check)
+            assert path.read_bytes() == before
+            assert not read_private(manifest_path).get("temporal_test_preparations")
+            return
         _profile, environment = prepare_native_check(current, broker.checkout, evidence, case.check)
         assert path.read_bytes() == before
         process.environment = environment
