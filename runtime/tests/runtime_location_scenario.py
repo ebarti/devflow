@@ -423,10 +423,12 @@ def seed(root, kind):
     )
     data.update(owner=str(case.store.config.path), old_root=str(SOURCE), cli=str(cli), kind=kind)
     write_private(root / "case.json", data)
-    for name in ("state.py", "schema.sql"):
-        target = root / "loaded-old-projector" / name
+    for source in (SOURCE / "skills/devflow/scripts").iterdir():
+        if source.suffix not in {".py", ".sql"}:
+            continue
+        target = root / "loaded-old-projector" / source.name
         target.parent.mkdir(exist_ok=True)
-        target.write_bytes((SOURCE / "skills/devflow/scripts" / name).read_bytes())
+        target.write_bytes(source.read_bytes())
     patch.undo()
 
 
@@ -555,6 +557,7 @@ def exercise(root, kind):
 
     def old_projector():
         try:
+            sys.path.insert(0, str(root / "loaded-old-projector"))
             spec = importlib.util.spec_from_file_location(
                 "owned_old_projector", root / "loaded-old-projector/state.py"
             )
