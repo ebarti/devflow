@@ -317,6 +317,7 @@ def seed(root, kind):
         )
     finally:
         sys.executable = saved
+    auxiliary(case.store)
     cut_operational_capacity(case)
     if kind.startswith("stale"):
         from test_delivery_blocked_scope import rewrite_assessment, rewrite_observation
@@ -362,7 +363,6 @@ def seed(root, kind):
             ],
         }
     case.store.config.path.chmod(0o600)
-    auxiliary(case.store)
     stale = None
     if kind.startswith("stale"):
         from test_delivery_controller_failure_boundary import _projection_error
