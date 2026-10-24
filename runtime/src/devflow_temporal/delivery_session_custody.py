@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -50,6 +51,144 @@ def _same_assessment(raw, result):
         {key: value for key, value in raw.items() if key != "traceback"}
         == {key: value for key, value in result.items() if key not in enriched}
     )
+
+
+def completed_blocked_finding(seal):
+    """Authenticate a provider's completed blocked finding without rewriting it.
+
+    The SDK's final assessment, raw role receipt and enriched supervisor result
+    must agree. Input and partial output are separate recorded checkpoints.
+    """
+    from .delivery_gates_admission import _native_attempt_bytes
+    from .delivery_sandbox import _native_role_home
+    from .supervisor import DeliverySupervisor
+
+    spec, state, session = seal['predecessor_spec'], seal['state'], seal['session_id']
+    role = next((r for r in reversed(state.get('roles', []))
+                 if r.get('role') == 'implement'), {})
+    attempts = [a for a in seal['attempts'] if a['role'] == 'implement'
+                and a['iteration'] == role.get('iteration')]
+    custody = seal.get('session_custody') or {}
+    if (spec.get('provider') != 'codex' or spec.get('feature_worker')
+            or role.get('status') != 'blocked' or role.get('finish_reason') != 'done'
+            or role.get('iteration') != state['iteration'] or len(attempts) != 1
+            or not isinstance(session, str) or not session
+            or role.get('session_id') != session or 'generation' not in custody):
+        raise ValueError('blocked scope finding lacks its completed native session')
+    attempt = attempts[0]
+    names = ('request.json', 'result.json', 'native-process.json', 'launch.json',
+             'start.json', 'native-thread-observation.json')
+    try:
+        originals = {name: _native_attempt_bytes(spec, attempt, name) for name in names}
+        request, raw, journal, launch, start, observation = (
+            json.loads(originals[name]) for name in names)
+        result = json.loads(attempt['result_json'])
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError('blocked scope finding lacks its private native receipts') from exc
+    if not all(isinstance(value, dict) for value in (
+            request, raw, journal, launch, start, observation, result)):
+        raise ValueError('blocked scope finding native receipts are malformed')
+    folder = Path(spec['state_dir']) / 'attempts' / attempt['job_key']
+    home = _native_role_home({'spec': {**spec, 'implementation_role_home_generation':
+                                      custody['generation']}, 'role': 'implement',
+                              'iteration': role['iteration']})
+    native, metadata, reference = (result.get('native_process') or {},
+                                   journal.get('provider_session') or {},
+                                   raw.get('native_thread_observation') or {})
+    intent, owned = journal.get('intent') or {}, journal.get('owned') or {}
+    environment = launch.get('environment')
+    turns = observation.get('turns')
+    if (not all(isinstance(v, dict) for v in (
+            native, metadata, reference, intent, owned, environment))
+            or not isinstance(turns, list) or not turns
+            or any(not isinstance(turn, dict) for turn in turns)):
+        raise ValueError('blocked scope finding native identities are malformed')
+    last = turns[-1]
+    turn, items = last.get('turn'), last.get('items')
+    if (not isinstance(turn, dict) or not isinstance(items, list)
+            or type(observation.get('pid')) is not int or observation['pid'] <= 1
+            or type(attempt.get('pid')) is not int or attempt['pid'] <= 1
+            or not isinstance(owned.get(str(observation['pid'])), dict)
+            or not isinstance(owned.get(str(attempt['pid'])), dict)):
+        raise ValueError('blocked scope finding final turn identity is malformed')
+    messages = [item for item in items if isinstance(item, dict)
+                and item.get('type') == 'agentMessage' and item.get('phase') == 'final_answer']
+    try:
+        assessment = json.loads(messages[0]['text']) if len(messages) == 1 else None
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError('blocked scope finding has no final structured assessment') from exc
+    if (not isinstance(assessment, dict)
+            or assessment != {key: raw.get(key) for key in ('status', 'summary', 'findings')}
+            or raw.get('status') != 'blocked' or raw.get('finish_reason') != 'done'
+            or not isinstance(raw.get('summary'), str) or not raw['summary'].strip()
+            or not isinstance(raw.get('findings'), list) or not raw['findings']
+            or any(not isinstance(item, str) or not item.strip() for item in raw['findings'])
+            or not _same_assessment(raw, result)
+            or role.get('candidate') != seal['candidate']
+            or request.get('spec') != spec or request.get('role') != 'implement'
+            or request.get('iteration') != role['iteration']
+            or request.get('native_authorized') is not True
+            or request.get('workspace') != spec['checkout']
+            or request.get('result_path') != str(folder / 'result.json')
+            or request.get('start_path') != str(folder / 'start.json')
+            or not isinstance(request.get('candidate'), dict)
+            or request['candidate'] != state.get('candidate')
+            or request['candidate'].get('id') != attempt['candidate_id']
+            or role.get('input_candidate_id') != attempt['candidate_id']
+            or DeliverySupervisor._job_key(request) != attempt['job_key']
+            or _native_role_home(request) != home
+            or environment.get('CODEX_HOME') != str(home / 'codex')
+            or intent.get('environment_sha256') != digest(launch.get('environment'))
+            or intent.get('argv') != launch.get('argv')
+            or intent.get('run_id') != spec['run_id']
+            or intent.get('policy_digest') != spec['policy_digest']
+            or intent.get('cwd') != spec['checkout']
+            or attempt['state'] != 'finished' or attempt['cleanup'] != 'confirmed'
+            or attempt.get('session_id') != session or raw.get('session_id') != session
+            or result.get('cleanup') != 'confirmed'
+            or result.get('process_cleanup') != 'observed-native-confirmed'
+            or journal.get('phase') != 'finished' or journal.get('monitoring_complete') is not True
+            or native != journal.get('result')
+            or native.get('journal') != str(folder / 'native-process.json')
+            or type(native.get('exit_code')) is not int
+            or any(native.get(key) is not False for key in ('cancelled', 'timed_out'))
+            or any(native.get(key) is not True for key in ('monitoring_complete', 'stdio_drained'))
+            or any(native.get(k) != v for k, v in {
+                'state': 'finished', 'exit_code': 0, 'cancelled': False, 'timed_out': False,
+                'monitoring_complete': True, 'stdio_drained': True,
+                'cleanup': 'observed-native-confirmed'}.items())
+            or metadata != {'role': 'implement', 'iteration': role['iteration'],
+                'session_id': session, 'resumed_from': request.get('resume_session'),
+                'result_digest': digest(result), 'output_candidate': {
+                    key: seal['candidate'][key] for key in ('id', 'head', 'content_sha256')}}
+            or reference.get('path') != str(folder / 'native-thread-observation.json')
+            or reference.get('sha256') != hashlib.sha256(
+                originals['native-thread-observation.json']).hexdigest()
+            or any(reference.get(key) != observation.get(key) for key in (
+                'schema', 'run_id', 'role', 'iteration', 'parent_thread_id', 'resumed_from',
+                'pid', 'start_identity', 'state'))
+            or reference.get('turn_count') != len(turns)
+            or observation.get('schema') != 'devflow-native-kit-threads-v1'
+            or observation.get('state') != 'confirmed' or reference.get('state') != 'confirmed'
+            or observation.get('run_id') != spec['run_id']
+            or observation.get('role') != 'implement'
+            or observation.get('iteration') != role['iteration']
+            or observation.get('parent_thread_id') != session
+            or observation.get('resumed_from') != request.get('resume_session')
+            or observation.get('new_child_thread_ids') != []
+            or observation.get('collaboration_items') != []
+            or start.get('pid') != observation.get('pid')
+            or owned.get(str(observation.get('pid')), {}).get('identity')
+                != observation.get('start_identity') or not observation.get('start_identity')
+            or owned.get(str(attempt.get('pid')), {}).get('identity') != attempt['process_identity']
+            or last.get('thread_id') != session or last.get('turn_id') != turn.get('id')
+            or not last.get('turn_id') or turn.get('status') != 'completed'
+            or turn.get('error') is not None):
+        raise ValueError('blocked scope finding lost its exact completed provider assessment')
+    return {'job_key': attempt['job_key'], 'session_id': session,
+            'result_sha256': digest(result), 'input_candidate_id': attempt['candidate_id'],
+            'output_candidate': role['candidate'], 'native_receipts': {
+                name: hashlib.sha256(content).hexdigest() for name, content in originals.items()}}
 
 
 def _unstarted_native_launch(spec, state, attempt, session, generation, *, input_rejection=False):

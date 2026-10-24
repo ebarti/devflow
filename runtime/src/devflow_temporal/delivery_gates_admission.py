@@ -40,12 +40,21 @@ def _source_authority_matches(policy, scope, semantic):
 
 def _native_result_bytes(spec, attempt):
     """Read only the frozen attempt's receipt; never create or chmod ancestry."""
+    return _native_attempt_bytes(spec, attempt, "result.json")
+
+
+def _native_attempt_bytes(spec, attempt, name):
+    """Bounded private reads of fixed native receipt names under one exact attempt."""
+    if name not in {"result.json", "request.json", "native-process.json", "launch.json",
+                    "start.json", "native-thread-observation.json"}:
+        raise ValueError("native receipt name is not supported")
     root = Path(spec["state_dir"])
     job = attempt["job_key"]
     if not isinstance(job, str) or job in {"", ".", ".."} or Path(job).name != job:
         raise ValueError("native result attempt identity is invalid")
     expected = root / "attempts" / job / "result.json"
     if (not root.is_absolute() or root.resolve(strict=True) != root
+            or not isinstance(attempt.get("result_path"), str)
             or Path(attempt["result_path"]) != expected):
         raise ValueError("native result left its exact frozen attempt")
     descriptors = []
@@ -59,7 +68,8 @@ def _native_result_bytes(spec, attempt):
             if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
                     or stat.S_IMODE(info.st_mode) not in modes):
                 raise ValueError("native result directory custody changed")
-        fd = os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptors[-1])
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=descriptors[-1])
         descriptors.append(fd)
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()

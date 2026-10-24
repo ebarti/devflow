@@ -47,11 +47,15 @@ def scope_spec(store, seal, command, *, _feature_scope=None):
     else:
         latest = next((role for role in reversed(seal['state'].get('roles', []))
                        if role.get('role') == 'implement'), None)
-        if (not latest or latest.get('status') != 'findings'
+        if (not latest or latest.get('status') not in {'findings', 'blocked'}
                 or latest.get('finish_reason') != 'done' or not seal['session_id']
                 or not latest.get('findings')
                 or seal['state'].get('error') != 'implementer did not establish a pass'):
             raise ValueError('scope resume requires an authenticated implementation finding')
+        if latest['status'] == 'blocked':
+            from .delivery_session_custody import completed_blocked_finding
+
+            completed_blocked_finding(seal)
         path = command['amended_config_path']
         if not isinstance(path, str) or not isinstance(command['amended_config_sha256'], str):
             raise ValueError('scope amendment configuration must be absolute')
@@ -767,6 +771,16 @@ def custody(db, recovery, *, retained_memo=None):
                     + int(details['command']['additional_iterations'] > 0))):
             raise ValueError('revision gate resume lost its exact passed implementation evidence')
     if SCOPE_FIELDS <= recovery['command'].keys():
+        latest = next((r for r in reversed(details['state'].get('roles', []))
+                       if r.get('role') == 'implement'), {})
+        if (not details['predecessor_spec'].get('feature_worker')
+                and latest.get('status') == 'blocked'):
+            from .delivery_session_custody import completed_blocked_finding
+
+            if details.get('blocked_scope_finding') != completed_blocked_finding(details):
+                raise ValueError('blocked scope finding lost its authenticated native receipt')
+        elif details.get('blocked_scope_finding') is not None:
+            raise ValueError('scope finding proof belongs to a different assessment')
         scope = recovery['command']
         if spec.get('feature_worker'):
             from .delivery_feature_scope import MARKER, receipt_config
@@ -1207,6 +1221,14 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                                         pending=bool(pending or gate_only or interrupted))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
+    scope_finding = None
+    if SCOPE_FIELDS <= command.keys() and not seal['predecessor_spec'].get('feature_worker'):
+        latest = next((r for r in reversed(seal['state'].get('roles', []))
+                       if r.get('role') == 'implement'), {})
+        if latest.get('status') == 'blocked':
+            from .delivery_session_custody import completed_blocked_finding
+
+            scope_finding = completed_blocked_finding(seal)
     if _revision is not None:
         from .delivery_feature_revision_recovery import validate_revision_recovery
 
@@ -1241,6 +1263,9 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                 raise ValueError('adopted worker derivation changed during runtime preparation')
         elif scope_spec(store, seal, command) != amended:
             raise ValueError('stopped scope configuration changed during runtime preparation')
+        if scope_finding is not None:
+            if completed_blocked_finding(seal) != scope_finding:
+                raise ValueError('blocked scope finding changed during runtime preparation')
         execution.pop('repair_allowance', None)
         if authority:
             if worker_allowance(spec, seal['state']['iteration'],
@@ -1275,6 +1300,7 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'execution_spec': execution, 'execution_candidate': candidate,
                     'maximum_iteration': maximum,
                     'predecessor_result_digest': digest(seal['state']),
+                    **({'blocked_scope_finding': scope_finding} if scope_finding else {}),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
                     **({'ci_findings': ci_findings} if ci_findings else {}),
