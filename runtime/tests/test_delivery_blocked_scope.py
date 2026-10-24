@@ -84,7 +84,7 @@ def prepared_spec(spec):
     return preparation.bind_native_spec(spec, identity, cached, reused=True)
 
 
-def scope_case(service, monkeypatch, *, browser_qa=None, extra_sources=None):
+def scope_case(service, monkeypatch, *, browser_qa=None, extra_sources=None, checks=None):
     owner, submitted = service
     source = owner.config.path.parent / "source"
     api = "apps/api/src/approval.ts"
@@ -121,6 +121,8 @@ def scope_case(service, monkeypatch, *, browser_qa=None, extra_sources=None):
             "protected_paths": [".git", ".github", ".agents", ".codex"],
         },
     )
+    if checks is not None:
+        repository["checks"] = checks
     if browser_qa is not None:
         repository["browser_qa"] = browser_qa
     owner.config.path.write_text(json.dumps(config))
@@ -764,6 +766,8 @@ async def test_public_native_blocked_scope_runs_worker_same_session_and_all_norm
         @activity.defn(name="delivery_checks")
         async def checks(body):
             calls.append("checks")
+            if getattr(case, "actual_checks", None):
+                return await case.actual_checks(body)
             return {
                 "state": "passed",
                 "candidate_id": body["candidate"]["id"],
@@ -818,7 +822,9 @@ async def test_public_native_blocked_scope_runs_worker_same_session_and_all_norm
                 id=response["workflow_id"],
                 task_queue="blocked-native-scope",
             )
-            result = await asyncio.wait_for(handle.result(), 30)
+            result = await asyncio.wait_for(
+                handle.result(), getattr(case, "owner_test_timeout", 30)
+            )
             assert result["outcome"] == "delivered", (result.get("error"), calls, result["checks"])
             assert result["iteration"] == 4 and result["roles"][0] == original_role
             assert result["roles"][0]["status"] == "blocked"

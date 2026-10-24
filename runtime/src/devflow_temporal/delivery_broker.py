@@ -852,6 +852,12 @@ class DeliveryBroker:
                     "diagnostic": parsed_output[-2000:] if not passed else None,
                     "log": str(artifact),
                     "log_sha256": _sha256(artifact),
+                    **({'temporal_test_prerequisites': {
+                        'receipt': str(evidence_dir / check['id'] / 'temporal-prerequisites.json'),
+                        'receipt_sha256': _sha256(
+                            evidence_dir / check['id'] / 'temporal-prerequisites.json')}}
+                       if (evidence_dir / check['id'] / 'temporal-prerequisites.json').exists()
+                       else {}),
                     **({"plan_provenance": check["plan_provenance"]}
                        if check.get("plan_provenance") else {}),
                     **({"satisfies": check["satisfies"]} if check.get("satisfies") else {}),
@@ -1123,6 +1129,12 @@ class DeliveryBroker:
             raise CheckCancelledBeforeLaunch("native check cancelled before launch")
         if self.check_superseded():
             raise CheckSuperseded("native check superseded before launch")
+        from .delivery_temporal_prerequisites import check_launch as temporal_check_launch
+
+        try:
+            temporal_check_launch(process)
+        except (ValueError, OSError) as exc:
+            raise CheckPreparationFailure('temporal-test-prerequisites', exc) from exc
         self.native_cleanup_confirmed = False
         self.native_journals += (process.journal,)
         result = process.run()

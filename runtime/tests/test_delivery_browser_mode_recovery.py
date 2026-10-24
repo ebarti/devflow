@@ -83,7 +83,7 @@ print('1 skipped\\n1 passed' if mode=='1' else '2 passed',flush=True)
 REAL_TABLE, REAL_LISTENERS = native.process_table, native.listeners
 
 
-def browser_case(service, monkeypatch, *, ports=None):
+def browser_case(service, monkeypatch, *, ports=None, extra_sources=None, checks=None):
     qa = {
         "id": "owned-browser",
         "argv": [
@@ -116,7 +116,13 @@ def browser_case(service, monkeypatch, *, ports=None):
         },
         "apps/web/e2e/fixtures/gate.py": GATE,
     }
-    case = scope_case(service, monkeypatch, browser_qa=qa, extra_sources=sources)
+    case = scope_case(
+        service,
+        monkeypatch,
+        browser_qa=qa,
+        extra_sources={**sources, **(extra_sources or {})},
+        checks=checks,
+    )
     raw = copy.deepcopy(case.raw)
     raw.update(status="pass", summary="Completed prior implementation", findings=[])
     rewrite_assessment(case, raw)
@@ -784,6 +790,8 @@ async def test_public_browser_amendment_real_preparation_worker_native_gate_and_
         @activity.defn(name="delivery_checks")
         async def checks(body):
             calls.append("checks")
+            if getattr(case, "actual_checks", None):
+                return await case.actual_checks(body)
             return {
                 "state": "passed",
                 "candidate_id": body["candidate"]["id"],
@@ -827,7 +835,9 @@ async def test_public_browser_amendment_real_preparation_worker_native_gate_and_
                 id=response["workflow_id"],
                 task_queue="browser-mode-recovery",
             )
-            result = await asyncio.wait_for(handle.result(), 45)
+            result = await asyncio.wait_for(
+                handle.result(), getattr(case, "owner_test_timeout", 45)
+            )
             assert result["outcome"] == "delivered", result.get("error")
             assert result["iteration"] == 4 and result["roles"][0] == before["roles"][0]
             assert result["checks"]["browser_qa"]["test_count"] == 2

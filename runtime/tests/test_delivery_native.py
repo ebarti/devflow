@@ -125,20 +125,22 @@ def test_native_checks_share_browser_assets_without_sharing_private_homes(
     browser_cache.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: original_home)
     environments = []
-    for name in ("browser-a", "browser-b"):
-        profile, environment = prepare_native_check(
-            spec, checkout, Path(spec["state_dir"]) / "checks",
-            {"id": name, "argv": ["node", "browser.cjs"]},
-        )
-        environments.append(environment)
-        assert environment["PLAYWRIGHT_BROWSERS_PATH"] == str(browser_cache)
-        assert Path(environment["HOME"]) != original_home
-        lines = (Path(environment["CODEX_HOME"]) / "config.toml").read_text()
-        assert f'{json.dumps(str(browser_cache.resolve()))} = "read"' in lines
-        assert f'{json.dumps(str(original_home.resolve()))} = "read"' not in lines
-        assert profile == "devflow-check"
-    assert environments[0]["HOME"] != environments[1]["HOME"]
-
+    try:
+        for name in ("browser-a", "browser-b"):
+            profile, environment = prepare_native_check(
+                spec, checkout, Path(spec["state_dir"]) / "checks",
+                {"id": name, "argv": ["node", "browser.cjs"]},
+            )
+            environments.append(environment)
+            assert environment["PLAYWRIGHT_BROWSERS_PATH"] == str(browser_cache)
+            assert Path(environment["HOME"]) != original_home
+            lines = (Path(environment["CODEX_HOME"]) / "config.toml").read_text()
+            assert f'{json.dumps(str(browser_cache.resolve()))} = "read"' in lines
+            assert f'{json.dumps(str(original_home.resolve()))} = "read"' not in lines
+            assert profile == "devflow-check"
+        assert environments[0]["HOME"] != environments[1]["HOME"]
+    finally:
+        assert RunResources(spec).finalize("blocked")["state"] == "confirmed"
 
 
 
@@ -549,8 +551,8 @@ from fixtures.activity_liveness_workflow import FinalizationClock
 import devflow_temporal.delivery_resources as resources
 real_remove = resources.remove_directory
 
-def crash_after_remove(path, identity):
-    real_remove(path, identity)
+def crash_after_remove(path, identity, **kwargs):
+    real_remove(path, identity, **kwargs)
     Path(sys.argv[2]).write_text(str(os.getpid()))
     os.kill(os.getpid(), signal.SIGKILL)
 

@@ -742,7 +742,13 @@ def prepare_native_check(
         }
     )
     if trusted_local(spec) and check.get("kind") == "test":
-        _seed_temporal_test_server(checkout, check, scratch)
+        from .delivery_temporal_prerequisites import prepare_check as prepare_temporal_check
+
+        temporal_environment = prepare_temporal_check(spec, checkout, evidence_dir, check, scratch)
+        if temporal_environment:
+            env.update(temporal_environment)
+        else:
+            _seed_temporal_test_server(checkout, check, scratch)
         artifacts = RunResources(spec).check_artifacts(
             evidence_dir / check["id"] / "pytest-artifacts")
         # pytest replaces its basetemp directory. Its fixture child may change

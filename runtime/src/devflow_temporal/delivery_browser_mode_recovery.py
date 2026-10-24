@@ -477,6 +477,12 @@ def custody(db, spec, recovery):
         or spec.get(MARKER) != expected.get(MARKER)
     ):
         raise ValueError("browser amendment lost its exact proposal or original failed evidence")
+    if "temporal_test_prerequisites" in details["command"]:
+        from .delivery_temporal_prerequisites import proposal as temporal_proposal
+
+        expected, _ = temporal_proposal(
+            details, details["command"], historical=True, execution=expected
+        )
     _transition(expected, details["execution_spec"])
     from .delivery_native_preparation import verify_native_spec
 

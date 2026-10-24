@@ -29,6 +29,7 @@ from .delivery_policy_recovery import (
 from .delivery_preparation import _lock
 from .delivery_repair import _ci_diagnostics, published_identity
 from .delivery_resources import private_directory, read_private
+from .delivery_temporal_prerequisites import FIELDS as TEMPORAL_FIELDS
 
 KIND = 'stopped_delivery_resume'
 FIELDS = {'continuation_kind', 'command_id', 'expected_revision', 'expected_iteration',
@@ -808,6 +809,9 @@ def custody(db, recovery, *, retained_memo=None):
     from .delivery_browser_mode_recovery import custody as browser_custody
 
     browser_custody(db, spec, recovery)
+    from .delivery_temporal_prerequisites import custody as temporal_custody
+
+    temporal_custody(db, spec, recovery)
     if details.get('operational_capacity') is not None:
         if spec['policy']['capacity'] != details['predecessor_spec']['policy']['capacity']:
             raise ValueError('amended execution changed frozen policy capacity')
@@ -1169,7 +1173,8 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     original = store.submitted_spec(run_id)
     allowed = range(0, 102) if original.get('feature_worker') else (0, 1, 2)
     if (not isinstance(command, dict) or set(command) not in (
-            FIELDS, FIELDS | SCOPE_FIELDS, FIELDS | BROWSER_FIELDS)
+            FIELDS, FIELDS | SCOPE_FIELDS, FIELDS | BROWSER_FIELDS, FIELDS | TEMPORAL_FIELDS,
+            FIELDS | SCOPE_FIELDS | TEMPORAL_FIELDS, FIELDS | BROWSER_FIELDS | TEMPORAL_FIELDS)
             or command.get('continuation_kind') != KIND
             or not isinstance(command.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', command['command_id'])
@@ -1243,6 +1248,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         from .delivery_browser_mode_recovery import proposal
 
         amended, browser_amendment = proposal(seal, command)
+    temporal_preparation = None
+    if TEMPORAL_FIELDS <= command.keys():
+        from .delivery_temporal_prerequisites import proposal as temporal_proposal
+
+        amended, temporal_preparation = temporal_proposal(seal, command, execution=amended)
     capacity_receipt = None
     if (not seal['predecessor_spec'].get('feature_worker')
             and (SCOPE_FIELDS <= command.keys() or BROWSER_FIELDS <= command.keys())):
@@ -1270,7 +1280,12 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                    if SCOPE_FIELDS <= command.keys() else {}),
                 **({'browser_qa_amendment': {key: browser_amendment[key] for key in (
                     'original_recipe_sha256', 'effective_recipe_sha256')}}
-                   if browser_amendment else {})}
+                   if browser_amendment else {}),
+                **({'temporal_test_prerequisites': {
+                    'check_sha256': temporal_preparation['check_sha256'],
+                    'metadata': temporal_preparation['metadata'],
+                    'sdk': temporal_preparation['sdk']}}
+                   if temporal_preparation else {})}
     spec = seal['predecessor_spec']
     root = Path(spec['state_dir']) / 'stopped-resumes' / command_digest
     with _lock(Path(spec['state_dir']) / 'stopped-resumes' / 'controller.lock'):
@@ -1296,9 +1311,21 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             from .delivery_browser_mode_recovery import _transition
 
             checked, proof = proposal(seal, command)
+            if temporal_preparation is not None:
+                checked, temporal_proof = temporal_proposal(seal, command, execution=checked)
+                if temporal_proof != temporal_preparation:
+                    raise ValueError('combined Temporal prerequisite changed during preparation')
             if checked != amended or proof != browser_amendment:
                 raise ValueError('browser amendment evidence changed during runtime preparation')
             _transition(amended, execution)
+        elif temporal_preparation is not None:
+            from .delivery_temporal_prerequisites import _transition as temporal_transition
+
+            checked, proof = temporal_proposal(
+                seal, command, execution=scope_spec(store, seal, command))
+            if checked != amended or proof != temporal_preparation:
+                raise ValueError('Temporal prerequisite evidence changed during preparation')
+            temporal_transition(amended, execution)
         elif scope_spec(store, seal, command) != amended:
             raise ValueError('stopped scope configuration changed during runtime preparation')
         if scope_finding is not None:
@@ -1346,6 +1373,8 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'predecessor_result_digest': digest(seal['state']),
                     **({'blocked_scope_finding': scope_finding} if scope_finding else {}),
                     **({'browser_qa_amendment': browser_amendment} if browser_amendment else {}),
+                    **({'temporal_test_prerequisites': temporal_preparation}
+                       if temporal_preparation else {}),
                     **({'operational_capacity': capacity_receipt} if capacity_receipt else {}),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
