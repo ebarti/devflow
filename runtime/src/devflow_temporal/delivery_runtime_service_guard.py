@@ -272,7 +272,8 @@ def _receipt(config, *, stop=False, reference=None):
     from .delivery_runtime_location import validate_destination
 
     validate_destination(
-        receipt["destination"], receipt["runs"][0]["original_spec"], strict_source=False
+        receipt["destination"], receipt["runs"][0]["original_spec"], strict_source=False,
+        installed_identity=receipt["runs"][0].get("installed_native_identity"),
     )
     return receipt
 

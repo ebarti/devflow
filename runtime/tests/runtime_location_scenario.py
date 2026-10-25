@@ -68,6 +68,28 @@ def fixture_service(root):
         temporal_address=os.environ["DEVFLOW_TEST_LOCATION_TEMPORAL_ADDRESS"],
         execution_registry=str(home / ".local/state/devflow/execution-ownership/registry.sqlite3"),
     )
+    # A real service may retain different repository/browser authorities under
+    # one physical installation. Freeze both declarations BEFORE any admission.
+    browser_cache = home / ".cache/ms-playwright"
+    browser_cache.mkdir(mode=0o700, parents=True)
+    web_port, api_port = ports()
+    browser_repository = copy.deepcopy(raw["repositories"]["fixture"])
+    browser_repository.update(
+        expected_base_sha=None,
+        browser_qa={
+            "id": "owned-browser-scope",
+            "argv": [str(Path(sys.executable).resolve()), "-c", "print('1 passed')"],
+            "cwd": ".",
+            "ports": {"WEB_PORT": web_port, "API_PORT": api_port},
+            "env": {"JOBCTRL_E2E_ISOLATED": "1"},
+            "read_roots": [str(browser_cache)],
+            "artifact_paths": [],
+            "test_count_regex": r"(\d+) passed",
+            "min_tests": 1,
+            "timeout_seconds": 30,
+        },
+    )
+    raw["repositories"]["fixture-browser"] = browser_repository
     store.config.path.write_text(json.dumps(raw))
     store.config.path.chmod(0o600)
     return DeliveryStore(DeliveryConfig.load(store.config.path)), request
@@ -264,7 +286,7 @@ def auxiliary(store, index):
         "run_id": run_id,
         "work_id": "work-" + str(index),
         "issue_url": "https://github.com/example/fixture/issues/" + str(index + 2),
-        "repository_key": "fixture",
+        "repository_key": "fixture-browser" if index != 3 else "fixture",
         "goal": "Owned second stopped delivery",
         "accepted_plan": "Retain the original source.",
         "base_ref": "HEAD",
@@ -568,6 +590,28 @@ def scoped_external_boundaries(case, patch):
         }
 
     patch.setattr(delivery_automatic_retry, "_tracker_sync", tracker)
+
+
+def assert_cohort_native_authority(config):
+    from devflow_temporal import delivery_runtime_installation as installation
+    from devflow_temporal import delivery_runtime_location as location
+
+    receipt = location._acknowledged(config)
+    assert receipt["destination"]["identity_kind"] == installation.PHYSICAL_DESTINATION
+    assert not installation.RUN_NATIVE_SCOPE & receipt["destination"]["identity"].keys()
+    scopes = []
+    binary = receipt["destination"]["identity"]["codex_bin"]
+    for item in receipt["runs"]:
+        full = installation.scoped_identity(receipt["destination"], item)
+        frozen = item["original_spec"]["policy"]["native_identity"]
+        assert {key: full[key] for key in installation.RUN_NATIVE_SCOPE} == {
+            key: frozen[key] for key in installation.RUN_NATIVE_SCOPE
+        }
+        # The actual normal preparation consumer must honor BOTH scope shapes.
+        location.require_preparation_location(item["original_spec"], binary)
+        scopes.append(full["browser_read_roots"])
+    assert len(scopes) == 6 and len({digest(value) for value in scopes}) >= 2
+    return scopes
 
 
 def crash_apply(root, kind):
@@ -1306,6 +1350,7 @@ def exercise(root, kind):
     assert compatible and not errors, errors
     assert result["state"] == "acknowledged" and original_rows(config) == rows
     assert location._acknowledged(DeliveryConfig.load(config.path))
+    assert_cohort_native_authority(DeliveryConfig.load(config.path))
     reject_partial_membership(DeliveryConfig.load(config.path))
     control(config, "adopt-runtime-location", request)
     case.store = DeliveryStore(DeliveryConfig.load(config.path))

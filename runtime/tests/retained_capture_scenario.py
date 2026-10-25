@@ -497,6 +497,8 @@ def install(root):
     write_private(request, supplied)
     result = fixture.control(config, "adopt-runtime-location", request)
     assert result["state"] == "acknowledged"
+    scopes = fixture.assert_cohort_native_authority(DeliveryConfig.load(config.path))
+    assert scopes.count([]) == 2 and sum(bool(value) for value in scopes) == 4
     assert fixture.original_rows(config) == rows
     print(json.dumps({"state": "installed", "all_six": True, "rows_unchanged": True}))
 

@@ -329,6 +329,7 @@ def _collect(store, migration, supplied, leases):
         _native_inputs,
         _native_observation,
         destination,
+        shared_destination,
     )
     from .delivery_runtime_location import KIND, PENDING, REVERSED
 
@@ -363,9 +364,10 @@ def _collect(store, migration, supplied, leases):
         for previous in history:
             _old_proof(previous)
         measured = destination(spec)
-        if installed is not None and measured != installed:
+        physical = shared_destination(measured)
+        if installed is not None and physical != installed:
             raise ValueError("capture cohort has different native runtime authority")
-        installed = measured
+        installed = physical
         with store._connect() as db:
             if (
                 not store.state._schema_current(db)
@@ -439,6 +441,7 @@ def _collect(store, migration, supplied, leases):
         items.append(
             {
                 "original_spec": spec,
+                "installed_native_identity": measured["identity"],
                 "historical_specs": history,
                 "row": row,
                 "tables": tables,
@@ -462,6 +465,7 @@ def _current(store, authority, db):
         _global_current,
         _native_current,
         _native_inputs,
+        scoped_identity,
     )
 
     _capture_stopped(store.config)
@@ -469,6 +473,7 @@ def _current(store, authority, db):
     if _native_inputs(store, db) != authority["native_inputs"]:
         raise ValueError("capture native execution input changed")
     for item in authority["runs"]:
+        scoped_identity(authority["destination"], item)
         row, spec = item["row"], item["original_spec"]
         current = db.execute(
             "SELECT * FROM delivery_runs WHERE run_id=?", (row["run_id"],)
@@ -1557,7 +1562,7 @@ def verify_record(store, record):
 def _capture(config, supplied):
     from .delivery_closures import insert_seal, prepare_seal
     from .delivery_interrupted_recovery import installation_recovery_lease
-    from .delivery_runtime_installation import destination, same_destination
+    from .delivery_runtime_installation import destination_current
     from .delivery_runtime_service_guard import check, describe, installation_lease
     from .delivery_store import DeliveryStore
 
@@ -1651,10 +1656,7 @@ def _capture(config, supplied):
                     or _sha(private_bytes(config.path)) != intent["owner_sha256"]
                 ):
                     raise ValueError("capture original owner or configured reader changed")
-                if not same_destination(
-                    authority["destination"], destination(authority["runs"][0]["original_spec"])
-                ):
-                    raise ValueError("capture reviewed runtime source changed")
+                destination_current(authority)
                 _publish_exports(folder, exports)
                 histories = [v["envelope"] for v in exports]
                 receipt = {

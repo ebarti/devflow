@@ -124,7 +124,53 @@ def _directory(path):
     }
 
 
+PHYSICAL_DESTINATION = "devflow-shared-physical-installation-v1"
+RUN_NATIVE_SCOPE = frozenset({"browser_read_roots", "toolchain_roots", "package_manager_cache"})
+
+
+def shared_destination(measured):
+    """Separate shared installed objects from each run's retained native grants."""
+    value = deepcopy(measured)
+    if value.get("identity_kind") == PHYSICAL_DESTINATION:
+        if RUN_NATIVE_SCOPE & value["identity"].keys():
+            raise ValueError("shared installation contains a run's native scope")
+        return value
+    if "identity_kind" in value or not RUN_NATIVE_SCOPE <= value["identity"].keys():
+        raise ValueError("installed measurement lacks its complete per-run native scope")
+    value["identity"] = {
+        key: item for key, item in value["identity"].items() if key not in RUN_NATIVE_SCOPE
+    }
+    value["identity_kind"] = PHYSICAL_DESTINATION
+    return value
+
+
+def scoped_identity(shared, item):
+    """A shared location never supplies, merges or rewrites a run's native grants."""
+    if shared.get("identity_kind") != PHYSICAL_DESTINATION:
+        return None  # Previously acknowledged full-identity destinations stay strict.
+    original = item["original_spec"]
+    frozen = original["policy"]["native_identity"]
+    policy = original["policy"]
+    scope = {
+        "toolchain_roots": policy.get("toolchain_roots", []),
+        "package_manager_cache": policy.get("package_manager_cache"),
+        "browser_read_roots": (policy.get("browser_qa") or {}).get("read_roots", []),
+    }
+    if scope != {key: frozen[key] for key in RUN_NATIVE_SCOPE}:
+        raise ValueError("installation run scope differs from its frozen native authority")
+    expected = {**shared_destination(shared)["identity"], **scope}
+    actual = item.get("installed_native_identity")
+    if not isinstance(actual, dict) or actual != expected:
+        raise ValueError("installation lost its full per-run measured native identity")
+    validate_measured_location(original, actual, Path(shared["root"]))
+    return actual
+
+
 def same_destination(expected, actual, *, strict_source=True):
+    if expected.get("identity_kind") == PHYSICAL_DESTINATION:
+        actual = shared_destination(actual)
+    elif "identity_kind" in expected or "identity_kind" in actual:
+        return False
     before, current = deepcopy(expected), deepcopy(actual)
     for key in ("root_identity", "environment_identity"):
         old, new = before[key], current[key]
@@ -150,6 +196,20 @@ def same_destination(expected, actual, *, strict_source=True):
                 value.pop(key)
             value["identity"].pop("runtime_payload_sha256")
     return before == current
+
+
+def destination_current(receipt, *, strict_source=True):
+    """Observe shared objects freshly and authenticate every recorded run grant."""
+    from .delivery_native_renewal import _old_proof
+
+    if not same_destination(
+        receipt["destination"], destination(receipt["runs"][0]["original_spec"]),
+        strict_source=strict_source,
+    ):
+        raise ValueError("acknowledged installed runtime destination changed")
+    for item in receipt["runs"]:
+        scoped_identity(receipt["destination"], item)
+        _old_proof(item["original_spec"])
 
 
 def _protected(root, binary):
@@ -667,9 +727,10 @@ def collect(store, supplied, leases):
         for previous in histories:
             _old_proof(previous)
         measured = destination(spec)
+        physical = shared_destination(measured)
         if installed is None:
-            installed = measured
-        elif measured != installed:
+            installed = physical
+        elif physical != installed:
             raise ValueError("installation cohort has different native runtime authority")
         with store._connect() as db:
             row = dict(
@@ -713,6 +774,7 @@ def collect(store, supplied, leases):
                 "request_digest": row["request_digest"],
                 "request_json_sha256": hashlib.sha256(row["request_json"].encode()).hexdigest(),
                 "original_spec": spec,
+                "installed_native_identity": measured["identity"],
                 "historical_spec_digests": sorted(digest(v) for v in histories),
                 "historical_specs": histories,
                 "native_identities": sorted(
@@ -997,6 +1059,7 @@ def _rows_current(store, receipt, db):
         raise ValueError("installation has a new or changed native execution input")
     _global_current(receipt)
     for item in receipt["runs"]:
+        scoped_identity(receipt["destination"], item)
         run_id, spec = item["run_id"], item["original_spec"]
         row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
         if (
@@ -1224,10 +1287,7 @@ def apply(config, supplied):
             )
         if active:
             install_guard(config, receipt, reference, service_descriptor)
-            if not same_destination(
-                receipt["destination"], destination(receipt["runs"][0]["original_spec"])
-            ):
-                raise ValueError("acknowledged installation object changed before replay")
+            destination_current(receipt)
             validate(receipt["registrations"], after=True, objects=receipt["installed_objects"])
             _pointer(config.state_root / "runtime-installations/current.json", reference)
             pending_path = config.state_root / "runtime-installations/pending.json"
@@ -1316,8 +1376,7 @@ def apply(config, supplied):
             check(config, receipt["service_guard"], service_descriptor, linked=True)
             census(service_descriptor, receipt["service_guard"])
             sealed_objects(receipt)
-            if destination(receipt["runs"][0]["original_spec"]) != receipt["destination"]:
-                raise ValueError("installation destination changed during effects")
+            destination_current(receipt)
             actual = hashlib.sha256(private_bytes(config.path)).hexdigest()
             if actual not in {supplied["owner_before_sha256"], supplied["owner_after_sha256"]}:
                 raise ValueError("installation operational owner drifted during effects")
@@ -1432,10 +1491,7 @@ def rollback(config, supplied):
             check(config, receipt["service_guard"], service_descriptor, linked=True)
             census(service_descriptor, receipt["service_guard"])
             sealed_objects(receipt)
-            if not same_destination(
-                receipt["destination"], destination(receipt["runs"][0]["original_spec"])
-            ):
-                raise ValueError("rollback installed destination changed")
+            destination_current(receipt)
             if hashlib.sha256(private_bytes(config.path)).hexdigest() not in {
                 supplied["owner_before_sha256"],
                 supplied["owner_after_sha256"],

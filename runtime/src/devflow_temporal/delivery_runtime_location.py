@@ -158,6 +158,9 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
         finally:
             connection.close()
     for item in receipt["runs"]:
+        from .delivery_runtime_installation import scoped_identity
+
+        scoped_identity(receipt["destination"], item)
         key = command_id(receipt, item["run_id"])
         saved = db.execute(
             "SELECT request_digest,response_json FROM delivery_commands "
@@ -316,12 +319,15 @@ def require_preparation_location(spec, binary):
     value = _binding(spec)
     if value is None:
         raise ValueError("new installed program location requires public acknowledgement")
-    receipt, _item = value
+    receipt, item = value
     if str(binary) != receipt["destination"]["identity"]["codex_bin"]:
         raise ValueError("preparation selected a different installed bundled executable")
     # The grant owns the installed objects/paths. A later clean committed
     # payload still needs the existing fresh native preparation owner.
-    validate_destination(receipt["destination"], spec, strict_source=False)
+    validate_destination(
+        receipt["destination"], spec, strict_source=False,
+        installed_identity=item.get("installed_native_identity"),
+    )
 
 
 def require_execution_location(spec):
@@ -357,7 +363,10 @@ def require_execution_location(spec):
     receipt, _item = active
     if spec["policy"]["codex_bin"] != receipt["destination"]["identity"]["codex_bin"]:
         raise ValueError("historical installed program location must be prepared before launch")
-    validate_destination(receipt["destination"], item["original_spec"], strict_source=False)
+    validate_destination(
+        receipt["destination"], item["original_spec"], strict_source=False,
+        installed_identity=item.get("installed_native_identity"),
+    )
 
 
 def verify_historical_prepared_spec(spec):
@@ -526,16 +535,28 @@ def require_ready(config):
         if previous is None or not compatible_owner(previous, config, live):
             raise ValueError("operational installation configuration changed during bootstrap")
     validate_destination(
-        receipt["destination"], receipt["runs"][0]["original_spec"], strict_source=False
+        receipt["destination"], receipt["runs"][0]["original_spec"], strict_source=False,
+        installed_identity=receipt["runs"][0].get("installed_native_identity"),
     )
 
 
-def validate_destination(expected, original, *, strict_source=True):
+def validate_destination(expected, original, *, strict_source=True, installed_identity=None):
     """Implemented by the installation owner, also called freshly by consumers."""
-    from .delivery_runtime_installation import destination, same_destination
+    from .delivery_native_preparation import pinned_identity
+    from .delivery_runtime_installation import destination, same_destination, scoped_identity
 
-    if not same_destination(expected, destination(original), strict_source=strict_source):
+    measured = destination(original)
+    if not same_destination(expected, measured, strict_source=strict_source):
         raise ValueError("acknowledged installed runtime destination changed")
+    identity = scoped_identity(
+        expected, {"original_spec": original, "installed_native_identity": installed_identity}
+    )
+    if identity is not None:
+        ignored = () if strict_source else ("runtime_payload_sha256",)
+        if pinned_identity(identity, original, *ignored) != pinned_identity(
+            measured["identity"], original, *ignored
+        ):
+            raise ValueError("installed runtime changed this run's full native authority")
 
 
 @contextmanager
