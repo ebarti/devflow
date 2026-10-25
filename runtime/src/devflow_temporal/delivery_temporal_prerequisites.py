@@ -425,9 +425,9 @@ def custody(db, spec, recovery):
     original, command = details["predecessor_spec"], details["command"]
     base = original
     if {"added_paths", "amended_config_path", "amended_config_sha256"} <= command.keys():
-        from .delivery_config import scope_amended_spec
+        from .delivery_config import scope_receipt_spec
 
-        base = scope_amended_spec(
+        base = scope_receipt_spec(
             original,
             Path(command["amended_config_path"]),
             command["amended_config_sha256"],

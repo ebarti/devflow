@@ -753,6 +753,37 @@ def scope_amendment_config(
     return amended
 
 
+def scope_receipt_spec(
+    original: dict[str, Any], config_path: Path, config_sha256: str,
+    added_paths: list[str],
+) -> dict[str, Any]:
+    """Reconstruct only a sealed ordinary scope receipt, granting no current access.
+
+    The caller must first authenticate its immutable command/admission. Current
+    proposal and worker readback retain their independent physical source/base
+    observers; historical composition never re-admits against a mutable ref.
+    """
+    if (original.get("provider") != "codex" or original.get("feature_worker")
+            or original.get("feature_delivery")):
+        raise ValueError("scope receipt requires its original ordinary native authority")
+    amended = scope_amendment_config(original, config_path, config_sha256, added_paths)
+    repository = amended.raw["repositories"][original["repository_key"]]
+    effective = deepcopy(original)
+    effective["policy"]["allowed_paths"] = deepcopy(repository.get("allowed_paths", []))
+    if repository.get("source_scope") is not None:
+        effective["policy"]["source_scope"] = deepcopy(repository["source_scope"])
+    else:
+        effective["policy"].pop("source_scope", None)
+    effective["config_path"] = str(amended.path)
+    effective["config_digest"] = digest(amended.raw)
+    effective["policy_digest"] = digest(effective["policy"])
+    if original.get("preparation_version") == 1:
+        from .delivery_runtime_location import bind_provenance
+
+        effective = bind_provenance(effective, original)
+    return effective
+
+
 def scope_amended_spec(
     original: dict[str, Any], config_path: Path, config_sha256: str,
     added_paths: list[str],
