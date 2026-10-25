@@ -23,6 +23,7 @@ KIND = "installed_runtime_location_acknowledged"
 PENDING = "installed_runtime_location_pending"
 REVERSED = "installed_runtime_location_rolled_back"
 SCHEMA = "devflow-installed-runtime-location-v1"
+RECEIPT_LIMIT = 16 * 1024 * 1024
 ANSWER = "Migrate this stopped installation; preserve every original run and execution allowance"
 _BOOTSTRAP = contextvars.ContextVar("devflow_runtime_location_bootstrap", default=None)
 
@@ -70,6 +71,10 @@ def private_bytes(path, *, maximum=4 * 1024 * 1024):
         return raw
     finally:
         os.close(descriptor)
+
+
+def receipt_bytes(path):
+    return private_bytes(path, maximum=RECEIPT_LIMIT)
 
 
 def command_id(receipt, run_id):
@@ -121,7 +126,7 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
     expected = config.state_root / "runtime-installations" / pointer["command_id"] / "receipt.json"
     if receipt_path != expected:
         raise ValueError("installation receipt left its exact owner namespace")
-    raw = private_bytes(receipt_path)
+    raw = receipt_bytes(receipt_path)
     if hashlib.sha256(raw).hexdigest() != pointer["receipt_sha256"]:
         raise ValueError("installation receipt changed")
     receipt = json.loads(raw)

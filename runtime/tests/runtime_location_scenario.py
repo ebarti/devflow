@@ -212,6 +212,7 @@ def registrations(root, config):
     cli.chmod(0o755)
     from shlex import quote
 
+    activated = {}
     for name in ("devflow", "devflow-delivery", "devflow-delivery-mcp"):
         path = home / ".local/share/devflow/delivery-launchers/owned/entries" / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,6 +229,26 @@ def registrations(root, config):
         link.parent.mkdir(parents=True, exist_ok=True)
         link.unlink(missing_ok=True)
         link.symlink_to(path)
+        activated[name] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    marker = path.parent.parent / "activation-manifest.json"
+    write_private(
+        marker,
+        {
+            "revision": git(SOURCE, "rev-parse", "HEAD"),
+            "tree": git(SOURCE, "rev-parse", "HEAD^{tree}"),
+            "config": {
+                "owner": 5,
+                "original": str(root / "retained-original-policy.json"),
+                "config_path": str(config.path),
+                "sha256": "5" * 64,
+            },
+            "entries": activated,
+        },
+    )
+    path.parent.parent.parent.chmod(0o700)
     return cli
 
 
@@ -659,6 +680,145 @@ def reject_partial_membership(config):
             db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)", saved)
 
 
+async def actual_worker(case, current, recovery, response, patch):
+    """Actual workflow, readback, native checks/browser/finalization and replay.
+
+    Provider verdicts and GitHub/ProjectSync are controlled external boundaries.
+    The unchanged owner/preparation/resource/process/check/recipe consumers run.
+    """
+    from temporalio import activity
+    from temporalio.client import Client
+    from temporalio.worker import Replayer, Worker
+    from test_delivery_temporal_prerequisites import owned_sdk_environment
+
+    from devflow_temporal.delivery_activities import (
+        delivery_browser_qa,
+        delivery_checks,
+        delivery_finalize_resources,
+        delivery_project,
+        delivery_repair_preflight,
+    )
+    from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
+    from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+    original_checks = DeliveryBroker._run_check_list
+    native_checks = []
+
+    def checks_with_dependencies(self, checkout, checks, *args, **kwargs):
+        if any(value["id"] == case.check["id"] for value in checks):
+            owned_sdk_environment(self, checkout)
+        return original_checks(self, checkout, checks, *args, **kwargs)
+
+    patch.setattr(DeliveryBroker, "_run_check_list", checks_with_dependencies)
+    calls = []
+
+    @activity.defn(name="delivery_role")
+    async def role(body):
+        calls.append(body["role"])
+        assert body["iteration"] == 4
+        if body["role"] == "implement":
+            assert body["resume_session"] == recovery["session_id"]
+            path = Path(current["checkout"]) / case.api
+            path.write_text(path.read_text() + "\nAuthorized owned fixture iteration4\n")
+            git(Path(current["checkout"]), "add", case.api)
+            git(Path(current["checkout"]), "commit", "-qm", "Owned finite fixture implementation")
+        return {
+            "role": body["role"],
+            "iteration": 4,
+            "status": "pass",
+            "cleanup": "confirmed",
+            "findings": [],
+            "session_id": recovery["session_id"] if body["role"] == "implement" else body["role"],
+            "candidate": DeliveryBroker(case.store, body["spec"]).candidate(),
+        }
+
+    @activity.defn(name="delivery_tracker_start")
+    async def tracker_start(_body):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_precheck")
+    async def precheck(body):
+        calls.append("precheck")
+        return {"state": "passed", "candidate_id": body["candidate"]["id"], "cleanup": "confirmed"}
+
+    @activity.defn(name="delivery_publish")
+    async def publish(body):
+        calls.append("publish")
+        git(Path(current["checkout"]), "push", "origin", "HEAD:refs/heads/" + current["branch"])
+        case.publication.update(head=body["candidate"]["head"], candidate=body["candidate"])
+        return copy.deepcopy(case.publication)
+
+    @activity.defn(name="delivery_checks")
+    async def checks(body):
+        calls.append("checks")
+        result = await delivery_checks(body)
+        native_checks.append(result)
+        return result
+
+    @activity.defn(name="delivery_ci")
+    async def ci(body):
+        calls.append("ci")
+        return {"state": "passed", "head": body["pull_request"]["head"]}
+
+    @activity.defn(name="delivery_terminal_tracker")
+    async def terminal_tracker(body):
+        calls.append("terminal_tracker")
+        if body["release"]:
+            with case.store._connect() as db:
+                case.store.state.release_work(db, current["work_id"], "external:devflow:run-1")
+        return {"state": "consistent"}
+
+    client = await Client.connect(
+        case.store.config.temporal_address, data_converter=DELIVERY_DATA_CONVERTER
+    )
+    queue = "owned-location-" + case.kind
+    case.store.mark_start("run-1", accepted=True)
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[DeliveryWorkflow],
+        activities=[
+            delivery_repair_preflight,
+            delivery_project,
+            delivery_finalize_resources,
+            delivery_browser_qa,
+            role,
+            tracker_start,
+            precheck,
+            publish,
+            checks,
+            ci,
+            terminal_tracker,
+        ],
+    ):
+        handle = await client.start_workflow(
+            DeliveryWorkflow.run,
+            args=[current, recovery],
+            id=response["workflow_id"],
+            task_queue=queue,
+        )
+        result = await asyncio.wait_for(handle.result(), 150)
+        assert result["outcome"] == "delivered", result.get("error")
+        assert result["iteration"] == 4 and result["roles"][0] == recovery["state"]["roles"][0]
+        assert result["cleanup"] == "confirmed"
+        assert native_checks and native_checks[0]["state"] == "passed", native_checks
+        worker = next(
+            value for value in native_checks[0]["results"] if value["id"] == case.check["id"]
+        )
+        assert worker["junit"]["passed"] == 3 and worker["passed"] is True
+        if case.kind == "browser":
+            qa = result["checks"]["browser_qa"]
+            assert qa["test_count"] == 2
+            assert [item["state"] for item in qa["browser_qa_amendment"]["cases"]] == [
+                "passed",
+                "passed",
+            ]
+        assert "review" in calls and "verify" in calls and "ci" in calls
+        history = await handle.fetch_history()
+    await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
+    return {"native_junit_passed": 3, "workflow_replay": "passed", "iteration": 4}
+
+
 def exercise(root, kind):
     from test_delivery_temporal_prerequisites import native_check_ready
 
@@ -843,24 +1003,31 @@ def exercise(root, kind):
     }
     # The actual launch owner consumes the current candidate, claim, manifest,
     # recipe, independent pinned tool receipt and fresh installed native proof.
-    broker = native_check_ready(case, current)
+    if kind in {"scope", "browser"}:
+        worker_result = asyncio.run(actual_worker(case, current, recovery, response, patch))
+    else:
+        worker_result = None
+    broker = native_check_ready(case, current) if worker_result is None else None
     from devflow_temporal.delivery_sandbox import prepare_native_check
     from devflow_temporal.delivery_temporal_prerequisites import check_launch
 
-    evidence = broker.evidence_dir / "checks/4"
-    try:
-        _profile, environment = prepare_native_check(current, broker.checkout, evidence, case.check)
-        process = SimpleNamespace(
-            spec=current,
-            folder=evidence / case.check["id"] / "native",
-            argv=case.check["argv"],
-            cwd=broker.checkout,
-            environment=environment,
-            timeout=2700,
-        )
-        check_launch(process)
-    finally:
-        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
+    if broker is not None:
+        evidence = broker.evidence_dir / "checks/4"
+        try:
+            _profile, environment = prepare_native_check(
+                current, broker.checkout, evidence, case.check
+            )
+            process = SimpleNamespace(
+                spec=current,
+                folder=evidence / case.check["id"] / "native",
+                argv=case.check["argv"],
+                cwd=broker.checkout,
+                environment=environment,
+                timeout=2700,
+            )
+            check_launch(process)
+        finally:
+            assert RunResources(current).finalize("blocked")["state"] == "confirmed"
     control(DeliveryConfig.load(config.path), "rollback-runtime-location", request, success=False)
     assert case.store.continue_repair("run-1", case.command) == response
     print(
@@ -876,6 +1043,7 @@ def exercise(root, kind):
                 "frozen_capacity": 6,
                 "kind": kind,
                 "source": str(SOURCE),
+                "worker": worker_result,
             }
         )
     )

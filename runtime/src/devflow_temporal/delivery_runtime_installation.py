@@ -10,7 +10,9 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import stat
+import subprocess
 import sys
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -23,12 +25,14 @@ from .contracts import canonical_json, digest
 from .delivery_runtime_location import (
     ANSWER,
     KIND,
+    RECEIPT_LIMIT,
     REVERSED,
     SCHEMA,
     _transport,
     bootstrap,
     command_id,
     private_bytes,
+    receipt_bytes,
     source_root,
 )
 
@@ -440,7 +444,7 @@ def bootstrap_inputs(config, supplied):
     if hashlib.sha256(current).hexdigest() != supplied["owner_before_sha256"]:
         if not intent_path.exists():
             raise ValueError("owner changed before an authenticated installation intent")
-        raw = private_bytes(intent_path)
+        raw = receipt_bytes(intent_path)
         intent = json.loads(raw)
         reference = {
             "command_id": supplied["command_id"],
@@ -628,12 +632,12 @@ def collect(store, supplied, leases):
             raise ValueError("installation admitted snapshot is not already a private owned file")
     stopped = store.config.state_root / "service-stopped.json"
     read_private(stopped)
-    from .delivery_control import _owned, _read_manifest
+    from .delivery_control import _owned, _read_manifest, _recorded_deployment
 
-    if any(
-        _owned(actor)
-        for actor in (_read_manifest(store.config) or {}).get("processes", {}).values()
-    ):
+    lifecycle = _read_manifest(store.config) or {"processes": {}}
+    if _recorded_deployment(lifecycle) is not None:
+        raise ValueError("retained worker deployment requires its existing deployment owner")
+    if any(_owned(actor) for actor in lifecycle.get("processes", {}).values()):
         raise ValueError("stop and drain the original delivery actors before installation")
     entries, observations, installed = [], {}, None
     for run_id in sorted(supplied["runs"]):
@@ -679,6 +683,8 @@ def collect(store, supplied, leases):
             from .delivery_policy_recovery import work_binding
 
             work = work_binding(store, spec, db)
+        if any(attempt["state"] != "finished" for attempt in attempts):
+            raise ValueError("installation cohort still has an unfinished native attempt")
         if claim and claim["owner"] != "external:devflow:" + run_id:
             raise ValueError("installation cohort lost its own claim")
         closed, closure_record = _closure(store, row)
@@ -746,7 +752,124 @@ def _authority(config, supplied, inputs, leases, *, read_only=True):
     )
     with store._connect() as db:
         authority["native_inputs"] = _native_inputs(store, db)
+    authority["global_native"] = _global_native(config, authority, leases)
     return store, authority, observations
+
+
+def _process_views():
+    """Native monitors use host-default time; controllers may inherit UTC."""
+    values = {}
+    for zone in (None, "UTC"):
+        environment = dict(os.environ)
+        environment.pop("TZ", None)
+        if zone:
+            environment["TZ"] = zone
+        output = subprocess.run(
+            ["ps", "-A", "-o", "pid=,stat=,lstart="],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        for line in output.splitlines():
+            row = line.strip().split(maxsplit=2)
+            if len(row) == 3 and row[0].isdigit() and not row[1].startswith("Z"):
+                values.setdefault(int(row[0]), set()).add(row[2])
+    return values
+
+
+def _original_programs_absent(receipt):
+    roots = {
+        Path(item["original_spec"]["policy"]["codex_bin"]).parents[7] for item in receipt["runs"]
+    }
+    output = subprocess.run(
+        ["ps", "-A", "-o", "pid=,command="], check=True, capture_output=True, text=True, timeout=5
+    ).stdout
+    observed = set()
+    for line in output.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        try:
+            argv = shlex.split(fields[1])
+        except ValueError:
+            if any(str(root) in fields[1] for root in roots):
+                raise ValueError(
+                    "original runtime process command cannot be authenticated"
+                ) from None
+            continue
+        for root in roots:
+            first = Path(argv[0]) if argv else None
+            scripts = {
+                str(root / "runtime/.venv/bin" / name)
+                for name in ("devflow-delivery", "devflow-delivery-mcp", "devflow-temporal")
+            }
+            if (first and first.is_relative_to(root / "runtime/.venv")) or (
+                first
+                and first.name.startswith("python")
+                and any(arg in scripts for arg in argv[1:3])
+            ):
+                observed.add(int(fields[0]))
+    after = _process_views()
+    if any(pid in after for pid in observed):
+        raise ValueError("original runtime controller or MCP process is still live; drain it first")
+
+
+def _global_native(config, receipt, leases):
+    """Current actor observation only; unnamed historical custody is not adopted."""
+    from .delivery_filesystem_custody import _opened
+
+    known = {
+        path
+        for item in receipt["runs"]
+        for path in item["native"]["journals"]
+        if Path(path).name == "native-process.json"
+    }
+    journals, actors, ports = {}, set(), set()
+    paths = sorted(config.state_root.rglob("native-process.json"))
+    if len(paths) > 4096:
+        raise ValueError("installation exceeds its bounded registered native observation")
+    for path in paths:
+        raw = private_bytes(path)
+        journal = json.loads(raw)
+        if journal.get("phase") != "finished":
+            raise ValueError("installation has an unfinished historical native monitor")
+        if str(path) not in known:
+            for name in ("native-process.lock", "native-monitor.lock"):
+                lock = path.with_name(name)
+                if lock.exists():
+                    leases.enter_context(_opened(lock, lock=True))
+        journals[str(path)] = hashlib.sha256(raw).hexdigest()
+        actors.update(
+            (int(pid), item["identity"]) for pid, item in journal.get("owned", {}).items()
+        )
+        if journal.get("monitor"):
+            actors.add((int(journal["monitor"]["pid"]), journal["monitor"]["identity"]))
+        ports.update(journal.get("ports", []))
+    observation = {
+        "journals": journals,
+        "actors": sorted(actors),
+        "ports": sorted(ports),
+        "process_time_views": ["host-default", "UTC"],
+    }
+    _global_current({**receipt, "global_native": observation})
+    return observation
+
+
+def _global_current(receipt):
+    from .delivery_native_process import listeners
+
+    value = receipt["global_native"]
+    for raw, expected in value["journals"].items():
+        if hashlib.sha256(private_bytes(Path(raw))).hexdigest() != expected:
+            raise ValueError("installation historical native actor evidence changed")
+    table = _process_views()
+    if any(identity in table.get(pid, set()) for pid, identity in value["actors"]) or any(
+        listeners(port) for port in value["ports"]
+    ):
+        raise ValueError("installation has live historical native actors or ports")
+    _original_programs_absent(receipt)
 
 
 def _native_inputs(store, db):
@@ -824,6 +947,7 @@ def _rows_current(store, receipt, db):
 
     if _native_inputs(store, db) != receipt["native_inputs"]:
         raise ValueError("installation has a new or changed native execution input")
+    _global_current(receipt)
     for item in receipt["runs"]:
         run_id, spec = item["run_id"], item["original_spec"]
         row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
@@ -1007,6 +1131,9 @@ def apply(config, supplied):
         ExitStack() as leases,
         bootstrap(config, inputs),
     ):
+        from .delivery_runtime_registrations import update_leases
+
+        update_leases(supplied, leases)
         leases.enter_context(_owner_lease(config.path))
         leases.enter_context(_opened(Path(supplied["owner_after_path"]), lock=True))
         folder = inputs["folder"]
@@ -1017,12 +1144,12 @@ def apply(config, supplied):
         ):
             raise ValueError("installation already has a different location acknowledgement")
         path = folder / "receipt.json"
-        receipt = json.loads(private_bytes(path)) if path.exists() else None
+        receipt = json.loads(receipt_bytes(path)) if path.exists() else None
         reference = (
             {
                 "command_id": supplied["command_id"],
                 "receipt": str(path),
-                "receipt_sha256": hashlib.sha256(private_bytes(path)).hexdigest(),
+                "receipt_sha256": hashlib.sha256(receipt_bytes(path)).hexdigest(),
             }
             if receipt
             else None
@@ -1075,7 +1202,7 @@ def apply(config, supplied):
                     stage(item) for item in receipt["registrations"]["objects"]
                 ]
             raw = (canonical_json(receipt) + "\n").encode()
-            if len(raw) > 4 * 1024 * 1024:
+            if len(raw) > RECEIPT_LIMIT:
                 raise ValueError("installation cohort exceeds its bounded immutable receipt")
             _immutable(folder / "owner-before.json", inputs["before"])
             _immutable(path, raw)
@@ -1153,7 +1280,7 @@ def rollback(config, supplied):
 
     inputs = bootstrap_inputs(config, supplied)
     path = inputs["folder"] / "receipt.json"
-    raw = private_bytes(path)
+    raw = receipt_bytes(path)
     receipt = json.loads(raw)
     reference = {
         "command_id": supplied["command_id"],
@@ -1172,6 +1299,9 @@ def rollback(config, supplied):
         ExitStack() as leases,
         bootstrap(config, inputs),
     ):
+        from .delivery_runtime_registrations import update_leases
+
+        update_leases(supplied, leases)
         leases.enter_context(_owner_lease(config.path))
         leases.enter_context(_opened(Path(supplied["owner_after_path"]), lock=True))
         current_path = config.state_root / "runtime-installations/current.json"

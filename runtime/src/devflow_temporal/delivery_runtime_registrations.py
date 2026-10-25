@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -188,6 +190,27 @@ def _cli(supplied):
     return str(path)
 
 
+def update_leases(supplied, leases):
+    """Use the installed owners' same locks; keep ProjectSync outside them."""
+    home = Path(supplied["host_home"])
+    if home != Path.home().resolve(strict=True):
+        raise ValueError("installer leases belong to a different host home")
+    link = _link(home / ".local/bin/devflow")
+    target = Path(link["target"])
+    journal = target.parent.parent
+    if target.parent.name != "entries" or not journal.is_relative_to(
+        home / ".local/share/devflow/delivery-launchers"
+    ):
+        raise ValueError("launcher lease belongs to another registration")
+    source = source_root() / "scripts/install-delivery-launchers.py"
+    spec = importlib.util.spec_from_file_location("devflow_installed_launcher_owner", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    leases.enter_context(module.locked(journal))
+    owned, _package = _desktop()
+    leases.enter_context(owned.locked(home / ".codex"))
+
+
 def observe(config, supplied, original, installed):
     home = Path(supplied["host_home"])
     if home != Path.home().resolve(strict=True) or home.resolve(strict=True) != home:
@@ -195,6 +218,7 @@ def observe(config, supplied, original, installed):
     old_root = Path(original["policy"]["codex_bin"]).parents[7]
     root = Path(installed["root"])
     objects = []
+    launcher = None
     for name in ("devflow", "devflow-delivery", "devflow-delivery-mcp"):
         link = home / ".local/bin" / name
         registered = _link(link)
@@ -208,6 +232,23 @@ def observe(config, supplied, original, installed):
         before = _read(target)
         if before != _wrapper(old_root, config.path, name):
             raise ValueError("global delivery wrapper differs from the original owner/program")
+        marker_path = target.parent.parent / "activation-manifest.json"
+        raw_marker = _read(marker_path)
+        marker = json.loads(raw_marker)
+        if (
+            marker.get("config", {}).get("config_path") != str(config.path)
+            or marker.get("entries", {}).get(name, {}).get("path") != str(target)
+            or marker["entries"][name].get("sha256") != hashlib.sha256(before).hexdigest()
+        ):
+            raise ValueError("original launcher activation does not own this exact registration")
+        current_marker = {
+            "path": str(marker_path),
+            "sha256": hashlib.sha256(raw_marker).hexdigest(),
+            "identity": object_identity(marker_path),
+        }
+        if launcher is not None and launcher != current_marker:
+            raise ValueError("delivery commands have different original activation owners")
+        launcher = current_marker
         objects.append(
             {
                 "path": str(target),
@@ -271,6 +312,7 @@ def observe(config, supplied, original, installed):
         {name: base64.b64decode(raw) for name, raw in before_files.items()},
     )
     return {
+        "launcher_activation": launcher,
         "objects": objects,
         "logical_helper": str(logical),
         "logical_helper_identity": _link(logical) if logical.is_symlink() else None,
@@ -609,6 +651,12 @@ def package(plan):
 
 
 def validate(plan, *, after=False, before=False, objects=None):
+    activation = plan["launcher_activation"]
+    if (
+        object_identity(Path(activation["path"])) != activation["identity"]
+        or hashlib.sha256(_read(Path(activation["path"]))).hexdigest() != activation["sha256"]
+    ):
+        raise ValueError("original launcher activation bytes or generation changed")
     logical = Path(plan["logical_helper"])
     if (
         plan["logical_helper_identity"] is not None
