@@ -502,7 +502,10 @@ def receive_bound(root):
 
 
 def continue_original(root):
+    import httpx
+
     from devflow_temporal.delivery_activities import delivery_repair_preflight
+    from devflow_temporal.delivery_api import create_app
     from devflow_temporal.delivery_closed_projection import reconcile_completed_projections
     from devflow_temporal.delivery_closures import sealed_closure
     from devflow_temporal.delivery_native_preparation import verify_native_spec
@@ -534,9 +537,34 @@ def continue_original(root):
     case.command["expected_revision"] = 48
     request = case.store.config.state_root / "operator-inputs/finite-continuation.json"
     write_private(request, case.command)
-    outcome = public(case.store.config, "repair-admission-preflight", run="run-1", request=request)
+    # Real public API handlers and CSRF, without a lifespan/dispatcher/API worker
+    # or a provider. Only the HTTP transport is in-process in this owned case.
+    app = create_app(case.store.config.path)
+
+    def api(operation):
+        async def send():
+            transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 40000))
+            async with httpx.AsyncClient(
+                transport=transport, base_url=case.store.config.dashboard_url
+            ) as caller:
+                session = await caller.get("/api/session")
+                assert session.status_code == 200
+                response = await caller.post(
+                    "/api/runs/run-1/" + operation,
+                    json=read_private(request),
+                    headers={
+                        "Origin": case.store.config.dashboard_url,
+                        "X-Devflow-CSRF": session.json()["csrf_token"],
+                    },
+                )
+                assert response.status_code == 200, response.text
+                return response.json()
+
+        return asyncio.run(send())
+
+    outcome = api("repair-admission-preflight")
     assert outcome["authorized_through_iteration"] == 4
-    response = public(case.store.config, "continue-repair", run="run-1", request=request)
+    response = api("continue-repair")
     assert response["run_id"] == "run-1"
     current = case.store.effective_spec("run-1")
     with case.store._connect() as db:
