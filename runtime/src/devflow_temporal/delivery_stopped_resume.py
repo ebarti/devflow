@@ -273,11 +273,14 @@ def pending_repair(seal, *, db=None):
         preflight = _unstarted_preflight(seal, previous, db)
         if preflight is not None:
             return preflight
+    unstarted = None
     if not seal.get('session_custody', {}).get('missing_rollout'):
-        if db is None or not _unstarted_repair(seal, previous, db):
+        unstarted = _unstarted_repair(seal, previous, db) if db is not None else None
+        if not unstarted:
             return None
         if previous.get('pending_repair'):
-            return previous['pending_repair']
+            return {**previous['pending_repair'], **(
+                {'implementation_preparation': unstarted} if isinstance(unstarted, dict) else {})}
     state = previous['state']
     if previous.get('resume_iteration', state['iteration'] + 1) == state['iteration']:
         # The predecessor re-ran its own sealed iteration; it requested no repair.
@@ -291,7 +294,8 @@ def pending_repair(seal, *, db=None):
         if role.get('iteration') == state['iteration']
         for finding in role.get('findings', [])]]
     return {'iteration': iteration,
-            'findings': [finding for finding in findings if finding is not None]}
+            'findings': [finding for finding in findings if finding is not None],
+            **({'implementation_preparation': unstarted} if isinstance(unstarted, dict) else {})}
 
 
 def _unstarted_repair(seal, previous, db, *, closing=False):
@@ -336,6 +340,21 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
                           for item in preparation['results'])
                   and preparation['results'][-1].get('launched') is False
                   and preparation['results'][-1].get('failure_kind') == 'preparation')
+    native_preparation = None
+    if (not closing and not unlaunched and len(remainder) == 1
+            and remainder[0].get('role') == 'implement'
+            and remainder[0].get('iteration') == iteration
+            and remainder[0].get('status') == 'blocked'
+            and remainder[0].get('session_id') is None
+            and remainder[0].get('cleanup') == 'confirmed'
+            and remainder[0].get('candidate') == candidate
+            and preparation.get('state') == 'failed'
+            and preparation.get('cleanup') == 'confirmed'
+            and preparation.get('source_unchanged') is True):
+        from .delivery_preparation_recovery import completed_prerequisite
+
+        native_preparation = completed_prerequisite(seal, previous, remainder[0])
+        unlaunched = bool(native_preparation)
     rejected_input = (rejected_input and len(remainder) == len(current_attempts) == 1
                       and remainder[0].get('role') == current_attempts[0]['role'] == 'implement'
                       and remainder[0].get('iteration') == iteration
@@ -393,7 +412,7 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
         # Ordinary deliveries have no shared feature debit. The immutable
         # admission plus unchanged inventory and absent provider turn above prove
         # that this exact fixed-budget iteration has not executed yet.
-        return True
+        return native_preparation or True
     shared = registry(spec)
     owner = origin['execution_spec']['repair_allowance']['owner']
     current_owner = spec['repair_allowance']['owner']
