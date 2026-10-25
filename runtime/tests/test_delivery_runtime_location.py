@@ -111,6 +111,10 @@ async def test_public_permanent_location_owner_and_continuation(installed_pair, 
             env=bound,
             timeout=420,
         )
+        if kind == "scope":
+            for line in output.splitlines():
+                if "actual_native_post_ack_public_get" in line:
+                    print(line)
     result = json.loads(output.splitlines()[-1])
     if kind in {"rollback", "pendingrollback"}:
         assert result["state"] == "rolled_back"

@@ -138,6 +138,13 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
     if reference is None and not os.path.lexists(path):
         return None
     pointer = reference if reference is not None else json.loads(private_bytes(path))
+    if db is None:
+        connection = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            return _acknowledged(config, db=connection, historical=historical, reference=pointer)
+        finally:
+            connection.close()
     receipt_path = Path(pointer["receipt"])
     expected = config.state_root / "runtime-installations" / pointer["command_id"] / "receipt.json"
     if receipt_path != expected:
@@ -154,13 +161,6 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
         or receipt["command"]["command_id"] != pointer["command_id"]
     ):
         raise ValueError("installation receipt belongs to another operational owner")
-    if db is None:
-        connection = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
-        try:
-            connection.execute("PRAGMA query_only=ON")
-            return _acknowledged(config, db=connection, historical=historical, reference=pointer)
-        finally:
-            connection.close()
     for item in receipt["runs"]:
         from .delivery_runtime_installation import scoped_identity
 

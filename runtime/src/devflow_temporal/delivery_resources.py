@@ -425,6 +425,8 @@ def retained_worktrees(spec: dict) -> dict:
     try:
         registry = RunResources(spec, read_only=True)
         with registry.locked(read_only=True) as manifest:
+            registry._observing_gate_roots = True
+            registry._observation_gate_roots = None
             roots = []
             for raw, entry in manifest["roots"].items():
                 if entry["kind"] not in {"checkout", "gate"}:
@@ -436,6 +438,9 @@ def retained_worktrees(spec: dict) -> dict:
                     if not same_object(spec, path, entry["identity"]):
                         raise ValueError("retained worktree identity changed")
                     roots.append({"path": raw, "reason": entry.get("receipt", {}).get("reason")})
+            if (registry._observation_gate_roots is not None
+                    and _gate_roots(spec) != registry._observation_gate_roots):
+                raise ValueError("resource execution authority changed during observation")
             return {"state": "observed", "count": len(roots), "roots": roots}
     except (OSError, ValueError, KeyError):
         return {"state": "unavailable", "count": None, "roots": []}

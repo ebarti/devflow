@@ -1439,6 +1439,24 @@ def exercise(root, kind):
     reject_partial_membership(DeliveryConfig.load(config.path))
     control(config, "adopt-runtime-location", request)
     case.store = DeliveryStore(DeliveryConfig.load(config.path))
+    if kind == "scope":
+        import httpx
+
+        from devflow_temporal.delivery_api import create_app
+
+        async def public_read():
+            app = create_app(config.path)
+            transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+            async with httpx.AsyncClient(
+                transport=transport, base_url=case.store.config.dashboard_url, timeout=30,
+            ) as browser:
+                started = time.monotonic()
+                response = await asyncio.wait_for(browser.get("/api/runs/run-1"), timeout=30)
+            assert response.status_code == 200, response.text[:1000]
+            assert response.json()["run"]["run_id"] == "run-1"
+            return {"seconds": time.monotonic() - started, "bytes": len(response.content)}
+
+        print(json.dumps({"actual_native_post_ack_public_get": asyncio.run(public_read())}))
     from devflow_temporal.delivery_control import _deadline, _lifecycle_lock
 
     with _lifecycle_lock(case.store.config, _deadline(case.store.config)):

@@ -725,10 +725,10 @@ def create_app(config_path: Path) -> FastAPI:
             value = await asyncio.to_thread(service.store.detail, run_id)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
+        evidence = await asyncio.to_thread(service.store.evidence_index, run_id, details=value)
         events = value.pop("events")
         run = {key: item for key, item in value.items() if key != "run"}
         run["sequence"] = events[-1]["sequence"] if events else 0
-        evidence = await asyncio.to_thread(service.store.evidence_index, run_id)
         return {"run": run, "events": events, "evidence": evidence}
 
     @app.get("/api/runs/{run_id}/evidence/{evidence_id}")

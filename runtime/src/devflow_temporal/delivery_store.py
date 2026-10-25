@@ -4275,7 +4275,11 @@ class DeliveryStore:
 
         return detail(self, spec)
 
-    def _evidence_items(self, run_id: str) -> list[dict[str, Any]]:
+    def _evidence_items(
+        self, run_id: str, *, details: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if details is not None and details.get("run_id") != run_id:
+            raise ValueError("evidence detail observation belongs to another run")
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
@@ -4420,7 +4424,7 @@ class DeliveryStore:
                                     "label": item["relative_path"], "path": Path(item["path"]),
                                     "expected_sha256": item["sha256"],
                                     "limit": 50 * 1024 * 1024})
-        details = self.detail(run_id)
+        details = self.detail(run_id) if details is None else details
         for result in details.get("checks", {}).get("local", {}).get("results", []):
             if "log" not in result:
                 continue  # Preparation can fail before a process log exists.
@@ -4552,9 +4556,11 @@ class DeliveryStore:
             safe.append(item)
         return safe
 
-    def evidence_index(self, run_id: str) -> list[dict[str, Any]]:
+    def evidence_index(
+        self, run_id: str, *, details: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         safe = []
-        for item in self._evidence_items(run_id):
+        for item in self._evidence_items(run_id, details=details):
             path = item["path"]
             safe.append(
                 {
