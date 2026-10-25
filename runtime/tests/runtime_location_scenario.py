@@ -788,6 +788,106 @@ def fresh_admission(case):
     return {"state": "prepared", "native_identity": "actual bundled permanent runtime"}
 
 
+def reject_retained_custody_drift(case):
+    """Real public preflight rereads raw proof, canonical owner, candidate and claim."""
+    proof = Path(case.spec["preparation"]["environment"]["path"])
+    owner = case.store.config.path
+    source = Path(case.spec["checkout"]) / case.api
+    for path, changed in (
+        (proof, proof.read_bytes() + b" "),
+        (owner, json.dumps({**case.store.config.raw, "capacity": 3}).encode()),
+        (source, source.read_bytes() + b"\nOwned changed retained candidate\n"),
+    ):
+        original, mode = path.read_bytes(), path.stat().st_mode & 0o777
+        try:
+            path.write_bytes(changed)
+            with pytest.raises((ValueError, OSError)):
+                case.store.repair_admission_preflight("run-1", case.command)
+        finally:
+            path.write_bytes(original)
+            path.chmod(mode)
+    work = case.spec["work_id"]
+    with case.store._connect() as db:
+        assert case.store.state.claim_for(db, work) is None
+        case.store.state.claim_work(db, work, "external:owned-foreign-fixture")
+    try:
+        with pytest.raises(ValueError):
+            case.store.repair_admission_preflight("run-1", case.command)
+    finally:
+        with case.store._connect() as db:
+            case.store.state.release_work(db, work, "external:owned-foreign-fixture")
+
+
+def reject_installed_custody_drift(case, current):
+    """Changed artifacts are observed by real strict readers; never executed."""
+    from devflow_temporal.delivery_native_preparation import verify_native_spec
+    from devflow_temporal.delivery_runtime_location import historical_proof
+
+    registry = RunResources(current)
+    for root in (SOURCE, SOURCE.parent):
+        with pytest.raises(ValueError, match="cannot own the installed runtime"):
+            registry.register(root, "generated")
+    link = Path(current["state_dir"]) / "installed-link"
+    link.symlink_to(SOURCE, target_is_directory=True)
+    try:
+        with pytest.raises(ValueError, match="cannot own the installed runtime"):
+            registry.register(link, "generated")
+    finally:
+        link.unlink()
+    foreign = copy.deepcopy(case.spec)
+    foreign["run_id"] = "unregistered-foreign-run"
+    with pytest.raises(ValueError):
+        historical_proof(foreign)
+    binary = Path(current["policy"]["codex_bin"])
+    extra = binary.with_name("unacknowledged-hardlink")
+    os.link(binary, extra)
+    try:
+        with pytest.raises((ValueError, OSError)):
+            verify_native_spec(current)
+    finally:
+        extra.unlink()
+    mode = binary.stat().st_mode & 0o777
+    binary.chmod(mode | 0o200)
+    fd = os.open(binary, os.O_RDWR | os.O_NOFOLLOW)
+    original = None
+    try:
+        offset = os.fstat(fd).st_size - 1
+        original = os.pread(fd, 1, offset)
+        os.pwrite(fd, bytes([original[0] ^ 1]), offset)
+        with pytest.raises(ValueError):
+            verify_native_spec(current)
+    finally:
+        if original is not None:
+            os.pwrite(fd, original, offset)
+            os.fsync(fd)
+        os.close(fd)
+        binary.chmod(mode)
+    metadata = Path(distribution("openai-codex")._path) / "METADATA"
+    original = metadata.read_bytes()
+    try:
+        changed = original.replace(
+            ("Version: " + distribution("openai-codex").version).encode(), b"Version: 999.0.0"
+        )
+        assert changed != original
+        metadata.write_bytes(changed)
+        with pytest.raises(ValueError):
+            verify_native_spec(current)
+    finally:
+        metadata.write_bytes(original)
+    # The imported program cannot gain another owning directory through a
+    # path alias, even when all contents and the underlying inode are retained.
+    moved = SOURCE.with_name("displaced-runtime-fixture")
+    SOURCE.rename(moved)
+    SOURCE.symlink_to(moved, target_is_directory=True)
+    try:
+        with pytest.raises((ValueError, OSError)):
+            verify_native_spec(current)
+    finally:
+        SOURCE.unlink()
+        moved.rename(SOURCE)
+    verify_native_spec(current)
+
+
 async def actual_worker(case, current, recovery, response, patch):
     """Actual workflow, readback, native checks/browser/finalization and replay.
 
@@ -1065,6 +1165,31 @@ def exercise(root, kind):
     assert location.historical_proof(case.spec)
     with pytest.raises((ValueError, OSError)):
         native.verify_native_spec(case.spec)
+    if kind == "rollback":
+        result = control(case.store.config, "rollback-runtime-location", request)
+        restored_owner = DeliveryConfig.load(config.path)
+        assert restored_owner.path.read_bytes() == before
+        assert original_rows(restored_owner) == rows
+        assert location._acknowledged(restored_owner) is None
+        assert location.historical_proof(case.spec)
+        control(restored_owner, "stop")
+        error = control(restored_owner, "adopt-runtime-location", request, success=False)
+        assert "rolled back" in error, error
+        print(
+            json.dumps(
+                {
+                    **result,
+                    "ack_row_unchanged": True,
+                    "historical_proof_readable": True,
+                    "legacy_guard_retained": (config.state_root / "service.lock").stat().st_nlink
+                    == 2,
+                }
+            )
+        )
+        patch.undo()
+        return
+    if kind == "scope":
+        reject_retained_custody_drift(case)
     if kind.startswith("stale"):
         from temporalio.client import Client
 
@@ -1116,6 +1241,8 @@ def exercise(root, kind):
     assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery})) == {
         "state": "confirmed"
     }
+    if kind == "scope":
+        reject_installed_custody_drift(case, current)
     # The actual launch owner consumes the current candidate, claim, manifest,
     # recipe, independent pinned tool receipt and fresh installed native proof.
     if kind in {"scope", "browser"}:

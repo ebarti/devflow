@@ -613,7 +613,7 @@ def _stopped(config):
 
     # Re-observe on replay too: a prevalidated legacy FD may have acted after
     # an unfinished pre-zero attempt released its exclusive lifecycle lease.
-    private_bytes(config.state_root / "service-stopped.json")
+    json.loads(private_bytes(config.state_root / "service-stopped.json"))
     lifecycle = _read_manifest(config) or {"processes": {}}
     if _recorded_deployment(lifecycle) is not None:
         raise ValueError("retained worker deployment requires its existing deployment owner")

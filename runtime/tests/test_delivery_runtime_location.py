@@ -79,7 +79,7 @@ def installed_pair(tmp_path_factory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["scope", "browser", "stale1169", "stale1173"])
+@pytest.mark.parametrize("kind", ["scope", "browser", "stale1169", "stale1173", "rollback"])
 async def test_public_permanent_location_owner_and_continuation(installed_pair, kind):
     from temporal_test_server import local_temporal
 
@@ -110,6 +110,13 @@ async def test_public_permanent_location_owner_and_continuation(installed_pair, 
             timeout=420,
         )
     result = json.loads(output.splitlines()[-1])
+    if kind == "rollback":
+        assert result["state"] == "rolled_back"
+        assert result["legacy_runtime_ready"] is False
+        assert result["ack_row_unchanged"] is True
+        assert result["historical_proof_readable"] is True
+        assert result["legacy_guard_retained"] is True
+        return
     assert result["old_runtime_absent"] is True
     assert result["ack_row_unchanged"] is True
     assert result["cohort_size"] == 6
