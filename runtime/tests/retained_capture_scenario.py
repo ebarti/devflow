@@ -576,6 +576,7 @@ def install(root):
     rows = fixture.original_rows(config)
     assert rows == captured["rows"]
     request = Path(captured["migration"])
+    original_capture_input = (request, request.read_bytes())
     archived = Path(captured["response"]["receipt"]).parent / "owner-before.json"
     original_archive = archived.read_bytes()
     try:
@@ -661,7 +662,17 @@ def install(root):
         replay = fixture.control(current_config, "adopt-runtime-location", request)
         assert replay["replayed"] is True
         assert fixture.original_rows(current_config) == rows
-    print(json.dumps({"state": "installed", "all_six": True, "rows_unchanged": True}))
+    assert original_capture_input[0].read_bytes() == original_capture_input[1]
+    print(
+        json.dumps(
+            {
+                "state": "installed",
+                "all_six": True,
+                "rows_unchanged": True,
+                "historical_capture_input_preserved": True,
+            }
+        )
+    )
 
 
 def receive_bound(root):

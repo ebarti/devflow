@@ -674,6 +674,21 @@ def assert_cohort_native_authority(config):
     return scopes
 
 
+def assert_original_plugin_bytes(case):
+    from devflow_temporal import delivery_runtime_registrations as registration
+
+    witness = case.plugin_origin
+    for folder in (
+        Path(witness["marketplace"]) / "plugins/devflow",
+        Path.home() / ".codex/plugins/cache/devflow-local/devflow/0.1.0",
+    ):
+        files = registration._package_tree(folder, registration.PLUGIN_FILES)["files"]
+        assert {
+            name: hashlib.sha256(base64.b64decode(raw)).hexdigest()
+            for name, raw in files.items()
+        } == witness["files_sha256"]
+
+
 def crash_apply(root, kind):
     """Kill an owned public invocation at exact durable/effect boundaries."""
     import argparse
@@ -890,6 +905,7 @@ def pending_rollback(root, case, config, request, rows, before):
     assert "rolled back" in error, error
     assert control(config, "rollback-runtime-location", request)["state"] == "rolled_back"
     control(config, "stop")
+    assert_original_plugin_bytes(case)
     assert read_private(Path.home() / ".codex/public-inventory.json")["calls"] == calls
     assert all(_state(item) == "before" for item in receipt["installed_objects"])
     assert (
@@ -915,6 +931,7 @@ def pending_rollback(root, case, config, request, rows, before):
                 **result,
                 "ack_row_unchanged": True,
                 "original_proof_preserved": True,
+                "original_package_bytes": True,
                 "legacy_guard_retained": (config.state_root / "service.lock").stat().st_nlink == 2,
                 "pending_only": True,
                 "location_permission": False,
@@ -1439,6 +1456,7 @@ def exercise(root, kind):
         assert location._acknowledged(restored_owner) is None
         assert location.historical_proof(case.spec)
         control(restored_owner, "stop")
+        assert_original_plugin_bytes(case)
         error = control(restored_owner, "adopt-runtime-location", request, success=False)
         assert "rolled back" in error, error
         print(
@@ -1447,6 +1465,7 @@ def exercise(root, kind):
                     **result,
                     "ack_row_unchanged": True,
                     "original_proof_preserved": True,
+                    "original_package_bytes": True,
                     "historical_proof_readable": True,
                     "legacy_guard_retained": (config.state_root / "service.lock").stat().st_nlink
                     == 2,

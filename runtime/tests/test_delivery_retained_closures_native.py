@@ -149,7 +149,9 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
     assert {p.name: p.read_bytes() for p in state.glob("temporal.sqlite3*")} == source_bytes
     command(["git", "-C", new, "checkout", "--quiet", "--detach", successor])
     installed = command([executable, "-I", SCENARIO, "install", case], env=bound, timeout=240)
-    assert json.loads(installed.splitlines()[-1])["all_six"] is True
+    installed_result = json.loads(installed.splitlines()[-1])
+    assert installed_result["all_six"] is True
+    assert installed_result["historical_capture_input_preserved"] is True
     # Only after the actual six-member installation, expose the retained fixture
     # server at its ORIGINAL transport for normal historical maintenance. No API,
     # delivery worker or provider is launched by the recovery operation.

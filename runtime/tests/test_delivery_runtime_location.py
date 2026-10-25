@@ -117,6 +117,7 @@ async def test_public_permanent_location_owner_and_continuation(installed_pair, 
         assert result["legacy_runtime_ready"] is False
         assert result["ack_row_unchanged"] is True
         assert result["original_proof_preserved"] is True
+        assert result["original_package_bytes"] is True
         assert result["legacy_guard_retained"] is True
         if kind == "pendingrollback":
             assert result["pending_only"] is True and result["location_permission"] is False
