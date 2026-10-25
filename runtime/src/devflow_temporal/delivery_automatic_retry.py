@@ -252,7 +252,16 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
     A published run keeps its branch and PR; only its native cleanup and claim
     are closed here, so its same-run continuations can be admitted.
     """
+    from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
+
+    previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    history = quarantine_history(previous)
+    if history:
+        quarantined = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
+
     def checkpoint():
+        if quarantine_history(previous) != history:
+            raise ValueError('historical provider teardown custody changed')
         if closure_checkpoint is not None:
             from .delivery_unpublished_recovery import cleanup_checkpoint
 
@@ -315,8 +324,9 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
              **({'closure': 'published'} if published else
                 {'closure': closure} if closure else {}),
              **({'unpublished_checkpoint': closure_checkpoint} if closure_checkpoint else {}),
-             **({('quarantined_cleanup' if closure_checkpoint
-                  and closure_checkpoint.get('quarantined_cleanup') else
+             **({'historical_quarantines': history} if history else {}),
+             **({('quarantined_cleanup' if history or (closure_checkpoint
+                  and closure_checkpoint.get('quarantined_cleanup')) else
                   'quarantined_implementation'): quarantined} if quarantined else {})}
         if closure_checkpoint is not None:
             payload['key'] = digest(payload)
@@ -350,8 +360,16 @@ def _reuse_cleanup(store, row, spec, closed, stopped):
         return False
     attempts = _current(store, row, spec, stopped)
     execution = store.intake_execution_spec(spec['run_id'])
-    fresh = observe_completed_resources(execution, attempts)
-    observed = observe_finalized_resources(execution)
+    from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
+
+    history = quarantine_history(json.loads(row['recovery_json']) if row['recovery_json'] else None)
+    teardown = teardown_checkpoint(history)
+    if history and (prior.get('historical_quarantines') != history
+                    or prior.get('quarantined_cleanup') != teardown):
+        raise ValueError('later cleanup lost its historical provider teardown custody')
+    arguments = {'quarantined': teardown} if teardown else {}
+    fresh = observe_completed_resources(execution, attempts, **arguments)
+    observed = observe_finalized_resources(execution, **arguments)
     if (attempts != prior['original_attempts']
             or fresh['journal_sha256'] != prior['native_observation']['journal_sha256']
             or observed['finalization_sha256'] != checks['resource_cleanup']['receipt_sha256']):

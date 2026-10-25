@@ -697,6 +697,15 @@ async def test_public_native_blocked_scope_runs_worker_same_session_and_all_norm
         initial.config.path.write_text(json.dumps(config))
         store = DeliveryStore(DeliveryConfig.load(initial.config.path))
         case = scope_case((store, submitted), monkeypatch)
+        # Real completed SDK streams can retain an earlier terminal-labelled
+        # item. The final typed item is the producer's structured assessment.
+        observation = read_private(case.folder / "native-thread-observation.json")
+        final = observation["turns"][-1]["items"][-1]
+        earlier = {**final, "id": "earlier-terminal-item", "text": "Earlier native observation"}
+        observation["turns"][-1]["items"].insert(0, earlier)
+        observation["turns"][-1]["turn"]["items"].insert(0, copy.deepcopy(earlier))
+        observation["raw_turn_items"] = 2
+        rewrite_observation(case, observation)
         store = case.store
         assert (
             store.repair_admission_preflight("run-1", case.command)["authorized_through_iteration"]

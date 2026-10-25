@@ -69,6 +69,12 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
                 raise ValueError('cleanup reconciliation has an unfinished effect or role')
         published = row['pr_json'] is not None
         checkpoint = None
+        history, teardown = [], None
+        if published:
+            from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
+
+            history = quarantine_history(recovery)
+            teardown = teardown_checkpoint(history)
         if not published:
             from .delivery_unpublished_recovery import cleanup_checkpoint
 
@@ -78,19 +84,24 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
         if row['cleanup'] == 'confirmed':
             record = reconciled_cleanup(store, row, state, closed=closed)
             if record is not None:
-                if checkpoint:
+                if checkpoint or teardown:
                     from .delivery_automatic_retry import unpublished
                     from .delivery_resources import (
                         observe_completed_resources,
                         observe_finalized_resources,
                     )
 
-                    unpublished(store, spec)
+                    if checkpoint:
+                        unpublished(store, spec)
                     with store._connect() as db:
                         attempts = [dict(item) for item in db.execute(
                             'SELECT * FROM delivery_attempts WHERE run_id=?', (run_id,))]
-                    quarantine = (checkpoint.get('quarantined_implementation')
-                                  or checkpoint.get('quarantined_cleanup'))
+                    quarantine = ((checkpoint.get('quarantined_implementation')
+                                   or checkpoint.get('quarantined_cleanup'))
+                                  if checkpoint else teardown)
+                    if teardown and (record.get('historical_quarantines') != history
+                                     or record.get('quarantined_cleanup') != teardown):
+                        raise ValueError('published cleanup lost its historical teardown custody')
                     arguments = {'quarantined': quarantine} if quarantine else {}
                     fresh = observe_completed_resources(spec, attempts, **arguments)
                     final = observe_finalized_resources(spec, **arguments)

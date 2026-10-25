@@ -151,8 +151,8 @@ def cleanup_checkpoint(store, row, spec, closed):
             'attempts_sha256': digest(attempts), 'effects_sha256': digest(effects),
             **({'quarantined_implementation': quarantine} if quarantine else {}),
             **({'historical_quarantines': history,
-                'quarantined_cleanup': teardown_checkpoint(history),
-                'pending_preflight': pending} if retained else {})}
+                'quarantined_cleanup': teardown_checkpoint(history)} if history else {}),
+            **({'pending_preflight': pending} if retained else {})}
 
 
 def quarantine_history(previous):

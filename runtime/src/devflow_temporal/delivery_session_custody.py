@@ -114,7 +114,10 @@ def completed_blocked_finding(seal):
     messages = [item for item in items if isinstance(item, dict)
                 and item.get('type') == 'agentMessage' and item.get('phase') == 'final_answer']
     try:
-        assessment = json.loads(messages[0]['text']) if len(messages) == 1 else None
+        # The typed completion owner uses the last final_answer item. Earlier
+        # terminal-labelled stream items are not the final assessment; never
+        # search backwards for parseable JSON if that last item is malformed.
+        assessment = json.loads(messages[-1]['text']) if messages else None
     except (ValueError, TypeError, KeyError) as exc:
         raise ValueError('blocked scope finding has no final structured assessment') from exc
     if (not isinstance(assessment, dict)
