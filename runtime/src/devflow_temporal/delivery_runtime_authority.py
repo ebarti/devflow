@@ -271,10 +271,39 @@ def load(path, kind, *, expected_sha256=None):
         os.close(descriptor)
 
 
-def _load(path, directory, kind, expected_sha256, root_descriptor, root_before):
-    from .delivery_runtime_location import receipt_bytes
+def _root_bytes(path, descriptor, before):
+    """The held object supplies bytes; a second pathname cannot supply facts."""
+    from .delivery_runtime_location import RECEIPT_LIMIT
 
-    raw = receipt_bytes(path)
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+        or info.st_size > RECEIPT_LIMIT
+    ):
+        raise ValueError("installation evidence is not a bounded private owned file")
+    if before != _stamp(info) or before != _stamp(path.lstat()):
+        raise ValueError("runtime authority held root changed before its byte read")
+    raw = bytearray()
+    while len(raw) <= RECEIPT_LIMIT:
+        chunk = os.read(descriptor, min(128 * 1024, RECEIPT_LIMIT + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+    if (
+        len(raw) != info.st_size
+        or before != _stamp(os.fstat(descriptor))
+        or before != _stamp(path.lstat())
+    ):
+        raise ValueError("runtime authority held root changed during its byte read")
+    return bytes(raw)
+
+
+def _load(path, directory, kind, expected_sha256, root_descriptor, root_before):
+
+    raw = _root_bytes(path, root_descriptor, root_before)
     if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise ValueError("runtime authority root differs from its acknowledged bytes")
     value = json.loads(raw)

@@ -340,3 +340,66 @@ def test_interrupted_prefix_cannot_grow_alternative_authority(tmp_path, monkeypa
     if defect != "unknown":
         owner.publish(path, value, owner.CAPTURE_INTENT)
         assert owner.load(path, owner.CAPTURE_INTENT) == value
+
+
+def test_actual_held_root_supplies_bytes_without_another_path_reader(tmp_path, monkeypatch):
+    path, value = namespace(tmp_path)
+    replace(path, value)
+    reader = owner.os.read
+    observed = []
+
+    def held(descriptor, size):
+        assert os.fstat(descriptor).st_ino == path.stat().st_ino
+        observed.append(descriptor)
+        return reader(descriptor, size)
+
+    def second_path(_path):
+        raise AssertionError("A second pathname reader must not supply root facts")
+
+    monkeypatch.setattr(owner.os, "read", held)
+    monkeypatch.setattr(location, "receipt_bytes", second_path)
+    # The optional-hash case still derives facts only from its held object.
+    assert owner.load(path, owner.CAPTURE_INTENT) == value
+    assert observed and len(set(observed)) == 1
+
+
+def test_name_replacement_during_actual_root_fd_read_refuses(tmp_path, monkeypatch):
+    path, value = namespace(tmp_path)
+    replace(path, value)
+    reader = owner.os.read
+    swapped = []
+
+    def changed(descriptor, size):
+        raw = reader(descriptor, size)
+        if not swapped:
+            replacement = path.with_name("different-root.json")
+            replace(replacement, {**value, "different": True})
+            os.replace(replacement, path)
+            swapped.append(True)
+        return raw
+
+    monkeypatch.setattr(owner.os, "read", changed)
+    with pytest.raises(ValueError, match="held root changed during"):
+        owner.load(path, owner.CAPTURE_INTENT)
+    assert swapped
+
+
+@pytest.mark.parametrize("defect", ["mode", "link", "fifo", "symlink", "oversize"])
+def test_direct_root_reader_keeps_original_private_file_and_size_limits(tmp_path, defect):
+    path, value = namespace(tmp_path)
+    replace(path, value)
+    if defect == "mode":
+        path.chmod(0o644)
+    elif defect == "link":
+        os.link(path, path.with_name("other-name.json"))
+    elif defect == "fifo":
+        path.unlink()
+        os.mkfifo(path, 0o600)
+    elif defect == "symlink":
+        target = path.with_name("linked-root.json")
+        path.rename(target)
+        path.symlink_to(target)
+    else:
+        path.write_bytes(b"x" * (location.RECEIPT_LIMIT + 1))
+    with pytest.raises((ValueError, OSError)):
+        owner.load(path, owner.CAPTURE_INTENT)
