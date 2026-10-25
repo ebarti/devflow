@@ -1414,7 +1414,6 @@ def rollback(config, supplied):
             return {"state": "abandoned_unacknowledged", **reference, "legacy_runtime_ready": False}
         from .delivery_runtime_service_guard import install as install_guard
 
-        install_guard(config, receipt, reference, service_descriptor)
         store = DeliveryStore(config)
         with store._connect() as db:
             if _native_inputs(store, db) != receipt["native_inputs"]:
@@ -1423,6 +1422,9 @@ def rollback(config, supplied):
         # Observe them honestly, then pin those *current* rows for reverse effects.
         observed, _metadata = collect(store, supplied, leases)
         reverse = {**receipt, "runs": observed["runs"]}
+        with store._connect() as db:
+            _rows_current(store, reverse, db)
+        install_guard(config, receipt, reference, service_descriptor)
 
         def guard(db=None):
             from .delivery_runtime_service_guard import census, check

@@ -281,17 +281,33 @@ def _receipt(config, *, stop=False, reference=None):
 def installation_lease(config, supplied):
     """Same original EX flock as legacy start, including attributable pending replay."""
     path = config.state_root / "service.lock"
+    receipt_path = (
+        config.state_root / "runtime-installations" / supplied["command_id"] / "receipt.json"
+    )
+
+    def committed_guard():
+        if not receipt_path.exists():
+            return None
+        reference = {
+            "command_id": supplied["command_id"],
+            "receipt": str(receipt_path),
+            "receipt_sha256": hashlib.sha256(receipt_bytes(receipt_path)).hexdigest(),
+        }
+        if _acknowledged(
+            config, historical=True, reference=reference
+        ) is None and not reversed_reference(config, reference):
+            return None
+        # Historical proof permits data inspection; every effectful recovery
+        # still needs the committed original guard, even when nlink became 1.
+        return _receipt(config, stop=True, reference=reference)
+
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         proof = describe(config, supplied["command_id"], descriptor)
-        if os.fstat(descriptor).st_nlink == 2:
-            receipt_path = (
-                config.state_root
-                / "runtime-installations"
-                / supplied["command_id"]
-                / "receipt.json"
-            )
-            receipt = _receipt(
+        committed = committed_guard()
+        linked = committed is not None or os.fstat(descriptor).st_nlink == 2
+        if linked:
+            receipt = committed or _receipt(
                 config,
                 stop=True,
                 reference={
@@ -315,9 +331,9 @@ def installation_lease(config, supplied):
                 break
             except BlockingIOError:
                 time.sleep(min(0.05, _remaining(deadline)))
-        check(config, proof, descriptor, linked=os.path.lexists(Path(proof["link"])))
+        check(config, proof, descriptor, linked=linked)
         yield descriptor
-        if os.path.lexists(Path(proof["link"])):
+        if linked or os.path.lexists(Path(proof["link"])) or committed_guard() is not None:
             check(config, proof, descriptor, linked=True)
             census(descriptor, proof)
     finally:

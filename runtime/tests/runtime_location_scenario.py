@@ -1020,6 +1020,7 @@ def reject_active_guard_drift(case, current, request):
             assert readonly.submitted_spec("run-1")["request_digest"] == case.spec["request_digest"]
             assert location.historical_proof(case.spec)
             control(config, "adopt-runtime-location", request, success=False)
+            control(config, "rollback-runtime-location", request, success=False)
             assert original_rows(config) == rows and read_private(platform)["calls"] == calls
             if kind == "missing-guard":
                 assert not link.exists()  # Replaying an ACK cannot silently heal custody.
