@@ -266,7 +266,12 @@ def scope_case(
         "phase": "finished",
         "ports": [],
         "monitoring_complete": True,
-        "owned": {"17017": {"identity": "opaque-role"}},
+        # NativeProcess finishes with the monitor in its complete owned set;
+        # finalization receipts and the retained observer bind that same set.
+        "owned": {
+            "17017": {"identity": "opaque-role"},
+            "17019": {"pid": 17019, "identity": "opaque-monitor"},
+        },
         "monitor": {"pid": 17019, "identity": "opaque-monitor"},
         "result": outcome,
         "provider_session": {
