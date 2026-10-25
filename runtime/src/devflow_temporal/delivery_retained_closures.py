@@ -31,6 +31,16 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_filesystem_custody import _immutable, _publish_exclusive
 from .delivery_resources import write_private
+from .delivery_runtime_authority import (
+    CAPTURE_INTENT,
+    CAPTURE_RECEIPT,
+)
+from .delivery_runtime_authority import (
+    load as load_authority,
+)
+from .delivery_runtime_authority import (
+    publish as publish_authority,
+)
 from .delivery_runtime_location import bootstrap, private_bytes, receipt_bytes
 
 SCHEMA = "devflow.retained-closure-capture/v1"
@@ -124,8 +134,10 @@ def _master(master, expected):
             raise ValueError("capture pristine master bytes changed")
 
 
-def _publish(path, value):
+def _publish(path, value, *, authority_kind=None):
     _folder(path.parent)
+    if authority_kind is not None:
+        return publish_authority(path, value, authority_kind)
     _immutable(path, canonical_json(value).encode())
     return _sha(receipt_bytes(path))
 
@@ -818,7 +830,9 @@ def _reader_authority(folder):
         raise ValueError("capture reader left its owned generation namespace")
     plan = json.loads(private_bytes(folder / "intent.json"))
     intent_raw = receipt_bytes(capture / "intent.json")
-    command = json.loads(intent_raw)["command"]
+    command = load_authority(
+        capture / "intent.json", CAPTURE_INTENT, expected_sha256=_sha(intent_raw)
+    )["command"]
     launch = json.loads(private_bytes(folder / "launch.json"))
     ports = plan.get("ports")
     if (
@@ -1390,7 +1404,9 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
     intent_raw = receipt_bytes(folder / "intent.json")
     if _sha(intent_raw) != intent_sha256:
         raise ValueError("capture original source intent changed before working preparation")
-    expected = json.loads(intent_raw)["source"]
+    expected = load_authority(
+        folder / "intent.json", CAPTURE_INTENT, expected_sha256=intent_sha256
+    )["source"]
     reader = _new_folder(readers / str(len(entries)))
     reader_identity = _object(reader.lstat())
     # Every generation has a new writable copy; the pristine master is never served.
@@ -1497,7 +1513,7 @@ def _launch_reader(config, store, authority, supplied, reader, intent_sha256, la
 def _response(config, folder, supplied):
     path = folder / "receipt.json"
     raw = receipt_bytes(path)
-    receipt = json.loads(raw)
+    receipt = load_authority(path, CAPTURE_RECEIPT, expected_sha256=_sha(raw))
     if receipt["command"] != supplied:
         raise ValueError("capture command identity already binds different inputs")
     return {
@@ -1527,7 +1543,7 @@ def verify_record(store, record):
             or _sha(receipt_bytes(path)) != record["source_sha256"]
         ):
             raise ValueError("snapshot closure provenance receipt changed")
-        receipt = json.loads(receipt_bytes(path))
+        receipt = load_authority(path, CAPTURE_RECEIPT, expected_sha256=record["source_sha256"])
         for name, expected in (
             ("owner-before.json", receipt["owner_sha256"]),
             ("migration-input.json", receipt["command"]["migration_sha256"]),
@@ -1633,7 +1649,7 @@ def _capture(config, supplied):
                     "source": source.initial,
                     "service_lock": guard,
                 }
-                intent_sha = _publish(folder / "intent.json", intent)
+                intent_sha = _publish(folder / "intent.json", intent, authority_kind=CAPTURE_INTENT)
                 source.snapshot(folder)
 
                 def launch_guard():
@@ -1668,7 +1684,7 @@ def _capture(config, supplied):
                 }
                 receipt_path = folder / "receipt.json"
                 if receipt_path.exists():
-                    previous = json.loads(receipt_bytes(receipt_path))
+                    previous = load_authority(receipt_path, CAPTURE_RECEIPT)
                     if digest(
                         {k: v for k, v in previous.items() if k != "reader_generation"}
                     ) != digest({k: v for k, v in receipt.items() if k != "reader_generation"}):
@@ -1694,7 +1710,7 @@ def _capture(config, supplied):
                         ):
                             raise ValueError("capture original reader export bytes changed")
                     receipt = previous
-                receipt_sha = _publish(receipt_path, receipt)
+                receipt_sha = _publish(receipt_path, receipt, authority_kind=CAPTURE_RECEIPT)
                 records = [
                     prepare_seal(
                         store,

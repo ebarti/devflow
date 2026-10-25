@@ -20,6 +20,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .delivery_runtime_authority import INSTALLATION_RECEIPT
+from .delivery_runtime_authority import load as load_authority
 from .delivery_runtime_location import (
     _acknowledged,
     _transport,
@@ -233,7 +235,11 @@ def _receipt(config, *, stop=False, reference=None):
     raw = receipt_bytes(Path(reference["receipt"]))
     if hashlib.sha256(raw).hexdigest() != reference["receipt_sha256"]:
         raise ValueError("installation service guard receipt changed")
-    receipt = json.loads(raw)
+    receipt = load_authority(
+        Path(reference["receipt"]),
+        INSTALLATION_RECEIPT,
+        expected_sha256=reference["receipt_sha256"],
+    )
     if (
         receipt["owner_path"] != str(config.path)
         or receipt["transport"] != _transport(config)

@@ -80,6 +80,8 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
         root, old_template, new, environment, python
     )
     executable = new / "runtime/.venv/bin/python"
+    volume = command([executable, "-I", SCENARIO, "volume", case], env=bound, timeout=90)
+    assert json.loads(volume.splitlines()[-1])["actors"] == 808640
 
     def tracking():
         with closing(sqlite3.connect(case / "workflow.sqlite3")) as db:
@@ -100,6 +102,11 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
         [executable, "-I", SCENARIO, "capture", case, "inputs"], env=bound, timeout=240
     )
     assert len(json.loads(refused.splitlines()[-1])["refused"]) == 6
+    assert tracking() == (before, 0, 0)
+    sentinel = command(
+        [executable, "-I", SCENARIO, "capture", case, "live-tail"], env=bound, timeout=120
+    )
+    assert json.loads(sentinel.splitlines()[-1])["far_end_live_actor_refused"] is True
     assert tracking() == (before, 0, 0)
     pre_go = command(
         [executable, "-I", SCENARIO, "capture", case, "pre-go"], env=bound, timeout=240
@@ -157,10 +164,20 @@ async def test_previous_ba0_public_capture_reproduces_mixed_scope_refusal(instal
     new.parent.mkdir(parents=True)
     bound = {**environment, "HOME": str(home)}
     command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", ROOT, new])
-    command(["git", "-C", new, "checkout", "--quiet", "--detach",
-             "ba0efc53941dd3df47c71adef1b7bc640ee5b9a4"])
-    command(["uv", "sync", "--frozen", "--offline", "--python", python],
-            cwd=new / "runtime", env=bound)
+    command(
+        [
+            "git",
+            "-C",
+            new,
+            "checkout",
+            "--quiet",
+            "--detach",
+            "ba0efc53941dd3df47c71adef1b7bc640ee5b9a4",
+        ]
+    )
+    command(
+        ["uv", "sync", "--frozen", "--offline", "--python", python], cwd=new / "runtime", env=bound
+    )
     case, state, _address, bound, original = await owned_retained_case(
         root, old_template, new, bound, python
     )
@@ -168,7 +185,10 @@ async def test_previous_ba0_public_capture_reproduces_mixed_scope_refusal(instal
         before = db.execute("SELECT * FROM delivery_runs ORDER BY run_id").fetchall()
     refused = subprocess.run(
         [str(new / "runtime/.venv/bin/python"), "-I", str(SCENARIO), "capture", str(case)],
-        env=bound, capture_output=True, text=True, timeout=120,
+        env=bound,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     assert refused.returncode == 1
     assert "capture cohort has different native runtime authority" in refused.stderr
@@ -180,4 +200,59 @@ async def test_previous_ba0_public_capture_reproduces_mixed_scope_refusal(instal
     assert {p.name: p.read_bytes() for p in state.glob("temporal.sqlite3*")} == original
     assert not (state / "closure-captures").exists()
     assert not (state / "runtime-installations/current.json").exists()
+    assert (state / "service.lock").stat().st_nlink == 1
+
+
+@pytest.mark.asyncio
+async def test_previous_030_public_capture_reproduces_complete_authority_size_refusal(
+    installed_pair,
+):
+    original_root, old_template, _new, environment, python = installed_pair
+    root = original_root / "baseline-030"
+    home = root / "home"
+    new = home / ".local/share/devflow/developer-workflow"
+    new.parent.mkdir(parents=True)
+    bound = {**environment, "HOME": str(home)}
+    command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", ROOT, new])
+    command(
+        [
+            "git",
+            "-C",
+            new,
+            "checkout",
+            "--quiet",
+            "--detach",
+            "030fda7b3c792eef0014aa4bc86c09a5f60ad091",
+        ]
+    )
+    command(
+        ["uv", "sync", "--frozen", "--offline", "--python", python], cwd=new / "runtime", env=bound
+    )
+    case, state, _address, bound, original = await owned_retained_case(
+        root, old_template, new, bound, python
+    )
+    executable = new / "runtime/.venv/bin/python"
+    command([executable, "-I", SCENARIO, "volume", case], env=bound, timeout=90)
+    with closing(sqlite3.connect(case / "workflow.sqlite3")) as db:
+        before = db.execute("SELECT * FROM delivery_runs ORDER BY run_id").fetchall()
+    refused = subprocess.run(
+        [str(executable), "-I", str(SCENARIO), "capture", str(case)],
+        env=bound,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert refused.returncode == 1
+    assert "installation evidence is not a bounded private owned file" in refused.stderr
+    folder = state / "closure-captures/owned-two-history-capture"
+    assert (folder / "intent.json").stat().st_size > 30571522
+    assert not (folder / "master").exists()
+    assert not (folder / "readers").exists()
+    assert not (folder / "receipt.json").exists()
+    with closing(sqlite3.connect(case / "workflow.sqlite3")) as db:
+        assert db.execute("SELECT * FROM delivery_runs ORDER BY run_id").fetchall() == before
+        assert not db.execute(
+            "SELECT 1 FROM delivery_commands WHERE command_id LIKE 'retained-history-%'"
+        ).fetchone()
+    assert {p.name: p.read_bytes() for p in state.glob("temporal.sqlite3*")} == original
     assert (state / "service.lock").stat().st_nlink == 1

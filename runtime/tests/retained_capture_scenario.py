@@ -17,8 +17,9 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from contextlib import redirect_stdout
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -224,6 +225,48 @@ def seed(root):
     asyncio.run(original_histories(root))
 
 
+def volume(root):
+    """Complete historical actors, not an ignored padding field in authority.
+
+    Reused synthetic PIDs have distinct authentic-format historical start times.
+    None is a current actor. Every pair and journal hash is read by the actual
+    global observation/current owner in capture AND subsequent installation.
+    """
+    from devflow_temporal.contracts import canonical_json
+
+    case = fixture.restored(root)
+    config = DeliveryConfig.load(Path(case.owner))
+    actors = 0
+    for index in range(2527):
+        owned = {}
+        for item in range(320):
+            key = index * 320 + item
+            identity = (datetime(2001, 1, 1) + timedelta(days=key // 90000)).strftime(
+                "%a %b %e %H:%M:%S %Y"
+            )
+            owned[str(10000 + key % 90000)] = {"identity": identity}
+        journal = (
+            config.state_root / "owned-history-volume" / f"{index:04d}" / "native-process.json"
+        )
+        journal.parent.mkdir(parents=True, mode=0o700)
+        raw = canonical_json(
+            {
+                "version": 1,
+                "phase": "finished",
+                "owned": owned,
+                "ports": [],
+                "result": {"cleanup": "confirmed"},
+            }
+        ).encode()
+        descriptor = os.open(journal, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+        actors += len(owned)
+    result = {"journals": 2527, "actors": actors, "last_journal": str(journal)}
+    write_private(root / "volume.json", result)
+    print(json.dumps(result))
+
+
 def migration(case, config):
     from importlib.metadata import distribution
 
@@ -353,6 +396,24 @@ def capture(root, mode):
             sqlite3.connect = connect
 
     owner.capture = guarded_capture
+    if mode == "live-tail":
+        from devflow_temporal.delivery_native_process import process_table
+
+        last = Path(read_private(root / "volume.json")["last_journal"])
+        original = last.read_bytes()
+        changed = json.loads(original)
+        changed["owned"][str(os.getpid())] = {"identity": process_table()[os.getpid()]["identity"]}
+        try:
+            write_private(last, changed)
+            with pytest.raises(SystemExit) as rejected:
+                public(config, "capture-retained-closures", request=path)
+            assert rejected.value.code == 1
+        finally:
+            last.write_bytes(original)
+        assert not (config.state_root / "closure-captures").exists()
+        assert fixture.original_rows(config) == before
+        print(json.dumps({"far_end_live_actor_refused": True, "rows_unchanged": True}))
+        return
     if mode == "pre-go":
         original = owner._serve
 
@@ -444,6 +505,28 @@ def capture(root, mode):
     replay = public(config, "capture-retained-closures", request=path)
     assert replay["replayed"] is True
     assert fixture.original_rows(config) == before
+    if (root / "volume.json").exists():
+        from devflow_temporal import delivery_runtime_authority as representation
+
+        receipt_path = Path(response["receipt"])
+        manifest = json.loads(receipt_path.read_bytes())
+        intent = json.loads((receipt_path.parent / "intent.json").read_bytes())
+        assert manifest["schema"] == intent["schema"] == representation.SCHEMA
+        assert min(manifest["canonical_bytes"], intent["canonical_bytes"]) > 30571522
+        part = (
+            receipt_path.parent
+            / (receipt_path.name + ".authority-parts")
+            / (representation._name(manifest["parts"][-1]))
+        )
+        original = part.read_bytes()
+        try:
+            part.write_bytes(b"!" + original[1:])
+            with pytest.raises(SystemExit) as rejected:
+                public(config, "capture-retained-closures", request=path)
+            assert rejected.value.code == 1
+            assert fixture.original_rows(config) == before
+        finally:
+            part.write_bytes(original)
     # The separate old projector does not know the new command/audit types.
     # Its actual unchanged helper still reads/refreshes unrelated owned work.
     sys.path.insert(0, str(root / "loaded-old-projector"))
@@ -495,11 +578,58 @@ def install(root):
     supplied = read_private(request)
     supplied["expected_evidence_sha256"] = preflight["expected_evidence_sha256"]
     write_private(request, supplied)
+    if (root / "volume.json").exists():
+        last = Path(read_private(root / "volume.json")["last_journal"])
+        original = last.read_bytes()
+        try:
+            changed = json.loads(original)
+            changed["result"]["cleanup"] = "unknown"
+            write_private(last, changed)
+            refused = fixture.control(config, "adopt-runtime-location", request, success=False)
+            assert "preflight authority changed" in refused
+            assert fixture.original_rows(config) == rows
+            assert not (config.state_root / "runtime-installations/current.json").exists()
+        finally:
+            last.write_bytes(original)
     result = fixture.control(config, "adopt-runtime-location", request)
     assert result["state"] == "acknowledged"
     scopes = fixture.assert_cohort_native_authority(DeliveryConfig.load(config.path))
     assert scopes.count([]) == 2 and sum(bool(value) for value in scopes) == 4
     assert fixture.original_rows(config) == rows
+    if (root / "volume.json").exists():
+        from devflow_temporal import delivery_runtime_authority as representation
+        from devflow_temporal import delivery_runtime_location as location
+        from devflow_temporal.delivery_control import _lifecycle_lock
+
+        current_config = DeliveryConfig.load(config.path)
+        existing_store = DeliveryStore(current_config)
+        receipt_path = Path(result["receipt"])
+        manifest = json.loads(receipt_path.read_bytes())
+        assert manifest["schema"] == representation.SCHEMA
+        assert manifest["canonical_bytes"] > 30571522
+        part = (
+            receipt_path.parent
+            / (receipt_path.name + ".authority-parts")
+            / (representation._name(manifest["parts"][-1]))
+        )
+        original = part.read_bytes()
+        try:
+            part.write_bytes(b"!" + original[1:])
+            with pytest.raises(ValueError, match="part bytes changed"):
+                location.require_ready(current_config)
+            with pytest.raises(ValueError, match="part bytes changed"):
+                with existing_store._connect():
+                    raise AssertionError("Untrusted authority reached a writable connection")
+            with pytest.raises(ValueError, match="part bytes changed"):
+                with _lifecycle_lock(current_config, time.monotonic() + 5):
+                    raise AssertionError("Untrusted authority reached lifecycle control")
+            with pytest.raises(ValueError, match="part bytes changed"):
+                location.require_preparation_location(case.spec, current_config.raw["codex_bin"])
+        finally:
+            part.write_bytes(original)
+        replay = fixture.control(current_config, "adopt-runtime-location", request)
+        assert replay["replayed"] is True
+        assert fixture.original_rows(current_config) == rows
     print(json.dumps({"state": "installed", "all_six": True, "rows_unchanged": True}))
 
 
@@ -634,6 +764,7 @@ if __name__ == "__main__":
         "install": install,
         "continue": continue_original,
         "receive-bound": receive_bound,
+        "volume": volume,
     }
     if phase == "capture":
         capture(Path(raw_root), rest[0] if rest else "normal")

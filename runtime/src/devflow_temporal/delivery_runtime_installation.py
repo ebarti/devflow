@@ -23,10 +23,18 @@ from importlib.metadata import distributions
 from pathlib import Path
 
 from .contracts import canonical_json, digest
+from .delivery_runtime_authority import (
+    INSTALLATION_RECEIPT,
+)
+from .delivery_runtime_authority import (
+    load as load_authority,
+)
+from .delivery_runtime_authority import (
+    publish as publish_authority,
+)
 from .delivery_runtime_location import (
     ANSWER,
     KIND,
-    RECEIPT_LIMIT,
     REVERSED,
     SCHEMA,
     _transport,
@@ -203,7 +211,8 @@ def destination_current(receipt, *, strict_source=True):
     from .delivery_native_renewal import _old_proof
 
     if not same_destination(
-        receipt["destination"], destination(receipt["runs"][0]["original_spec"]),
+        receipt["destination"],
+        destination(receipt["runs"][0]["original_spec"]),
         strict_source=strict_source,
     ):
         raise ValueError("acknowledged installed runtime destination changed")
@@ -506,7 +515,9 @@ def bootstrap_inputs(config, supplied):
         if not intent_path.exists():
             raise ValueError("owner changed before an authenticated installation intent")
         raw = receipt_bytes(intent_path)
-        intent = json.loads(raw)
+        intent = load_authority(
+            intent_path, INSTALLATION_RECEIPT, expected_sha256=hashlib.sha256(raw).hexdigest()
+        )
         reference = {
             "command_id": supplied["command_id"],
             "receipt": str(intent_path),
@@ -1259,12 +1270,19 @@ def apply(config, supplied):
         ):
             raise ValueError("installation already has a different location acknowledgement")
         path = folder / "receipt.json"
-        receipt = json.loads(receipt_bytes(path)) if path.exists() else None
+        raw = receipt_bytes(path) if path.exists() else None
+        receipt = (
+            load_authority(
+                path, INSTALLATION_RECEIPT, expected_sha256=hashlib.sha256(raw).hexdigest()
+            )
+            if raw is not None
+            else None
+        )
         reference = (
             {
                 "command_id": supplied["command_id"],
                 "receipt": str(path),
-                "receipt_sha256": hashlib.sha256(receipt_bytes(path)).hexdigest(),
+                "receipt_sha256": hashlib.sha256(raw).hexdigest(),
             }
             if receipt
             else None
@@ -1322,15 +1340,12 @@ def apply(config, supplied):
                 receipt["installed_objects"] = [
                     stage(item) for item in receipt["registrations"]["objects"]
                 ]
-            raw = (canonical_json(receipt) + "\n").encode()
-            if len(raw) > RECEIPT_LIMIT:
-                raise ValueError("installation cohort exceeds its bounded immutable receipt")
             _immutable(folder / "owner-before.json", inputs["before"])
-            _immutable(path, raw)
+            receipt_sha = publish_authority(path, receipt, INSTALLATION_RECEIPT)
             reference = {
                 "command_id": supplied["command_id"],
                 "receipt": str(path),
-                "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+                "receipt_sha256": receipt_sha,
             }
             # Writable Store creation occurs only in this explicit effectful
             # owner, after every read-only preflight; no ordinary bypass flag.
@@ -1426,7 +1441,9 @@ def rollback(config, supplied):
     inputs = bootstrap_inputs(config, supplied)
     path = inputs["folder"] / "receipt.json"
     raw = receipt_bytes(path)
-    receipt = json.loads(raw)
+    receipt = load_authority(
+        path, INSTALLATION_RECEIPT, expected_sha256=hashlib.sha256(raw).hexdigest()
+    )
     reference = {
         "command_id": supplied["command_id"],
         "receipt": str(path),

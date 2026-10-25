@@ -110,6 +110,27 @@ Immutable provenance binds the snapshot, reader, namespace, explicit workflow an
 execution IDs, raw exports and full canonical history hashes. It is not a new
 execution transport or installation permission.
 
+Complete stopped-owner authority can span more than one evidence file. Capture
+intent/final receipts and installation receipts retain the existing bounded full
+JSON form through16MiB. Larger documents use an explicit owner/document-scoped
+immutable manifest: ordered private1MiB content-addressed parts, at most64parts
+and64MiB of complete canonical authority. The small acknowledged root binds every
+part's exact index, length and hash, the whole canonical hash/length and logical
+root members. All parts and held file/directory generations are authenticated
+before replay, historical/current validation or an effect can consume facts.
+This preserves every run record, historical scope, journal hash, PID/start pair
+and native input; it neither truncates evidence nor expands generic private-file
+or history limits. Parts and a complete unacknowledged manifest remain inert
+until the existing atomic capture or all-member installation acknowledgement.
+Missing, changed, reordered, linked or excess parts refuse the entire document.
+An aggregate above64MiB refuses before publishing a final root.
+
+An earlier oversized immutable full intent remains evidence and is never
+converted or overwritten. After proving that it reached no snapshot, reader,
+export or acknowledgement, the operator may use a fresh explicit capture command
+ID with the same original run/execution selections and fresh current checks.
+This creates no replacement run or execution allowance.
+
 The same exact command replays safely after an interrupted capture or lost
 acknowledgement. A child without durable GO authorization is never signalable;
 unknown actor/cwd/port ownership refuses replacement. A complete file-only

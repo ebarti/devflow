@@ -18,6 +18,8 @@ from copy import deepcopy
 from pathlib import Path
 
 from .contracts import canonical_json, digest
+from .delivery_runtime_authority import INSTALLATION_RECEIPT
+from .delivery_runtime_authority import load as load_authority
 
 KIND = "installed_runtime_location_acknowledged"
 PENDING = "installed_runtime_location_pending"
@@ -143,7 +145,9 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
     raw = receipt_bytes(receipt_path)
     if hashlib.sha256(raw).hexdigest() != pointer["receipt_sha256"]:
         raise ValueError("installation receipt changed")
-    receipt = json.loads(raw)
+    receipt = load_authority(
+        receipt_path, INSTALLATION_RECEIPT, expected_sha256=pointer["receipt_sha256"]
+    )
     if (
         receipt.get("schema") != SCHEMA
         or receipt.get("transport") != _transport(config)
