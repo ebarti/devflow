@@ -12,19 +12,16 @@ from pathlib import Path
 
 import pytest
 from temporal_test_server import local_temporal
-from test_delivery_runtime_location import command
+from test_delivery_runtime_location import ROOT, command
 from test_delivery_runtime_location import installed_pair as installed_pair
 
 SCENARIO = Path(__file__).with_name("retained_capture_scenario.py")
 pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS installation")
 
 
-@pytest.mark.asyncio
-async def test_actual_public_capture_crash_replay_six_migration_and_finite_continuation(
-    installed_pair,
-):
-    root, old_template, new, environment, python = installed_pair
-    old = root / "home/.codex/worktrees/capture/developer-workflow"
+async def owned_retained_case(root, old_template, new, environment, python):
+    old = Path(environment["HOME"]) / ".codex/worktrees/capture/developer-workflow"
+    old.parent.mkdir(parents=True, exist_ok=True)
     command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", old_template, old])
     command(
         ["uv", "sync", "--frozen", "--offline", "--python", python],
@@ -71,6 +68,17 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
     assert source_bytes["temporal.sqlite3-wal"]
     shutil.rmtree(old)
     assert not old.exists()
+    return case, state, address, bound, source_bytes
+
+
+@pytest.mark.asyncio
+async def test_actual_public_capture_crash_replay_six_migration_and_finite_continuation(
+    installed_pair,
+):
+    root, old_template, new, environment, python = installed_pair
+    case, state, address, bound, source_bytes = await owned_retained_case(
+        root, old_template, new, environment, python
+    )
     executable = new / "runtime/.venv/bin/python"
 
     def tracking():
@@ -138,3 +146,38 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
         "original_unknown_unchanged": True,
         "full_resource_readback": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_previous_ba0_public_capture_reproduces_mixed_scope_refusal(installed_pair):
+    original_root, old_template, _new, environment, python = installed_pair
+    root = original_root / "baseline-ba0"
+    home = root / "home"
+    new = home / ".local/share/devflow/developer-workflow"
+    new.parent.mkdir(parents=True)
+    bound = {**environment, "HOME": str(home)}
+    command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", ROOT, new])
+    command(["git", "-C", new, "checkout", "--quiet", "--detach",
+             "ba0efc53941dd3df47c71adef1b7bc640ee5b9a4"])
+    command(["uv", "sync", "--frozen", "--offline", "--python", python],
+            cwd=new / "runtime", env=bound)
+    case, state, _address, bound, original = await owned_retained_case(
+        root, old_template, new, bound, python
+    )
+    with closing(sqlite3.connect(case / "workflow.sqlite3")) as db:
+        before = db.execute("SELECT * FROM delivery_runs ORDER BY run_id").fetchall()
+    refused = subprocess.run(
+        [str(new / "runtime/.venv/bin/python"), "-I", str(SCENARIO), "capture", str(case)],
+        env=bound, capture_output=True, text=True, timeout=120,
+    )
+    assert refused.returncode == 1
+    assert "capture cohort has different native runtime authority" in refused.stderr
+    with closing(sqlite3.connect(case / "workflow.sqlite3")) as db:
+        assert db.execute("SELECT * FROM delivery_runs ORDER BY run_id").fetchall() == before
+        assert not db.execute(
+            "SELECT 1 FROM delivery_commands WHERE command_id LIKE 'retained-history-%'"
+        ).fetchone()
+    assert {p.name: p.read_bytes() for p in state.glob("temporal.sqlite3*")} == original
+    assert not (state / "closure-captures").exists()
+    assert not (state / "runtime-installations/current.json").exists()
+    assert (state / "service.lock").stat().st_nlink == 1

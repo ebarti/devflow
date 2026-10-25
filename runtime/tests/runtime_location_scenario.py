@@ -76,6 +76,18 @@ def fixture_service(root):
     browser_repository = copy.deepcopy(raw["repositories"]["fixture"])
     browser_repository.update(
         expected_base_sha=None,
+        allowed_paths=[],
+        checks=[{"id": "local", "argv": ["/usr/bin/true"]}],
+        prepublish_checks=[{"id": "prepublish", "argv": ["/usr/bin/true"]}],
+        required_ci=["ci"],
+        project_url="https://github.com/users/example/projects/1",
+        assignee="example",
+        source_scope={
+            "version": 1,
+            "allowed_roots": ["apps/api/src"],
+            "allowed_files": [],
+            "protected_paths": [".git", ".github", ".agents", ".codex"],
+        },
         browser_qa={
             "id": "owned-browser-scope",
             "argv": [str(Path(sys.executable).resolve()), "-c", "print('1 passed')"],
