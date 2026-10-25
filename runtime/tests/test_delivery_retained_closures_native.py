@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -64,6 +66,22 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
     shutil.rmtree(old)
     assert not old.exists()
     executable = new / "runtime/.venv/bin/python"
+
+    def tracking():
+        with closing(sqlite3.connect(case / "workflow.sqlite3")) as db:
+            db.row_factory = sqlite3.Row
+            rows = [dict(v) for v in db.execute("SELECT * FROM delivery_runs ORDER BY run_id")]
+            count = db.execute(
+                "SELECT COUNT(*) FROM delivery_closures WHERE workflow_id IN (?,?)",
+                ("delivery-run-1", "delivery-run-2"),
+            ).fetchone()[0]
+            commands = db.execute(
+                "SELECT COUNT(*) FROM delivery_commands WHERE command_id LIKE 'retained-history-%'"
+            ).fetchone()[0]
+            return rows, count, commands
+
+    before, count, commands = tracking()
+    assert count == commands == 0
     for mode, code in (("popen", 73), ("transaction", 74), ("ack", 75)):
         result = subprocess.run(
             [str(executable), "-I", str(SCENARIO), "capture", str(case), mode],
@@ -73,6 +91,9 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
             timeout=240,
         )
         assert result.returncode == code, result.stdout[-2000:] + result.stderr[-6000:]
+        rows, count, commands = tracking()
+        assert rows == before
+        assert (count, commands) == ((2, 1) if mode == "ack" else (0, 0))
         assert {p.name: p.read_bytes() for p in state.glob("temporal.sqlite3*")} == source_bytes
     output = command([executable, "-I", SCENARIO, "capture", case], env=bound, timeout=240)
     assert json.loads(output.splitlines()[-1])["rows_unchanged"] is True

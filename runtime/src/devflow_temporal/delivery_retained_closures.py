@@ -141,6 +141,9 @@ def _inputs(config, supplied):
         or not isinstance(supplied["migration_sha256"], str)
     ):
         raise ValueError("invalid explicit two-execution retained-history capture")
+    data = config.state_root / "temporal.sqlite3"
+    if data.exists() and config.tracking_db.samefile(data):
+        raise ValueError("capture tracking database aliases original Temporal data")
     migration_path = Path(supplied["migration_path"])
     if not migration_path.is_relative_to(config.state_root / "operator-inputs"):
         raise ValueError("capture migration input left original operator inputs")
@@ -640,7 +643,9 @@ def _working(folder, namespace):
     with closing(sqlite3.connect(raw)) as source:
         if source.execute("PRAGMA integrity_check").fetchone() != ("ok",):
             raise ValueError("capture working snapshot fails SQLite integrity")
-        rows = source.execute("SELECT id FROM namespaces WHERE name=?", (namespace,)).fetchall()
+        rows = source.execute(
+            "SELECT id FROM namespaces WHERE name=? LIMIT 2", (namespace,)
+        ).fetchall()
         if len(rows) != 1:
             raise ValueError("capture pristine snapshot lacks its original namespace")
         identity = str(uuid.UUID(bytes=bytes(rows[0][0])))
@@ -1387,10 +1392,30 @@ def capture(config, supplied):
                 receipt_path = folder / "receipt.json"
                 if receipt_path.exists():
                     previous = json.loads(receipt_bytes(receipt_path))
-                    if {k: v for k, v in previous.items() if k != "reader_generation"} != {
-                        k: v for k, v in receipt.items() if k != "reader_generation"
-                    }:
+                    if digest(
+                        {k: v for k, v in previous.items() if k != "reader_generation"}
+                    ) != digest({k: v for k, v in receipt.items() if k != "reader_generation"}):
                         raise ValueError("capture immutable receipt differs from fresh authority")
+                    prior_reader = Path(previous["reader_generation"])
+                    if prior_reader.parent != folder / "readers":
+                        raise ValueError("capture receipt reader left its owned generation")
+                    if not (prior_reader / "authorized.json").exists():
+                        raise ValueError(
+                            "capture receipt reader never received durable authorization"
+                        )
+                    plan = _reader_authority(prior_reader)
+                    if json.loads(private_bytes(prior_reader / "cleanup.json")) != {
+                        "state": "confirmed",
+                        "intent_sha256": digest(plan),
+                    }:
+                        raise ValueError("capture receipt has no exact original reader cleanup")
+                    for envelope in previous["histories"]:
+                        old_export = prior_reader / "exports" / (envelope["run_id"] + ".json")
+                        if (
+                            _sha(private_bytes(old_export, maximum=MAX_HISTORY))
+                            != envelope["raw_sha256"]
+                        ):
+                            raise ValueError("capture original reader export bytes changed")
                     receipt = previous
                 receipt_sha = _publish(receipt_path, receipt)
                 records = [
@@ -1407,7 +1432,7 @@ def capture(config, supplied):
                 response = _response(config, folder, supplied)
                 # The ONLY writable connection is this append-only metadata commit.
                 # No normal Store bootstrap/migration or run projection is invoked.
-                with store.state.connect(config.tracking_db) as db:
+                with closing(store.state.connect(config.tracking_db)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     _current(store, authority, db)
                     source.observe()

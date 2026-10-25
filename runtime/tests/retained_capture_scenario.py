@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import sys
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
@@ -266,6 +267,48 @@ def capture(root, mode):
     path = config.state_root / "operator-inputs/capture.json"
     write_private(path, value)
     before = fixture.original_rows(config)
+    original_capture = owner.capture
+
+    def guarded_capture(config, supplied):
+        connect = sqlite3.connect
+
+        def observed(database, *args, **kwargs):
+            raw = str(database)
+            if raw.startswith("file:"):
+                from urllib.parse import unquote, urlsplit
+
+                target = Path(unquote(urlsplit(raw).path))
+            else:
+                target = Path(raw)
+            if target == config.state_root / "temporal.sqlite3":
+                raise AssertionError("Capture MUST NOT SQLite-open original Temporal data")
+            db = connect(database, *args, **kwargs)
+            if target == config.tracking_db:
+
+                def readonly_rows(action, table, _column, _database, _trigger):
+                    if action in {
+                        sqlite3.SQLITE_INSERT,
+                        sqlite3.SQLITE_UPDATE,
+                        sqlite3.SQLITE_DELETE,
+                    }:
+                        if action != sqlite3.SQLITE_INSERT or table not in {
+                            "delivery_commands",
+                            "delivery_events",
+                            "delivery_closures",
+                        }:
+                            return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                db.set_authorizer(readonly_rows)
+            return db
+
+        sqlite3.connect = observed
+        try:
+            return original_capture(config, supplied)
+        finally:
+            sqlite3.connect = connect
+
+    owner.capture = guarded_capture
     if mode != "normal":
         # Faults are scoped to this owned public CLI process; production has no fault flag.
         if mode == "popen":
@@ -299,10 +342,10 @@ def capture(root, mode):
             owner.capture = crash
         public(config, "capture-retained-closures", request=path)
         raise AssertionError("The intended owned crash did not happen")
-    response = fixture.control(config, "capture-retained-closures", path)
+    response = public(config, "capture-retained-closures", request=path)
     assert fixture.original_rows(config) == before
     assert response["kind"] == owner.SCHEMA and len(response["histories"]) == 2
-    replay = fixture.control(config, "capture-retained-closures", path)
+    replay = public(config, "capture-retained-closures", request=path)
     assert replay["replayed"] is True
     assert fixture.original_rows(config) == before
     # The separate old projector does not know the new command/audit types.
