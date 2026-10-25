@@ -59,6 +59,44 @@ def publication_base_ref(source: Path, base_ref: str, base_sha: str) -> str:
     raise ValueError("publication base requires a branch, not a tag or ambiguous commit")
 
 
+def ordinary_scope_base(config: DeliveryConfig, original: dict[str, Any]) -> dict[str, str]:
+    """Observe a current named branch without replacing an ordinary accepted base.
+
+    The stopped-scope owner authenticates the complete original spec/config first.
+    This observer grants no admission and is deliberately outside historical
+    custody hydration: only current preparation/readback needs the physical refs.
+    """
+    repository = config.raw["repositories"].get(original.get("repository_key"), {})
+    if (original.get("provider") != "codex" or config.raw.get("provider", "codex") != "codex"
+            or original.get("feature_worker") or original.get("feature_delivery")
+            or not re.fullmatch(r"[0-9a-f]{40}", original.get("base_sha", ""))
+            or repository.get("base_ref") != original.get("base_ref")
+            or repository.get("origin_url") != original.get("origin_url")
+            or repository.get("github_repo") != original.get("github_repo")
+            or repository.get("expected_base_sha") not in (None, original["base_sha"])):
+        raise ValueError("ordinary scope continuation changed its frozen base authority")
+    source = Path(repository["source_path"]).resolve(strict=True)
+    if (str(source) != original.get("source_path")
+            or _git(source, "rev-parse", "--show-toplevel") != str(source)
+            or _git(source, "remote", "get-url", "origin") != original["origin_url"]):
+        raise ValueError("ordinary scope continuation changed its frozen source identity")
+    try:
+        if _git(source, "--no-replace-objects", "cat-file", "-t", original["base_sha"]) != "commit":
+            raise ValueError("ordinary scope continuation lost its frozen base commit")
+        current = _git(source, "--no-replace-objects", "rev-parse", original["base_ref"])
+        branch = publication_base_ref(source, original["base_ref"], current)
+        if branch != original.get("publication_base_ref"):
+            raise ValueError("ordinary scope continuation changed its named publication branch")
+        _git(source, "--no-replace-objects", "merge-base", "--is-ancestor",
+             original["base_sha"], current)
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            "ordinary scope continuation lost its original commit or descendant branch"
+        ) from exc
+    return {"base_sha": original["base_sha"], "current_base": current,
+            "publication_base_ref": branch}
+
+
 @dataclass(frozen=True)
 class DeliveryConfig:
     path: Path
@@ -183,6 +221,7 @@ class DeliveryConfig:
     def admit(
         self, supplied: dict[str, Any], *, _base_ref: str | None = None,
         _feature_base: dict[str, Any] | None = None, legacy_publication: bool = False,
+        _scope_base: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         required = {
             "command_id",
@@ -286,8 +325,20 @@ class DeliveryConfig:
             if resolved_ref not in {branch, "refs/heads/" + branch, "origin/" + branch, _base_ref}:
                 raise ValueError("fresh base changed the configured named branch")
             resolved_ref = _base_ref
-        current_base = _git(source, "rev-parse", resolved_ref)
-        base_sha = current_base
+        if _scope_base is not None:
+            if (_base_ref is not None or _feature_base is not None
+                    or any(supplied.get(key) != _scope_base.get(key) for key in (
+                        "command_id", "run_id", "work_id", "issue_url", "repository_key",
+                        "goal", "base_ref", "branch", "authorized_endpoint", "origin_thread_id"))
+                    or summary.get("publication_summary")
+                    != _scope_base.get("publication_summary")):
+                raise ValueError("ordinary scope continuation changed its original request")
+            observed = ordinary_scope_base(self, _scope_base)
+            current_base = observed["current_base"]
+            base_sha = observed["base_sha"]
+        else:
+            current_base = _git(source, "rev-parse", resolved_ref)
+            base_sha = current_base
         if _feature_base is not None:
             # Store admission has authenticated this exact stopped predecessor.
             # Its accepted baseline survives integration of the retained workers.
@@ -702,7 +753,10 @@ def scope_amended_spec(
         supplied.pop("accepted_plan", None)
         supplied["plan_approval"] = original.get("plan_approval", "required")
     # Re-admission of a historical frozen spec must not acquire new metadata.
-    effective = amended.admit(supplied, legacy_publication="publication_summary" not in original)
+    effective = amended.admit(
+        supplied, legacy_publication="publication_summary" not in original,
+        **({"_scope_base": original} if original["provider"] == "codex" else {}),
+    )
     if "provider_max_attempts" in original["policy"]:
         effective["policy"]["provider_max_attempts"] = original["policy"]["provider_max_attempts"]
     else:
@@ -770,6 +824,8 @@ def scope_amended_spec(
     ):
         if effective[key] != original[key]:
             raise ValueError("scope amendment changed the admitted run identity")
+    if effective.get("publication_base_ref") != original.get("publication_base_ref"):
+        raise ValueError("scope amendment changed the named publication branch")
     if effective.get("origin_thread_id") != original.get("origin_thread_id"):
         raise ValueError("scope amendment changed the originating thread")
     if effective.get("publication_summary") != original.get("publication_summary"):

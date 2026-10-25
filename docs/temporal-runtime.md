@@ -252,6 +252,19 @@ An admitted ordinary native iteration can also stop before its provider turn whe
 
 Those historical receipt proofs retain exact canonical workspace metadata after its checkout custody ends. They do not grant current source access: admission and worker readback still independently require the registered physical source and exact candidate, and refuse missing or replaced current checkouts.
 
+An ordinary stopped file-scope amendment retains its original accepted base commit
+when the configured named branch advances. The public request cannot override that
+commit or acquire new main-branch metadata. Re-admission authenticates the same
+original source, origin, repository and publication branch, requires the original
+commit still to exist and to be an ancestor of the current named branch, and
+derives policy from that original commit and the exact private configuration delta.
+It never rebases the retained candidate or changes the two explicitly named files,
+session, finite allowance or required gates. Preparation and current worker
+readback recheck the branch/commit and registered physical checkout; rewritten
+history, a missing commit, changed branch or replaced source refuses. Historical
+custody remains readable without current source refs. Fresh submissions still
+require the configured ref to match `expected_base_sha` exactly.
+
 Native predecessor observation resolves resources through the current acknowledged execution and requires the exact historical predecessor to be a member of its authenticated execution bindings. Both the bindings and current gate namespaces are rechecked after observation. Supplying an old spec as current authority, an unrecorded historical graft, changed configuration/admission/evidence, or authority drift during observation remains a refusal.
 
 The local CLI can execute reviewed cleanup against already closed runs without starting or replacing the service. New continuation semantics must not be queued to an older worker: its custody/readback guards intentionally refuse them. The bundled lifecycle has no rolling-upgrade or launch-quiescence operation. Let every open native workflow finish all gates and cleanup, confirm no eligible automatic continuation or uncertain effect remains, then use the supported runtime update/start sequence before preflighting and admitting these continuations. A gap between native roles does not establish that drain.

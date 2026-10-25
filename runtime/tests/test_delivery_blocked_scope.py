@@ -84,7 +84,9 @@ def prepared_spec(spec):
     return preparation.bind_native_spec(spec, identity, cached, reused=True)
 
 
-def scope_case(service, monkeypatch, *, browser_qa=None, extra_sources=None, checks=None):
+def scope_case(
+    service, monkeypatch, *, browser_qa=None, extra_sources=None, checks=None, named_base=False
+):
     owner, submitted = service
     source = owner.config.path.parent / "source"
     api = "apps/api/src/approval.ts"
@@ -98,6 +100,10 @@ def scope_case(service, monkeypatch, *, browser_qa=None, extra_sources=None, che
         path.write_text(content)
     _git(source, "add", ".")
     _git(source, "commit", "-qm", "Track caller and API fixtures")
+    if named_base:
+        _git(source, "branch", "-M", "main")
+        _git(source, "push", "origin", "main")
+        submitted = {**submitted, "base_ref": "refs/remotes/origin/main"}
     config = copy.deepcopy(owner.config.raw)
     config.update(
         provider="codex",
@@ -106,6 +112,8 @@ def scope_case(service, monkeypatch, *, browser_qa=None, extra_sources=None, che
         codex_bin=str(distribution("openai-codex-cli-bin").locate_file("codex_cli_bin/bin/codex")),
     )
     repository = config["repositories"]["fixture"]
+    if named_base:
+        repository["base_ref"] = submitted["base_ref"]
     repository.update(
         expected_base_sha=_git(source, "rev-parse", "HEAD"),
         allowed_paths=[],

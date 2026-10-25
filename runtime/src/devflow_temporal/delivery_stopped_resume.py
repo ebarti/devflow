@@ -85,6 +85,8 @@ def scope_spec(store, seal, command, *, _feature_scope=None):
             parent = parent.parent
     # The delta is still a proposal. Keep source observation under the sealed
     # predecessor custody until admission grants the new execution namespace.
+    if not spec.get('feature_worker') and spec['provider'] == 'codex':
+        observed_preparation_cleanup(spec)
     amended = broker.candidate()
     if any(amended[key] != seal['candidate'][key] for key in (
             'id', 'head', 'content_sha256', 'base_sha', 'environment_digest')):
@@ -1496,6 +1498,14 @@ def readback(store, spec, recovery):
         if attempts != details['attempts'] or effects != details['effects']:
             raise ValueError('stopped receipt inventory changed before resume')
     predecessor = details['predecessor_spec']
+    current_scope_base = (SCOPE_FIELDS <= details['command'].keys()
+                          and not predecessor.get('feature_worker')
+                          and predecessor['provider'] == 'codex')
+    if current_scope_base:
+        from .delivery_config import ordinary_scope_base
+
+        ordinary_scope_base(load_execution_config(spec), predecessor)
+        observed_preparation_cleanup(predecessor, resource_spec=spec)
     if recovery.get('session_custody'):
         from .delivery_session_custody import implementation_custody
 
@@ -1538,4 +1548,7 @@ def readback(store, spec, recovery):
         published_identity(broker, recovery['execution_candidate'], details['publication'])
     else:
         _unpublished_remote(broker)
+    if current_scope_base:
+        ordinary_scope_base(load_execution_config(spec), predecessor)
+        observed_preparation_cleanup(predecessor, resource_spec=spec)
     return {'state': 'confirmed'}
