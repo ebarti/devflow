@@ -1716,11 +1716,15 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         str(state / 'attempts' / item['job_key'] / 'native-process.json'): item
         for item in attempts
     }
-    if freshly_completed and not set(attempt_journals).issubset(manifest['processes']):
-        raise ValueError('original completed attempt is not registered')
-    execution_specs, completed_intakes = {}, []
+    execution_specs, completed_intakes, prelaunch = {}, [], {}
     if freshly_completed:
         _gate_roots(spec, execution_specs=execution_specs, completed_intakes=completed_intakes)
+        from .delivery_prelaunch_cleanup import completed_prelaunch
+
+        for raw in sorted(attempt_journals.keys() - set(manifest['processes'])):
+            attempt = attempt_journals[raw]
+            prelaunch[raw] = role_leases.enter_context(completed_prelaunch(
+                spec, attempt, execution_specs, manifest, completed_intakes=completed_intakes))
     for raw in manifest["processes"]:
         path = Path(raw)
         if not path.is_relative_to(state) or path.resolve(strict=True) != path:
@@ -1883,4 +1887,5 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         "finalization_sha256": hashlib.sha256(final_path.read_bytes()).hexdigest(),
         "journal_sha256": journals,
         "roots": roots,
+        **({'prelaunch_attempts': prelaunch} if prelaunch else {}),
     }

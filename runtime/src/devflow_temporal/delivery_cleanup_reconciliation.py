@@ -84,7 +84,8 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
         if row['cleanup'] == 'confirmed':
             record = reconciled_cleanup(store, row, state, closed=closed)
             if record is not None:
-                if checkpoint or teardown:
+                if checkpoint or teardown or record.get('native_observation', {}).get(
+                        'prelaunch_attempts'):
                     from .delivery_automatic_retry import unpublished
                     from .delivery_resources import (
                         observe_completed_resources,
@@ -106,6 +107,8 @@ def reconcile_stopped_cleanup(store, run_id: str, iteration: int) -> dict:
                     fresh = observe_completed_resources(spec, attempts, **arguments)
                     final = observe_finalized_resources(spec, **arguments)
                     if (fresh['journal_sha256'] != record['native_observation']['journal_sha256']
+                            or fresh.get('prelaunch_attempts', {})
+                                != record['native_observation'].get('prelaunch_attempts', {})
                             or final['finalization_sha256']
                                 != record['resource_cleanup']['receipt_sha256']):
                         raise ValueError('unpublished later cleanup observation changed')

@@ -287,6 +287,15 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
             or observed['finalization_sha256'] != receipt.get('receipt_sha256')
             or before['journal_sha256'] != observed['journal_sha256']):
         raise ValueError('fresh original cleanup remains unconfirmed')
+    def prelaunch_checkpoint():
+        if before.get('prelaunch_attempts'):
+            fresh = observe_completed_resources(execution, attempts, **observation_args)
+            if fresh.get('prelaunch_attempts') != before['prelaunch_attempts']:
+                raise ValueError('completed prelaunch custody changed before acknowledgement')
+
+    prelaunch_checkpoint()
+    if before.get('prelaunch_attempts'):
+        observed['prelaunch_attempts'] = before['prelaunch_attempts']
     if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original completed attempts changed before tracker closure')
     if not published:
@@ -299,6 +308,7 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
     if not _tracker_closed(execution, tracker):
         raise ValueError('terminal tracker closure remains unacknowledged')
     checkpoint()
+    prelaunch_checkpoint()
     checks = json.loads(row['checks_json'])
     with store._connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -372,6 +382,8 @@ def _reuse_cleanup(store, row, spec, closed, stopped):
     observed = observe_finalized_resources(execution, **arguments)
     if (attempts != prior['original_attempts']
             or fresh['journal_sha256'] != prior['native_observation']['journal_sha256']
+            or fresh.get('prelaunch_attempts', {})
+                != prior['native_observation'].get('prelaunch_attempts', {})
             or observed['finalization_sha256'] != checks['resource_cleanup']['receipt_sha256']):
         raise ValueError('later cleanup changed after its acknowledged closure')
     _preserve_cleanup(store, row, spec, execution, closed, fresh, attempts, stopped)
