@@ -30,6 +30,8 @@ def test_actual_native_preparation_no_launch_history_then_public_cleanup(service
     owner, submission = service
     config = copy.deepcopy(owner.config.raw)
     config.update(provider='codex', execution_mode='trusted-local', max_repairs=10,
+                  execution_registry=str(Path.home() / '.local/state/devflow/'
+                                         'execution-ownership/registry.sqlite3'),
                   codex_bin=str(distribution('openai-codex-cli-bin').locate_file(
                       'codex_cli_bin/bin/codex')))
     config['roles'] = {role: {'model': 'gpt-6.1-sol', 'effort': 'max'}
