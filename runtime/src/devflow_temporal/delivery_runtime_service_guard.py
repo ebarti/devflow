@@ -26,8 +26,13 @@ from .delivery_runtime_location import (
     pending_acknowledged,
     private_bytes,
     receipt_bytes,
+    reversed_reference,
     source_root,
 )
+
+
+class GuardCustodyError(ValueError):
+    """An acknowledged guard lost its exact original two-name custody."""
 
 
 def _identity(path, descriptor):
@@ -110,6 +115,19 @@ def check(config, proof, descriptor, *, linked):
         raise ValueError("installation service lock acquired an unacknowledged additional name")
 
 
+def observe(config, receipt):
+    """Read active custody only; never create a name, take EX or run an FD census."""
+    try:
+        proof = receipt["service_guard"]
+        descriptor = os.open(proof["path"], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        try:
+            check(config, proof, descriptor, linked=True)
+        finally:
+            os.close(descriptor)
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise GuardCustodyError("acknowledged service guard custody changed") from exc
+
+
 def census(descriptor, proof):
     """Count every inode-wide FD, including a thread paused before first flock."""
     result = subprocess.run(
@@ -189,6 +207,10 @@ def _reference(config):
 
         with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
             db.execute("PRAGMA query_only=ON")
+            if not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_events'"
+            ).fetchone():
+                return None  # A legacy pre-delivery database cannot contain a guard ACK.
             for row in db.execute(
                 "SELECT payload_json FROM delivery_events WHERE type=? ORDER BY sequence DESC",
                 (PENDING,),
@@ -306,16 +328,38 @@ def installation_lease(config, supplied):
 def recognized_lifecycle(config, deadline, *, stop=False):
     """No generic multi-link allowance: require this exact committed two-name owner."""
     path = config.state_root / "service.lock"
-    if not path.exists() or path.lstat().st_nlink == 1:
-        yield False
-        return
-    receipt = _receipt(config, stop=stop)
+    reference = _reference(config)
+    if reference is None:
+        if not path.exists() or path.lstat().st_nlink == 1:
+            yield False
+            return
+        raise ValueError("service lock additional name has no acknowledged installation authority")
+    receipt = _receipt(config, stop=stop, reference=reference)
     if receipt is None:
         raise ValueError("service lock additional name has no acknowledged installation authority")
+
+    def linked_mode(current):
+        # A genuine PENDING crash before the first link may still be stopped,
+        # using its recorded original inode. It grants no native/start authority.
+        if (
+            stop
+            and path.exists()
+            and path.lstat().st_nlink == 1
+            and not os.path.lexists(Path(current["service_guard"]["link"]))
+            and _acknowledged(config, historical=True, reference=reference) is None
+            and not reversed_reference(config, reference)
+        ):
+            from .delivery_runtime_registrations import sealed_objects, validate
+
+            sealed_objects(current)
+            validate(current["registrations"], before=True, objects=current["installed_objects"])
+            return False
+        return True
+
     descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW)
     try:
         proof = receipt["service_guard"]
-        check(config, proof, descriptor, linked=True)
+        check(config, proof, descriptor, linked=linked_mode(receipt))
         from .delivery_control import _remaining
 
         while True:
@@ -324,11 +368,12 @@ def recognized_lifecycle(config, deadline, *, stop=False):
                 break
             except BlockingIOError:
                 time.sleep(min(0.05, _remaining(deadline)))
-        check(config, proof, descriptor, linked=True)
         # Authority may have changed while this descriptor waited for EX.
-        renewed = _receipt(config, stop=stop)
+        renewed = _receipt(config, stop=stop, reference=reference)
         if renewed is None or renewed["service_guard"] != proof:
             raise ValueError("installation service guard authority changed while waiting")
+        linked = linked_mode(renewed)
+        check(config, proof, descriptor, linked=linked)
         try:
             active = _acknowledged(config)
         except ValueError:
@@ -338,6 +383,6 @@ def recognized_lifecycle(config, deadline, *, stop=False):
         if active is None:
             census(descriptor, proof)  # A pending stop must not overclaim an old waiter settled.
         yield True
-        check(config, proof, descriptor, linked=True)
+        check(config, proof, descriptor, linked=linked)
     finally:
         os.close(descriptor)

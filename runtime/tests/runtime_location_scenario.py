@@ -582,6 +582,15 @@ def crash_apply(root, kind):
     case = restored(root)
     if kind == "guard":
         service_guard.census = lambda *_: os._exit(73)
+    elif kind == "intent":
+        original = installation._pointer
+
+        def pointer(path, value, **kwargs):
+            if path.name == "pending.json":
+                os._exit(74)
+            return original(path, value, **kwargs)
+
+        installation._pointer = pointer
     elif kind == "swap":
         original = registrations._exchange
 
@@ -731,6 +740,18 @@ def pending_rollback(root, case, config, request, rows, before):
     from devflow_temporal.delivery_native_renewal import _old_proof
     from devflow_temporal.delivery_runtime_registrations import _state
 
+    unlinked = subprocess.run(
+        [sys.executable, "-I", __file__, "crash", str(root), "intent"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert unlinked.returncode == 74, unlinked.stdout + unlinked.stderr
+    original_inode = (config.state_root / "service.lock").stat().st_ino
+    assert (config.state_root / "service.lock").stat().st_nlink == 1
+    control(config, "stop")  # Authentic PENDING before first link is still stoppable.
+    assert (config.state_root / "service.lock").stat().st_ino == original_inode
+    assert (config.state_root / "service.lock").stat().st_nlink == 1
     crash = subprocess.run(
         [sys.executable, "-I", __file__, "crash", str(root), "guard"],
         capture_output=True,
@@ -961,6 +982,58 @@ def reject_installed_custody_drift(case, current):
         SOURCE.unlink()
         moved.rename(SOURCE)
     verify_prepared_spec(current)
+
+
+def reject_active_guard_drift(case, current, request):
+    """Real postadmission authority must not fall back or heal a lost active guard."""
+    from devflow_temporal import delivery_runtime_location as location
+    from devflow_temporal.delivery_control import _deadline, _lifecycle_lock
+    from devflow_temporal.delivery_preparation import verify_prepared_spec
+    from devflow_temporal.delivery_runtime_service_guard import GuardCustodyError
+
+    config = DeliveryConfig.load(case.store.config.path)
+    receipt = location._acknowledged(config)
+    path, link = Path(receipt["service_guard"]["path"]), Path(receipt["service_guard"]["link"])
+    rows = original_rows(config)
+    platform = Path.home() / ".codex/public-inventory.json"
+    calls = read_private(platform)["calls"]
+    for kind in ("missing-guard", "replaced-lock", "missing-lock"):
+        if kind == "missing-guard":
+            link.unlink()
+        else:
+            path.unlink()
+            if kind == "replaced-lock":
+                path.write_bytes(b"")
+                path.chmod(0o600)
+        try:
+            with pytest.raises((GuardCustodyError, ValueError, OSError)):
+                with _lifecycle_lock(config, _deadline(config)):
+                    pytest.fail("Known active guard loss reached ordinary lifecycle")
+            with pytest.raises(GuardCustodyError):
+                location.require_ready(config)
+            with pytest.raises(GuardCustodyError):
+                with case.store._connect():
+                    pytest.fail("An existing API Store retained writes after guard loss")
+            with pytest.raises(GuardCustodyError):
+                verify_prepared_spec(current)
+            readonly = DeliveryStore(config, read_only=True)
+            assert readonly.submitted_spec("run-1")["request_digest"] == case.spec["request_digest"]
+            assert location.historical_proof(case.spec)
+            control(config, "adopt-runtime-location", request, success=False)
+            assert original_rows(config) == rows and read_private(platform)["calls"] == calls
+            if kind == "missing-guard":
+                assert not link.exists()  # Replaying an ACK cannot silently heal custody.
+            elif kind == "missing-lock":
+                assert not path.exists()  # The legacy O_CREAT path was not taken.
+        finally:
+            if kind == "missing-guard":
+                os.link(path, link)
+            else:
+                path.unlink(missing_ok=True)
+                os.link(link, path)
+    verify_prepared_spec(current)
+    with case.store._connect() as db:
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 0
 
 
 async def actual_worker(case, current, recovery, response, patch):
@@ -1323,6 +1396,7 @@ def exercise(root, kind):
     }
     if kind == "scope":
         reject_installed_custody_drift(case, current)
+        reject_active_guard_drift(case, current, request)
     # The actual launch owner consumes the current candidate, claim, manifest,
     # recipe, independent pinned tool receipt and fresh installed native proof.
     if kind in {"scope", "browser"}:

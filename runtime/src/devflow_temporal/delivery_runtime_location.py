@@ -204,6 +204,9 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
             or _transport(live) != receipt["transport"]
         ):
             raise ValueError("acknowledged live installation location/transport changed")
+        from .delivery_runtime_service_guard import observe
+
+        observe(config, receipt)
     return receipt
 
 
@@ -418,7 +421,14 @@ def helper_path(config, *, read_only=False):
         and (str(config.helpers_dir) == boot["helpers_dir"])
     ):
         return source_root() / "skills/devflow/scripts/state.py"
-    receipt = _acknowledged(config)
+    from .delivery_runtime_service_guard import GuardCustodyError
+
+    try:
+        receipt = _acknowledged(config)
+    except GuardCustodyError:
+        if not read_only:
+            raise
+        receipt = None  # Historical proof access grants no write or native permission.
     if receipt is None and read_only:
         receipt = _acknowledged(config, historical=True)
     if receipt is None:
@@ -449,11 +459,17 @@ def require_not_pending(config):
     pending = config.state_root / "runtime-installations/pending.json"
     if not os.path.lexists(pending):
         folder = pending.parent
-        if (
-            not folder.exists()
-            or os.path.lexists(folder / "current.json")
-            or not config.tracking_db.exists()
-        ):
+        if os.path.lexists(folder / "current.json"):
+            receipt = _acknowledged(config)  # Recheck even for an already-existing writable Store.
+            if receipt is None:
+                historical = _acknowledged(config, historical=True)
+                if historical is None:
+                    raise ValueError("installed runtime cohort is not completely acknowledged")
+                from .delivery_runtime_service_guard import observe
+
+                observe(config, historical)
+            return
+        if not folder.exists() or not config.tracking_db.exists():
             return
         with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
             db.execute("PRAGMA query_only=ON")
