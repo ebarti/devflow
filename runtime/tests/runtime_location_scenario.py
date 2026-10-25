@@ -577,9 +577,12 @@ def crash_apply(root, kind):
     from devflow_temporal import delivery_control
     from devflow_temporal import delivery_runtime_installation as installation
     from devflow_temporal import delivery_runtime_registrations as registrations
+    from devflow_temporal import delivery_runtime_service_guard as service_guard
 
     case = restored(root)
-    if kind == "swap":
+    if kind == "guard":
+        service_guard.census = lambda *_: os._exit(73)
+    elif kind == "swap":
         original = registrations._exchange
 
         def exchange(left, right):
@@ -630,11 +633,14 @@ def cohort_faults(root, config, request, rows):
             == 0
         )
         db.execute("DROP TRIGGER owned_partial_intent")
-    with pytest.raises(ValueError, match="installation is incomplete"):
+    # File-only staged evidence did not install a guard or fence the owner.
+    assert not (config.state_root / "runtime-installations/pending.json").exists()
+    assert (config.state_root / "service.lock").stat().st_nlink == 1
+    with pytest.raises(ValueError, match="helper|scripts|missing|does not exist"):
         DeliveryStore(config)
     # The exact immutable receipt and six-row pending transaction survive a
     # process death immediately after the first actual atomic file exchange.
-    for mode, code in (("swap", 71), ("ack", 72)):
+    for mode, code in (("guard", 73), ("swap", 71), ("ack", 72)):
         result = subprocess.run(
             [sys.executable, "-I", __file__, "crash", str(root), mode],
             capture_output=True,
@@ -645,6 +651,7 @@ def cohort_faults(root, config, request, rows):
         assert original_rows(config) == rows
         pending = config.state_root / "runtime-installations/pending.json"
         assert pending.is_file()
+        assert (config.state_root / "service.lock").stat().st_nlink == 2
         with sqlite3.connect(config.tracking_db) as db:
             assert (
                 db.execute(
@@ -655,6 +662,11 @@ def cohort_faults(root, config, request, rows):
             assert db.execute(
                 "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.KIND,)
             ).fetchone()[0] == (6 if mode == "ack" else 0)
+        if mode == "guard":
+            receipt = json.loads(location.receipt_bytes(Path(read_private(pending)["receipt"])))
+            from devflow_temporal.delivery_runtime_registrations import _state
+
+            assert all(_state(item) == "before" for item in receipt["installed_objects"])
         if mode == "swap":
             pending.unlink()  # File loss cannot erase the durable pending fence.
         with pytest.raises(ValueError, match="installation is incomplete"):
@@ -946,6 +958,11 @@ def exercise(root, kind):
     reject_partial_membership(DeliveryConfig.load(config.path))
     control(config, "adopt-runtime-location", request)
     case.store = DeliveryStore(DeliveryConfig.load(config.path))
+    from devflow_temporal.delivery_control import _deadline, _lifecycle_lock
+
+    with _lifecycle_lock(case.store.config, _deadline(case.store.config)):
+        assert (config.state_root / "service.lock").stat().st_nlink == 2
+    control(case.store.config, "stop")
     case.broker = DeliveryBroker(case.store, case.spec)
     assert location.historical_proof(case.spec)
     with pytest.raises((ValueError, OSError)):

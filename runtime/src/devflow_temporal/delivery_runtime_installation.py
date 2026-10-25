@@ -727,7 +727,7 @@ def collect(store, supplied, leases):
     return {"runs": entries, "destination": installed}, observations
 
 
-def _authority(config, supplied, inputs, leases, *, read_only=True):
+def _authority(config, supplied, inputs, leases, *, service_descriptor, read_only=True):
     from .delivery_runtime_registrations import observe
     from .delivery_runtime_registrations import registration as pin_registration
     from .delivery_store import DeliveryStore
@@ -750,6 +750,9 @@ def _authority(config, supplied, inputs, leases, *, read_only=True):
         transport=_transport(config),
         registrations=registrations,
     )
+    from .delivery_runtime_service_guard import describe
+
+    authority["service_guard"] = describe(config, supplied["command_id"], service_descriptor)
     with store._connect() as db:
         authority["native_inputs"] = _native_inputs(store, db)
     authority["global_native"] = _global_native(config, authority, leases)
@@ -805,6 +808,17 @@ def _original_programs_absent(receipt):
                 str(root / "runtime/.venv/bin" / name)
                 for name in ("devflow-delivery", "devflow-delivery-mcp", "devflow-temporal")
             }
+            mcp = str(root / "runtime/.venv/bin/devflow-delivery-mcp")
+            forwarded = mcp in argv[:3] or (
+                first
+                and first.is_relative_to(root / "runtime/.venv")
+                and "-m" in argv
+                and "devflow_temporal.delivery_mcp" in argv
+            )
+            if forwarded and "--config" in argv:
+                index = argv.index("--config")
+                if index + 1 < len(argv) and argv[index + 1] == receipt["owner_path"]:
+                    continue  # Original EX lease and exact two-name guard fence this adapter.
             if (first and first.is_relative_to(root / "runtime/.venv")) or (
                 first
                 and first.name.startswith("python")
@@ -905,8 +919,13 @@ def preflight(config, supplied):
     from .delivery_interrupted_recovery import installation_recovery_lease
 
     inputs = bootstrap_inputs(config, supplied)
+    from .delivery_runtime_service_guard import installation_lease
+
     with installation_recovery_lease(config, exclusive=True), ExitStack() as leases:
-        _store, authority, observations = _authority(config, supplied, inputs, leases)
+        descriptor = leases.enter_context(installation_lease(config, supplied))
+        _store, authority, observations = _authority(
+            config, supplied, inputs, leases, service_descriptor=descriptor
+        )
         return {
             "kind": SCHEMA,
             "preflight": True,
@@ -1134,6 +1153,10 @@ def apply(config, supplied):
         from .delivery_runtime_registrations import update_leases
 
         update_leases(supplied, leases)
+        from .delivery_runtime_service_guard import install as install_guard
+        from .delivery_runtime_service_guard import installation_lease
+
+        service_descriptor = leases.enter_context(installation_lease(config, supplied))
         leases.enter_context(_owner_lease(config.path))
         leases.enter_context(_opened(Path(supplied["owner_after_path"]), lock=True))
         folder = inputs["folder"]
@@ -1167,6 +1190,7 @@ def apply(config, supplied):
                 "this installation location was rolled back; apply cannot reactivate it"
             )
         if active:
+            install_guard(config, receipt, reference, service_descriptor)
             if not same_destination(
                 receipt["destination"], destination(receipt["runs"][0]["original_spec"])
             ):
@@ -1179,7 +1203,9 @@ def apply(config, supplied):
             return {"state": "acknowledged", "replayed": True, **reference}
         pending = bool(reference and pending_acknowledged(config, receipt, reference))
         if not pending:
-            store, authority, observations = _authority(config, supplied, inputs, leases)
+            store, authority, observations = _authority(
+                config, supplied, inputs, leases, service_descriptor=service_descriptor
+            )
             if digest(authority) != supplied["expected_evidence_sha256"]:
                 raise ValueError("installation preflight authority changed")
             candidate = {
@@ -1190,11 +1216,13 @@ def apply(config, supplied):
                 "owner_after_digest": digest(json.loads(inputs["after"])),
             }
             if receipt:
-                if {
-                    k: v
-                    for k, v in receipt.items()
-                    if k not in {"observations", "installed_objects"}
-                } != {k: v for k, v in candidate.items() if k != "observations"}:
+                if canonical_json(
+                    {
+                        k: v
+                        for k, v in receipt.items()
+                        if k not in {"observations", "installed_objects"}
+                    }
+                ) != canonical_json({k: v for k, v in candidate.items() if k != "observations"}):
                     raise ValueError("staged installation receipt has different owner inputs")
             else:
                 receipt = candidate
@@ -1214,7 +1242,6 @@ def apply(config, supplied):
             # Writable Store creation occurs only in this explicit effectful
             # owner, after every read-only preflight; no ordinary bypass flag.
             store = DeliveryStore(config)
-            _pointer(config.state_root / "runtime-installations/pending.json", reference)
             _record_cohort(
                 store,
                 receipt,
@@ -1227,8 +1254,32 @@ def apply(config, supplied):
             for item in receipt["runs"]:
                 _native_observation(item["original_spec"], leases)
         _pointer(config.state_root / "runtime-installations/pending.json", reference)
+        try:
+            install_guard(config, receipt, reference, service_descriptor)
+        except (ValueError, OSError) as exc:
+            from .delivery_resources import write_private
+            from .delivery_runtime_registrations import _state
+
+            write_private(
+                folder / "service-guard-observation.json",
+                {
+                    "state": "unfinished",
+                    "error": str(exc),
+                    "relocation_started": any(
+                        _state(item) == "after" for item in receipt["installed_objects"]
+                    ),
+                    "legacy_lifecycle_may_act_through_prevalidated_fd": True,
+                    "stopped_asserted": False,
+                    "drained_asserted": False,
+                },
+            )
+            raise
 
         def guard(db=None):
+            from .delivery_runtime_service_guard import census, check
+
+            check(config, receipt["service_guard"], service_descriptor, linked=True)
+            census(service_descriptor, receipt["service_guard"])
             sealed_objects(receipt)
             if destination(receipt["runs"][0]["original_spec"]) != receipt["destination"]:
                 raise ValueError("installation destination changed during effects")
@@ -1302,6 +1353,9 @@ def rollback(config, supplied):
         from .delivery_runtime_registrations import update_leases
 
         update_leases(supplied, leases)
+        from .delivery_runtime_service_guard import installation_lease
+
+        service_descriptor = leases.enter_context(installation_lease(config, supplied))
         leases.enter_context(_owner_lease(config.path))
         leases.enter_context(_opened(Path(supplied["owner_after_path"]), lock=True))
         current_path = config.state_root / "runtime-installations/current.json"
@@ -1323,6 +1377,9 @@ def rollback(config, supplied):
             if pending_path.exists():
                 pending_path.unlink()
             return {"state": "abandoned_unacknowledged", **reference, "legacy_runtime_ready": False}
+        from .delivery_runtime_service_guard import install as install_guard
+
+        install_guard(config, receipt, reference, service_descriptor)
         store = DeliveryStore(config)
         with store._connect() as db:
             if _native_inputs(store, db) != receipt["native_inputs"]:
@@ -1333,6 +1390,10 @@ def rollback(config, supplied):
         reverse = {**receipt, "runs": observed["runs"]}
 
         def guard(db=None):
+            from .delivery_runtime_service_guard import census, check
+
+            check(config, receipt["service_guard"], service_descriptor, linked=True)
+            census(service_descriptor, receipt["service_guard"])
             sealed_objects(receipt)
             if not same_destination(
                 receipt["destination"], destination(receipt["runs"][0]["original_spec"])
@@ -1368,4 +1429,5 @@ def rollback(config, supplied):
             **reference,
             "legacy_runtime_ready": False,
             "historical_acknowledgement_retained": bool(acknowledged),
+            "legacy_lifecycle_guard": "retained; retirement requires separate old-authority proof",
         }

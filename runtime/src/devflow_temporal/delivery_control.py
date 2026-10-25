@@ -159,7 +159,13 @@ def _ensure_namespace_retention(config: DeliveryConfig, deadline: float) -> None
 
 
 @contextmanager
-def _lifecycle_lock(config: DeliveryConfig, deadline: float):
+def _lifecycle_lock(config: DeliveryConfig, deadline: float, *, pending_stop: bool = False):
+    from .delivery_runtime_service_guard import recognized_lifecycle
+
+    with recognized_lifecycle(config, deadline, stop=pending_stop) as guarded:
+        if guarded:
+            yield
+            return
     _private_directory(config.state_root)
     path = config.state_root / "service.lock"
     message = f"service lock must be an owned private file (0600): {path}"
@@ -188,6 +194,12 @@ def _lifecycle_lock(config: DeliveryConfig, deadline: float):
                 break
             except BlockingIOError:
                 time.sleep(min(0.05, _remaining(deadline)))
+        if not pending_stop:
+            from .delivery_runtime_location import require_ready
+
+            # A current caller may have opened this FD before PENDING and then
+            # waited behind installation. Recheck before touching the marker.
+            require_ready(config)
         yield
     finally:
         os.close(descriptor)
@@ -350,7 +362,7 @@ def _stopped_marker(config: DeliveryConfig) -> Path:
 
 
 def service_stop(config: DeliveryConfig) -> dict:
-    with _lifecycle_lock(config, _deadline(config)):
+    with _lifecycle_lock(config, _deadline(config), pending_stop=True):
         results = _stop(config, _read_manifest(config) or {"processes": {}})
         # A supervisor's periodic start must not undo this; the next explicit
         # start, restart or write-triggered start lifts it.
