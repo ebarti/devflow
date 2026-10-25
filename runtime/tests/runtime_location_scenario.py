@@ -820,7 +820,7 @@ def reject_retained_custody_drift(case):
 
 def reject_installed_custody_drift(case, current):
     """Changed artifacts are observed by real strict readers; never executed."""
-    from devflow_temporal.delivery_preparation import verify_prepared_spec
+    from devflow_temporal.delivery_preparation import PreparationError, verify_prepared_spec
     from devflow_temporal.delivery_runtime_location import historical_proof
 
     registry = RunResources(current)
@@ -854,7 +854,7 @@ def reject_installed_custody_drift(case, current):
         offset = os.fstat(fd).st_size - 1
         original = os.pread(fd, 1, offset)
         os.pwrite(fd, bytes([original[0] ^ 1]), offset)
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, PreparationError)):
             verify_prepared_spec(current)
     finally:
         if original is not None:
@@ -870,7 +870,7 @@ def reject_installed_custody_drift(case, current):
         )
         assert changed != original
         metadata.write_bytes(changed)
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, PreparationError)):
             verify_prepared_spec(current)
     finally:
         metadata.write_bytes(original)
