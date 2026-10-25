@@ -474,6 +474,9 @@ class DeliveryStore:
             from .delivery_merge_followup import initialize as initialize_merges
 
             initialize_merges(db)
+            from .delivery_native_diagnostic import initialize as initialize_native_diagnostics
+
+            initialize_native_diagnostics(db)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -501,6 +504,12 @@ class DeliveryStore:
         try:
             with db:
                 yield db
+        except sqlite3.IntegrityError as exc:
+            from .delivery_native_diagnostic import ERROR
+
+            if str(exc) == ERROR:
+                raise ValueError(ERROR) from exc
+            raise
         finally:
             db.close()
         if feature_event:
@@ -4299,6 +4308,20 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        diagnostic_root = root / 'native-diagnostics'
+        if diagnostic_root.is_dir() and not diagnostic_root.is_symlink():
+            with self._connect() as db:
+                diagnostics = db.execute(
+                    'SELECT identity FROM delivery_native_diagnostics WHERE run_id=?',
+                    (run_id,)).fetchall()
+            for diagnostic in diagnostics:
+                identity = diagnostic['identity']
+                for name in ('intent.json', 'readiness.json', 'receipt.json'):
+                    path = diagnostic_root / identity / name
+                    if path.is_file() and not path.is_symlink():
+                        indexed.append({'id': 'native-diagnostic-' + identity + '-' + name,
+                                        'label': 'Diagnostic only; no delivery acceptance: ' + name,
+                                        'path': path, 'limit': 4 * 1024 * 1024})
         context_root = root / "issue-context"
         if context_root.is_dir() and not context_root.is_symlink():
             for path in sorted(context_root.glob("*.json")):

@@ -671,7 +671,7 @@ def _browser_qa_evidence(request: dict[str, Any]) -> None:
 
 def prepare_native_check(
     spec: dict[str, Any], checkout: Path, evidence_dir: Path, check: dict[str, Any],
-    *, dependency_store: Path | None = None,
+    *, dependency_store: Path | None = None, resources=None, diagnostic_context=None,
 ) -> tuple[str, dict[str, str]]:
     """Run candidate-controlled check commands in a separate credential-free profile."""
 
@@ -685,8 +685,15 @@ def prepare_native_check(
 
     from .delivery_resources import RunResources
 
+    resources = resources or RunResources(spec)
+    if diagnostic_context is None:
+        if resources.spec != spec:
+            raise ValueError('native check received an unauthenticated resource context')
+    elif (diagnostic_context.spec != spec
+          or resources.spec != diagnostic_context.resource_spec):
+        raise ValueError('diagnostic check lost its acknowledged resource context')
     key = _native_check_key(spec, evidence_dir, check["id"])
-    home = RunResources(spec).scratch("checks", key)
+    home = resources.scratch("checks", key)
     codex_home = home / "codex"
     for path in (home, codex_home):
         _private(path)
@@ -697,7 +704,7 @@ def prepare_native_check(
     )
     if addon_version is not None and (addon_version >= 3) != (environment_version >= 3):
         raise ValueError("native addon retained PATH recipes disagree")
-    scratch = (RunResources(spec).execution_scratch("checks", key)
+    scratch = (resources.execution_scratch("checks", key)
                if environment_version >= 2 else home / "tmp")
     _private(scratch)
     domains = tuple(check.get("network_domains", ()))
@@ -744,12 +751,14 @@ def prepare_native_check(
     if trusted_local(spec) and check.get("kind") == "test":
         from .delivery_temporal_prerequisites import prepare_check as prepare_temporal_check
 
-        temporal_environment = prepare_temporal_check(spec, checkout, evidence_dir, check, scratch)
+        temporal_environment = prepare_temporal_check(
+            spec, checkout, evidence_dir, check, scratch,
+            diagnostic_context=diagnostic_context, resources=resources)
         if temporal_environment:
             env.update(temporal_environment)
         else:
             _seed_temporal_test_server(checkout, check, scratch)
-        artifacts = RunResources(spec).check_artifacts(
+        artifacts = resources.check_artifacts(
             evidence_dir / check["id"] / "pytest-artifacts")
         # pytest replaces its basetemp directory. Its fixture child may change
         # inode; the registered disposable parent must keep exclusive custody.

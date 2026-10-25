@@ -551,6 +551,10 @@ async def reconcile_closed_native(store, client):
     rows = await asyncio.to_thread(_unfinished_rows, store)
     for row in rows:
         try:
+            from .delivery_native_diagnostic import active as diagnostic_active
+
+            if await asyncio.to_thread(diagnostic_active, store, row['run_id']):
+                continue  # Separate diagnostic resources never authorize normal finalization.
             spec = await asyncio.to_thread(_owned_native_spec, store, row['run_id'])
             if spec is None:
                 continue

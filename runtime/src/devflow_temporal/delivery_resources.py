@@ -457,11 +457,18 @@ class RunResources:
         if read_only:
             _identity(self.root)
         else:
+            from .delivery_native_diagnostic import require_resource_idle
+
+            require_resource_idle(spec)
             private_directory(self.root)
         _ancestors(self.state)
 
     @contextmanager
     def locked(self, *, read_only: bool = False):
+        if not read_only:
+            from .delivery_native_diagnostic import require_resource_idle
+
+            require_resource_idle(self.spec)
         lock = self.root / "ownership.lock"
         flags = os.O_RDONLY if read_only else os.O_CREAT | os.O_RDWR
         descriptor = os.open(lock, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -479,6 +486,8 @@ class RunResources:
             fcntl.flock(descriptor, fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
             if read_only:
                 authenticate()
+            else:
+                require_resource_idle(self.spec)
             value = (
                 read_private(self.manifest)
                 if read_only or self.manifest.exists()

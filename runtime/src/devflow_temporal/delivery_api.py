@@ -284,6 +284,14 @@ class DeliveryService:
     async def _dispatch_loop(self) -> None:
         while True:
             try:
+                from .delivery_native_diagnostic import dispatch_once as dispatch_diagnostics
+
+                await dispatch_diagnostics(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('Native diagnostic dispatch unavailable: %s', type(exc).__name__)
+            try:
                 await self.dispatch_merges_once()
             except asyncio.CancelledError:
                 raise
@@ -407,6 +415,10 @@ def create_app(config_path: Path) -> FastAPI:
         finally:
             service.dispatch_task.cancel()
             await asyncio.gather(service.dispatch_task, return_exceptions=True)
+            diagnostics = list(getattr(service, 'native_diagnostic_tasks', {}).values())
+            for task in diagnostics:
+                task.cancel()
+            await asyncio.gather(*diagnostics, return_exceptions=True)
 
     app = FastAPI(title="Devflow local delivery", lifespan=lifespan)
     app.state.delivery = service
@@ -679,6 +691,36 @@ def create_app(config_path: Path) -> FastAPI:
                 service.store.admit_gates_only, run_id, await request.json(),
             )
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/native-diagnostic-preflight')
+    async def native_diagnostic_preflight(request: Request, run_id: str):
+        _host(request)
+        from .delivery_native_diagnostic import preflight
+
+        try:
+            return await asyncio.to_thread(preflight, service.store, run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/ack-native-diagnostic')
+    async def ack_native_diagnostic(request: Request, run_id: str):
+        _mutation(request)
+        from .delivery_native_diagnostic import acknowledge
+
+        try:
+            return await asyncio.to_thread(acknowledge, service.store, run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get('/api/runs/{run_id}/native-diagnostics/{command_id}')
+    async def native_diagnostic(request: Request, run_id: str, command_id: str):
+        _host(request)
+        from .delivery_native_diagnostic import info
+
+        try:
+            return await asyncio.to_thread(info, service.store, run_id, command_id)
+        except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/repair-admission-preflight")

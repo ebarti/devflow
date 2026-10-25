@@ -594,3 +594,66 @@ and the exact tested whole tree before closing the issue. A divergent base requi
 fresh integration evidence. Concurrent administrative changes to branch rules are
 outside that server-enforcement guarantee. Unknown merge effects retain the claim;
 read-only terminal reconciliation never schedules another merge.
+
+### Evidence-only frozen worker diagnostic
+
+A stopped ordinary trusted-local delivery can expose a failed native worker
+recipe after a genuinely completed blocked implementation. The public
+`native-diagnostic-preflight` and `ack-native-diagnostic` commands preserve that
+blocked assessment and every normal gate. They authorize one separate diagnostic
+of the exact recorded `worker-regressions` recipe; they do not authorize a model
+turn, change a repair ceiling, reopen a delivery or establish normal acceptance.
+The first supported recipe retains its Node wrapper, cwd, 2700-second deadline,
+xdist settings, selection, required JUnit and 1000-passing-test minimum.
+
+Both commands require `--id` and a private JSON `--request`. The preflight body
+contains `command_id`, `expected_revision`, `expected_projection_revision`,
+`expected_iteration`, `expected_candidate_id`, `expected_candidate_head`,
+`expected_content_sha256`, `expected_pr_number`, `expected_pr_head`, `check_id`
+and `expected_check_sha256`. The acknowledgement adds the returned
+`preflight_key` and the literal
+`"acknowledgement": "diagnostic_only_no_delivery_acceptance"`. The service
+rechecks the exact closed execution, completed terminal assessment, original
+session/input/output, current source and publication, released claim, original
+failed native log/journal, full resource cleanup and live operational owner.
+A caller cannot provide a replacement command, cwd, environment, spec or result.
+These commands connect only to an existing service; they do not start one.
+
+The existing acknowledged `temporal_test_preparation` remains authoritative when
+present. Otherwise the diagnostic acknowledgement may include the already
+supported `temporal_test_prerequisites` declaration with `check_id`,
+`python_project`, `provenance_path` and `provenance_sha256`. This first purpose
+accepts only the existing official prerequisite receipt
+`70e40d7284f61cfc4f3054ed9005028ec08394a6abb3ad30e10e2c59e991c0e1`.
+The normal preparation owner authenticates its project/lock, SDK, archives,
+executables and evidence. Its derived marker belongs to this diagnostic only;
+the original admitted spec and policy are unchanged. No browser acquisition,
+browser root, arbitrary environment or different tool authority is granted.
+
+The durable diagnostic acknowledgement fences writes to that stopped execution
+and claim, without changing any `delivery_runs` column or normal event history.
+The API dispatches it through the existing cross-worker native check slots. Its
+server-derived resource namespace contains an independent copy of the exact
+candidate and an independent finalization generation. NativeProcess receives
+the original admitted spec. Configured dependency preparation and native check
+environment assembly use the existing owners, including the controller's
+existing Playwright browser binding. Four fixed browser/Temporal readiness
+controls run through that environment before the full unchanged recipe. Their
+JUnit is separate readiness evidence and cannot satisfy the full gate.
+
+Read status with `native-diagnostic --id RUN --diagnostic-command-id COMMAND`.
+The immutable diagnostic intent, readiness and result receipts are also indexed
+as diagnostic-only evidence. A completed diagnostic, including a passing one,
+never becomes an implementation/review/verification/browser/CI verdict. Any
+later original-within-ceiling assessment requires its own ordinary admissible
+continuation and all normal acceptance gates.
+
+A lost monitor is never retried by this purpose. A new command ID or a different
+copy of the same tool declaration cannot mint a second invocation for the same
+closed subject and recipe. Replay the original acknowledgement to observe the
+one operation. After controller loss, replay can acknowledge an already saved
+receipt or finalize only its own fully finished, freshly observed actor-free
+resources. Missing or incomplete journals, live actors/ports, source or claim
+drift and unconfirmed finalization remain unknown and fenced. Replay neither
+launches a replacement nor kills an uncertain actor. An unacknowledged result
+cannot claim a passing diagnostic verdict.

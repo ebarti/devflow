@@ -143,9 +143,24 @@ class DeliveryBroker:
         self.effect_namespace = ""
         self.check_cancelled = lambda: False
         self.native_cleanup_confirmed = True
+        self.diagnostic_context = None
         self.publication_may_have_effect = True
         # (effect key, insertion stamp) of the row this broker inserted, if any.
         self.inserted_effect: tuple[str, str] | None = None
+
+    def run_resources(self, *, read_only=False):
+        from .delivery_resources import RunResources
+
+        return (self.diagnostic_context.resources(read_only=read_only)
+                if self.diagnostic_context is not None else RunResources(
+                    self.spec, read_only=read_only))
+
+    def _native_process(self, folder, **options):
+        from .delivery_native_process import NativeProcess
+
+        if self.diagnostic_context is not None:
+            options['register_resources'] = False
+        return NativeProcess(self.spec, folder, **options)
 
     def _effect(self, key: str, kind: str, request: dict[str, Any]) -> dict[str, Any] | None:
         serialized = canonical_json(request)
@@ -196,9 +211,7 @@ class DeliveryBroker:
         self.checkout.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         resources = None
         if self.spec.get("resource_cleanup_version") == 1:
-            from .delivery_resources import RunResources
-
-            resources = RunResources(self.spec)
+            resources = self.run_resources()
             resources.register(self.checkout, "checkout")
         if self.checkout.exists():
             if _git(self.checkout, "rev-parse", "--show-toplevel") != str(self.checkout):
@@ -433,9 +446,7 @@ class DeliveryBroker:
         private_directory(path.parent)
         resources = None
         if self.spec.get("resource_cleanup_version") == 1:
-            from .delivery_resources import RunResources
-
-            resources = RunResources(self.spec)
+            resources = self.run_resources()
             resources.register(path, "gate")
         if path.exists():
             if _git(path, "rev-parse", "HEAD") != candidate["head"]:
@@ -637,7 +648,6 @@ class DeliveryBroker:
             check_evidence = None
             preserved_modules = []
             if self.spec["provider"] == "codex":
-                from .delivery_native_process import NativeProcess
                 from .delivery_preparation import verify_prepared_spec
                 from .delivery_sandbox import native_check_argv, prepare_native_check
 
@@ -654,6 +664,7 @@ class DeliveryBroker:
                         dependency_store=(
                             Path(native_dependencies["store"]) if native_dependencies else None
                         ),
+                        resources=self.run_resources(), diagnostic_context=self.diagnostic_context,
                     )
                     if check.get('native_addon_prerequisite'):
                         environment['npm_config_python'] = str(Path(sys.executable).resolve())
@@ -665,12 +676,10 @@ class DeliveryBroker:
                             raise ValueError('locked Python environment left controller ownership')
                         environment['UV_PROJECT_ENVIRONMENT'] = str(isolated_python)
                     if preserve_workspace_dependencies and '/store' in argv:
-                        from .delivery_resources import RunResources
-
                         require_prepared_source(check['id'])
                         if self.candidate() != candidate:
                             raise ValueError('implementation dependency source changed')
-                        preserved_modules = RunResources(self.spec).preserve_workspace_dependencies(
+                        preserved_modules = self.run_resources().preserve_workspace_dependencies(
                             checkout, candidate, check)
                     generated = self._register_generated(checkout,
                         list(dict.fromkeys([
@@ -695,16 +704,21 @@ class DeliveryBroker:
                     "cancelled": self._native_cancelled,
                 }
                 require_prepared_source(check["id"])
-                native_result = self._run_native_check(NativeProcess(
-                    self.spec, evidence_dir / check["id"] / "native", **options,
+                native_result = self._run_native_check(self._native_process(
+                    evidence_dir / check["id"] / "native", **options,
                 ))
                 if native_result.get("interrupted_monitor") is True:
+                    if self.diagnostic_context is not None:
+                        return {'state': 'unknown', 'cleanup': native_result['cleanup'],
+                                'candidate_id': candidate['id'], 'native_process': native_result,
+                                'reason': ('diagnostic monitor was lost; '
+                                           'invocation is never retried')}
                     # A lost monitor yields no verdict. One fresh invocation
                     # re-runs the gate; the interrupted journal stays as evidence.
                     interrupted.append(native_result)
                     require_prepared_source(check["id"])
-                    native_result = self._run_native_check(NativeProcess(
-                        self.spec, evidence_dir / check["id"] / "native-retry", **options,
+                    native_result = self._run_native_check(self._native_process(
+                        evidence_dir / check["id"] / "native-retry", **options,
                     ))
                 self._record_generated(generated)
                 if native_result["cleanup"] == "unknown":
@@ -718,9 +732,7 @@ class DeliveryBroker:
                     interrupted.append(native_result)
                     if (self.spec['policy'].get('host_sandbox') == 'trusted-local'
                             and check.get('kind') == 'test'):
-                        from .delivery_resources import RunResources
-
-                        disposal = RunResources(self.spec).cleanup_check_artifacts(
+                        disposal = self.run_resources().cleanup_check_artifacts(
                             evidence_dir / check['id'] / 'pytest-artifacts',
                             [Path(item['journal']) for item in interrupted])
                         if disposal['state'] == 'failed_unknown':
@@ -782,9 +794,7 @@ class DeliveryBroker:
                     evidence_failure = str(exc)
                 finally:
                     if self.spec['provider'] == 'codex':
-                        from .delivery_resources import RunResources
-
-                        artifact_cleanup = RunResources(self.spec).cleanup_check_artifacts(
+                        artifact_cleanup = self.run_resources().cleanup_check_artifacts(
                             evidence_dir / check['id'] / 'pytest-artifacts',
                             [Path(item['journal']) for item in [*interrupted, native_result]])
                         if artifact_cleanup['state'] == 'failed_unknown':
@@ -957,13 +967,13 @@ class DeliveryBroker:
             native_addon_authority,
             validate_native_addon,
         )
-        from .delivery_resources import RunResources, read_private, write_private
+        from .delivery_resources import read_private, write_private
         from .delivery_sandbox import _native_addon_environment_version, _native_path
 
         authority = native_addon_authority(self.spec, checkout, projects)
         if authority is None:
             return None
-        resources = RunResources(self.spec)
+        resources = self.run_resources()
         owned = read_private(resources.manifest)
         # The original install owns this generated root; a historical/foreign tree
         # cannot be adopted merely because it contains the expected package name.
@@ -977,7 +987,9 @@ class DeliveryBroker:
             raise ValueError("native addon requires the frozen Node22 toolchain root")
         toolchain = roots[0]
         receipt = evidence / "native-addon-preparation.json"
-        environment_version = _native_addon_environment_version(self.spec, evidence)
+        environment_version = _native_addon_environment_version(
+            self.diagnostic_context.resource_spec if self.diagnostic_context is not None
+            else self.spec, evidence)
         node, corepack = toolchain / "bin/node", toolchain / "bin/corepack"
         if (
             node.resolve(strict=True) != node
@@ -1132,12 +1144,18 @@ class DeliveryBroker:
         from .delivery_temporal_prerequisites import check_launch as temporal_check_launch
 
         try:
+            if self.diagnostic_context is not None:
+                self.diagnostic_context.process(process)
             temporal_check_launch(process)
         except (ValueError, OSError) as exc:
             raise CheckPreparationFailure('temporal-test-prerequisites', exc) from exc
         self.native_cleanup_confirmed = False
         self.native_journals += (process.journal,)
-        result = process.run()
+        try:
+            result = process.run()
+        finally:
+            if self.diagnostic_context is not None:
+                self.diagnostic_context.observed_process(process)
         self.native_cleanup_confirmed = result["cleanup"] == "observed-native-confirmed"
         if self.check_superseded():
             # The retry scores this invocation from its journal; a replaced body
@@ -1161,9 +1179,9 @@ class DeliveryBroker:
             declared_generated_directories,
             workspace_dependency_directories,
         )
-        from .delivery_resources import RunResources, private_directory
+        from .delivery_resources import private_directory
 
-        resources = RunResources(self.spec)
+        resources = self.run_resources()
         declared = declared_generated_directories(self.spec)
         browser = (self.spec['policy'].get('browser_qa') or {}).get('artifact_paths', [])
         if 'node_modules' in names:
@@ -1194,9 +1212,7 @@ class DeliveryBroker:
         return roots
 
     def _record_generated(self, roots: list[Path]) -> None:
-        from .delivery_resources import RunResources
-
-        resources = RunResources(self.spec)
+        resources = self.run_resources()
         for root in roots:
             if os.path.lexists(root):
                 resources.created(root)
@@ -1204,9 +1220,8 @@ class DeliveryBroker:
     def _ensure_native_dependency_store(self, checkout: Path) -> dict[str, Any]:
         """Fetch frozen registry data without exposing candidate setup or credentials."""
         from .delivery_native_dependencies import REGISTRY, frozen_pnpm_inputs, write_frozen_inputs
-        from .delivery_native_process import NativeProcess
         from .delivery_preparation import verify_prepared_spec
-        from .delivery_resources import RunResources, private_directory, read_private, write_private
+        from .delivery_resources import private_directory, read_private, write_private
         from .delivery_sandbox import native_check_argv, prepare_native_check
 
         try:
@@ -1215,7 +1230,7 @@ class DeliveryBroker:
             raise CheckPreparationFailure("native-execution-authority", exc) from exc
         provenance = {}
         manager, inputs = frozen_pnpm_inputs(self.spec, checkout, provenance=provenance)
-        resources = RunResources(self.spec)
+        resources = self.run_resources()
         scratch = resources.scratch("dependencies", self.spec["policy_digest"])
         transient = read_private(resources.manifest)["roots"][str(self.state_dir / "transient")]
         generation = transient.get("generation", 0)
@@ -1242,13 +1257,14 @@ class DeliveryBroker:
         profile, environment = prepare_native_check(
             self.spec, staging, folder,
             {"id": "pnpm-fetch", "network_domains": [REGISTRY]},
+            resources=self.run_resources(), diagnostic_context=self.diagnostic_context,
         )
         environment.update({
             "COREPACK_ENABLE_NETWORK": "0", "npm_config_registry": "https://" + REGISTRY + "/",
         })
         def launch(name):
-            return self._run_native_check(NativeProcess(
-                self.spec, folder / name,
+            return self._run_native_check(self._native_process(
+                folder / name,
                 argv=native_check_argv(self.spec, profile, staging, [
                     "corepack", manager, "fetch", "--frozen-lockfile", "--ignore-scripts",
                     "--ignore-pnpmfile", "--store-dir", str(dependencies),
@@ -1258,6 +1274,8 @@ class DeliveryBroker:
             ))
 
         process = launch("process")
+        if process.get("interrupted_monitor") is True and self.diagnostic_context is not None:
+            raise ValueError('diagnostic dependency monitor was lost; invocation is never retried')
         if process.get("interrupted_monitor") is True:
             # A lost monitor leaves no fetch outcome; one fresh invocation repeats it.
             process = launch("process-retry")
@@ -1311,9 +1329,8 @@ class DeliveryBroker:
         planned = planned_checks(self.spec, self.checkout, folder, preparation=True)
         dependencies = [c for c in planned if c['id'].startswith('planned-python-dependencies-')]
         dependencies = implementation_prerequisites(self.spec) + dependencies
-        from .delivery_resources import RunResources
 
-        resources = RunResources(self.spec)
+        resources = self.run_resources()
         self._prepare_generated_outputs(self.checkout)
         with resources.locked() as manifest:
             owned = set(manifest['roots'])

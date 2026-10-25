@@ -515,6 +515,9 @@ def _copy(source, target, pinned):
 
 def _preparation_authority(spec, checkout, evidence, check, registry, manifest):
     """Derive a subject and generation from the admitted resource owner, not a receipt."""
+    diagnostic = getattr(registry, 'diagnostic_context', None)
+    if diagnostic is not None:
+        return diagnostic.temporal_authority(checkout, evidence, check, registry, manifest)
     from .candidate import candidate_for
     from .delivery_broker import _git
     from .delivery_execution_config import load_execution_config
@@ -625,10 +628,16 @@ def _preparation_authority(spec, checkout, evidence, check, registry, manifest):
     }
 
 
-def prepare_check(spec, checkout, evidence, check, scratch):
-    if spec.get(MARKER) is None:
+def prepare_check(spec, checkout, evidence, check, scratch, *,
+                  diagnostic_context=None, resources=None):
+    marker = (diagnostic_context.snapshot['temporal_marker'] if diagnostic_context is not None
+              else spec.get(MARKER))
+    if marker is None:
         return {}
-    proof = launch_authority(spec)
+    if diagnostic_context is not None:
+        diagnostic_context.guard()
+    proof = (diagnostic_context.snapshot['preparation'] if diagnostic_context is not None
+             else launch_authority(spec))
     if check["id"] != proof["check"]["id"]:
         return {}
     if (
@@ -638,7 +647,7 @@ def prepare_check(spec, checkout, evidence, check, scratch):
         raise ValueError("Temporal prerequisite native check or metadata changed")
     from .delivery_resources import RunResources, write_private
 
-    registry = RunResources(spec)
+    registry = resources if resources is not None else RunResources(spec)
     with registry.locked() as manifest:
         authority = _preparation_authority(spec, checkout, evidence, check, registry, manifest)
         if scratch != Path(authority["scratch"]):
@@ -654,7 +663,7 @@ def prepare_check(spec, checkout, evidence, check, scratch):
 
         request = {
             "run_id": spec["run_id"],
-            "preparation": spec[MARKER],
+            "preparation": marker,
             "policy_digest": spec["policy_digest"],
             "check_sha256": digest(check),
             "owner_authority": authority,
@@ -689,7 +698,7 @@ def prepare_check(spec, checkout, evidence, check, scratch):
             "authority": authority,
             "receipt": str(path),
             "receipt_sha256": expected_sha256,
-            "preparation": spec[MARKER],
+            "preparation": marker,
         }
         prior = manifest.setdefault("temporal_test_preparations", {}).get(authority["key"])
         if prior is not None and prior != seal:
@@ -700,6 +709,9 @@ def prepare_check(spec, checkout, evidence, check, scratch):
 
 
 def check_launch(process):
+    diagnostic = getattr(process, 'diagnostic_context', None)
+    if diagnostic is not None:
+        return diagnostic.temporal_launch(process)
     keys = {tool["environment"] for tool in TOOLS.values()}
     present = keys & process.environment.keys()
     if not present:
@@ -740,26 +752,32 @@ def check_launch(process):
             raise ValueError("Temporal preparation subject changed during launch observation")
 
 
-def _check_owned_launch(process, proof, recorded, authority):
+def _check_owned_launch(process, proof, recorded, authority, *, diagnostic_context=None):
     keys = {tool["environment"] for tool in TOOLS.values()}
     check = proof["check"]
     environment = {key: process.environment[key] for key in keys}
     checkout = Path(authority["subject"]["path"])
+    marker = (process.spec[MARKER] if diagnostic_context is None
+              else diagnostic_context.snapshot['temporal_marker'])
+    argv, timeout, folders = (check['argv'], check.get('timeout_seconds', 600),
+                              {'native', 'native-retry'})
+    if diagnostic_context is not None:
+        argv, timeout, folders = diagnostic_context.launch_binding(process)
     if (
         recorded.get("run_id") != process.spec["run_id"]
         or recorded.get("checkout") != str(checkout)
         or recorded.get("scratch") != authority["scratch"]
         or recorded.get("scratch_identity") != authority["scratch_identity"]
-        or recorded.get("preparation") != process.spec[MARKER]
+        or recorded.get("preparation") != marker
         or recorded.get("policy_digest") != process.spec["policy_digest"]
         or recorded.get("check_sha256") != proof["check_sha256"]
         or recorded.get("owner_authority") != authority
         or environment != recorded.get("environment")
-        or process.folder.name not in {"native", "native-retry"}
+        or process.folder.name not in folders
         or process.folder.parent.name != check["id"]
-        or process.argv != check["argv"]
+        or process.argv != argv
         or process.cwd != (checkout / check.get("cwd", ".")).resolve(strict=True)
-        or process.timeout != check.get("timeout_seconds", 600)
+        or process.timeout != timeout
         or process.environment.get("TMPDIR") != recorded.get("scratch")
         or _project(process.spec, proof["declaration"]["python_project"], checkout)
         != proof["metadata"]

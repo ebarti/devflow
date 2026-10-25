@@ -843,6 +843,9 @@ _COMMANDS = (
     "reconcile-tracker",
     "recover-publication",
     "repair-admission-preflight",
+    "native-diagnostic-preflight",
+    "ack-native-diagnostic",
+    "native-diagnostic",
     "gates-only-preflight",
     "admit-gates-only",
     "continue-repair",
@@ -871,6 +874,8 @@ def main() -> None:
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
     parser.add_argument("--id", help="run ID")
     parser.add_argument("--evidence-id", help="indexed evidence ID")
+    parser.add_argument('--diagnostic-command-id',
+                        help='original acknowledged diagnostic command ID')
     parser.add_argument("--deployment-name", help="explicit Temporal worker deployment")
     parser.add_argument("--deployment-build-id", help="immutable retained source artifact version")
     parser.add_argument("--limit", type=int, default=50, help="run page size (1-100)")
@@ -924,6 +929,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     read_commands = {"merge-preflight",
         "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
+        'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "filesystem-custody-preflight",
     }
     if args.command in read_commands | {"status", "token", "disable-limits", "stop"}:
@@ -993,6 +999,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "reconcile-tracker",
         "recover-publication",
         "repair-admission-preflight",
+        'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "gates-only-preflight",
         "admit-gates-only",
         "continue-repair",
@@ -1012,6 +1019,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "reconcile-tracker",
             "recover-publication",
             "repair-admission-preflight",
+            'native-diagnostic-preflight', 'ack-native-diagnostic',
             "admit-gates-only",
             "continue-repair",
             "continue-feature",
@@ -1034,6 +1042,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "reconcile-tracker",
                 "recover-publication",
                 "repair-admission-preflight",
+                'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
                 "gates-only-preflight",
                 "admit-gates-only",
                 "continue-repair",
@@ -1047,6 +1056,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("--id is required for this command")
         if args.command == "evidence" and not args.evidence_id:
             parser.error("--evidence-id is required")
+        if args.command == 'native-diagnostic' and not args.diagnostic_command_id:
+            parser.error('--diagnostic-command-id is required')
         try:
             if args.command == "submit":
                 from .delivery_origin import bind_origin
@@ -1073,6 +1084,11 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "recover-publication": lambda: caller.recover_publication(args.id, request),
                 "repair-admission-preflight": lambda: caller.repair_admission_preflight(
                     args.id, request),
+                'native-diagnostic-preflight': lambda: caller.native_diagnostic_preflight(
+                    args.id, request),
+                'ack-native-diagnostic': lambda: caller.ack_native_diagnostic(args.id, request),
+                'native-diagnostic': lambda: caller.native_diagnostic(
+                    args.id, args.diagnostic_command_id),
                 "gates-only-preflight": lambda: caller.gates_only_preflight(args.id),
                 "admit-gates-only": lambda: caller.admit_gates_only(args.id, request),
                 "continue-repair": lambda: caller.continue_repair(args.id, request),

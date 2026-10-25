@@ -85,7 +85,8 @@ def prepared_spec(spec):
 
 
 def scope_case(
-    service, monkeypatch, *, browser_qa=None, extra_sources=None, checks=None, named_base=False
+    service, monkeypatch, *, browser_qa=None, extra_sources=None, checks=None, named_base=False,
+    prepublish_checks=None,
 ):
     owner, submitted = service
     source = owner.config.path.parent / "source"
@@ -118,7 +119,8 @@ def scope_case(
         expected_base_sha=_git(source, "rev-parse", "HEAD"),
         allowed_paths=[],
         checks=[{"id": "local", "argv": ["/usr/bin/true"]}],
-        prepublish_checks=[{"id": "prepublish", "argv": ["/usr/bin/true"]}],
+        prepublish_checks=(prepublish_checks if prepublish_checks is not None else
+                           [{"id": "prepublish", "argv": ["/usr/bin/true"]}]),
         required_ci=["ci"],
         project_url="https://github.com/users/example/projects/1",
         assignee="example",
