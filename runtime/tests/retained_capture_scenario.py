@@ -24,7 +24,7 @@ import pytest
 import devflow_temporal
 
 SOURCE = Path(devflow_temporal.__file__).resolve().parents[3]
-sys.path.insert(0, str(SOURCE / "runtime/tests"))
+sys.path.insert(0, str(Path(__file__).parent))
 import runtime_location_scenario as fixture  # noqa: E402
 
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER  # noqa: E402

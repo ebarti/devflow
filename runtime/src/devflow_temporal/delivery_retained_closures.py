@@ -893,6 +893,34 @@ async def _history(handle, deadline, budget):
     return history, raw
 
 
+def _listener_proof(folder, root_pid):
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(root_pid), "-iTCP", "-sTCP:LISTEN", "-F0pn"],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise ValueError("capture copy listener visibility is indeterminate")
+    addresses = []
+    for raw in result.stdout.split(b"\0"):
+        field = raw.strip(b"\n")
+        if field.startswith(b"n"):
+            address = field[1:].decode()
+            if not re.fullmatch(r"(?:127\.0\.0\.1|\[::1\]):[0-9]+", address):
+                raise ValueError("capture copy server exposed a nonloopback listener")
+            addresses.append(address)
+    if not addresses:
+        raise ValueError("capture copy server has no independently observed listeners")
+    _publish(
+        folder / "listeners.json",
+        {
+            "authorization_sha256": _sha(private_bytes(folder / "authorized.json")),
+            "addresses": sorted(set(addresses)),
+        },
+    )
+
+
 async def _exports(config, reader, authority, selections, namespace_id, folder):
     from temporalio.api.workflowservice.v1 import DescribeNamespaceRequest
     from temporalio.client import Client, WorkflowExecutionStatus
@@ -915,6 +943,7 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
     )
     _owned(folder)
     root_pid = json.loads(private_bytes(folder / "authorized.json"))["root_pid"]
+    _listener_proof(folder, root_pid)
     if any(listeners(port) != {root_pid} for port in plan["ports"]):
         raise ValueError("capture copy endpoint has a foreign listener")
     response = await asyncio.wait_for(
@@ -1052,6 +1081,10 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
     _folder(reader / "home")
     _folder(reader / "tmp")
     ports = _ports()
+    from .delivery_control import _ports as service_ports
+
+    if set(ports) & set(service_ports(config)[1:]):
+        raise ValueError("capture copy endpoint overlaps original execution transport")
     argv = _argv(supplied["reader"]["resolved_path"], database, ports)
     environment = _environment(reader)
     _publish(reader / "launch.json", {"argv": argv, "environment": environment})
