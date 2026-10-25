@@ -327,6 +327,9 @@ def _published_cleanup_chain(store, row, state, closed):
                     and datetime.fromisoformat(row['updated_at']) <= written):
                 return {'closure': 'published', 'original_result_digest': digest(state),
                         'resource_cleanup': receipt, 'tracker': record['tracker'],
+                        **{key: record[key] for key in (
+                            'historical_quarantines', 'quarantined_cleanup', 'native_observation')
+                           if key in record},
                         'maintenance_chain': {'anchor_sequence': anchor['sequence'],
                                               'anchor_sha256': digest(record),
                                               'latest_sequence': latest['sequence'],

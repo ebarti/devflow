@@ -4,10 +4,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_delivery_closed_cleanup_projection import _maintenance
 from test_delivery_quarantined_authority import admitted
 from test_delivery_quarantined_authority import native_quarantine as native_quarantine
 from test_delivery_store import _git
@@ -18,6 +20,7 @@ from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_orphans import reconcile_attempt
+from devflow_temporal.delivery_policy_recovery import reconciled_cleanup
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_sandbox import _native_role_home
 from devflow_temporal.supervisor import DeliverySupervisor
@@ -134,6 +137,75 @@ def test_public_published_cleanup_preserves_old_unknown_and_replays(published_af
                'expected_candidate_head': value.candidate['head'], 'additional_iterations': 1}
     assert value.store.repair_admission_preflight('run-1', command)[
         'authorized_through_iteration'] == 2
+
+
+def _later_compact_maintenance(value):
+    assert reconcile_attempt(value.store, run_id='run-1', role='cleanup', iteration=1)['changed']
+    with value.store._connect() as db:
+        anchor = json.loads(db.execute(
+            "SELECT payload_json FROM delivery_events WHERE "
+            "type='resource_cleanup_reconciled' AND "
+            "json_extract(payload_json,'$.closure')='published'").fetchone()[0])
+    # A fresh registered transient creates a genuinely new finalization receipt.
+    # Use the same real finalizer + compact store.project producer exercised by
+    # ordinary closed-run maintenance, without replacing resource observations.
+    scratch = value.registry.scratch('maintenance', 'after-published-cleanup')
+    (scratch / 'owned.txt').write_text('Owned maintenance scratch\n')
+    closed = value.closed
+    receipt = _maintenance(value.store, value.current, SimpleNamespace(
+        id=closed['workflow_id'], run_id=closed['execution_run_id'],
+        close_time=datetime.fromisoformat(closed['closed_at'])), uncertain=False)
+    assert receipt['state'] == receipt['resource_cleanup'] == 'confirmed'
+    assert receipt['receipt_sha256'] != anchor['resource_cleanup']['receipt_sha256']
+    assert not scratch.exists()
+    with value.store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+        latest = json.loads(db.execute(
+            "SELECT payload_json FROM delivery_events WHERE "
+            "type='resource_cleanup_reconciled' ORDER BY sequence DESC LIMIT 1").fetchone()[0])
+    assert set(latest) == {'key', 'iteration', 'candidate_id'}
+    assert latest['iteration'] == 1 and latest['candidate_id'] is None
+    return row, anchor, receipt
+
+
+def test_public_published_cleanup_replays_after_compact_maintenance(published_after_unknown):
+    value = published_after_unknown
+    before = copy.deepcopy(value.closed)
+    row, anchor, receipt = _later_compact_maintenance(value)
+    assert reconcile_attempt(value.store, run_id='run-1', role='cleanup', iteration=1)[
+        'changed'] is False
+    proof = reconciled_cleanup(value.store, row, value.state, closed=value.closed)
+    assert proof['maintenance_chain']['anchor_sha256'] == digest(anchor)
+    assert proof['resource_cleanup'] == receipt
+    for field in ('historical_quarantines', 'quarantined_cleanup', 'native_observation'):
+        assert proof[field] == anchor[field]
+    command = {'continuation_kind': resume.KIND, 'command_id': 'finite-after-maintenance',
+               'expected_revision': 39, 'expected_iteration': 1,
+               'expected_candidate_id': value.candidate['id'],
+               'expected_candidate_head': value.candidate['head'], 'additional_iterations': 1}
+    assert value.store.repair_admission_preflight('run-1', command)[
+        'authorized_through_iteration'] == 2
+    assert value.closed == before and value.case.journal.read_bytes() == value.original_unknown
+    assert read_private(value.case.journal)['monitoring_complete'] is False
+    assert read_private(value.case.journal)['result']['provider_outcome'] == 'unknown'
+
+
+@pytest.mark.parametrize('field', ['historical_quarantines', 'quarantined_cleanup',
+                                  'native_observation'])
+def test_compact_maintenance_never_replaces_anchor_custody(published_after_unknown, field):
+    value = published_after_unknown
+    _row, anchor, _receipt = _later_compact_maintenance(value)
+    if field == 'historical_quarantines':
+        anchor[field] = []
+    else:
+        anchor[field]['journal_sha256'][str(value.case.journal)] = digest('changed old journal')
+    with value.store._connect() as db:
+        db.execute("UPDATE delivery_events SET payload_json=? WHERE "
+                   "type='resource_cleanup_reconciled' AND "
+                   "json_extract(payload_json,'$.closure')='published'",
+                   (canonical_json(anchor),))
+    with pytest.raises(ValueError):
+        reconcile_attempt(value.store, run_id='run-1', role='cleanup', iteration=1)
 
 
 @pytest.mark.parametrize('drift', ['old_journal', 'old_request', 'live_actor', 'live_port',
