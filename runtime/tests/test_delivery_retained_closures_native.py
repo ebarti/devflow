@@ -88,6 +88,11 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
 
     before, count, commands = tracking()
     assert count == commands == 0
+    refused = command(
+        [executable, "-I", SCENARIO, "capture", case, "inputs"], env=bound, timeout=240
+    )
+    assert len(json.loads(refused.splitlines()[-1])["refused"]) == 6
+    assert tracking() == (before, 0, 0)
     for mode, code in (("popen", 73), ("transaction", 74), ("ack", 75)):
         result = subprocess.run(
             [str(executable), "-I", str(SCENARIO), "capture", str(case), mode],

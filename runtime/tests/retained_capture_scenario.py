@@ -353,6 +353,31 @@ def capture(root, mode):
             sqlite3.connect = connect
 
     owner.capture = guarded_capture
+    if mode == "inputs":
+        invalid = []
+        for defect in ("partial", "duplicate", "revision", "workflow", "digest", "reader"):
+            changed = copy.deepcopy(value)
+            if defect == "partial":
+                changed["captures"].pop()
+            elif defect == "duplicate":
+                changed["captures"][1] = copy.deepcopy(changed["captures"][0])
+            elif defect == "revision":
+                changed["captures"][0]["revision"] += 1
+            elif defect == "workflow":
+                changed["captures"][0]["workflow_id"] += "-foreign"
+            elif defect == "digest":
+                changed["migration_sha256"] = "0" * 64
+            else:
+                changed["reader"]["sha256"] = "0" * 64
+            write_private(path, changed)
+            with pytest.raises(ValueError):
+                public(config, "capture-retained-closures", request=path)
+            assert fixture.original_rows(config) == before
+            invalid.append(defect)
+        write_private(path, value)
+        assert not (config.state_root / "closure-captures").exists()
+        print(json.dumps({"refused": invalid, "rows_unchanged": True}))
+        return
     if mode != "normal":
         # Faults are scoped to this owned public CLI process; production has no fault flag.
         if mode == "popen":
@@ -428,6 +453,15 @@ def install(root):
     rows = fixture.original_rows(config)
     assert rows == captured["rows"]
     request = Path(captured["migration"])
+    archived = Path(captured["response"]["receipt"]).parent / "owner-before.json"
+    original_archive = archived.read_bytes()
+    try:
+        archived.write_bytes(original_archive + b" ")
+        with pytest.raises(ValueError):
+            public(config, "runtime-location-preflight", request=request)
+    finally:
+        archived.write_bytes(original_archive)
+    assert fixture.original_rows(config) == rows
     preflight = fixture.control(config, "runtime-location-preflight", request)
     assert len(preflight["authority"]["runs"]) == 6
     supplied = read_private(request)
@@ -441,7 +475,7 @@ def install(root):
 
 def receive_bound(root):
     from temporalio.client import Client
-    from temporalio.service import RPCError, RPCStatusCode
+    from temporalio.service import RetryConfig, RPCError, RPCStatusCode
 
     from devflow_temporal import delivery_retained_closures as owner
 
@@ -450,11 +484,13 @@ def receive_bound(root):
     config = DeliveryConfig.load(Path(case.owner))
 
     async def observe():
-        client = await Client.connect(config.temporal_address)
+        client = await Client.connect(
+            config.temporal_address, retry_config=RetryConfig(max_retries=1)
+        )
         iterator = client.get_workflow_handle("delivery-run-1").fetch_history_events()
         with pytest.raises(RPCError) as rejected:
             await iterator.fetch_next_page()
-        assert rejected.value.status == RPCStatusCode.RESOURCE_EXHAUSTED
+        assert rejected.value.status == RPCStatusCode.OUT_OF_RANGE
         return str(rejected.value)
 
     with owner._sdk_receive_limit():
