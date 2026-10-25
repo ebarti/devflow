@@ -706,6 +706,24 @@ def observed_native_cleanup(spec, *, read_only=False, quarantined=None, resource
     return digest(_stopped_cleanup(spec, read_only=True) if read_only else _stopped_cleanup(spec))
 
 
+def observed_preparation_cleanup(spec, *, resource_spec=None, quarantined=None):
+    """Current native reentry needs retained source identity, not only Git bytes."""
+    from .delivery_resources import _gate_roots, observe_finalized_resources
+
+    current = resource_spec or spec
+    bindings = {}
+    authority = _gate_roots(current, execution_specs=bindings)
+    if spec not in bindings.values():
+        raise ValueError('preparation cleanup lost its admitted predecessor')
+    observed = observe_finalized_resources(current, quarantined=quarantined)
+    if observed['roots'].get(current['checkout']) is None:
+        raise ValueError('unstarted implementation lacks its registered current source')
+    after = {}
+    if _gate_roots(current, execution_specs=after) != authority or after != bindings:
+        raise ValueError('preparation resource authority changed during observation')
+    return digest(observed)
+
+
 def namespace(recovery):
     return 'stopped-resumes/' + recovery['command_digest']
 
@@ -1172,8 +1190,10 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
             **({'cleanup_reconciliation': reconciled} if reconciled else {}),
             **({'quarantined_implementation': quarantined} if quarantined else {}),
             **({'historical_quarantines': history} if history else {}),
-            'cleanup_digest': (observed_native_cleanup(spec, read_only=True) if review_subject
-                               else observed_native_cleanup(spec, **(
+            'cleanup_digest': (observed_preparation_cleanup(spec, quarantined=teardown)
+                               if (pending or {}).get('implementation_preparation') else
+                               observed_native_cleanup(spec, read_only=True) if review_subject else
+                               observed_native_cleanup(spec, **(
                                    {"quarantined": teardown} if teardown else {}))),
             'work_binding': binding,
             **({'session_custody': session_custody} if session_custody else {})}
@@ -1505,8 +1525,10 @@ def readback(store, spec, recovery):
                 or spec.get('implementation_role_home_generation') is not None):
             raise ValueError('quarantined implementation changed before its new finite turn')
     teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
-    cleanup = observed_native_cleanup(predecessor, **(
-        {'quarantined': teardown, 'resource_spec': spec} if teardown else {}))
+    cleanup = (observed_preparation_cleanup(predecessor, resource_spec=spec, quarantined=teardown)
+               if (details.get('pending_repair') or {}).get('implementation_preparation') else
+               observed_native_cleanup(predecessor, **(
+                   {'quarantined': teardown, 'resource_spec': spec} if teardown else {})))
     if cleanup != details['cleanup_digest']:
         raise ValueError('stopped predecessor process ownership changed')
     broker = DeliveryBroker(store, spec)

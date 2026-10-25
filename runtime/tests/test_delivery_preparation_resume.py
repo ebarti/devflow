@@ -79,6 +79,9 @@ def native_preparation_stop(service, monkeypatch, tmp_path):
     spec = prepare_authority(store, store.submitted_spec('run-1'))
     broker = DeliveryBroker(store, spec)
     broker.prepare()
+    assert spec['resource_cleanup_version'] == 1
+    source_entry = read_private(RunResources(spec).manifest)['roots'][spec['checkout']]
+    assert source_entry['kind'] == 'checkout'
     baseline = run_baseline_checks(broker)
     assert baseline['state'] == 'passed'
     ready.unlink()
@@ -236,6 +239,30 @@ def test_native_prerequisite_failure_retains_only_its_unused_provider_turn(
     proof = recovery['pending_repair']['implementation_preparation']
     assert proof['closed_role_sha256'] == digest(case.role)
     assert proof['files'][str(journal)] == hashlib.sha256(original_journal).hexdigest()
+    assert asyncio.run(delivery_repair_preflight({'spec': current, 'recovery': recovery})) == {
+        'state': 'confirmed'}
+
+    # Retained metadata can be read without the old cwd, but the current worker
+    # must reject missing, aliased or replaced source after admission as well.
+    checkout.rename(retained_checkout)
+    try:
+        assert store.effective_spec('run-1') == current
+        with pytest.raises(ValueError):
+            asyncio.run(delivery_repair_preflight({'spec': current, 'recovery': recovery}))
+        checkout.symlink_to(retained_checkout, target_is_directory=True)
+        with pytest.raises(ValueError):
+            asyncio.run(delivery_repair_preflight({'spec': current, 'recovery': recovery}))
+        checkout.unlink()
+        checkout.mkdir(mode=0o700)
+        with pytest.raises(ValueError):
+            asyncio.run(delivery_repair_preflight({'spec': current, 'recovery': recovery}))
+        checkout.rmdir()
+    finally:
+        if checkout.is_symlink():
+            checkout.unlink()
+        elif checkout.exists():
+            checkout.rmdir()
+        retained_checkout.rename(checkout)
     assert asyncio.run(delivery_repair_preflight({'spec': current, 'recovery': recovery})) == {
         'state': 'confirmed'}
 
