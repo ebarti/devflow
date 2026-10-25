@@ -21,6 +21,10 @@ def completed_prerequisite(seal, previous, role):
     if (spec.get('feature_worker') or spec.get('provider') != 'codex'
             or spec.get('policy', {}).get('host_sandbox') != 'trusted-local'):
         return None
+    checkout = Path(spec['checkout'])
+    if (not checkout.is_absolute() or str(checkout) != spec['checkout']
+            or '..' in checkout.parts):
+        raise ValueError('implementation prerequisite checkout metadata changed')
     preparation = role.get('implementation_preparation') or {}
     results = preparation.get('results')
     if (preparation.get('candidate_id') != candidate['id']
@@ -47,8 +51,9 @@ def completed_prerequisite(seal, previous, role):
         native = item.get('native_process') or {}
         if (not isinstance(identifier, str) or not identifier or identifier in {'.', '..'}
                 or Path(identifier).name != identifier or identifier in identifiers
-                or not isinstance(cwd, str) or not Path(cwd).is_relative_to(spec['checkout'])
-                or Path(cwd).resolve(strict=True) != Path(cwd)
+                or not isinstance(cwd, str) or not Path(cwd).is_absolute()
+                or str(Path(cwd)) != cwd or '..' in Path(cwd).parts
+                or not Path(cwd).is_relative_to(checkout)
                 or not isinstance(argv, list) or not argv
                 or any(not isinstance(arg, str) or not arg for arg in argv)
                 or type(item.get('exit_code')) is not int

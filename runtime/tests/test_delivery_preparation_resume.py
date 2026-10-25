@@ -171,6 +171,21 @@ def test_native_prerequisite_failure_retains_only_its_unused_provider_turn(
     assert preflight['authorized_through_iteration'] == 1
     assert state == original
 
+    checkout = Path(case.current['checkout'])
+    retained_checkout = checkout.with_name(checkout.name + '-owned-held-source')
+    checkout.rename(retained_checkout)
+    try:
+        with pytest.raises((ValueError, OSError)):
+            store.repair_admission_preflight('run-1', command)
+        checkout.symlink_to(retained_checkout, target_is_directory=True)
+        with pytest.raises((ValueError, OSError)):
+            store.repair_admission_preflight('run-1', command)
+        checkout.unlink()
+    finally:
+        if checkout.is_symlink():
+            checkout.unlink()
+        retained_checkout.rename(checkout)
+
     # Current work and provider inventory remain independent mandatory guards.
     with store._connect() as db:
         store.state.claim_work(db, case.current['work_id'], 'foreign-owner', 'Owned contradiction')
@@ -303,6 +318,31 @@ def test_configured_native_prerequisite_proof_binds_every_original_byte(prerequi
     assert proof['predecessor_command_digest'] == c.previous['command_digest']
     assert set(proof['files']) == {str(c.folder / name) for name in (
         'native-process.json', 'launch.json', 'process.log')}
+
+
+def test_historical_prerequisite_metadata_outlives_its_checkout(prerequisite_receipt):
+    c = prerequisite_receipt
+    checkout = Path(c.seal['predecessor_spec']['checkout'])
+    checkout.rmdir()
+    # Historical custody authenticates ended execution metadata. Independent
+    # current snapshot/readback still needs the actual source before admission.
+    proof = completed_prerequisite(c.seal, c.previous, c.role)
+    assert proof['closed_role_sha256'] == digest(c.role)
+
+
+@pytest.mark.parametrize('drift', ['relative', 'noncanonical', 'parent'])
+def test_prerequisite_cwd_metadata_remains_canonical(prerequisite_receipt, drift):
+    c = prerequisite_receipt
+    spec = c.seal['predecessor_spec']
+    if drift == 'relative':
+        spec['checkout'] = 'relative-checkout'
+    elif drift == 'noncanonical':
+        spec['checkout'] += '//'
+    else:
+        c.recipe['cwd'] = '../checkout'
+        c.item['cwd'] += '/../checkout'
+    with pytest.raises(ValueError):
+        completed_prerequisite(c.seal, c.previous, c.role)
 
 
 @pytest.mark.parametrize('drift', ['signal', 'timeout', 'cancelled', 'stdio', 'monitor',
