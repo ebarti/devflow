@@ -173,13 +173,20 @@ def test_native_prerequisite_failure_retains_only_its_unused_provider_turn(
 
     checkout = Path(case.current['checkout'])
     retained_checkout = checkout.with_name(checkout.name + '-owned-held-source')
+
+    def source_refused():
+        with pytest.raises((ValueError, OSError, subprocess.CalledProcessError)) as caught:
+            store.repair_admission_preflight('run-1', command)
+        if isinstance(caught.value, subprocess.CalledProcessError):
+            assert caught.value.returncode == 128
+            assert caught.value.cmd[:3] == ['git', '-C', str(checkout)]
+            assert caught.value.cmd[3:] == ['rev-parse', 'HEAD']
+
     checkout.rename(retained_checkout)
     try:
-        with pytest.raises((ValueError, OSError)):
-            store.repair_admission_preflight('run-1', command)
+        source_refused()
         checkout.symlink_to(retained_checkout, target_is_directory=True)
-        with pytest.raises((ValueError, OSError)):
-            store.repair_admission_preflight('run-1', command)
+        source_refused()
         checkout.unlink()
     finally:
         if checkout.is_symlink():
