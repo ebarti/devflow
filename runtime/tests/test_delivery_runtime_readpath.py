@@ -28,7 +28,9 @@ from devflow_temporal.delivery_resources import RunResources, write_private
 from devflow_temporal.delivery_store import DeliveryStore
 
 
-def acknowledge_reads(store, request, *, historical_specs=(), current_format=False):
+def acknowledge_reads(
+    store, request, *, historical_specs=(), current_format=False, observation=None,
+):
     """Exact ACK reader contracts; real native migration has a separate integration."""
     for index in range(2, 7):
         store.submit(
@@ -88,6 +90,8 @@ def acknowledge_reads(store, request, *, historical_specs=(), current_format=Fal
         "destination": destination,
         "service_guard": service_guard,
     }
+    if observation is not None:
+        observation(receipt)
     path = folder / "receipt.json"
     raw = canonical_json(receipt).encode()
     if current_format:

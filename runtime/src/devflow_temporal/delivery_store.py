@@ -2855,12 +2855,15 @@ class DeliveryStore:
 
     def spec(self, run_id: str) -> dict[str, Any]:
         with self._connect() as db:
-            row = db.execute(
-                "SELECT request_json FROM delivery_runs WHERE run_id=?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise ValueError("run ID not found")
-            return self._prepared_original(db, json.loads(row[0]))
+            return self._spec(db, run_id)
+
+    def _spec(self, db: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+        row = db.execute(
+            "SELECT request_json FROM delivery_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("run ID not found")
+        return self._prepared_original(db, json.loads(row[0]))
 
     def submitted_spec(self, run_id: str) -> dict[str, Any]:
         """Read immutable admission input, including after preparation freezes."""
@@ -3846,13 +3849,23 @@ class DeliveryStore:
                 " ORDER BY r.updated_at DESC,r.run_id DESC LIMIT ?",
                 (*parameters, limit + 1),
             ).fetchall()
+            # One page reads one owner. Opening a guarded connection per row
+            # repeatedly hydrates the entire installation authority, including
+            # its historical native actor inventory. Keep only this page's SQL
+            # connection; no proof or observation survives the operation.
+            runs = [self._compact(dict(row), db=db) for row in rows[:limit]]
+        if not self.read_only:
+            from .delivery_runtime_location import require_not_pending
+
+            # Row presentation may observe files. Recheck the complete mutable
+            # pointer/cohort/owner/guard authority after that work, before return.
+            require_not_pending(self.config)
         next_cursor = None
         if len(rows) > limit:
             last = rows[limit - 1]
             encoded = json.dumps([archived, last["updated_at"], last["run_id"]]).encode()
             next_cursor = base64.urlsafe_b64encode(encoded).decode().rstrip("=")
-        return {"runs": [self._compact(dict(row)) for row in rows[:limit]],
-                "next_cursor": next_cursor}
+        return {"runs": runs, "next_cursor": next_cursor}
 
     def feature(self, run_id: str) -> dict | None:
         from .delivery_features import current
@@ -3884,7 +3897,12 @@ class DeliveryStore:
                     "checkout": spec["checkout"]}
         return None
 
-    def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _compact(
+        self, row: dict[str, Any], *, db: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        if db is None:
+            with self._connect() as connection:
+                return self._compact(row, db=connection)
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         technical = False
@@ -3904,25 +3922,23 @@ class DeliveryStore:
         )
         if not isinstance(effective, dict):
             effective = spec
+        from .delivery_dashboard import presentation
         from .delivery_resources import projected_cleanup
 
-        with self._connect() as db:
-            from .delivery_dashboard import presentation
+        dashboard_state = presentation(db, row["run_id"])
+        from .delivery_features import current as current_feature
 
-            dashboard_state = presentation(db, row["run_id"])
-            from .delivery_features import current as current_feature
+        feature = current_feature(db, row["issue_url"])
+        active, unfinished = db.execute(
+            "SELECT COUNT(*),COALESCE(SUM(state!='finished'),0) FROM delivery_attempts "
+            "WHERE run_id=? AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
+        ).fetchone()
+        from .delivery_merge_followup import action as merge_action
 
-            feature = current_feature(db, row["issue_url"])
-            active, unfinished = db.execute(
-                "SELECT COUNT(*),COALESCE(SUM(state!='finished'),0) FROM delivery_attempts "
-                "WHERE run_id=? AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
-            ).fetchone()
-            from .delivery_merge_followup import action as merge_action
-
-            merge = merge_action(db, row, spec)
+        merge = merge_action(db, row, spec)
         execution_readback = self._historical_execution_readback(row, spec, unfinished=unfinished)
         if execution_readback:
-            effective = self.spec(row["run_id"])
+            effective = self._spec(db, row["run_id"])
         elif technical:
             effective = self.effective_spec(row["run_id"])
         cleanup = projected_cleanup(

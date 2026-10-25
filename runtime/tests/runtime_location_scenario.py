@@ -1546,6 +1546,30 @@ def exercise(root, kind):
         "state": "confirmed"
     }
     if kind == "scope":
+        import httpx
+
+        from devflow_temporal.delivery_api import create_app
+
+        async def admitted_public_reads():
+            app = create_app(config.path)
+            transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
+            async with httpx.AsyncClient(
+                transport=transport, base_url=case.store.config.dashboard_url, timeout=30,
+            ) as browser:
+                started = time.monotonic()
+                detail, listing = await asyncio.wait_for(asyncio.gather(
+                    browser.get("/api/runs/run-1"), browser.get("/api/runs"),
+                ), timeout=30)
+            assert detail.status_code == listing.status_code == 200
+            assert detail.json()["run"]["iteration"] == 3
+            assert len(listing.json()["runs"]) == 6
+            return {"seconds": time.monotonic() - started, "provider": current["provider"],
+                    "detail_bytes": len(detail.content), "default_page_rows": 6}
+
+        print(json.dumps({
+            "actual_native_post_admission_public_reads": asyncio.run(admitted_public_reads()),
+        }))
+    if kind == "scope":
         reject_installed_custody_drift(case, current)
         reject_active_guard_drift(case, current, request)
     # The actual launch owner consumes the current candidate, claim, manifest,

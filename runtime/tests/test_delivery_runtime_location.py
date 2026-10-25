@@ -113,7 +113,8 @@ async def test_public_permanent_location_owner_and_continuation(installed_pair, 
         )
         if kind == "scope":
             for line in output.splitlines():
-                if "actual_native_post_ack_public_get" in line:
+                if ("actual_native_post_ack_public_get" in line
+                        or "actual_native_post_admission_public_reads" in line):
                     print(line)
     result = json.loads(output.splitlines()[-1])
     if kind in {"rollback", "pendingrollback"}:
