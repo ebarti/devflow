@@ -447,9 +447,10 @@ def receive_bound(root):
 
     case = fixture.restored(root)
     owner.MAX_HISTORY = 1024  # Test only: prove Core refuses BEFORE page allocation.
+    config = DeliveryConfig.load(Path(case.owner))
 
     async def observe():
-        client = await Client.connect(case.store.config.temporal_address)
+        client = await Client.connect(config.temporal_address)
         iterator = client.get_workflow_handle("delivery-run-1").fetch_history_events()
         with pytest.raises(RPCError) as rejected:
             await iterator.fetch_next_page()
