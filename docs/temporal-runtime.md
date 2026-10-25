@@ -86,7 +86,10 @@ immutable master. It never opens the original Temporal SQLite connection or
 creates/checkpoints its sidecars. SHM is retained as forensic evidence and rebuilt
 locally in the working copy. A hot/unexpected journal, uncertain visibility,
 foreign FD, replaced name, changed source generation or insufficient bounded
-storage refuses capture.
+storage refuses capture. The pristine master admits exactly the original family
+and its manifest; an added WAL cannot acquire recovery authority. Writable reader,
+snapshot and working generations are exclusively allocated. Existing staging,
+symlink or hard-link destinations are never adopted for copy or SQLite writes.
 
 Only an identity-bound copy server runs, on fresh loopback endpoints with private
 HOME/cwd/tmp and no inherited original lock/data descriptors. The pinned SDK

@@ -71,7 +71,7 @@ def test_consistent_raw_snapshot_recovers_only_owned_copy_without_reusing_shm(tm
     folder.mkdir(mode=0o700)
     with capture.SourceFamily(root) as observed:
         observed.snapshot(folder)
-        working, actual_namespace = capture._working(folder, "default")
+        working, actual_namespace = capture._working(folder, "default", observed.initial)
         assert actual_namespace == str(namespace)
         with closing(sqlite3.connect(working)) as copy:
             assert copy.execute("SELECT value FROM probe").fetchall() == [("committed WAL",)]
@@ -150,6 +150,74 @@ def test_snapshot_revalidates_original_and_master_generations(tmp_path, defect):
             (folder / "master/temporal.sqlite3").write_bytes(b"changed master")
         with pytest.raises(ValueError, match="changed|generation"):
             observed.snapshot(folder)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
+@pytest.mark.parametrize("member", ["temporal.sqlite3-wal", "temporal.sqlite3-journal", "extra"])
+def test_master_namespace_cannot_add_unregistered_wal_or_other_members(tmp_path, member):
+    root, _database, _ = source(tmp_path)
+    original = bytes_of(root)
+    folder = tmp_path / "capture"
+    folder.mkdir(mode=0o700)
+    with capture.SourceFamily(root) as observed:
+        observed.snapshot(folder)
+        unexpected = folder / "master" / member
+        unexpected.write_bytes(b"not part of the original held family")
+        unexpected.chmod(0o600)
+        with pytest.raises(ValueError, match="unregistered member"):
+            observed.snapshot(folder)
+        with pytest.raises(ValueError, match="unregistered member"):
+            capture._working(folder, "default", observed.initial)
+    assert not (folder / "working").exists()
+    assert bytes_of(root) == original
+
+
+@pytest.mark.parametrize("alias", ["raw-symlink", "target-symlink", "target-hardlink"])
+def test_real_serve_refuses_staging_collision_before_any_alias_write(tmp_path, monkeypatch, alias):
+    # Exact causal 2cd shape: readers/{1} was reused because len(entries)==1.
+    original = tmp_path / "owned-original.sqlite3"
+    master = tmp_path / "capture/master"
+    working = tmp_path / "capture/readers/1/snapshot/working"
+    for path in (master, working):
+        path.mkdir(mode=0o700, parents=True)
+        for parent in path.parents:
+            if parent == tmp_path:
+                break
+            parent.chmod(0o700)
+    for path, value in ((original, "preserve original"), (master / "temporal.sqlite3", "copy")):
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE namespaces(id BLOB,name TEXT)")
+            db.execute("INSERT INTO namespaces VALUES (?,?)", (uuid.uuid4().bytes, "default"))
+            db.execute("CREATE TABLE probe(value TEXT)")
+            db.execute("INSERT INTO probe VALUES (?)", (value,))
+            db.commit()
+        path.chmod(0o600)
+    child = working / ("raw.sqlite3" if alias == "raw-symlink" else "server.sqlite3")
+    if alias == "target-hardlink":
+        os.link(original, child)
+    else:
+        child.symlink_to(original)
+    before = original.read_bytes()
+    monkeypatch.setattr(capture, "_ports", lambda: pytest.fail("No port or process preparation"))
+    with pytest.raises(ValueError, match="exact owned sequence"):
+        capture._serve(
+            SimpleNamespace(raw={}), None, None, {}, tmp_path / "capture", "unused", None
+        )
+    assert original.read_bytes() == before
+    assert not (working.parent / "master").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
+def test_working_copy_never_reuses_existing_empty_staging(tmp_path):
+    root, _database, _ = source(tmp_path)
+    folder = tmp_path / "capture"
+    folder.mkdir(mode=0o700)
+    with capture.SourceFamily(root) as observed:
+        observed.snapshot(folder)
+        (folder / "working").mkdir(mode=0o700)
+        with pytest.raises(ValueError, match="generation already exists"):
+            capture._working(folder, "default", observed.initial)
+    assert not list((folder / "working").iterdir())
 
 
 class Pages:

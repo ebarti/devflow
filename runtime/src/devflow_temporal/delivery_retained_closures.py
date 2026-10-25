@@ -83,6 +83,11 @@ def _folder(path):
     path = Path(path)
     if not path.exists():
         path.mkdir(mode=0o700)
+    return _existing_folder(path)
+
+
+def _existing_folder(path):
+    path = Path(path)
     info = path.lstat()
     if (
         path.resolve(strict=True) != path
@@ -92,6 +97,31 @@ def _folder(path):
     ):
         raise ValueError("capture directory is not its private owned generation")
     return path
+
+
+def _new_folder(path):
+    """A writable generation never adopts an existing staging namespace."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise ValueError("capture writable generation already exists") from exc
+    return _existing_folder(path)
+
+
+def _object(info):
+    return {key: getattr(info, key) for key in ("st_dev", "st_ino", "st_uid", "st_mode")}
+
+
+def _master(master, expected):
+    """Only the original held source family can appoint pristine copy members."""
+    _existing_folder(master)
+    if {p.name for p in master.iterdir()} != set(expected) | {"manifest.json"}:
+        raise ValueError("capture pristine master has an unregistered member")
+    if json.loads(receipt_bytes(master / "manifest.json")) != expected:
+        raise ValueError("capture immutable master belongs to another source generation")
+    for name, value in expected.items():
+        if _file_hash(master / name) != value["sha256"]:
+            raise ValueError("capture pristine master bytes changed")
 
 
 def _publish(path, value):
@@ -617,7 +647,7 @@ class SourceFamily:
         master = folder / "master"
         if not master.exists():
             stage = folder / (".snapshot-" + uuid.uuid4().hex)
-            _folder(stage)
+            _new_folder(stage)
             for name, fd in self.descriptors.items():
                 target = stage / name
                 output = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, 0o600)
@@ -635,36 +665,91 @@ class SourceFamily:
             self.observe()
             _publish(stage / "manifest.json", observed)
             _publish_exclusive(stage, master)
-        if json.loads(receipt_bytes(master / "manifest.json")) != observed:
-            raise ValueError("capture immutable master belongs to another source generation")
-        for name, value in observed.items():
-            if _file_hash(master / name) != value["sha256"]:
-                raise ValueError("capture pristine master bytes changed")
+        _master(master, observed)
         return observed
 
 
-def _working(folder, namespace):
+def _working(folder, namespace, expected):
     """Recover/backup only the owned copy; never reuse the original SHM cache."""
-    working = _folder(folder / "working")
-    raw = working / "raw.sqlite3"
-    for old, new in (("temporal.sqlite3", raw), ("temporal.sqlite3-wal", Path(str(raw) + "-wal"))):
-        source = folder / "master" / old
-        if source.exists():
-            shutil.copyfile(source, new, follow_symlinks=False)
-            new.chmod(0o600)
-    target = working / "server.sqlite3"
-    with closing(sqlite3.connect(raw)) as source:
-        if source.execute("PRAGMA integrity_check").fetchone() != ("ok",):
-            raise ValueError("capture working snapshot fails SQLite integrity")
-        rows = source.execute(
-            "SELECT id FROM namespaces WHERE name=? LIMIT 2", (namespace,)
-        ).fetchall()
-        if len(rows) != 1:
-            raise ValueError("capture pristine snapshot lacks its original namespace")
-        identity = str(uuid.UUID(bytes=bytes(rows[0][0])))
-        with closing(sqlite3.connect(target)) as dest:
-            source.backup(dest)
-    target.chmod(0o600)
+    master = folder / "master"
+    _master(master, expected)
+    working = _new_folder(folder / "working")
+    raw, target = working / "raw.sqlite3", working / "server.sqlite3"
+    with ExitStack() as held:
+        directory = os.open(working, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+        held.callback(os.close, directory)
+        directory_identity = _object(os.fstat(directory))
+        files = {}
+
+        def current(*paths):
+            if directory_identity != _object(working.lstat()) or directory_identity != _object(
+                os.fstat(directory)
+            ):
+                raise ValueError("capture working directory generation changed")
+            for path in paths:
+                fd, identity = files[path]
+                info = os.fstat(fd)
+                if (
+                    _object(info) != identity
+                    or _object(path.lstat()) != identity
+                    or info.st_nlink != 1
+                    or path.lstat().st_nlink != 1
+                ):
+                    raise ValueError("capture working file generation changed")
+
+        for old, path in (
+            ("temporal.sqlite3", raw),
+            ("temporal.sqlite3-wal", Path(str(raw) + "-wal")),
+            (None, target),
+        ):
+            if old and old not in expected:
+                continue
+            output = os.open(
+                path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
+            )
+            held.callback(os.close, output)
+            files[path] = output, _object(os.fstat(output))
+            if old:
+                descriptor = os.open(
+                    master / old, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+                )
+                try:
+                    before = _stamp(os.fstat(descriptor))
+                    sha = hashlib.sha256()
+                    # FileIO handles partial writes; never reopen a destination name.
+                    with os.fdopen(os.dup(output), "wb", closefd=True) as stream:
+                        while chunk := os.read(descriptor, 1024**2):
+                            sha.update(chunk)
+                            stream.write(chunk)
+                        stream.flush()
+                    os.fsync(output)
+                    if (
+                        before != _stamp(os.fstat(descriptor))
+                        or before != _stamp((master / old).lstat())
+                        or sha.hexdigest() != expected[old]["sha256"]
+                    ):
+                        raise ValueError("capture copied master generation changed")
+                finally:
+                    os.close(descriptor)
+            current(path)
+        current(*files)
+        with closing(sqlite3.connect(raw)) as source:
+            current(raw, target)
+            if source.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                raise ValueError("capture working snapshot fails SQLite integrity")
+            rows = source.execute(
+                "SELECT id FROM namespaces WHERE name=? AND length(id)=16 LIMIT 2", (namespace,)
+            ).fetchall()
+            if len(rows) != 1:
+                raise ValueError("capture pristine snapshot lacks its original namespace")
+            identity = str(uuid.UUID(bytes=bytes(rows[0][0])))
+            current(raw, target)
+            with closing(sqlite3.connect(target)) as dest:
+                current(raw, target)
+                source.backup(dest)
+                current(raw, target)
+        current(raw, target)
+        _master(master, expected)
     return target, identity
 
 
@@ -721,6 +806,10 @@ def _reader_authority(folder):
         or plan["command_digest"] != digest(command)
         or plan["cwd"] != str(folder)
         or plan["database"] != str(folder / "snapshot/working/server.sqlite3")
+        or plan["cwd_identity"] != _object(folder.lstat())
+        or plan["working_identity"] != _object((folder / "snapshot/working").lstat())
+        or plan["database_identity"] != _object(Path(plan["database"]).lstat())
+        or Path(plan["database"]).lstat().st_nlink != 1
         or plan["argv"] != _argv(command["reader"]["resolved_path"], plan["database"], ports)
         or launch["argv"] != plan["argv"]
         or launch["environment"] != _environment(folder)
@@ -1265,15 +1354,26 @@ def _publish_exports(folder, exports):
 
 def _serve(config, store, authority, supplied, folder, intent_sha256, launch_guard):
     readers = _folder(folder / "readers")
-    for prior in sorted(readers.iterdir()):
+    entries = list(readers.iterdir())
+    if {p.name for p in entries} != {str(i) for i in range(len(entries))}:
+        raise ValueError("capture reader generations are not their exact owned sequence")
+    for prior in sorted(entries):
+        _existing_folder(prior)
         _cleanup(prior)
-    if len(list(readers.iterdir())) >= 8:
+    if len(entries) >= 8:
         raise ValueError("capture exhausted its bounded explicit reader generations")
-    reader = _folder(readers / str(len(list(readers.iterdir()))))
+    intent_raw = receipt_bytes(folder / "intent.json")
+    if _sha(intent_raw) != intent_sha256:
+        raise ValueError("capture original source intent changed before working preparation")
+    expected = json.loads(intent_raw)["source"]
+    reader = _new_folder(readers / str(len(entries)))
     # Every generation has a new writable copy; the pristine master is never served.
-    generation = _folder(reader / "snapshot")
+    generation = _new_folder(reader / "snapshot")
+    _master(folder / "master", expected)
     shutil.copytree(folder / "master", generation / "master")
-    database, namespace = _working(generation, config.raw.get("temporal_namespace", "default"))
+    database, namespace = _working(
+        generation, config.raw.get("temporal_namespace", "default"), expected
+    )
     _folder(reader / "home")
     _folder(reader / "tmp")
     ports = _ports()
@@ -1294,6 +1394,9 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
             "database": str(database),
             "argv": argv,
             "cwd": str(reader),
+            "cwd_identity": _object(reader.lstat()),
+            "working_identity": _object((generation / "working").lstat()),
+            "database_identity": _object(database.lstat()),
         },
     )
     _reader(config, supplied["reader"])
