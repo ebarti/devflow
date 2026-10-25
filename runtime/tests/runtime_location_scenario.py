@@ -820,7 +820,7 @@ def reject_retained_custody_drift(case):
 
 def reject_installed_custody_drift(case, current):
     """Changed artifacts are observed by real strict readers; never executed."""
-    from devflow_temporal.delivery_native_preparation import verify_native_spec
+    from devflow_temporal.delivery_preparation import verify_prepared_spec
     from devflow_temporal.delivery_runtime_location import historical_proof
 
     registry = RunResources(current)
@@ -843,7 +843,7 @@ def reject_installed_custody_drift(case, current):
     os.link(binary, extra)
     try:
         with pytest.raises((ValueError, OSError)):
-            verify_native_spec(current)
+            verify_prepared_spec(current)
     finally:
         extra.unlink()
     mode = binary.stat().st_mode & 0o777
@@ -855,7 +855,7 @@ def reject_installed_custody_drift(case, current):
         original = os.pread(fd, 1, offset)
         os.pwrite(fd, bytes([original[0] ^ 1]), offset)
         with pytest.raises(ValueError):
-            verify_native_spec(current)
+            verify_prepared_spec(current)
     finally:
         if original is not None:
             os.pwrite(fd, original, offset)
@@ -871,7 +871,7 @@ def reject_installed_custody_drift(case, current):
         assert changed != original
         metadata.write_bytes(changed)
         with pytest.raises(ValueError):
-            verify_native_spec(current)
+            verify_prepared_spec(current)
     finally:
         metadata.write_bytes(original)
     # The imported program cannot gain another owning directory through a
@@ -881,11 +881,11 @@ def reject_installed_custody_drift(case, current):
     SOURCE.symlink_to(moved, target_is_directory=True)
     try:
         with pytest.raises((ValueError, OSError)):
-            verify_native_spec(current)
+            verify_prepared_spec(current)
     finally:
         SOURCE.unlink()
         moved.rename(SOURCE)
-    verify_native_spec(current)
+    verify_prepared_spec(current)
 
 
 async def actual_worker(case, current, recovery, response, patch):
