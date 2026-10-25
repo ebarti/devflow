@@ -819,6 +819,14 @@ def replace(item, *, reverse=False):
             stage.unlink(missing_ok=True)
 
 
+def _plugin_package(plan, *, reverse=False):
+    owned, module = _desktop()
+    root = Path(plan["before"]["marketplace"] if reverse else plan["new_marketplace"])
+    files = plan["before_files"] if reverse else plan["after_files"]
+    _original_tree(root, files, module)
+    owned.package_check(root, {name: base64.b64decode(raw) for name, raw in files.items()})
+
+
 def _plugin_state(plan):
     from .delivery_runtime_installation import _hash
 
@@ -852,6 +860,8 @@ def _plugin_state(plan):
     market = observed["marketplace"]
     if market not in (None, plan["before"]["marketplace"], plan["new_marketplace"]):
         raise ValueError("owned plugin marketplace was replaced")
+    if market == plan["new_marketplace"]:
+        _plugin_package(plan)
     payload = None
     if observed["plugin"]:
         current_tree = _package_tree(Path(plan["cache"]), PLUGIN_FILES)
@@ -889,6 +899,9 @@ def plugin_apply(plan, guard, *, reverse=False):
     log = read_private(progress) if progress.exists() else {"attempts": [], "observations": []}
     for _ in range(5):
         guard()
+        # The intended source is authority before any public effect, including
+        # removing the old plugin. Absence never skips this target check.
+        _plugin_package(plan, reverse=reverse)
         observed, payload = _plugin_state(plan)
         if (
             observed["plugin"]

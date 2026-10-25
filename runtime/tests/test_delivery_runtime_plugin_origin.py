@@ -7,7 +7,9 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -267,3 +269,109 @@ def test_original_tree_byte_and_generation_drift_refuses_before_cli_effects(orig
     skill.write_bytes(raw)  # Same bytes still cannot replace the sealed original generation.
     with pytest.raises(ValueError, match="custody changed"):
         owner._plugin_state(plan)
+
+
+def target_plan(case, tmp_path):
+    target = tmp_path / "target-marketplace"
+    shutil.copytree(case.market, target)
+    after = dict(case.encoded)
+    mcp = json.loads(base64.b64decode(after[".mcp.json"]))
+    mcp["mcpServers"]["devflow-local-delivery"]["command"] = (
+        "/owned/permanent/runtime/.venv/bin/devflow-delivery-mcp"
+    )
+    raw = case.package.json_bytes(mcp)
+    after[".mcp.json"] = base64.b64encode(raw).decode()
+    (target / "plugins/devflow/.mcp.json").write_bytes(raw)
+    cli = tmp_path / "host-cli"
+    cli.write_bytes(b"owned inert CLI identity\n")
+    return {
+        "before": case.snapshot,
+        "before_files": case.encoded,
+        "after_files": after,
+        "new_marketplace": str(target),
+        "progress": str(tmp_path / "public-progress.json"),
+        "original_tree": owner._original_tree(str(case.market), case.encoded, case.package),
+        "origin": owner._origin(case.supplied, dict(case.encoded)),
+        "cli": str(cli),
+        "cli_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
+        "cache": str(case.cache),
+        "codex_home": str(tmp_path),
+    }
+
+
+@pytest.mark.parametrize("defect", ["missing", "skill", "catalog", "empty-directory"])
+def test_intended_new_source_is_complete_before_any_public_effect(
+    original, tmp_path, monkeypatch, defect
+):
+    case = original
+    plan = target_plan(case, tmp_path)
+    target = tmp_path / "target-marketplace"
+    if defect == "missing":
+        shutil.rmtree(target)
+    elif defect == "skill":
+        (target / "plugins/devflow" / SKILL).write_bytes(b"foreign skill")
+    elif defect == "catalog":
+        (target / owner.CATALOG).write_bytes(b"{}")
+    else:
+        (target / "plugins/devflow/extra-empty").mkdir()
+    monkeypatch.setattr(owner, "_plugin_state", lambda _: (case.snapshot, case.encoded))
+    calls = []
+    monkeypatch.setattr(case.owned, "command", lambda *args: calls.append(args))
+    with pytest.raises((ValueError, OSError)):
+        owner.plugin_apply(plan, lambda: None)
+    assert calls == []
+    assert not (tmp_path / "public-progress.json").exists()
+
+
+def test_selected_new_source_drift_refuses_with_unchanged_valid_cache(
+    original, tmp_path, monkeypatch
+):
+    case = original
+    plan = target_plan(case, tmp_path)
+    selected = copy.deepcopy(case.snapshot)
+    selected["marketplace"] = plan["new_marketplace"]
+    selected["plugin"]["source"]["path"] = str(
+        Path(plan["new_marketplace"]) / "plugins/devflow"
+    )
+    selected["plugin"]["marketplaceSource"]["source"] = plan["new_marketplace"]
+    selected["plugin_mcp"]["transport"]["command"] = json.loads(
+        base64.b64decode(plan["after_files"][".mcp.json"])
+    )["mcpServers"]["devflow-local-delivery"]["command"]
+    (case.cache / ".mcp.json").write_bytes(base64.b64decode(plan["after_files"][".mcp.json"]))
+    monkeypatch.setattr(case.owned, "snapshot", lambda *_: selected)
+    owner._plugin_state(plan)
+    (Path(plan["new_marketplace"]) / "plugins/devflow/extra-empty").mkdir()
+    with pytest.raises(ValueError, match="extra or duplicate"):
+        owner._plugin_state(plan)
+
+
+def test_target_is_rechecked_before_the_next_public_effect(original, tmp_path, monkeypatch):
+    case = original
+    plan = target_plan(case, tmp_path)
+    observed = copy.deepcopy(case.snapshot)
+    monkeypatch.setattr(
+        owner, "_plugin_state", lambda _: (observed, case.encoded if observed["plugin"] else None)
+    )
+    calls = []
+
+    def effect(*args):
+        calls.append(args)
+        observed["plugin"] = None
+        (Path(plan["new_marketplace"]) / "plugins/devflow/extra-empty").mkdir()
+
+    monkeypatch.setattr(case.owned, "command", effect)
+    with pytest.raises(ValueError, match="extra or duplicate"):
+        owner.plugin_apply(plan, lambda: None)
+    assert len(calls) == 1
+    assert calls[0][-4:] == ("plugin", "remove", "devflow@devflow-local", "--json")
+
+
+def test_pending_reverse_needs_only_the_original_target(original, tmp_path, monkeypatch):
+    case = original
+    plan = target_plan(case, tmp_path)
+    shutil.rmtree(Path(plan["new_marketplace"]))
+    monkeypatch.setattr(owner, "_plugin_state", lambda _: (case.snapshot, case.encoded))
+    calls = []
+    monkeypatch.setattr(case.owned, "command", lambda *args: calls.append(args))
+    owner.plugin_apply(plan, lambda: None, reverse=True)
+    assert calls == []

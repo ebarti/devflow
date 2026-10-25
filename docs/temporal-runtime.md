@@ -419,7 +419,11 @@ refuses. The destination copies all authenticated original bytes and changes onl
 the MCP executable command to the derived permanent entry. Original bytes,
 inventories, generations and witness are retained in the common receipt and
 rechecked through public effects, replay and rollback. Current packaging templates
-remain unchanged. A fresh migration input may consume an already acknowledged
+remain unchanged. Before each public plugin effect, the complete intended target
+package and catalog must exist with the sealed bytes and exact member set; current
+new registrations also revalidate that source independently of the cache. Pending
+rollback needs only its original target when no forward package was published.
+A fresh migration input may consume an already acknowledged
 historical capture; it never rewrites that capture's archived input or recaptures
 the same execution to adopt a different program source.
 
