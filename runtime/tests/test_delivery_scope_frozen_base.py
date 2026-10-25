@@ -13,6 +13,7 @@ from test_delivery_blocked_scope import ADDED, SESSION, admitted, scope_case
 from test_delivery_store import _git
 from test_delivery_store import service as service
 
+from devflow_temporal import delivery_config as configuration
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.delivery_activities import delivery_repair_preflight
 from devflow_temporal.delivery_resources import read_private
@@ -211,6 +212,104 @@ def test_scope_does_not_acquire_new_main_configuration_or_file_authority(named_s
     assert current["policy"]["roles"] == case.spec["policy"]["roles"]
     assert current["policy"]["source_scope"]["allowed_files"] == ADDED
     assert not (case.broker.checkout / ".codex").exists()
+
+
+@pytest.mark.parametrize("view", ["graft", "replace", "packed_replace"])
+def test_public_scope_rejects_altered_git_ancestry_or_original_object_view(named_scope, view):
+    case = named_scope
+    descendant = advance_main(case)
+    if view == "graft":
+        rewrite_main(case)
+        unrelated = _git(case.broker.source, "rev-parse", "refs/remotes/origin/main")
+        (case.broker.source / ".git/info/grafts").write_text(
+            unrelated + " " + case.spec["base_sha"] + "\n"
+        )
+    else:
+        _git(case.broker.source, "replace", case.spec["base_sha"], descendant)
+        if view == "packed_replace":
+            _git(case.broker.source, "pack-refs", "--all", "--prune")
+    with pytest.raises(ValueError, match="altered Git object view"):
+        configuration.ordinary_scope_base(case.store.config, case.spec)
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        case.store.repair_admission_preflight("run-1", case.command)
+    with case.store._connect() as db:
+        assert case.store.state.claim_for(db, case.spec["work_id"]) is None
+        assert not db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
+                              (case.command["command_id"],)).fetchone()
+
+
+def test_same_commit_under_a_different_symbolic_publication_branch_refuses(named_scope):
+    case = named_scope
+    current = advance_main(case)
+    _git(case.broker.source, "update-ref", "refs/remotes/origin/other", current)
+    _git(case.broker.source, "symbolic-ref", "refs/remotes/origin/main",
+         "refs/remotes/origin/other")
+    with pytest.raises(ValueError, match="named publication branch"):
+        case.store.repair_admission_preflight("run-1", case.command)
+
+
+@pytest.mark.parametrize("stage", ["admission", "worker", "during_worker"])
+def test_late_git_object_view_drift_refuses_before_native_launch(named_scope, monkeypatch, stage):
+    case = named_scope
+    descendant = advance_main(case)
+
+    def replace():
+        _git(case.broker.source, "replace", case.spec["base_sha"], descendant)
+
+    if stage == "admission":
+        def prepare(spec, *_):
+            replace()
+            return copy.deepcopy(spec)
+
+        monkeypatch.setattr(resume, "prepare_runtime", prepare)
+        with pytest.raises(ValueError):
+            case.store.continue_repair("run-1", case.command)
+        with case.store._connect() as db:
+            assert case.store.state.claim_for(db, case.spec["work_id"]) is None
+    else:
+        _response, current, recovery = admitted(case)
+        if stage == "worker":
+            replace()
+        else:
+            observed = resume.published_identity
+
+            def publication(*args):
+                result = observed(*args)
+                replace()
+                return result
+
+            monkeypatch.setattr(resume, "published_identity", publication)
+        with pytest.raises(ValueError, match="altered Git object view"):
+            asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery}))
+
+
+def test_frozen_tree_read_never_uses_a_transient_replacement(named_scope, monkeypatch):
+    case = named_scope
+    (case.broker.source / "current-main-only.py").write_text("Unaccepted new metadata\n")
+    _git(case.broker.source, "add", "current-main-only.py")
+    descendant = advance_main(case)
+    physical = configuration._scope_git
+    observations = []
+
+    def read(source, *args):
+        if args[:1] == ("ls-tree",):
+            _git(source, "replace", case.spec["base_sha"], descendant)
+            try:
+                result = physical(source, *args)
+                observations.append(result)
+                assert result == _git(source, "--no-replace-objects", *args)
+                assert "current-main-only.py" not in result
+                assert "current-main-only.py" in _git(source, *args)
+                return result
+            finally:
+                _git(source, "replace", "-d", case.spec["base_sha"])
+        return physical(source, *args)
+
+    monkeypatch.setattr(configuration, "_scope_git", read)
+    observed = case.store.repair_admission_preflight("run-1", case.command)
+    assert observed["authorized_through_iteration"] == 4
+    assert observations
+    assert all("README.md" in value for value in observations)
 
 
 @pytest.mark.asyncio

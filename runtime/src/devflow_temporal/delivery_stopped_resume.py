@@ -12,7 +12,7 @@ from .delivery_baseline_contract import preparation_failure, repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_browser_mode_recovery import FIELDS as BROWSER_FIELDS
 from .delivery_budget_contract import continuation_maximum, fixed_budget_allows
-from .delivery_config import scope_amended_spec, scope_amendment_config
+from .delivery_config import ordinary_scope_base, scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
 from .delivery_gate_retry import prepare_runtime, transient_stop
 from .delivery_metadata_recovery import _immutable, preserve_resources
@@ -91,6 +91,8 @@ def scope_spec(store, seal, command, *, _feature_scope=None):
     if any(amended[key] != seal['candidate'][key] for key in (
             'id', 'head', 'content_sha256', 'base_sha', 'environment_digest')):
         raise ValueError('scope amendment changed stopped implementation bytes')
+    if not spec.get('feature_worker') and spec['provider'] == 'codex':
+        ordinary_scope_base(load_execution_config(effective), spec)
     return effective
 
 
@@ -1502,8 +1504,6 @@ def readback(store, spec, recovery):
                           and not predecessor.get('feature_worker')
                           and predecessor['provider'] == 'codex')
     if current_scope_base:
-        from .delivery_config import ordinary_scope_base
-
         ordinary_scope_base(load_execution_config(spec), predecessor)
         observed_preparation_cleanup(predecessor, resource_spec=spec)
     if recovery.get('session_custody'):

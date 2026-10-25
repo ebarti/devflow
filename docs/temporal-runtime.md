@@ -264,6 +264,9 @@ readback recheck the branch/commit and registered physical checkout; rewritten
 history, a missing commit, changed branch or replaced source refuses. Historical
 custody remains readable without current source refs. Fresh submissions still
 require the configured ref to match `expected_base_sha` exactly.
+The ordinary recovery observer rejects Git replacement refs and legacy graft
+files, and reads its frozen commit/tree with both replacement and graft views
+disabled. A synthetic ancestry or substituted old tree cannot authorize recovery.
 
 Native predecessor observation resolves resources through the current acknowledged execution and requires the exact historical predecessor to be a member of its authenticated execution bindings. Both the bindings and current gate namespaces are rechecked after observation. Supplying an old spec as current authority, an unrecorded historical graft, changed configuration/admission/evidence, or authority drift during observation remains a refusal.
 

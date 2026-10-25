@@ -40,6 +40,26 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _scope_git(repo: Path, *args: str) -> str:
+    """Read physical objects for this frozen-base context, never graft/replace views."""
+    result = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(repo), *args],
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull},
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    return result.stdout.strip()
+
+
+def _ordinary_scope_git_view(source: Path) -> None:
+    graft = Path(_scope_git(source, "rev-parse", "--path-format=absolute",
+                            "--git-path", "info/grafts"))
+    if (os.path.lexists(graft)
+            or _scope_git(source, "for-each-ref", "--format=%(refname)", "refs/replace/")
+            or os.environ.get("GIT_GRAFT_FILE") not in (None, os.devnull)
+            or os.environ.get("GIT_REPLACE_REF_BASE") not in (None, "refs/replace/")):
+        raise ValueError("ordinary scope continuation has an altered Git object view")
+
+
 def publication_base_ref(source: Path, base_ref: str, base_sha: str) -> str:
     """Bind GitHub's branch primitive independently of the pinned Git object."""
     try:
@@ -81,14 +101,15 @@ def ordinary_scope_base(config: DeliveryConfig, original: dict[str, Any]) -> dic
             or _git(source, "remote", "get-url", "origin") != original["origin_url"]):
         raise ValueError("ordinary scope continuation changed its frozen source identity")
     try:
-        if _git(source, "--no-replace-objects", "cat-file", "-t", original["base_sha"]) != "commit":
+        _ordinary_scope_git_view(source)
+        if _scope_git(source, "cat-file", "-t", original["base_sha"]) != "commit":
             raise ValueError("ordinary scope continuation lost its frozen base commit")
-        current = _git(source, "--no-replace-objects", "rev-parse", original["base_ref"])
+        current = _scope_git(source, "rev-parse", original["base_ref"])
         branch = publication_base_ref(source, original["base_ref"], current)
         if branch != original.get("publication_base_ref"):
             raise ValueError("ordinary scope continuation changed its named publication branch")
-        _git(source, "--no-replace-objects", "merge-base", "--is-ancestor",
-             original["base_sha"], current)
+        _scope_git(source, "merge-base", "--is-ancestor", original["base_sha"], current)
+        _ordinary_scope_git_view(source)
     except subprocess.CalledProcessError as exc:
         raise ValueError(
             "ordinary scope continuation lost its original commit or descendant branch"
@@ -359,7 +380,8 @@ class DeliveryConfig:
             base_sha = _git(source, "rev-parse", _feature_base["base_sha"])
             if base_sha != _feature_base["base_sha"]:
                 raise ValueError("feature continuation lost its frozen base commit")
-        base_paths = _git(source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
+        base_paths = (_scope_git if _scope_base is not None else _git)(
+            source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
         if any(path == ".codex" or path.startswith(".codex/") for path in base_paths):
             raise ValueError("project Codex configuration is not admitted")
         expected = repository.get("expected_base_sha")
@@ -837,4 +859,6 @@ def scope_amended_spec(
         from .delivery_runtime_location import bind_provenance
 
         effective = bind_provenance(effective, original)
+    if original["provider"] == "codex":
+        ordinary_scope_base(amended, original)
     return effective
