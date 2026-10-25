@@ -179,8 +179,9 @@ def test_native_prerequisite_failure_retains_only_its_unused_provider_turn(
     with store._connect() as db:
         store.state.release_work(db, case.current['work_id'], 'foreign-owner')
         db.execute("INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,"
-                   "state,cleanup) VALUES ('unexpected-provider','run-1','implement',1,?,"
-                   "'running','unknown')", (state['candidate']['id'],))
+                   "state,cleanup,result_json) VALUES "
+                   "('unexpected-provider','run-1','implement',1,?,"
+                   "'finished','confirmed','{}')", (state['candidate']['id'],))
     with pytest.raises(ValueError):
         store.repair_admission_preflight('run-1', command)
     with store._connect() as db:
