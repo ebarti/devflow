@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import lzma
 import os
 import re
 import shlex
@@ -21,7 +22,8 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import ExitStack, closing
+import zlib
+from contextlib import ExitStack, closing, contextmanager
 from datetime import timedelta
 from importlib.metadata import version
 from pathlib import Path
@@ -41,6 +43,9 @@ READER_FORMULA_SHA = "896766197690da2638d33740ebaa4ca0f05b1b675f4bbf245641800ef7
 READER_HEADER = "Temporal CLI 1.9.1 (Server 1.32.0, UI 2.54.1)"
 MAX_SNAPSHOT = 4 * 1024**3
 MAX_HISTORY = 48 * 1024**2
+MAX_DECODED = 64 * 1024**2
+MAX_PAYLOAD = 32 * 1024**2
+_SDK_LIMIT_PINNED = False
 MAX_EVENTS = 65536
 MAX_PAGES = 512
 TOTAL_SECONDS = 90
@@ -233,6 +238,7 @@ def _reader(config, declared):
         "homebrew_formula_sha256": READER_FORMULA_SHA,
         "original_log_sha256": _sha(raw),
         "sdk": "1.33.0",
+        "grpc_receive_limit_bytes": MAX_HISTORY,
         "python": "3.12.13",
     }
 
@@ -911,6 +917,97 @@ def _cleanup(folder):
     _publish(folder / "cleanup.json", {"state": "confirmed", "intent_sha256": digest(plan)})
 
 
+@contextmanager
+def _sdk_receive_limit():
+    """A fixed local read-client cap, never a native policy/environment amendment.
+
+    SDK1.33 Core honors this process-only setting before allocating an incoming
+    gRPC message. The public command runs standalone; an already used SDK runtime
+    outside this owner is refused rather than assuming its cached transport cap.
+    """
+    global _SDK_LIMIT_PINNED
+    from temporalio import runtime
+
+    key = "TEMPORAL_MAX_INCOMING_GRPC_BYTES"
+    original = os.environ.get(key)
+    if version("temporalio") != "1.33.0" or original not in {None, str(MAX_HISTORY)}:
+        raise ValueError("capture SDK receive resource authority changed")
+    if runtime._runtime_ref._default_runtime is not None and not _SDK_LIMIT_PINNED:
+        raise ValueError("capture requires a fresh standalone SDK owner process")
+    os.environ[key] = str(MAX_HISTORY)
+    _SDK_LIMIT_PINNED = True
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original
+
+
+def _payloads(message):
+    if message.DESCRIPTOR.full_name == "temporal.api.common.v1.Payload":
+        yield message
+        return
+    for field, value in message.ListFields():
+        if field.message_type is None:
+            continue
+        if field.is_repeated:
+            values = value.values() if field.message_type.GetOptions().map_entry else value
+            for child in values:
+                if hasattr(child, "DESCRIPTOR"):
+                    yield from _payloads(child)
+        else:
+            yield from _payloads(value)
+
+
+def _bounded_payloads(history):
+    """Prove expansion bounds BEFORE the unchanged workflow codec allocates it."""
+    total = 0
+    for event in history.events:
+        for payload in _payloads(event):
+            encoding = payload.metadata.get("encoding")
+            if encoding not in {b"binary/zlib", b"binary/xz"}:
+                size = len(payload.data)
+            else:
+                size, pending = 0, payload.data
+                decoder = (
+                    zlib.decompressobj()
+                    if encoding == b"binary/zlib"
+                    else lzma.LZMADecompressor(memlimit=32 * 1024**2)
+                )
+                try:
+                    while True:
+                        chunk = decoder.decompress(
+                            pending, max_length=min(1024**2, MAX_PAYLOAD - size) + 1
+                        )
+                        size += len(chunk)
+                        if size > MAX_PAYLOAD or total + size > MAX_DECODED:
+                            raise ValueError(
+                                "capture decoded history exceeds its payload/total bound"
+                            )
+                        if decoder.eof:
+                            if decoder.unused_data:
+                                raise ValueError("capture compressed payload has trailing data")
+                            break
+                        pending = decoder.unconsumed_tail if encoding == b"binary/zlib" else b""
+                        if not pending and (
+                            encoding == b"binary/zlib"
+                            and not chunk
+                            or encoding == b"binary/xz"
+                            and decoder.needs_input
+                        ):
+                            raise ValueError("capture compressed payload is incomplete")
+                except (lzma.LZMAError, zlib.error) as exc:
+                    raise ValueError(
+                        "capture compressed payload is invalid or exceeds memory bound"
+                    ) from exc
+            total += size
+            if size > MAX_PAYLOAD or total > MAX_DECODED:
+                raise ValueError("capture decoded history exceeds its payload/total bound")
+    return total
+
+
 async def _history(handle, deadline, budget):
     from temporalio.client import WorkflowHistory, WorkflowHistoryEventFilterType
 
@@ -1054,7 +1151,15 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
             raise ValueError(
                 "capture snapshot selected execution is not its exact completed workflow"
             )
+        if (
+            description.history_length > MAX_EVENTS
+            or not 0 < description.raw_info.history_size_bytes <= MAX_HISTORY
+        ):
+            raise ValueError(
+                "capture described history exceeds or lacks its prefetch resource bound"
+            )
         history, raw = await _history(exact, deadline, budget)
+        _bounded_payloads(history)
         facts = await closure_facts(history)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         if (
@@ -1270,6 +1375,13 @@ def verify_record(store, record):
         ):
             raise ValueError("snapshot closure provenance receipt changed")
         receipt = json.loads(receipt_bytes(path))
+        for name, expected in (
+            ("owner-before.json", receipt["owner_sha256"]),
+            ("migration-input.json", receipt["command"]["migration_sha256"]),
+            ("owner-proposal.json", receipt["migration"]["owner_after_sha256"]),
+        ):
+            if _sha(private_bytes(path.parent / name)) != expected:
+                raise ValueError("snapshot closure original input archive changed")
         if (
             receipt.get("schema") != SCHEMA
             or receipt["owner_path"] != str(store.config.path)
@@ -1294,7 +1406,7 @@ def verify_record(store, record):
     raise ValueError("snapshot closure has no public capture acknowledgement")
 
 
-def capture(config, supplied):
+def _capture(config, supplied):
     from .delivery_closures import insert_seal, prepare_seal
     from .delivery_interrupted_recovery import installation_recovery_lease
     from .delivery_runtime_installation import destination, same_destination
@@ -1350,6 +1462,11 @@ def capture(config, supplied):
             authority = _collect(store, migration, supplied, leases)
             _folder(folder.parent)
             _folder(folder)
+            _immutable(folder / "owner-before.json", inputs["before"])
+            _immutable(
+                folder / "migration-input.json", private_bytes(Path(supplied["migration_path"]))
+            )
+            _immutable(folder / "owner-proposal.json", inputs["after"])
             guard = describe(config, migration["command_id"], service)
             with SourceFamily(config.state_root) as source:
                 intent = {
@@ -1482,3 +1599,9 @@ def capture(config, supplied):
                             ),
                         )
                 return {**response, "replayed": False}
+
+
+def capture(config, supplied):
+    """Public standalone owner; no shared service/client runtime is modified."""
+    with _sdk_receive_limit():
+        return _capture(config, supplied)

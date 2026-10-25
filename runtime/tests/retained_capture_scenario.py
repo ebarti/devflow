@@ -430,10 +430,36 @@ def install(root):
     request = Path(captured["migration"])
     preflight = fixture.control(config, "runtime-location-preflight", request)
     assert len(preflight["authority"]["runs"]) == 6
+    supplied = read_private(request)
+    supplied["expected_evidence_sha256"] = preflight["expected_evidence_sha256"]
+    write_private(request, supplied)
     result = fixture.control(config, "adopt-runtime-location", request)
     assert result["state"] == "acknowledged"
     assert fixture.original_rows(config) == rows
     print(json.dumps({"state": "installed", "all_six": True, "rows_unchanged": True}))
+
+
+def receive_bound(root):
+    from temporalio.client import Client
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from devflow_temporal import delivery_retained_closures as owner
+
+    case = fixture.restored(root)
+    owner.MAX_HISTORY = 1024  # Test only: prove Core refuses BEFORE page allocation.
+
+    async def observe():
+        client = await Client.connect(case.store.config.temporal_address)
+        iterator = client.get_workflow_handle("delivery-run-1").fetch_history_events()
+        with pytest.raises(RPCError) as rejected:
+            await iterator.fetch_next_page()
+        assert rejected.value.status == RPCStatusCode.RESOURCE_EXHAUSTED
+        return str(rejected.value)
+
+    with owner._sdk_receive_limit():
+        detail = asyncio.run(observe())
+    assert "TEMPORAL_MAX_INCOMING_GRPC_BYTES" not in os.environ
+    print(json.dumps({"receive_bound": 1024, "sdk_refused": True, "detail": detail}))
 
 
 def continue_original(root):
@@ -508,7 +534,12 @@ def continue_original(root):
 
 if __name__ == "__main__":
     phase, raw_root, *rest = sys.argv[1:]
-    selected = {"seed": seed, "install": install, "continue": continue_original}
+    selected = {
+        "seed": seed,
+        "install": install,
+        "continue": continue_original,
+        "receive-bound": receive_bound,
+    }
     if phase == "capture":
         capture(Path(raw_root), rest[0] if rest else "normal")
     else:

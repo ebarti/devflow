@@ -39,6 +39,12 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
         command(
             [old / "runtime/.venv/bin/python", "-I", SCENARIO, "seed", case], env=bound, timeout=180
         )
+        cap = command(
+            [new / "runtime/.venv/bin/python", "-I", SCENARIO, "receive-bound", case],
+            env=bound,
+            timeout=30,
+        )
+        assert json.loads(cap.splitlines()[-1])["sdk_refused"] is True
     state = case / "service-state"
     for suffix in ("", "-wal", "-shm"):
         path = Path(str(original) + suffix)

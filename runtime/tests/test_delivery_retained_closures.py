@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import lzma
 import os
 import sqlite3
 import subprocess
 import sys
 import time
 import uuid
-from contextlib import closing
+import zlib
+from contextlib import ExitStack, closing
 from types import SimpleNamespace
 
 import pytest
 from temporalio.api.history.v1 import HistoryEvent
+from temporalio.client import WorkflowHistory
 
 from devflow_temporal import delivery_retained_closures as capture
 from devflow_temporal.delivery_resources import write_private
@@ -224,6 +227,70 @@ def test_pre_go_ready_identity_cannot_grant_signal_or_blind_replacement(tmp_path
     with pytest.raises(ValueError, match="before authorization"):
         capture._cleanup(reader)
     assert not (reader / "cleanup.json").exists()
+
+
+@pytest.mark.parametrize("defect", ["content", "restored-mtime", "replace", "link", "missing"])
+def test_capture_input_fd_and_name_generation_remain_bound(tmp_path, defect):
+    path = tmp_path / "owner.json"
+    write_private(path, {"original": "owned"})
+    with ExitStack() as leases:
+        current = capture._pin_inputs([path], leases)
+        info, raw = path.stat(), path.read_bytes()
+        if defect in {"content", "restored-mtime"}:
+            path.write_bytes(raw.replace(b"owned", b"other"))
+            if defect == "restored-mtime":
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+        elif defect == "replace":
+            path.unlink()
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        elif defect == "link":
+            os.link(path, tmp_path / "second-name")
+        else:
+            path.unlink()
+        with pytest.raises((ValueError, FileNotFoundError)):
+            current()
+
+
+def payload_history(encoding, payloads):
+    events = []
+    for index, raw in enumerate(payloads, 1):
+        event = HistoryEvent(event_id=index)
+        payload = event.workflow_execution_completed_event_attributes.result.payloads.add()
+        payload.metadata["encoding"] = encoding
+        payload.data = raw
+        events.append(event)
+    return WorkflowHistory("owned-workflow", events)
+
+
+@pytest.mark.parametrize("encoding", [b"binary/zlib", b"binary/xz"])
+@pytest.mark.parametrize("defect", [None, "payload", "total", "truncated", "trailing"])
+def test_payload_expansion_bound_is_proved_before_existing_codec(monkeypatch, encoding, defect):
+    monkeypatch.setattr(capture, "MAX_PAYLOAD", 128)
+    monkeypatch.setattr(capture, "MAX_DECODED", 192)
+    compressed = (zlib.compress if encoding == b"binary/zlib" else lzma.compress)(b"x" * 100)
+    blobs = [compressed]
+    if defect == "payload":
+        monkeypatch.setattr(capture, "MAX_PAYLOAD", 99)
+    elif defect == "total":
+        blobs *= 2
+    elif defect == "truncated":
+        blobs = [compressed[:-1]]
+    elif defect == "trailing":
+        blobs = [compressed + b"unconsumed"]
+    history = payload_history(encoding, blobs)
+    if defect:
+        with pytest.raises(ValueError, match="bound|incomplete|trailing"):
+            capture._bounded_payloads(history)
+    else:
+        assert capture._bounded_payloads(history) == 100
+
+
+def test_uncompressed_payloads_obey_same_total_bound(monkeypatch):
+    monkeypatch.setattr(capture, "MAX_PAYLOAD", 128)
+    monkeypatch.setattr(capture, "MAX_DECODED", 192)
+    with pytest.raises(ValueError, match="bound"):
+        capture._bounded_payloads(payload_history(b"json/plain", [b"x" * 100] * 2))
 
 
 def test_public_capture_route_authenticates_before_ordinary_missing_helper_store(

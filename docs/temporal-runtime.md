@@ -91,7 +91,11 @@ storage refuses capture.
 Only an identity-bound copy server runs, on fresh loopback endpoints with private
 HOME/cwd/tmp and no inherited original lock/data descriptors. The pinned SDK
 fetches both complete ALL_EVENT histories within total page/event/byte/time
-bounds. Full start, memo, recovery, current execution, native and failed terminal
+bounds (512 pages, 65,536 events, 48 MiB encoded history and 90 seconds). Its
+standalone SDK receive limit is fixed before first connection; compressed
+payloads are expansion-checked before the normal codec, with 32 MiB per payload
+and 64 MiB total decoded bounds. These are local copy-reader resource limits,
+not changes to any delivery check or provider policy. Full start, memo, recovery, current execution, native and failed terminal
 tracker/deadline authority must validate through the existing owners. Exceeding a
 bound refuses the whole history. The copy server is cleaned up before one atomic
 metadata acknowledgement appends both genuine `temporal_snapshot` closure seals.
