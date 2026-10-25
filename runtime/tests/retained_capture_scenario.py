@@ -370,8 +370,9 @@ def capture(root, mode):
             else:
                 changed["reader"]["sha256"] = "0" * 64
             write_private(path, changed)
-            with pytest.raises(ValueError):
+            with pytest.raises(SystemExit) as rejected:
                 public(config, "capture-retained-closures", request=path)
+            assert rejected.value.code == 1
             assert fixture.original_rows(config) == before
             invalid.append(defect)
         write_private(path, value)
@@ -457,8 +458,9 @@ def install(root):
     original_archive = archived.read_bytes()
     try:
         archived.write_bytes(original_archive + b" ")
-        with pytest.raises(ValueError):
+        with pytest.raises(SystemExit) as rejected:
             public(config, "runtime-location-preflight", request=request)
+        assert rejected.value.code == 1
     finally:
         archived.write_bytes(original_archive)
     assert fixture.original_rows(config) == rows
