@@ -51,8 +51,10 @@ def _scope_git(repo: Path, *args: str) -> str:
 
 
 def _ordinary_scope_git_view(source: Path) -> None:
-    graft = Path(_scope_git(source, "rev-parse", "--path-format=absolute",
-                            "--git-path", "info/grafts"))
+    # --git-path info/grafts honors our deliberately disabled GIT_GRAFT_FILE.
+    # The repository's actual legacy namespace lives in the common Git owner.
+    common = Path(_scope_git(source, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    graft = common / "info/grafts"
     if (os.path.lexists(graft)
             or _scope_git(source, "for-each-ref", "--format=%(refname)", "refs/replace/")
             or os.environ.get("GIT_GRAFT_FILE") not in (None, os.devnull)
