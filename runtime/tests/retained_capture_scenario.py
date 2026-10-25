@@ -18,7 +18,7 @@ import os
 import sqlite3
 import sys
 import time
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -233,6 +233,7 @@ def volume(root):
     global observation/current owner in capture AND subsequent installation.
     """
     from devflow_temporal.contracts import canonical_json
+    from devflow_temporal.delivery_runtime_installation import _global_native
 
     case = fixture.restored(root)
     config = DeliveryConfig.load(Path(case.owner))
@@ -262,7 +263,19 @@ def volume(root):
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(raw)
         actors += len(owned)
-    result = {"journals": 2527, "actors": actors, "last_journal": str(journal)}
+    # Calibrate BEFORE capture/copy/export/crash phases. The actual global owner
+    # reads every owned journal and checks all actors; its complete canonical
+    # observation alone is a strict lower bound on both owners' full authority.
+    with ExitStack() as leases:
+        observed = _global_native(config, {"runs": [], "owner_path": str(config.path)}, leases)
+    lower_bound = len(canonical_json({"global_native": observed}).encode())
+    assert lower_bound >= 30571522, "Increase meaningful evidence before expensive public phases"
+    result = {
+        "journals": 2527,
+        "actors": actors,
+        "last_journal": str(journal),
+        "canonical_global_authority_bytes": lower_bound,
+    }
     write_private(root / "volume.json", result)
     print(json.dumps(result))
 

@@ -124,6 +124,12 @@ or history limits. Parts and a complete unacknowledged manifest remain inert
 until the existing atomic capture or all-member installation acknowledgement.
 Missing, changed, reordered, linked or excess parts refuse the entire document.
 An aggregate above64MiB refuses before publishing a final root.
+An interrupted publication retains one bounded sequential part prefix; a retry
+cannot append a different hash at an occupied index or replace it with an inline
+document. Atomic staging remains separate and grants no permission. The exact
+root, part and directory descriptors stay held through canonical validation.
+Every read validates the complete content freshly; no authority cache replaces
+current source, claim, candidate or actor checks.
 
 An earlier oversized immutable full intent remains evidence and is never
 converted or overwritten. After proving that it reached no snapshot, reader,

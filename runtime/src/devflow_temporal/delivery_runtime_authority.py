@@ -123,11 +123,42 @@ def _fingerprint(value):
     return whole.hexdigest(), total
 
 
+def _prefix(directory):
+    """A crashed publication owns one bounded exact sequential prefix."""
+    entries = {}
+    with os.scandir(directory) as observed:
+        for entry in observed:
+            match = re.fullmatch(r"([0-9]{4})-([0-9a-f]{64})\.part", entry.name)
+            if not match or len(entries) >= MAX_PARTS:
+                raise ValueError("runtime authority has unregistered or excessive published parts")
+            index = int(match[1])
+            info = entry.stat(follow_symlinks=False)
+            if (
+                index >= MAX_PARTS
+                or index in entries
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1
+                or not 1 <= info.st_size <= PART_BYTES
+            ):
+                raise ValueError("runtime authority published prefix has changed index or custody")
+            entries[index] = entry.name
+    if set(entries) != set(range(len(entries))):
+        raise ValueError("runtime authority published parts are not one exact prefix")
+    return entries
+
+
 def _part(directory, part, raw):
     """Keep crash staging outside the exact published-parts namespace."""
     from .delivery_runtime_location import private_bytes
 
     path = directory / _name(part)
+    prefix = _prefix(directory)
+    if part["index"] > len(prefix) or (
+        part["index"] in prefix and prefix[part["index"]] != path.name
+    ):
+        raise ValueError("runtime authority occupied part index binds different immutable bytes")
     if os.path.lexists(path):
         if private_bytes(path, maximum=PART_BYTES) != raw:
             raise ValueError("runtime authority immutable part conflicts")
@@ -196,9 +227,13 @@ def publish(path, value, kind):
             buffered.clear()
             save(raw)
     if not parts:
+        if os.path.lexists(directory):
+            _directory(directory)
+            if _prefix(directory):
+                raise ValueError("runtime authority inline document conflicts with published parts")
         root_raw = b"".join(buffered)
     else:
-        if {entry.name for entry in directory.iterdir()} != {_name(part) for part in parts}:
+        if set(_prefix(directory).values()) != {_name(part) for part in parts}:
             raise ValueError("runtime authority has unregistered immutable parts")
         manifest = {
             "schema": SCHEMA,
@@ -222,10 +257,23 @@ def publish(path, value, kind):
 
 def load(path, kind, *, expected_sha256=None):
     """Authenticate every part and held generation before returning any facts."""
+    path, directory = _namespace(path, kind)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        root_before = _stamp(os.fstat(descriptor))
+        if root_before != _stamp(path.lstat()):
+            raise ValueError("runtime authority root generation changed before observation")
+        value = _load(path, directory, kind, expected_sha256, descriptor, root_before)
+        if root_before != _stamp(os.fstat(descriptor)) or root_before != _stamp(path.lstat()):
+            raise ValueError("runtime authority held root generation changed")
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def _load(path, directory, kind, expected_sha256, root_descriptor, root_before):
     from .delivery_runtime_location import receipt_bytes
 
-    path, directory = _namespace(path, kind)
-    root_before = _stamp(path.lstat())
     raw = receipt_bytes(path)
     if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise ValueError("runtime authority root differs from its acknowledged bytes")
@@ -281,7 +329,7 @@ def load(path, kind, *, expected_sha256=None):
     if sum(part["bytes"] for part in value["parts"]) != value["canonical_bytes"]:
         raise ValueError("runtime authority aggregate is incomplete")
     directory_before = _stamp(_directory(directory))
-    if {entry.name for entry in directory.iterdir()} != set(expected):
+    if set(_prefix(directory).values()) != set(expected):
         raise ValueError("runtime authority has missing or unregistered parts")
     whole, content, held = hashlib.sha256(), bytearray(), []
     with ExitStack() as leases:
@@ -318,6 +366,7 @@ def load(path, kind, *, expected_sha256=None):
         def current():
             if (
                 root_before != _stamp(path.lstat())
+                or root_before != _stamp(os.fstat(root_descriptor))
                 or directory_before != _stamp(os.fstat(directory_fd))
                 or directory_before != _stamp(directory.lstat())
                 or any(
@@ -337,10 +386,14 @@ def load(path, kind, *, expected_sha256=None):
         _logical(logical, kind)
         if sorted(logical) != value["root_fields"]:
             raise ValueError("runtime authority logical members changed")
-        canonical = hashlib.sha256()
-        for chunk in _chunks(logical):
-            canonical.update(chunk)
-        if canonical.hexdigest() != value["canonical_sha256"]:
+        # The complete input has already passed the finite aggregate bound.
+        # Reuse the existing exact canonical serializer for fresh equality;
+        # the streaming initial publisher still refuses excessive totals.
+        canonical = canonical_json(logical).encode()
+        if (
+            len(canonical) > MAX_BYTES
+            or hashlib.sha256(canonical).hexdigest() != value["canonical_sha256"]
+        ):
             raise ValueError("runtime authority logical bytes are not canonical")
         current()
         return logical

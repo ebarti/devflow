@@ -81,7 +81,9 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
     )
     executable = new / "runtime/.venv/bin/python"
     volume = command([executable, "-I", SCENARIO, "volume", case], env=bound, timeout=90)
-    assert json.loads(volume.splitlines()[-1])["actors"] == 909720
+    calibrated = json.loads(volume.splitlines()[-1])
+    assert calibrated["actors"] == 909720
+    assert calibrated["canonical_global_authority_bytes"] >= 30571522
 
     def tracking():
         with closing(sqlite3.connect(case / "workflow.sqlite3")) as db:

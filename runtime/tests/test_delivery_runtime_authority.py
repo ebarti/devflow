@@ -268,3 +268,75 @@ def test_crashed_atomic_staging_is_inert_outside_complete_part_namespace(tmp_pat
     owner.publish(path, value, owner.CAPTURE_INTENT)
     assert owner.load(path, owner.CAPTURE_INTENT) == value
     assert abandoned.read_bytes() == b"partial unacknowledged staging"
+
+
+def test_root_descriptor_is_held_through_decode_and_replacement_refuses(small, monkeypatch):
+    path, _value = small
+    implementation, decoder = owner._load, owner.json.loads
+    held = []
+
+    def loaded(path, directory, kind, expected, root_descriptor, root_before):
+        held.append(root_descriptor)
+        return implementation(path, directory, kind, expected, root_descriptor, root_before)
+
+    def replaced(raw):
+        value = decoder(raw)
+        if isinstance(raw, bytearray):
+            assert os.fstat(held[-1]).st_ino == path.stat().st_ino
+            alternate = path.with_name("replacement.json")
+            alternate.write_bytes(path.read_bytes())
+            alternate.chmod(0o600)
+            os.replace(alternate, path)
+            assert os.fstat(held[-1]).st_nlink == 0
+        return value
+
+    monkeypatch.setattr(owner, "_load", loaded)
+    monkeypatch.setattr(owner.json, "loads", replaced)
+    with pytest.raises(ValueError, match="held generation"):
+        owner.load(path, owner.CAPTURE_INTENT)
+    with pytest.raises(OSError):
+        os.fstat(held[-1])
+
+
+@pytest.mark.parametrize("defect", ["different-prefix", "late-prefix", "unknown", "inline"])
+def test_interrupted_prefix_cannot_grow_alternative_authority(tmp_path, monkeypatch, defect):
+    monkeypatch.setattr(owner, "INLINE_BYTES", 256)
+    monkeypatch.setattr(owner, "PART_BYTES", 128)
+    monkeypatch.setattr(owner, "MAX_BYTES", 8192)
+    path, value = namespace(tmp_path)
+    value["actors"] = [[i, "Sat Oct 24 14:20:35 2026"] for i in range(70)]
+    original = owner._part
+    published = 0
+
+    def crash(directory, part, raw):
+        nonlocal published
+        original(directory, part, raw)
+        published += 1
+        if published == 3:
+            raise RuntimeError("owned publication crash")
+
+    monkeypatch.setattr(owner, "_part", crash)
+    with pytest.raises(RuntimeError, match="owned publication crash"):
+        owner.publish(path, value, owner.CAPTURE_INTENT)
+    monkeypatch.setattr(owner, "_part", original)
+    folder = path.parent / (path.name + ".authority-parts")
+    if defect == "unknown":
+        extra = folder / "unregistered.part"
+        extra.write_bytes(b"untrusted")
+        extra.chmod(0o600)
+    before = {entry.name: entry.read_bytes() for entry in folder.iterdir()}
+    if defect == "inline":
+        changed = {"schema": value["schema"]}
+    elif defect == "late-prefix":
+        changed = json.loads(canonical_json(value))
+        changed["actors"][8][1] = "Sun Oct 25 14:20:35 2026"
+    else:
+        changed = {**value, "actors": [[99999999, "different start"], *value["actors"]]}
+    for _ in range(3):
+        with pytest.raises(ValueError):
+            owner.publish(path, changed, owner.CAPTURE_INTENT)
+        assert not path.exists()
+        assert {entry.name: entry.read_bytes() for entry in folder.iterdir()} == before
+    if defect != "unknown":
+        owner.publish(path, value, owner.CAPTURE_INTENT)
+        assert owner.load(path, owner.CAPTURE_INTENT) == value
