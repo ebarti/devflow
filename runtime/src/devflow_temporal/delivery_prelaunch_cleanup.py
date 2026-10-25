@@ -33,13 +33,21 @@ def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intake
     """
     from .supervisor import DeliverySupervisor
 
+    required = {'job_key', 'run_id', 'role', 'iteration', 'candidate_id', 'state', 'cleanup',
+                'finished_at', 'pid', 'process_identity', 'session_id', 'result_path',
+                'result_json'}
+    if not isinstance(attempt, dict) or not required.issubset(attempt):
+        raise ValueError('completed reservation lacks its original typed attempt')
+    if not isinstance(attempt['result_json'], str):
+        raise ValueError('completed reservation lacks its original typed result')
     result = json.loads(attempt['result_json'])
     state = Path(spec['state_dir'])
     key = attempt['job_key']
-    folder = state / 'attempts' / key
     if (not isinstance(key, str) or len(key) != 64
-            or any(char not in '0123456789abcdef' for char in key)
-            or attempt['run_id'] != spec['run_id']
+            or any(char not in '0123456789abcdef' for char in key)):
+        raise ValueError('completed reservation has an invalid attempt identity')
+    folder = state / 'attempts' / key
+    if (attempt['run_id'] != spec['run_id']
             or attempt['state'] != 'finished' or attempt['cleanup'] != 'confirmed'
             or not isinstance(attempt['finished_at'], str) or not attempt['finished_at']
             or any(attempt[name] is not None for name in ('pid', 'process_identity', 'session_id'))
@@ -109,6 +117,13 @@ def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intake
         if len(raw) != info.st_size:
             raise ValueError('completed prelaunch request changed during observation')
         request = json.loads(raw)
+        if (not isinstance(request, dict) or not isinstance(request.get('spec'), dict)
+                or not isinstance(request.get('candidate'), dict)
+                or not isinstance(request['candidate'].get('id'), str)
+                or not isinstance(request.get('role'), str)
+                or type(request.get('iteration')) is not int
+                or not isinstance(request.get('workspace'), str)):
+            raise ValueError('completed prelaunch original request is malformed')
         execution = request['spec']
         workspace = request.get('workspace')
         registered = manifest['roots'].get(workspace, {})
