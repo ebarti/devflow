@@ -34,8 +34,13 @@ def test_actual_native_preparation_no_launch_history_then_public_cleanup(service
                       'codex_cli_bin/bin/codex')))
     config['roles'] = {role: {'model': 'gpt-6.1-sol', 'effort': 'max'}
                        for role in ('implement', 'review', 'verify')}
+    prerequisite = {'id': 'owned-failed-prerequisite', 'kind': 'command',
+        'argv': [str(Path(sys.executable).resolve()), '-c',
+                 'print("Owned locked dependency unavailable before pytest");raise SystemExit(2)'],
+        'timeout_seconds': 10}
     config['repositories']['fixture'].update(project_url='https://github.com/users/test/projects/1',
-        assignee='test', required_ci=['owned-ci'], browser_qa={
+        assignee='test', required_ci=['owned-ci'], checks=[prerequisite],
+        prepublish_checks=[{'id': 'owned-prepublish', 'argv': ['/usr/bin/true']}], browser_qa={
             'id': 'owned-browser', 'argv': ['/usr/bin/false'], 'cwd': '.',
             'ports': {'QA_API_PORT': 43127, 'QA_WEB_PORT': 43128}, 'timeout_seconds': 10,
             'env': {'JOBCTRL_E2E_ISOLATED': '1'}, 'artifact_paths': [],
@@ -64,11 +69,7 @@ def test_actual_native_preparation_no_launch_history_then_public_cleanup(service
             'configured browser QA receipt is required for verification']
         assert result['finish_reason'] == 'prelaunch' and result['session_id'] is None
         roles.append({**result, 'role': 'verify', 'iteration': iteration, 'candidate': candidate})
-    prerequisite = {'id': 'owned-failed-prerequisite', 'kind': 'command',
-        'argv': [str(Path(sys.executable).resolve()), '-c',
-                 'print("Owned locked dependency unavailable before pytest");raise SystemExit(2)'],
-        'timeout_seconds': 10}
-    failed = broker._run_check_list(broker.checkout, [prerequisite],
+    failed = broker._run_check_list(broker.checkout, spec['policy']['checks'],
                                     broker.evidence_dir / 'checks/3', candidate)
     assert failed['state'] == 'failed' and failed['results'][0]['exit_code'] == 2
     journal = failed['results'][0]['native_process']['journal']
