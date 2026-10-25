@@ -593,7 +593,7 @@ class SourceFamily:
                 total += info.st_size
             if (
                 total > MAX_SNAPSHOT
-                or shutil.disk_usage(self.root).free < total * 3 + 128 * 1024**2
+                or shutil.disk_usage(self.root).free < total * 4 + 128 * 1024**2
             ):
                 raise ValueError("capture exceeds its bounded snapshot/disk allowance")
             self.initial = self.observe()
@@ -669,6 +669,7 @@ class SourceFamily:
         return observed
 
 
+@contextmanager
 def _working(folder, namespace, expected):
     """Recover/backup only the owned copy; never reuse the original SHM cache."""
     master = folder / "master"
@@ -750,7 +751,25 @@ def _working(folder, namespace, expected):
                 current(raw, target)
         current(raw, target)
         _master(master, expected)
-    return target, identity
+        prepared_stamp = _stamp(os.fstat(files[target][0]))
+        prepared_sha = _file_hash(target)
+
+        def pre_go():
+            current(raw, target)
+            if (
+                _stamp(os.fstat(files[target][0])) != prepared_stamp
+                or _file_hash(target) != prepared_sha
+                or _stamp(os.fstat(files[target][0])) != prepared_stamp
+            ):
+                raise ValueError("capture prepared database bytes changed before GO")
+            _master(master, expected)
+            current(raw, target)
+            return {
+                "working_identity": directory_identity,
+                "database_identity": files[target][1],
+            }
+
+        yield target, identity, pre_go
 
 
 def _ports():
@@ -1105,6 +1124,7 @@ async def _history(handle, deadline, budget):
     iterator = handle.fetch_history_events(
         page_size=128,
         event_filter_type=WorkflowHistoryEventFilterType.ALL_EVENT,
+        skip_archival=True,
         rpc_timeout=timedelta(seconds=10),
     )
     events = []
@@ -1367,13 +1387,22 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
         raise ValueError("capture original source intent changed before working preparation")
     expected = json.loads(intent_raw)["source"]
     reader = _new_folder(readers / str(len(entries)))
+    reader_identity = _object(reader.lstat())
     # Every generation has a new writable copy; the pristine master is never served.
     generation = _new_folder(reader / "snapshot")
     _master(folder / "master", expected)
     shutil.copytree(folder / "master", generation / "master")
-    database, namespace = _working(
+    with _working(
         generation, config.raw.get("temporal_namespace", "default"), expected
-    )
+    ) as (database, namespace, pre_go):
+        return _launch_reader(
+            config, store, authority, supplied, reader, intent_sha256, launch_guard,
+            database, namespace, pre_go, reader_identity,
+        )
+
+
+def _launch_reader(config, store, authority, supplied, reader, intent_sha256, launch_guard,
+                   database, namespace, pre_go, reader_identity):
     _folder(reader / "home")
     _folder(reader / "tmp")
     ports = _ports()
@@ -1383,6 +1412,7 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
         raise ValueError("capture copy endpoint overlaps original execution transport")
     argv = _argv(supplied["reader"]["resolved_path"], database, ports)
     environment = _environment(reader)
+    prepared = pre_go()
     _publish(reader / "launch.json", {"argv": argv, "environment": environment})
     _publish(
         reader / "intent.json",
@@ -1394,11 +1424,12 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
             "database": str(database),
             "argv": argv,
             "cwd": str(reader),
-            "cwd_identity": _object(reader.lstat()),
-            "working_identity": _object((generation / "working").lstat()),
-            "database_identity": _object(database.lstat()),
+            "cwd_identity": reader_identity,
+            **prepared,
         },
     )
+    _reader_authority(reader)
+    pre_go()
     _reader(config, supplied["reader"])
     with (reader / "server.log").open("xb") as log:
         (reader / "server.log").chmod(0o600)
@@ -1427,6 +1458,8 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
             ):
                 raise ValueError("capture child identity changed before GO")
             launch_guard()
+            _reader_authority(reader)
+            pre_go()
             _publish(
                 reader / "authorized.json",
                 {
@@ -1438,6 +1471,8 @@ def _serve(config, store, authority, supplied, folder, intent_sha256, launch_gua
                     "intent_sha256": _sha(private_bytes(reader / "intent.json")),
                 },
             )
+            _reader_authority(reader)
+            pre_go()
             child.stdin.write(b"GO\n")
             child.stdin.flush()
             child.stdin.close()

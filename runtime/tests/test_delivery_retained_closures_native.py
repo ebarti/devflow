@@ -93,6 +93,12 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
     )
     assert len(json.loads(refused.splitlines()[-1])["refused"]) == 6
     assert tracking() == (before, 0, 0)
+    pre_go = command(
+        [executable, "-I", SCENARIO, "capture", case, "pre-go"], env=bound, timeout=240
+    )
+    assert json.loads(pre_go.splitlines()[-1])["pre_go_refused"] is True
+    assert tracking() == (before, 0, 0)
+    assert {p.name: p.read_bytes() for p in state.glob("temporal.sqlite3*")} == source_bytes
     for mode, code in (("popen", 73), ("transaction", 74), ("ack", 75)):
         result = subprocess.run(
             [str(executable), "-I", str(SCENARIO), "capture", str(case), mode],

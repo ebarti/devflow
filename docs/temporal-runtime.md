@@ -90,10 +90,14 @@ storage refuses capture. The pristine master admits exactly the original family
 and its manifest; an added WAL cannot acquire recovery authority. Writable reader,
 snapshot and working generations are exclusively allocated. Existing staging,
 symlink or hard-link destinations are never adopted for copy or SQLite writes.
+The disk preflight reserves all four retained copies plus headroom. Prepared
+working-directory and database descriptors remain held through the child gate;
+their names, identities and exact prepared bytes are checked before GO.
 
 Only an identity-bound copy server runs, on fresh loopback endpoints with private
 HOME/cwd/tmp and no inherited original lock/data descriptors. The pinned SDK
-fetches both complete ALL_EVENT histories within total page/event/byte/time
+fetches both complete ALL_EVENT histories with archival explicitly skipped,
+within total page/event/byte/time
 bounds (512 pages, 65,536 events, 48 MiB encoded history and 90 seconds). Its
 standalone SDK receive limit is fixed before first connection; compressed
 payloads are expansion-checked before the normal codec, with 32 MiB per payload

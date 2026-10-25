@@ -353,6 +353,32 @@ def capture(root, mode):
             sqlite3.connect = connect
 
     owner.capture = guarded_capture
+    if mode == "pre-go":
+        original = owner._serve
+
+        def replaced_after_original_launch_guard(*args):
+            guard = args[-1]
+
+            def drift():
+                guard()
+                reader = config.state_root / "closure-captures" / value["command_id"] / "readers/0"
+                database = reader / "snapshot/working/server.sqlite3"
+                database.rename(database.with_suffix(".before-go"))
+                database.symlink_to(config.state_root / "temporal.sqlite3")
+
+            return original(*args[:-1], drift)
+
+        owner._serve = replaced_after_original_launch_guard
+        with pytest.raises(SystemExit) as rejected:
+            public(config, "capture-retained-closures", request=path)
+        assert rejected.value.code == 1
+        reader = config.state_root / "closure-captures" / value["command_id"] / "readers/0"
+        assert (reader / "ready.json").exists()  # The real child reached its GO gate.
+        assert not (reader / "authorized.json").exists()
+        assert (reader / "server.log").read_bytes() == b""  # Server never received GO.
+        assert fixture.original_rows(config) == before
+        print(json.dumps({"pre_go_refused": True, "rows_unchanged": True}))
+        return
     if mode == "inputs":
         invalid = []
         for defect in ("partial", "duplicate", "revision", "workflow", "digest", "reader"):

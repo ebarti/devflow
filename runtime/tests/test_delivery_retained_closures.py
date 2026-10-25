@@ -71,10 +71,12 @@ def test_consistent_raw_snapshot_recovers_only_owned_copy_without_reusing_shm(tm
     folder.mkdir(mode=0o700)
     with capture.SourceFamily(root) as observed:
         observed.snapshot(folder)
-        working, actual_namespace = capture._working(folder, "default", observed.initial)
-        assert actual_namespace == str(namespace)
-        with closing(sqlite3.connect(working)) as copy:
-            assert copy.execute("SELECT value FROM probe").fetchall() == [("committed WAL",)]
+        with capture._working(folder, "default", observed.initial) as prepared:
+            working, actual_namespace, pin = prepared
+            pin()
+            assert actual_namespace == str(namespace)
+            with closing(sqlite3.connect(working)) as copy:
+                assert copy.execute("SELECT value FROM probe").fetchall() == [("committed WAL",)]
         assert observed.observe() == observed.initial
         observed.snapshot(folder)  # Exact master reuse; no source SQLite access.
     assert bytes_of(root) == before
@@ -166,8 +168,10 @@ def test_master_namespace_cannot_add_unregistered_wal_or_other_members(tmp_path,
         unexpected.chmod(0o600)
         with pytest.raises(ValueError, match="unregistered member"):
             observed.snapshot(folder)
-        with pytest.raises(ValueError, match="unregistered member"):
-            capture._working(folder, "default", observed.initial)
+        with pytest.raises(ValueError, match="unregistered member"), capture._working(
+            folder, "default", observed.initial
+        ):
+            pytest.fail("Extra master membership cannot acquire working custody")
     assert not (folder / "working").exists()
     assert bytes_of(root) == original
 
@@ -215,9 +219,54 @@ def test_working_copy_never_reuses_existing_empty_staging(tmp_path):
     with capture.SourceFamily(root) as observed:
         observed.snapshot(folder)
         (folder / "working").mkdir(mode=0o700)
-        with pytest.raises(ValueError, match="generation already exists"):
-            capture._working(folder, "default", observed.initial)
+        with pytest.raises(ValueError, match="generation already exists"), capture._working(
+            folder, "default", observed.initial
+        ):
+            pytest.fail("Existing working namespace cannot acquire write custody")
     assert not list((folder / "working").iterdir())
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
+@pytest.mark.parametrize("defect", ["bytes", "replace", "link", "directory"])
+def test_held_pre_go_custody_refuses_prepared_name_or_byte_drift(tmp_path, defect):
+    root, _database, _ = source(tmp_path)
+    folder = tmp_path / "capture"
+    folder.mkdir(mode=0o700)
+    with capture.SourceFamily(root) as observed:
+        observed.snapshot(folder)
+        with capture._working(folder, "default", observed.initial) as (database, _namespace, pin):
+            pin()
+            if defect == "bytes":
+                info = database.stat()
+                with database.open("ab") as stream:
+                    stream.write(b"unexpected bytes")
+                os.utime(database, ns=(info.st_atime_ns, info.st_mtime_ns))
+            elif defect == "replace":
+                data = database.read_bytes()
+                database.rename(database.with_suffix(".retained"))
+                database.write_bytes(data)
+                database.chmod(0o600)
+            elif defect == "link":
+                os.link(database, database.with_suffix(".alias"))
+            else:
+                database.parent.rename(folder / "retained-working")
+                database.parent.mkdir(mode=0o700)
+            with pytest.raises((ValueError, FileNotFoundError), match="generation|bytes|No such"):
+                pin()
+
+
+def test_snapshot_reserves_all_four_retained_copies_before_staging(tmp_path, monkeypatch):
+    root, _database, _ = source(tmp_path)
+    total = sum(path.stat().st_size for path in root.iterdir())
+    between_three_and_four = 3 * total + total // 2 + 128 * 1024**2
+    monkeypatch.setattr(
+        capture.shutil, "disk_usage", lambda _path: SimpleNamespace(free=between_three_and_four)
+    )
+    original = bytes_of(root)
+    with pytest.raises(ValueError, match="snapshot/disk allowance"):
+        with capture.SourceFamily(root):
+            pytest.fail("Disk for four copies must be reserved before staging")
+    assert bytes_of(root) == original
 
 
 class Pages:
@@ -242,6 +291,7 @@ def handle(pages):
     def iterator(**kwargs):
         assert kwargs["page_size"] == 128
         assert kwargs["event_filter_type"].name == "ALL_EVENT"
+        assert kwargs["skip_archival"] is True
         return pages
 
     return SimpleNamespace(id="owned-workflow", fetch_history_events=iterator)
