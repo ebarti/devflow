@@ -167,6 +167,9 @@ def seed(root):
         store, request = original(path)
         raw = copy.deepcopy(store.config.raw)
         raw["temporal_bin"] = "/opt/homebrew/bin/temporal"
+        dashboard, ui = fixture.ports()
+        raw["dashboard_url"] = "http://127.0.0.1:" + str(dashboard)
+        raw["temporal_ui_port"] = ui
         store.config.path.write_text(json.dumps(raw))
         return DeliveryStore(DeliveryConfig.load(store.config.path)), request
 
@@ -241,6 +244,8 @@ def capture(root, mode):
     assert not Path(case.old_root).exists()
     with pytest.raises(ValueError, match="helper is missing"):
         DeliveryStore(config)
+    if not (config.state_root / "service.lock").exists():
+        fixture.control(config, "stop")
     request = migration(case, config)
     value = {
         "command_id": "owned-two-history-capture",

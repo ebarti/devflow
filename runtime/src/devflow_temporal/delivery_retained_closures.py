@@ -250,6 +250,29 @@ def _pin_inputs(paths, leases):
     return current
 
 
+def _listeners(port):
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode not in {0, 1} or result.stderr.strip():
+        raise ValueError("capture listener visibility is indeterminate")
+    if any(not v.isdecimal() for v in result.stdout.splitlines()):
+        raise ValueError("capture listener inventory is malformed")
+    return {int(v) for v in result.stdout.splitlines()}
+
+
+def _capture_stopped(config):
+    from .delivery_control import _ports
+    from .delivery_runtime_installation import _stopped
+
+    _stopped(config)
+    if any(_listeners(port) for port in _ports(config)[1:]):
+        raise ValueError("capture original service port is still occupied")
+
+
 def _collect(store, migration, supplied, leases):
     from .delivery_amendment_capacity import submitted_owner
     from .delivery_native_renewal import _old_proof
@@ -260,12 +283,11 @@ def _collect(store, migration, supplied, leases):
         _historical_specs,
         _native_inputs,
         _native_observation,
-        _stopped,
         destination,
     )
     from .delivery_runtime_location import KIND, PENDING, REVERSED
 
-    _stopped(store.config)
+    _capture_stopped(store.config)
     selected = {v["run_id"]: v for v in supplied["captures"]}
     items = []
     installed = None
@@ -284,6 +306,11 @@ def _collect(store, migration, supplied, leases):
             raise ValueError("capture cohort has different native runtime authority")
         installed = measured
         with store._connect() as db:
+            if (
+                not store.state._schema_current(db)
+                or db.execute("PRAGMA journal_mode").fetchone()[0] != "wal"
+            ):
+                raise ValueError("capture requires the original current shared schema and WAL mode")
             row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run,)).fetchone())
             if db.execute(
                 "SELECT 1 FROM delivery_events WHERE run_id=? AND type IN (?,?,?)",
@@ -373,10 +400,9 @@ def _current(store, authority, db):
         _global_current,
         _native_current,
         _native_inputs,
-        _stopped,
     )
 
-    _stopped(store.config)
+    _capture_stopped(store.config)
     _global_current(authority)
     if _native_inputs(store, db) != authority["native_inputs"]:
         raise ValueError("capture native execution input changed")
@@ -800,8 +826,6 @@ def _no_reader_cwd(folder):
 
 
 def _cleanup(folder):
-    from .delivery_native_process import listeners
-
     if not (folder / "intent.json").exists():
         if (folder / "ready.json").exists() or (folder / "authorized.json").exists():
             raise ValueError("capture child has no durable launch intent")
@@ -836,7 +860,7 @@ def _cleanup(folder):
     else:
         raise ValueError("capture owned copy server cleanup is unknown")
     plan = json.loads(private_bytes(folder / "intent.json"))
-    if any(listeners(port) for port in plan["ports"]):
+    if any(_listeners(port) for port in plan["ports"]):
         raise ValueError("capture copy-server port cleanup is unknown")
     table = _table()
     if owned:
@@ -928,7 +952,6 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
     from .delivery_closed_projection import observe_terminal_projection
     from .delivery_closures import closure_facts, history_json
     from .delivery_codec import DELIVERY_DATA_CONVERTER
-    from .delivery_native_process import listeners
 
     deadline = time.monotonic() + TOTAL_SECONDS
     plan = json.loads(private_bytes(folder / "intent.json"))
@@ -944,7 +967,7 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
     _owned(folder)
     root_pid = json.loads(private_bytes(folder / "authorized.json"))["root_pid"]
     _listener_proof(folder, root_pid)
-    if any(listeners(port) != {root_pid} for port in plan["ports"]):
+    if any(_listeners(port) != {root_pid} for port in plan["ports"]):
         raise ValueError("capture copy endpoint has a foreign listener")
     response = await asyncio.wait_for(
         client.workflow_service.describe_namespace(
@@ -1217,7 +1240,7 @@ def capture(config, supplied):
     from .delivery_closures import insert_seal, prepare_seal
     from .delivery_interrupted_recovery import installation_recovery_lease
     from .delivery_runtime_installation import destination, same_destination
-    from .delivery_runtime_service_guard import describe, installation_lease
+    from .delivery_runtime_service_guard import check, describe, installation_lease
     from .delivery_store import DeliveryStore
 
     migration, inputs = _inputs(config, supplied)
@@ -1262,6 +1285,7 @@ def capture(config, supplied):
                     / "INSTALL_RECEIPT.json",
                     Path(supplied["reader"]["resolved_path"]).parent.parent / ".brew/temporal.rb",
                     config.state_root / "temporal.log",
+                    config.state_root / "service-stopped.json",
                 ],
                 leases,
             )
@@ -1285,6 +1309,7 @@ def capture(config, supplied):
                 source.snapshot(folder)
 
                 def launch_guard():
+                    check(config, guard, service, linked=False)
                     revalidate_inputs()
                     source.observe()  # Also proves the gated child inherited NO original FDs.
                     if _reader(config, supplied["reader"]) != reader:
@@ -1296,6 +1321,7 @@ def capture(config, supplied):
                     config, store, authority, supplied, folder, intent_sha, launch_guard
                 )
                 source.observe()
+                check(config, guard, service, linked=False)
                 revalidate_inputs()
                 if (
                     _reader(config, supplied["reader"]) != reader
@@ -1342,6 +1368,7 @@ def capture(config, supplied):
                     db.execute("BEGIN IMMEDIATE")
                     _current(store, authority, db)
                     source.observe()
+                    check(config, guard, service, linked=False)
                     revalidate_inputs()
                     if private_bytes(config.path) != inputs["before"]:
                         raise ValueError("capture original owner changed before acknowledgement")
