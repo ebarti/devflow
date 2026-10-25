@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -22,6 +23,8 @@ import pytest
 import devflow_temporal
 
 SOURCE = Path(devflow_temporal.__file__).resolve().parents[3]
+PLUGIN_SOURCE = "27aa49e188d9a8b788169f69a066dc913061fb94"
+PLUGIN_BASELINE = "824f00f9cb664e6e61285589bf3c258e651d6653"
 sys.path.insert(0, str(SOURCE / "runtime/tests"))
 
 from devflow_temporal.contracts import canonical_json, digest  # noqa: E402
@@ -182,8 +185,18 @@ HOST_CLI = """#!/usr/bin/env python3
 import json,os,pathlib,shutil,sys
 home=pathlib.Path(os.environ['CODEX_HOME']);path=home/'public-inventory.json'
 value=json.loads(path.read_text());args=sys.argv[1:]
-plugin={'pluginId':'devflow@devflow-local','enabled':True}
-if args==['mcp','list','--json']: print('[]')
+plugin={'pluginId':'devflow@devflow-local','enabled':True,'installed':True,'name':'devflow',
+ 'version':'0.1.0','marketplaceName':'devflow-local','installPolicy':'AVAILABLE',
+ 'authPolicy':'ON_INSTALL','source':{'source':'local',
+ 'path':str(pathlib.Path(value['marketplace'] or '/absent')/'plugins/devflow')},
+ 'marketplaceSource':{'sourceType':'local','source':value['marketplace']}}
+cache=home/'plugins/cache/devflow-local/devflow/0.1.0'
+server=None
+if value['installed']:
+ raw=json.loads((cache/'.mcp.json').read_text())['mcpServers']['devflow-local-delivery']
+ server={'name':'devflow-local-delivery','enabled':True,'transport':raw}
+if args==['mcp','list','--json']: print(json.dumps([server] if server else []))
+elif args==['mcp','get','devflow-local-delivery','--json']: print(json.dumps(server))
 elif args==['plugin','list','--json']:
  print(json.dumps({'installed':[plugin] if value['installed'] else []}))
 elif args==['plugin','marketplace','list']:
@@ -215,6 +228,17 @@ def registrations(root, config):
 
     old_market = root / "original-marketplace"
     files = package_plugin.package_files(SOURCE / "runtime", config.path, "codex")
+    # The program advanced after this reviewed package was installed. Keep its
+    # genuine historical Git skill bytes rather than synthesizing arbitrary skew.
+    files["skills/devflow-local-delivery/SKILL.md"] = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(SOURCE),
+            "show",
+            PLUGIN_SOURCE + ":runtime/desktop/devflow-local-delivery/SKILL.md",
+        ]
+    )
     for name, raw in files.items():
         path = old_market / "plugins/devflow" / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,6 +254,16 @@ def registrations(root, config):
                 "plugins": [package_plugin.ENTRY],
             }
         )
+    )
+    write_private(
+        root / "plugin-origin.json",
+        {
+            "schema": "devflow.original-plugin-package/v1",
+            "source_revision": PLUGIN_SOURCE,
+            "marketplace": str(old_market),
+            "catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+            "files_sha256": {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()},
+        },
     )
     codex = home / ".codex"
     codex.mkdir(parents=True, exist_ok=True)
@@ -520,7 +554,13 @@ def seed(root, kind):
             default=str,
         )
     )
-    data.update(owner=str(case.store.config.path), old_root=str(SOURCE), cli=str(cli), kind=kind)
+    data.update(
+        owner=str(case.store.config.path),
+        old_root=str(SOURCE),
+        cli=str(cli),
+        kind=kind,
+        plugin_origin=read_private(root / "plugin-origin.json"),
+    )
     write_private(root / "case.json", data)
     for source in (SOURCE / "skills/devflow/scripts").iterdir():
         if source.suffix not in {".py", ".sql"}:
@@ -610,6 +650,13 @@ def assert_cohort_native_authority(config):
     from devflow_temporal import delivery_runtime_location as location
 
     receipt = location._acknowledged(config)
+    plugin = receipt["registrations"]["plugin"]
+    assert plugin["origin"]["request"]["source_revision"] == PLUGIN_SOURCE
+    assert {name: raw for name, raw in plugin["before_files"].items() if name != ".mcp.json"} == {
+        name: raw for name, raw in plugin["after_files"].items() if name != ".mcp.json"
+    }
+    old_skill = base64.b64decode(plugin["before_files"]["skills/devflow-local-delivery/SKILL.md"])
+    assert old_skill != (SOURCE / "runtime/desktop/devflow-local-delivery/SKILL.md").read_bytes()
     assert receipt["destination"]["identity_kind"] == installation.PHYSICAL_DESTINATION
     assert not installation.RUN_NATIVE_SCOPE & receipt["destination"]["identity"].keys()
     scopes = []
@@ -1278,12 +1325,20 @@ def exercise(root, kind):
         "host_home": str(Path.home()),
         "host_cli": case.cli,
         "host_cli_sha256": hashlib.sha256(Path(case.cli).read_bytes()).hexdigest(),
-        "baseline_revision": "1ebfc71ea5522ee74dbf6cd820f01649e3197bca",
+        "baseline_revision": PLUGIN_BASELINE,
+        "plugin_origin": case.plugin_origin,
         "answer": location.ANSWER,
     }
     request = config.state_root / "operator-inputs/permanent-request.json"
     write_private(request, supplied)
     if kind == "scope":
+        write_private(
+            request, {key: value for key, value in supplied.items() if key != "plugin_origin"}
+        )
+        assert "installed plugin differs" in control(
+            config, "runtime-location-preflight", request, success=False
+        )
+        write_private(request, supplied)
         reject_proposal_drift(config, request, supplied, proposal, binary)
     rows = original_rows(config)
     preflight = control(config, "runtime-location-preflight", request)

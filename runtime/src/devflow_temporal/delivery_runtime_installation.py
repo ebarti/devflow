@@ -436,7 +436,9 @@ def destination(original):
 def _request(config, supplied):
     if (
         not isinstance(supplied, dict)
-        or set(supplied) not in (BASE_FIELDS, BASE_FIELDS | {"expected_evidence_sha256"})
+        or not BASE_FIELDS
+        <= set(supplied)
+        <= BASE_FIELDS | {"expected_evidence_sha256", "plugin_origin"}
         or supplied["answer"] != ANSWER
         or not isinstance(supplied["runs"], list)
         or not 1 <= len(supplied["runs"]) <= 16
@@ -447,6 +449,10 @@ def _request(config, supplied):
     import re
 
     from .delivery_config import COMMAND_RE, DeliveryConfig
+    from .delivery_runtime_registrations import origin_request
+
+    if "plugin_origin" in supplied:
+        origin_request(supplied["plugin_origin"])
 
     if not isinstance(supplied["command_id"], str) or not COMMAND_RE.fullmatch(
         supplied["command_id"]

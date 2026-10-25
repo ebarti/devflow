@@ -14,14 +14,250 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
+from copy import deepcopy
 from pathlib import Path
 
 from .contracts import digest
 from .delivery_runtime_location import source_root
+
+PLUGIN_ORIGIN = "devflow.original-plugin-package/v1"
+PLUGIN_FILES = {".codex-plugin/plugin.json", ".mcp.json", "skills/devflow-local-delivery/SKILL.md"}
+CATALOG = ".agents/plugins/marketplace.json"
+GENERATION = (
+    "st_dev",
+    "st_ino",
+    "st_uid",
+    "st_mode",
+    "st_nlink",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+
+
+def origin_request(value):
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {"schema", "source_revision", "marketplace", "catalog_sha256", "files_sha256"}
+        or value["schema"] != PLUGIN_ORIGIN
+        or not isinstance(value["source_revision"], str)
+        or not re.fullmatch(r"[0-9a-f]{40}", value["source_revision"])
+        or not isinstance(value["marketplace"], str)
+        or not Path(value["marketplace"]).is_absolute()
+        or not isinstance(value["files_sha256"], dict)
+        or set(value["files_sha256"]) != PLUGIN_FILES
+        or any(
+            not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v)
+            for v in [value["catalog_sha256"], *value["files_sha256"].values()]
+        )
+    ):
+        raise ValueError("invalid explicit original plugin package witness")
+    return value
+
+
+def _generation(info):
+    return {key: getattr(info, key) for key in GENERATION}
+
+
+def _package_tree(root, names):
+    """Complete bounded file/directory inventory, read from held parent FDs."""
+    root = Path(root)
+    names = {Path(name) for name in names}
+    directories = {Path(".")}
+    for name in names:
+        directories.update(name.parents)
+    if (
+        len(names | directories) > 64
+        or any(name.is_absolute() or ".." in name.parts for name in names)
+        or root.resolve(strict=True) != root
+    ):
+        raise ValueError("plugin package left its bounded canonical member namespace")
+    files, generations, held = {}, {}, []
+    with ExitStack() as leases:
+
+        def opened(relative, descriptor, directory):
+            leases.callback(os.close, descriptor)
+            info = os.fstat(descriptor)
+            if (
+                info.st_uid != os.getuid()
+                or info.st_mode & 0o022
+                or (directory and not stat.S_ISDIR(info.st_mode))
+                or (
+                    not directory
+                    and (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_nlink != 1
+                        or info.st_size > 4 * 1024 * 1024
+                    )
+                )
+            ):
+                raise ValueError("plugin package member is not its protected owned object")
+            stamp = _generation(info)
+            generations[str(relative)] = stamp
+            held.append((descriptor, root / relative, stamp))
+            return info
+
+        initial = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        opened(Path("."), initial, True)
+        pending = [(Path("."), initial)]
+        while pending:
+            relative, parent = pending.pop()
+            with os.scandir(parent) as entries:
+                for entry in entries:
+                    member = relative / entry.name
+                    if member not in names | directories or str(member) in generations:
+                        raise ValueError("plugin package has an extra or duplicate member")
+                    directory = member in directories
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+                    if directory:
+                        flags |= os.O_DIRECTORY
+                    descriptor = os.open(entry.name, flags, dir_fd=parent)
+                    info = opened(member, descriptor, directory)
+                    if directory:
+                        pending.append((member, descriptor))
+                    else:
+                        with os.fdopen(os.dup(descriptor), "rb") as stream:
+                            raw = stream.read(4 * 1024 * 1024 + 1)
+                        if len(raw) != info.st_size:
+                            raise ValueError("plugin package changed during its byte read")
+                        files[str(member)] = base64.b64encode(raw).decode()
+        if set(files) != {str(name) for name in names} or set(generations) != {
+            str(name) for name in names | directories
+        }:
+            raise ValueError("plugin package member inventory is incomplete")
+        if any(
+            stamp != _generation(os.fstat(fd)) or stamp != _generation(path.lstat())
+            for fd, path, stamp in held
+        ):
+            raise ValueError("plugin package held generation changed")
+    return {"files": files, "generations": generations}
+
+
+def _original_tree(marketplace, files, package):
+    root = Path(marketplace)
+    payload = _package_tree(root / "plugins/devflow", PLUGIN_FILES)
+    catalog = _package_tree(root / ".agents/plugins", {"marketplace.json"})
+    expected_catalog = package.json_bytes(
+        {
+            "name": "devflow-local",
+            "interface": {"displayName": "Devflow Local"},
+            "plugins": [package.ENTRY],
+        }
+    )
+    if (
+        payload["files"] != files
+        or base64.b64decode(catalog["files"]["marketplace.json"]) != expected_catalog
+    ):
+        raise ValueError("registered original plugin package/catalog differs from its cache")
+    return {
+        "package": payload,
+        "catalog": catalog,
+        "parents": {
+            name: object_identity(root / name, directory=True)
+            for name in (".", "plugins", ".agents")
+        },
+    }
+
+
+def _git_data(*args):
+    try:
+        return subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(source_root()), *args],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        ).stdout
+    except subprocess.SubprocessError as exc:
+        raise ValueError("original plugin Git data/ancestry could not be authenticated") from exc
+
+
+def _grafts_absent():
+    if os.environ.get("GIT_GRAFT_FILE"):
+        raise ValueError("original plugin witness refuses an inherited Git graft source")
+    path = Path(os.fsdecode(_git_data("rev-parse", "--git-path", "info/grafts")).strip())
+    if not path.is_absolute():
+        path = source_root() / path
+    if os.path.lexists(path):
+        raise ValueError("original plugin witness refuses Git graft interpretation")
+
+
+def _git_blob(revision, name):
+    size = int(_git_data("cat-file", "-s", revision + ":" + name))
+    if not 0 < size <= 4 * 1024 * 1024:
+        raise ValueError("original plugin source blob exceeds its bound")
+    raw = _git_data("show", revision + ":" + name)
+    if len(raw) != size:
+        raise ValueError("original plugin source blob changed")
+    return raw
+
+
+def _origin(supplied, expected_old):
+    """A named source witness supplements complete live package custody."""
+    witness = origin_request(supplied["plugin_origin"])
+    root, revision = source_root(), witness["source_revision"]
+    _grafts_absent()
+    _git_data("merge-base", "--is-ancestor", revision, supplied["baseline_revision"])
+    _git_data("merge-base", "--is-ancestor", supplied["baseline_revision"], "HEAD")
+    proof = {}
+    # This bounded witness supports the unchanged packaging/layout owner. It
+    # reads old data only; it never imports or executes old installer code.
+    for name in ("package_plugin.py", "plugin.json", "devflow-local-delivery/SKILL.md"):
+        path = "runtime/desktop/" + name
+        raw = _git_blob(revision, path)
+        if name != "devflow-local-delivery/SKILL.md" and raw != _read(root / path):
+            raise ValueError("original plugin witness names another package format owner")
+        proof[path] = hashlib.sha256(raw).hexdigest()
+        if name == "devflow-local-delivery/SKILL.md":
+            expected_old["skills/devflow-local-delivery/SKILL.md"] = base64.b64encode(raw).decode()
+    if {
+        name: hashlib.sha256(base64.b64decode(raw)).hexdigest()
+        for name, raw in expected_old.items()
+    } != witness["files_sha256"]:
+        raise ValueError("original plugin witness differs from complete source/transport bytes")
+    _grafts_absent()
+    return {
+        "request": witness,
+        "source_blobs_sha256": proof,
+        "baseline_revision": supplied["baseline_revision"],
+    }
+
+
+def _plugin_metadata(snapshot, files, marketplace, command, config, *, original=None):
+    owned, _package = _desktop()
+    plugin = snapshot.get("plugin")
+    version = json.loads(base64.b64decode(files[".codex-plugin/plugin.json"]))["version"]
+    if (
+        snapshot.get("direct") is not None
+        or not plugin
+        or plugin.get("pluginId") != "devflow@devflow-local"
+        or plugin.get("enabled") is not True
+        or plugin.get("installed") is not True
+        or plugin.get("name") != "devflow"
+        or plugin.get("version") != version
+        or plugin.get("marketplaceName") != "devflow-local"
+        or snapshot.get("marketplace") != marketplace
+        or plugin.get("source")
+        != {"source": "local", "path": str(Path(marketplace) / "plugins/devflow")}
+        or plugin.get("marketplaceSource") != {"sourceType": "local", "source": marketplace}
+        or not owned.registration(snapshot.get("plugin_mcp") or {}, command, config)
+    ):
+        raise ValueError("owned plugin public identity, transport or source changed")
+    if original is not None:
+        wanted = deepcopy(original["plugin"])
+        wanted["source"]["path"] = str(Path(marketplace) / "plugins/devflow")
+        wanted["marketplaceSource"]["source"] = marketplace
+        mcp = deepcopy(original["plugin_mcp"])
+        mcp["transport"]["command"] = command
+        if plugin != wanted or snapshot["plugin_mcp"] != mcp:
+            raise ValueError("owned plugin metadata changed beyond its exact runtime location")
 
 
 def _desktop():
@@ -294,19 +530,41 @@ def observe(config, supplied, original, installed):
     if snapshot["direct"] is not None or not snapshot["plugin"] or not snapshot["marketplace"]:
         raise ValueError("location migration requires the inspected existing primary plugin")
     cache = codex_home / "plugins/cache/devflow-local/devflow/0.1.0"
-    before_files = _files(cache)
-    after_files = {
+    cache_observation = _package_tree(cache, PLUGIN_FILES)
+    before_files = cache_observation["files"]
+    generated = {
         name: base64.b64encode(raw).decode()
         for name, raw in package.package_files(root / "runtime", config.path, "codex").items()
     }
-    expected_old = dict(after_files)
+    expected_old = dict(generated)
     old_mcp = json.loads(base64.b64decode(expected_old[".mcp.json"]))
     old_mcp["mcpServers"]["devflow-local-delivery"]["command"] = str(
         old_root / "runtime/.venv/bin/devflow-delivery-mcp"
     )
     expected_old[".mcp.json"] = base64.b64encode(package.json_bytes(old_mcp)).decode()
+    origin = _origin(supplied, expected_old) if "plugin_origin" in supplied else None
     if before_files != expected_old:
         raise ValueError("installed plugin differs beyond its exact owned runtime location")
+    original_tree = _original_tree(snapshot["marketplace"], before_files, package)
+    if origin and (
+        snapshot["marketplace"] != origin["request"]["marketplace"]
+        or hashlib.sha256(
+            base64.b64decode(original_tree["catalog"]["files"]["marketplace.json"])
+        ).hexdigest()
+        != origin["request"]["catalog_sha256"]
+    ):
+        raise ValueError("original plugin witness belongs to another registered marketplace")
+    _plugin_metadata(
+        snapshot,
+        before_files,
+        snapshot["marketplace"],
+        old_mcp["mcpServers"]["devflow-local-delivery"]["command"],
+        config.path,
+    )
+    # Relocation preserves the actual authenticated installed package. Current
+    # templates continue to govern fresh packaging, never historical beforeimages.
+    after_files = dict(before_files)
+    after_files[".mcp.json"] = generated[".mcp.json"]
     owned.package_check(
         Path(snapshot["marketplace"]),
         {name: base64.b64decode(raw) for name, raw in before_files.items()},
@@ -322,6 +580,9 @@ def observe(config, supplied, original, installed):
             "before": snapshot,
             "before_files": before_files,
             "after_files": after_files,
+            "origin": origin,
+            "original_tree": original_tree,
+            "original_cache_generations": cache_observation["generations"],
             "cache": str(cache),
             "codex_home": str(codex_home),
             "cli": codex,
@@ -561,7 +822,23 @@ def replace(item, *, reverse=False):
 def _plugin_state(plan):
     from .delivery_runtime_installation import _hash
 
-    owned, _package = _desktop()
+    owned, package = _desktop()
+    if plan.get("origin") is not None:
+        current = _origin(
+            {
+                "plugin_origin": plan["origin"]["request"],
+                "baseline_revision": plan["origin"]["baseline_revision"],
+            },
+            dict(plan["before_files"]),
+        )
+        if current != plan["origin"]:
+            raise ValueError("original plugin source witness changed")
+    if (
+        plan.get("original_tree") is not None
+        and _original_tree(plan["before"]["marketplace"], plan["before_files"], package)
+        != plan["original_tree"]
+    ):
+        raise ValueError("original plugin package/catalog custody changed")
     owned.package_check(
         Path(plan["before"]["marketplace"]),
         {name: base64.b64decode(raw) for name, raw in plan["before_files"].items()},
@@ -577,9 +854,27 @@ def _plugin_state(plan):
         raise ValueError("owned plugin marketplace was replaced")
     payload = None
     if observed["plugin"]:
-        payload = _files(Path(plan["cache"]))
-        if payload not in (plan["before_files"], plan["after_files"]):
+        current_tree = _package_tree(Path(plan["cache"]), PLUGIN_FILES)
+        payload = current_tree["files"]
+        expected = (
+            plan["before_files"]
+            if market == plan["before"]["marketplace"]
+            else plan["after_files"]
+            if market == plan["new_marketplace"]
+            else None
+        )
+        if payload != expected:
             raise ValueError("owned plugin cache changed beyond the acknowledged location")
+        config = json.loads(base64.b64decode(expected[".mcp.json"]))
+        server = config["mcpServers"]["devflow-local-delivery"]
+        _plugin_metadata(
+            observed,
+            expected,
+            market,
+            server["command"],
+            Path(server["args"][1]),
+            original=plan["before"],
+        )
     return observed, payload
 
 

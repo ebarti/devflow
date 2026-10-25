@@ -76,6 +76,21 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
     installed_pair,
 ):
     root, old_template, new, environment, python = installed_pair
+    successor = command(["git", "-C", new, "rev-parse", "HEAD"]).strip()
+    # An already genuine8d capture is historical authority. Advancing the
+    # stopped controller must consume it, without rewriting its old inputs or
+    # capturing the same execution again under the new program.
+    command(
+        [
+            "git",
+            "-C",
+            new,
+            "checkout",
+            "--quiet",
+            "--detach",
+            "8d0297efee691b5b6826ab00264de6e4d6e8426c",
+        ]
+    )
     case, state, address, bound, source_bytes = await owned_retained_case(
         root, old_template, new, environment, python
     )
@@ -132,6 +147,7 @@ async def test_actual_public_capture_crash_replay_six_migration_and_finite_conti
     output = command([executable, "-I", SCENARIO, "capture", case], env=bound, timeout=240)
     assert json.loads(output.splitlines()[-1])["rows_unchanged"] is True
     assert {p.name: p.read_bytes() for p in state.glob("temporal.sqlite3*")} == source_bytes
+    command(["git", "-C", new, "checkout", "--quiet", "--detach", successor])
     installed = command([executable, "-I", SCENARIO, "install", case], env=bound, timeout=240)
     assert json.loads(installed.splitlines()[-1])["all_six"] is True
     # Only after the actual six-member installation, expose the retained fixture

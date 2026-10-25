@@ -402,6 +402,27 @@ The private request names `command_id`, `owner_before_sha256`, `owner_after_path
 
 Preflight does not publish config snapshots or migrate the database. Apply retains the exact original owner bytes and one immutable common receipt. Exact forward/reverse wrapper, physical helper-link and owner-file generations are sealed before the pending cohort transaction. File-only staging grants no execution authority. Pending intent fences new execution-critical code; existing old ProjectSync code can still write unrelated tracker data. Native/claim/source authority is revalidated under the native/resource/installation leases and final SQLite transaction. The original primary plugin changes only through its public management CLI with unrelated-state and exact-package checks. An ambiguous public plugin effect is observed before any further step and is never blindly repeated.
 
+A previously installed package can legitimately retain an older canonical skill.
+The migration does not upgrade that text. An explicit optional `plugin_origin`
+witness uses schema `devflow.original-plugin-package/v1`, the full40-hex
+`source_revision`, exact currently registered `marketplace`, `catalog_sha256`, and
+`files_sha256` for all three Codex package members. The named source must be an
+ancestor of the request's authorized `baseline_revision`, which must itself be an
+ancestor of the current installation. Git data reads ignore replacement objects
+and refuse graft interpretation; no old code runs. This bounded version requires
+the same packaging/layout owner and manifest, with the exact historical skill
+blob. Source provenance supplements protected complete catalog/package/cache
+custody and exact public enabled/installed identity, version, source and original
+stdio/configuration; it cannot bless an arbitrary skill edit or extra member.
+Cache inventories include directories, so an unregistered empty directory also
+refuses. The destination copies all authenticated original bytes and changes only
+the MCP executable command to the derived permanent entry. Original bytes,
+inventories, generations and witness are retained in the common receipt and
+rechecked through public effects, replay and rollback. Current packaging templates
+remain unchanged. A fresh migration input may consume an already acknowledged
+historical capture; it never rewrites that capture's archived input or recaptures
+the same execution to adopt a different program source.
+
 The common receipt identifies shared physical program, interpreter, dependency,
 source and filesystem objects explicitly. Each run separately retains its full
 measured native identity, including its original browser read roots, toolchain

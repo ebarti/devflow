@@ -586,6 +586,24 @@ def install(root):
     finally:
         archived.write_bytes(original_archive)
     assert fixture.original_rows(config) == rows
+    # Preserve the original capture input/proposal/ACK. A later compatible
+    # migration names current source and the original package witness separately.
+    supplied = read_private(request)
+    supplied.update(
+        command_id=supplied["command_id"] + "-package-v1",
+        baseline_revision=fixture.PLUGIN_BASELINE,
+        plugin_origin=case.plugin_origin,
+    )
+    from devflow_temporal.payload import payload_digest
+
+    supplied["destination"] = {
+        "root": str(SOURCE),
+        "revision": fixture.git(SOURCE, "rev-parse", "HEAD"),
+        "tree": fixture.git(SOURCE, "rev-parse", "HEAD^{tree}"),
+        "payload_sha256": payload_digest(SOURCE / "runtime/src/devflow_temporal"),
+    }
+    request = config.state_root / "operator-inputs/after-capture-package-v1.json"
+    write_private(request, supplied)
     preflight = fixture.control(config, "runtime-location-preflight", request)
     assert len(preflight["authority"]["runs"]) == 6
     supplied = read_private(request)
