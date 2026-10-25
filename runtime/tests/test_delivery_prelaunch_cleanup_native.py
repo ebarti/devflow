@@ -42,7 +42,7 @@ def test_actual_native_preparation_no_launch_history_then_public_cleanup(service
         assignee='test', required_ci=['owned-ci'], checks=[prerequisite],
         prepublish_checks=[{'id': 'owned-prepublish', 'argv': ['/usr/bin/true']}], browser_qa={
             'id': 'owned-browser', 'argv': ['/usr/bin/false'], 'cwd': '.',
-            'ports': {'QA_API_PORT': 43127, 'QA_WEB_PORT': 43128}, 'timeout_seconds': 10,
+            'ports': {'QA_API_PORT': 43127, 'QA_WEB_PORT': 43128}, 'timeout_seconds': 30,
             'env': {'JOBCTRL_E2E_ISOLATED': '1'}, 'artifact_paths': [],
             'test_count_regex': r'(\d+) passed', 'min_tests': 1})
     owner.config.path.write_text(json.dumps(config))
