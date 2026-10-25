@@ -71,7 +71,8 @@ def fixture_service(root):
     # A real service may retain different repository/browser authorities under
     # one physical installation. Freeze both declarations BEFORE any admission.
     browser_cache = home / ".cache/ms-playwright"
-    browser_cache.mkdir(mode=0o700, parents=True)
+    browser_cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+    assert browser_cache.resolve(strict=True) == browser_cache and browser_cache.is_dir()
     web_port, api_port = ports()
     browser_repository = copy.deepcopy(raw["repositories"]["fixture"])
     browser_repository.update(
