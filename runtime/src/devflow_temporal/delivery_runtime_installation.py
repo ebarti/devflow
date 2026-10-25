@@ -17,6 +17,7 @@ import sys
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from contextvars import copy_context
 from copy import deepcopy
 from importlib.metadata import distributions
 from pathlib import Path
@@ -511,10 +512,13 @@ def _native_observation(spec, leases):
     from .candidate import candidate_for
     from .delivery_filesystem_custody import _opened
     from .delivery_native_process import interrupted_cleanup_proven, listeners, process_table
-    from .delivery_resources import RunResources, read_private
+    from .delivery_resources import RunResources
 
     registry = RunResources(spec, read_only=True)
     manifest = leases.enter_context(registry.locked(read_only=True))
+    manifest_raw = private_bytes(registry.manifest)
+    if json.loads(manifest_raw) != manifest:
+        raise ValueError("installation resource manifest changed during locked observation")
     hashes, actors, ports = {}, [], set()
     for raw in sorted(manifest["processes"]):
         path = Path(raw)
@@ -522,7 +526,8 @@ def _native_observation(spec, leases):
             raise ValueError("installation native journal left its original run")
         for name in ("native-process.lock", "native-monitor.lock"):
             leases.enter_context(_opened(path.with_name(name), lock=True))
-        journal = read_private(path)
+        journal_raw = private_bytes(path)
+        journal = json.loads(journal_raw)
         result = journal.get("result") or {}
         if (
             journal.get("phase") != "finished"
@@ -539,7 +544,7 @@ def _native_observation(spec, leases):
         if journal.get("monitor"):
             actors.append((int(journal["monitor"]["pid"]), journal["monitor"]["identity"]))
         ports.update(journal.get("ports", []))
-        hashes[raw] = hashlib.sha256(private_bytes(path)).hexdigest()
+        hashes[raw] = hashlib.sha256(journal_raw).hexdigest()
         for name in (
             "request.json",
             "result.json",
@@ -566,7 +571,7 @@ def _native_observation(spec, leases):
         "actors": actors,
         "ports": sorted(ports),
         "manifest": str(registry.manifest),
-        "manifest_sha256": hashlib.sha256(private_bytes(registry.manifest)).hexdigest(),
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
         "candidate": candidate_for(checkout) if checkout.exists() else None,
     }
 
@@ -581,7 +586,12 @@ def _closure(store, row):
         return (value, await closure_facts(value["history"])) if value else (None, None)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        closed, facts = pool.submit(lambda: asyncio.run(observe())).result(timeout=30)
+        # This fixed historical reader must retain the already authenticated
+        # public installation owner's scope during PENDING rollback. It grants
+        # no ordinary Store or native-launch bypass outside that operation.
+        closed, facts = pool.submit(copy_context().run, lambda: asyncio.run(observe())).result(
+            timeout=30
+        )
     if not closed or closed["status"] != "COMPLETED":
         raise ValueError(
             "installation requires authentic sealed closed history; import it publicly first"
@@ -786,10 +796,33 @@ def _process_views():
     return values
 
 
+def _forwarding_adapter(argv, root, owner, interpreters):
+    """Only the actual entrypoint position identifies a known legacy adapter."""
+    mcp = str(root / "runtime/.venv/bin/devflow-delivery-mcp")
+    tail = ["--config", owner]
+    if argv == [mcp, *tail]:
+        return True
+    if not argv or argv[0] not in interpreters:
+        return False
+    index = 1
+    while index < len(argv) and argv[index] in {"-I", "-u", "-B"}:
+        index += 1
+    return argv[index:] in ([mcp, *tail], ["-m", "devflow_temporal.delivery_mcp", *tail])
+
+
 def _original_programs_absent(receipt):
     roots = {
         Path(item["original_spec"]["policy"]["codex_bin"]).parents[7] for item in receipt["runs"]
     }
+    interpreters = {}
+    for root in roots:
+        bases = {
+            item["original_spec"]["policy"].get("native_identity", {}).get("python")
+            for item in receipt["runs"]
+            if Path(item["original_spec"]["policy"]["codex_bin"]).parents[7] == root
+        } - {None}
+        names = {"python", "python3", *(Path(base).name for base in bases)}
+        interpreters[root] = bases | {str(root / "runtime/.venv/bin" / name) for name in names}
     output = subprocess.run(
         ["ps", "-A", "-o", "pid=,command="], check=True, capture_output=True, text=True, timeout=5
     ).stdout
@@ -812,17 +845,8 @@ def _original_programs_absent(receipt):
                 str(root / "runtime/.venv/bin" / name)
                 for name in ("devflow-delivery", "devflow-delivery-mcp", "devflow-temporal")
             }
-            mcp = str(root / "runtime/.venv/bin/devflow-delivery-mcp")
-            forwarded = mcp in argv[:3] or (
-                first
-                and first.is_relative_to(root / "runtime/.venv")
-                and "-m" in argv
-                and "devflow_temporal.delivery_mcp" in argv
-            )
-            if forwarded and "--config" in argv:
-                index = argv.index("--config")
-                if index + 1 < len(argv) and argv[index + 1] == receipt["owner_path"]:
-                    continue  # Original EX lease and exact two-name guard fence this adapter.
+            if _forwarding_adapter(argv, root, receipt["owner_path"], interpreters[root]):
+                continue  # Original EX lease and exact two-name guard fence this adapter.
             if (first and first.is_relative_to(root / "runtime/.venv")) or (
                 first
                 and first.name.startswith("python")
@@ -1134,7 +1158,7 @@ def _owner_lease(path):
 def apply(config, supplied):
     from .delivery_filesystem_custody import _immutable
     from .delivery_interrupted_recovery import installation_recovery_lease
-    from .delivery_runtime_location import _acknowledged, pending_acknowledged
+    from .delivery_runtime_location import _acknowledged, pending_acknowledged, reversed_reference
     from .delivery_runtime_registrations import (
         package,
         plugin_apply,
@@ -1186,6 +1210,10 @@ def apply(config, supplied):
             raise ValueError("installation command ID already belongs to different authority")
         if receipt:
             sealed_objects(receipt)
+            if reversed_reference(config, reference):
+                raise ValueError(
+                    "this installation location was rolled back; apply cannot reactivate it"
+                )
         active = _acknowledged(config, reference=reference) if reference else None
         historical = (
             _acknowledged(config, reference=reference, historical=True) if reference else None

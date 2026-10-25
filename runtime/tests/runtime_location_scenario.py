@@ -723,6 +723,81 @@ def reject_partial_membership(config):
             db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)", saved)
 
 
+def pending_rollback(root, case, config, request, rows, before):
+    """Actual public rollback before FINAL ACK, not a simulated completed state."""
+    import sqlite3
+
+    from devflow_temporal import delivery_runtime_location as location
+    from devflow_temporal.delivery_native_renewal import _old_proof
+    from devflow_temporal.delivery_runtime_registrations import _state
+
+    crash = subprocess.run(
+        [sys.executable, "-I", __file__, "crash", str(root), "guard"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert crash.returncode == 73, crash.stdout + crash.stderr
+    reference = read_private(config.state_root / "runtime-installations/pending.json")
+    receipt = json.loads(location.receipt_bytes(Path(reference["receipt"])))
+    assert all(_state(item) == "before" for item in receipt["installed_objects"])
+    with sqlite3.connect(config.tracking_db) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.PENDING,)
+            ).fetchone()[0]
+            == 6
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.KIND,)
+            ).fetchone()[0]
+            == 0
+        )
+    result = control(config, "rollback-runtime-location", request)
+    assert result["state"] == "rolled_back" and result["legacy_runtime_ready"] is False
+    assert config.path.read_bytes() == before and original_rows(config) == rows
+    assert location._acknowledged(config) is None
+    assert location.historical_proof(case.spec) is False
+    _old_proof(case.spec)  # Original evidence remains authentic data, never launch permission.
+    calls = read_private(Path.home() / ".codex/public-inventory.json")["calls"]
+    error = control(config, "adopt-runtime-location", request, success=False)
+    assert "rolled back" in error, error
+    assert control(config, "rollback-runtime-location", request)["state"] == "rolled_back"
+    control(config, "stop")
+    assert read_private(Path.home() / ".codex/public-inventory.json")["calls"] == calls
+    assert all(_state(item) == "before" for item in receipt["installed_objects"])
+    assert (
+        original_rows(config) == rows
+        and not (config.state_root / "runtime-installations/current.json").exists()
+    )
+    with sqlite3.connect(config.tracking_db) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.KIND,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.REVERSED,)
+            ).fetchone()[0]
+            == 6
+        )
+    print(
+        json.dumps(
+            {
+                **result,
+                "ack_row_unchanged": True,
+                "original_proof_preserved": True,
+                "legacy_guard_retained": (config.state_root / "service.lock").stat().st_nlink == 2,
+                "pending_only": True,
+                "location_permission": False,
+            }
+        )
+    )
+
+
 def reject_proposal_drift(config, request, supplied, proposal, binary):
     """Public bootstrap rejects semantic changes and an equal-byte unbundled CLI."""
     original = proposal.read_bytes()
@@ -1088,6 +1163,10 @@ def exercise(root, kind):
     )
     supplied["expected_evidence_sha256"] = preflight["expected_evidence_sha256"]
     write_private(request, supplied)
+    if kind == "pendingrollback":
+        pending_rollback(root, case, config, request, rows, before)
+        patch.undo()
+        return
     if kind == "scope":
         cohort_faults(root, config, request, rows)
     # The old ProjectSync module can write unrelated tracker data even while the
@@ -1180,6 +1259,7 @@ def exercise(root, kind):
                 {
                     **result,
                     "ack_row_unchanged": True,
+                    "original_proof_preserved": True,
                     "historical_proof_readable": True,
                     "legacy_guard_retained": (config.state_root / "service.lock").stat().st_nlink
                     == 2,

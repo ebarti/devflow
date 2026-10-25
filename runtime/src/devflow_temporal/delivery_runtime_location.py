@@ -116,6 +116,20 @@ def pending_acknowledged(config, receipt, reference, *, db=None):
     return True
 
 
+def reversed_reference(config, reference, *, db=None):
+    """A reversed intent is final even when its forward ACK never committed."""
+    if db is None:
+        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as source:
+            source.execute("PRAGMA query_only=ON")
+            return reversed_reference(config, reference, db=source)
+    return bool(
+        db.execute(
+            "SELECT 1 FROM delivery_events WHERE type=? AND payload_json=? LIMIT 1",
+            (REVERSED, canonical_json(reference)),
+        ).fetchone()
+    )
+
+
 def _acknowledged(config, *, db=None, historical=False, reference=None):
     """A complete file and a partial cohort are both inert."""
     path = config.state_root / "runtime-installations/current.json"
@@ -177,11 +191,7 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
             or json.loads(original[1])["config_path"] != receipt["owner_path"]
         ):
             raise ValueError("installation original owner or submitted authority changed")
-    reversed_event = db.execute(
-        "SELECT 1 FROM delivery_events WHERE type=? AND payload_json=? LIMIT 1",
-        (REVERSED, canonical_json(pointer)),
-    ).fetchone()
-    if reversed_event and not historical:
+    if reversed_reference(config, pointer, db=db) and not historical:
         return None
     if not historical:
         from .delivery_config import DeliveryConfig
