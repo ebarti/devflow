@@ -311,6 +311,8 @@ def _collect(store, migration, supplied, leases):
     for path in (store.config.state_root / "configuration-snapshots").glob("*.json"):
         private_bytes(path)
     _capture_stopped(store.config)
+    from .delivery_closures import sealed_record
+
     selected = {v["run_id"]: v for v in supplied["captures"]}
     items = []
     installed = None
@@ -375,6 +377,7 @@ def _collect(store, migration, supplied, leases):
         ):
             raise ValueError("capture has unfinished native work or a foreign claim")
         if run in selected:
+            sealed_record(store, row["workflow_id"] or "delivery-" + run)
             expected = selected[run]
             recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
             current = {
@@ -459,6 +462,10 @@ def _current(store, authority, db):
         if store.effective_spec(row["run_id"]) != spec:
             raise ValueError("capture admitted execution bytes changed")
         _native_current(item)
+        if item["closure_record"] is None:
+            from .delivery_closures import sealed_record
+
+            sealed_record(store, row["workflow_id"] or "delivery-" + row["run_id"])
         actual_closures = [
             dict(v)
             for v in db.execute(
@@ -1058,6 +1065,8 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
             or facts["request_digest"] != row["request_digest"]
             or facts["recovery_digest"] != selected["recovery_digest"]
             or facts["inputs"] != [spec, recovery]
+            or history.events[0].workflow_execution_started_event_attributes.task_queue.name
+            != config.queue
             or await description.memo_value("request_digest", None) != row["request_digest"]
             or await description.memo_value("recovery_digest", None) != selected["recovery_digest"]
         ):
@@ -1079,6 +1088,7 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
             "execution_run_id": selected["execution_run_id"],
             "run_id": selected["run_id"],
             "namespace": client.namespace,
+            "task_queue": config.queue,
             "namespace_id": namespace_id,
             "raw_sha256": _sha(raw),
             "history_sha256": _sha(history_json(history)),

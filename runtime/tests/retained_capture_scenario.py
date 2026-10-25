@@ -41,6 +41,8 @@ async def original_histories(root):
     from temporalio.exceptions import ApplicationError
     from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
+    from devflow_temporal.delivery_activities import delivery_project
+    from devflow_temporal.delivery_orphans import reconcile_closed_native
     from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
     case = fixture.restored(root)
@@ -90,8 +92,10 @@ async def original_histories(root):
             )
 
     @activity.defn(name="delivery_project")
-    async def unavailable(_request):
-        raise ApplicationError("Owned terminal projection unavailable", non_retryable=True)
+    async def unavailable(request):
+        if request["event_type"] == "tracker_deadline":
+            raise ApplicationError("Owned terminal projection unavailable", non_retryable=True)
+        return await delivery_project(request)
 
     @activity.defn(name="delivery_finalize_resources")
     async def finalizer(_request):
@@ -104,6 +108,26 @@ async def original_histories(root):
     async def terminal(self, spec, recovery=None):
         assert recovery is None
         self.state = copy.deepcopy(states[spec["run_id"]])
+        terminal_revision = self.state["revision"]
+        self.state.update(
+            revision=terminal_revision - 2,
+            outcome=None,
+            execution_state="running",
+            phase="checks" if spec["run_id"] == "run-1" else "repair",
+            error=None,
+        )
+        await self._project(
+            spec,
+            "checks_started" if spec["run_id"] == "run-1" else "role_started",
+            "Owned immutable in-flight checkpoint",
+        )
+        self.state.update(
+            revision=terminal_revision,
+            phase="blocked",
+            execution_state="blocked",
+            outcome="blocked",
+            error="terminal tracker synchronization conflicted",
+        )
         await self._project(spec, "blocked", self.state["error"])
         return self.state
 
@@ -116,7 +140,7 @@ async def original_histories(root):
     try:
         async with Worker(
             client,
-            task_queue="owned-retained-capture",
+            task_queue=store.config.queue,
             workflows=[DeliveryWorkflow],
             activities=[unavailable, finalizer, tracker],
             workflow_runner=UnsandboxedWorkflowRunner(),
@@ -126,7 +150,7 @@ async def original_histories(root):
                     DeliveryWorkflow.run,
                     args=[specs[run], None],
                     id="delivery-" + run,
-                    task_queue="owned-retained-capture",
+                    task_queue=store.config.queue,
                     memo={"request_digest": specs[run]["request_digest"]},
                 )
                 state = await asyncio.wait_for(handle.result(), 30)
@@ -155,6 +179,26 @@ async def original_histories(root):
                 if run == "run-1":
                     case.state = state
                     case.command["expected_revision"] = 48
+        await reconcile_closed_native(store, client)
+        with store._connect() as db:
+            for item in selected:
+                row = dict(
+                    db.execute(
+                        "SELECT * FROM delivery_runs WHERE run_id=?", (item["run_id"],)
+                    ).fetchone()
+                )
+                closed = await client.get_workflow_handle(item["workflow_id"]).describe()
+                assert datetime.fromisoformat(row["updated_at"]) > closed.close_time
+                assert db.execute(
+                    "SELECT 1 FROM delivery_events WHERE run_id=? "
+                    "AND type='resource_cleanup_reconciled'",
+                    (item["run_id"],),
+                ).fetchone()
+                item["revision"] = row["revision"]
+                # Setup simulates the genuinely missing cache, never alters Temporal.
+                db.execute(
+                    "DELETE FROM delivery_closures WHERE workflow_id=?", (item["workflow_id"],)
+                )
     finally:
         patch.undo()
     saved = read_private(root / "case.json")
@@ -350,6 +394,7 @@ def capture(root, mode):
     assert fixture.original_rows(config) == before
     # The separate old projector does not know the new command/audit types.
     # Its actual unchanged helper still reads/refreshes unrelated owned work.
+    sys.path.insert(0, str(root / "loaded-old-projector"))
     loader = importlib.util.spec_from_file_location(
         "retained_old_projector", root / "loaded-old-projector/state.py"
     )
