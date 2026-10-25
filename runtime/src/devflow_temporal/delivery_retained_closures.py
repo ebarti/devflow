@@ -135,7 +135,10 @@ def _inputs(config, supplied):
         or not isinstance(supplied["captures"], list)
         or len(supplied["captures"]) != 2
         or any(not isinstance(v, dict) or set(v) != SELECTION for v in supplied["captures"])
+        or any(not isinstance(v["run_id"], str) for v in supplied["captures"])
         or len({v["run_id"] for v in supplied["captures"]}) != 2
+        or not isinstance(supplied["migration_path"], str)
+        or not isinstance(supplied["migration_sha256"], str)
     ):
         raise ValueError("invalid explicit two-execution retained-history capture")
     migration_path = Path(supplied["migration_path"])
@@ -171,7 +174,10 @@ def _inputs(config, supplied):
             )
             or (
                 item["recovery_digest"] is not None
-                and not re.fullmatch(r"[0-9a-f]{64}", item["recovery_digest"])
+                and (
+                    not isinstance(item["recovery_digest"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", item["recovery_digest"])
+                )
             )
         ):
             raise ValueError("capture selection lacks exact current execution authority")
@@ -287,6 +293,20 @@ def _collect(store, migration, supplied, leases):
     )
     from .delivery_runtime_location import KIND, PENDING, REVERSED
 
+    # Existing closure/config readers can repair benign directory modes.
+    # Capture, like installation preflight, refuses drift before those readers.
+    for folder in (
+        store.config.state_root,
+        store.config.state_root / "closures",
+        store.config.state_root / "configuration-snapshots",
+    ):
+        if not folder.is_dir() or folder.resolve(strict=True) != folder:
+            raise ValueError("capture original evidence directory is absent or linked")
+        info = folder.lstat()
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise ValueError("capture original evidence directory is not already private")
+    for path in (store.config.state_root / "configuration-snapshots").glob("*.json"):
+        private_bytes(path)
     _capture_stopped(store.config)
     selected = {v["run_id"]: v for v in supplied["captures"]}
     items = []
@@ -956,16 +976,36 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
     deadline = time.monotonic() + TOTAL_SECONDS
     plan = json.loads(private_bytes(folder / "intent.json"))
     address = "127.0.0.1:" + str(plan["ports"][0])
-    client = await asyncio.wait_for(
-        Client.connect(
-            address,
-            namespace=config.raw.get("temporal_namespace", "default"),
-            data_converter=DELIVERY_DATA_CONVERTER,
-        ),
-        20,
-    )
-    _owned(folder)
     root_pid = json.loads(private_bytes(folder / "authorized.json"))["root_pid"]
+    startup = min(deadline, time.monotonic() + 20)
+    client, last = None, None
+    while client is None:
+        _owned(folder)
+        live = _table().get(root_pid)
+        if not live or live["stat"].startswith("Z"):
+            raise ValueError("capture copy server exited before readiness; inspect its private log")
+        remaining = startup - time.monotonic()
+        if remaining <= 0:
+            raise ValueError(
+                "capture copy server did not become ready within its finite deadline"
+            ) from last
+        owners = [_listeners(port) for port in plan["ports"]]
+        if any(pids and pids != {root_pid} for pids in owners):
+            raise ValueError("capture copy endpoint has a foreign listener")
+        if all(pids == {root_pid} for pids in owners):
+            try:
+                client = await asyncio.wait_for(
+                    Client.connect(
+                        address,
+                        namespace=config.raw.get("temporal_namespace", "default"),
+                        data_converter=DELIVERY_DATA_CONVERTER,
+                    ),
+                    min(2, remaining),
+                )
+            except (RuntimeError, OSError, TimeoutError) as exc:
+                last = exc
+        if client is None:
+            await asyncio.sleep(0.1)
     _listener_proof(folder, root_pid)
     if any(_listeners(port) != {root_pid} for port in plan["ports"]):
         raise ValueError("capture copy endpoint has a foreign listener")
@@ -1053,7 +1093,10 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
 
 
 async def _bounded_exports(*args):
-    return await asyncio.wait_for(_exports(*args), TOTAL_SECONDS)
+    try:
+        return await asyncio.wait_for(_exports(*args), TOTAL_SECONDS)
+    except TimeoutError as exc:
+        raise ValueError("capture SDK export exceeded its total time bound") from exc
 
 
 def _publish_exports(folder, exports):

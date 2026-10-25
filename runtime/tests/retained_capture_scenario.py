@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -303,6 +304,20 @@ def capture(root, mode):
     assert response["kind"] == owner.SCHEMA and len(response["histories"]) == 2
     replay = fixture.control(config, "capture-retained-closures", path)
     assert replay["replayed"] is True
+    assert fixture.original_rows(config) == before
+    # The separate old projector does not know the new command/audit types.
+    # Its actual unchanged helper still reads/refreshes unrelated owned work.
+    loader = importlib.util.spec_from_file_location(
+        "retained_old_projector", root / "loaded-old-projector/state.py"
+    )
+    old = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(old)
+    with old.connect(config.tracking_db) as db:
+        assert old.metrics(db)
+        old.record(db, "work", {"id": "copy-history-old-projector", "title": "Owned observation"})
+        old.update(
+            db, "work", {"id": "copy-history-old-projector", "title": "Owned refresh"}, "owned"
+        )
     assert fixture.original_rows(config) == before
     assert (config.state_root / "service.lock").stat().st_nlink == 1
     assert not (config.state_root / "runtime-installations/current.json").exists()
