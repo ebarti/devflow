@@ -608,9 +608,21 @@ def _closure(store, row):
     )
 
 
+def _stopped(config):
+    from .delivery_control import _owned, _read_manifest, _recorded_deployment
+
+    # Re-observe on replay too: a prevalidated legacy FD may have acted after
+    # an unfinished pre-zero attempt released its exclusive lifecycle lease.
+    private_bytes(config.state_root / "service-stopped.json")
+    lifecycle = _read_manifest(config) or {"processes": {}}
+    if _recorded_deployment(lifecycle) is not None:
+        raise ValueError("retained worker deployment requires its existing deployment owner")
+    if any(_owned(actor) for actor in lifecycle.get("processes", {}).values()):
+        raise ValueError("stop and drain the original delivery actors before installation")
+
+
 def collect(store, supplied, leases):
     from .delivery_native_renewal import _old_proof
-    from .delivery_resources import read_private
 
     # Existing execution/closure readers can repair benign directory modes.
     # This public inspection refuses that drift before entering those readers.
@@ -630,15 +642,7 @@ def collect(store, supplied, leases):
             or info.st_nlink != 1
         ):
             raise ValueError("installation admitted snapshot is not already a private owned file")
-    stopped = store.config.state_root / "service-stopped.json"
-    read_private(stopped)
-    from .delivery_control import _owned, _read_manifest, _recorded_deployment
-
-    lifecycle = _read_manifest(store.config) or {"processes": {}}
-    if _recorded_deployment(lifecycle) is not None:
-        raise ValueError("retained worker deployment requires its existing deployment owner")
-    if any(_owned(actor) for actor in lifecycle.get("processes", {}).values()):
-        raise ValueError("stop and drain the original delivery actors before installation")
+    _stopped(store.config)
     entries, observations, installed = [], {}, None
     for run_id in sorted(supplied["runs"]):
         spec = store.effective_spec(run_id)
@@ -964,6 +968,7 @@ def _rows_current(store, receipt, db):
     from .delivery_native_renewal import _old_proof
     from .delivery_policy_recovery import work_binding
 
+    _stopped(store.config)
     if _native_inputs(store, db) != receipt["native_inputs"]:
         raise ValueError("installation has a new or changed native execution input")
     _global_current(receipt)
@@ -1254,6 +1259,8 @@ def apply(config, supplied):
             for item in receipt["runs"]:
                 _native_observation(item["original_spec"], leases)
         _pointer(config.state_root / "runtime-installations/pending.json", reference)
+        with store._connect() as connection:
+            _rows_current(store, receipt, connection)
         try:
             install_guard(config, receipt, reference, service_descriptor)
         except (ValueError, OSError) as exc:

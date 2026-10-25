@@ -638,6 +638,37 @@ def cohort_faults(root, config, request, rows):
     assert (config.state_root / "service.lock").stat().st_nlink == 1
     with pytest.raises(ValueError, match="helper|scripts|missing|does not exist"):
         DeliveryStore(config)
+    # An extra descriptor in this observer process is foreign to the exact
+    # installer's FD. PENDING+guard may survive; every relocation preimage stays.
+    extra = os.open(config.state_root / "service.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        error = control(config, "adopt-runtime-location", request, success=False)
+        assert "foreign service-lock FDs" in error, error
+        pending = config.state_root / "runtime-installations/pending.json"
+        receipt = json.loads(location.receipt_bytes(Path(read_private(pending)["receipt"])))
+        from devflow_temporal.delivery_runtime_registrations import _state
+
+        assert all(_state(item) == "before" for item in receipt["installed_objects"])
+        assert original_rows(config) == rows
+        observation = read_private(
+            Path(read_private(pending)["receipt"]).with_name("service-guard-observation.json")
+        )
+        assert observation["relocation_started"] is False
+        assert observation["stopped_asserted"] is False
+        assert observation["legacy_lifecycle_may_act_through_prevalidated_fd"] is True
+    finally:
+        os.close(extra)
+    stopped = config.state_root / "service-stopped.json"
+    marker = stopped.read_bytes()
+    stopped.unlink()  # Model the demonstrated old prevalidated lifecycle effect.
+    try:
+        error = control(config, "adopt-runtime-location", request, success=False)
+        assert "service-stopped.json" in error, error
+        assert all(_state(item) == "before" for item in receipt["installed_objects"])
+        assert original_rows(config) == rows
+    finally:
+        stopped.write_bytes(marker)
+        stopped.chmod(0o600)
     # The exact immutable receipt and six-row pending transaction survive a
     # process death immediately after the first actual atomic file exchange.
     for mode, code in (("guard", 73), ("swap", 71), ("ack", 72)):
@@ -690,6 +721,71 @@ def reject_partial_membership(config):
     finally:
         with sqlite3.connect(config.tracking_db) as db:
             db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)", saved)
+
+
+def reject_proposal_drift(config, request, supplied, proposal, binary):
+    """Public bootstrap rejects semantic changes and an equal-byte unbundled CLI."""
+    original = proposal.read_bytes()
+    equal = proposal.with_name("unbundled-codex")
+    shutil.copyfile(binary, equal)
+    equal.chmod(0o700)
+    assert (
+        hashlib.sha256(equal.read_bytes()).hexdigest()
+        == hashlib.sha256(binary.read_bytes()).hexdigest()
+    )
+    roles = json.loads(original)["roles"]
+    roles["implement"]["model"] = "foreign-model"
+    try:
+        for key, value in (
+            ("capacity", 6),
+            ("temporal_address", "127.0.0.1:19999"),
+            ("roles", roles),
+            ("codex_bin", str(equal)),
+        ):
+            changed = json.loads(original)
+            changed[key] = value
+            write_private(proposal, changed)
+            attempt = {
+                **supplied,
+                "owner_after_sha256": hashlib.sha256(proposal.read_bytes()).hexdigest(),
+            }
+            write_private(request, attempt)
+            error = control(config, "runtime-location-preflight", request, success=False)
+            assert "may change only" in error, error
+    finally:
+        proposal.write_bytes(original)
+        proposal.chmod(0o600)
+        equal.unlink()
+        write_private(request, supplied)
+
+
+def fresh_admission(case):
+    from devflow_temporal.delivery_native_preparation import verify_native_spec
+    from devflow_temporal.delivery_preparation import prepare_authority
+
+    request = {
+        "command_id": "fresh-permanent-registration",
+        "run_id": "fresh-permanent-run",
+        "work_id": "fresh-permanent-work",
+        "issue_url": "https://github.com/example/fixture/issues/99",
+        "repository_key": "fixture",
+        "goal": "Owned fresh permanent runtime registration",
+        "accepted_plan": "Retain the original scope and all gates.",
+        "base_ref": "HEAD",
+        "branch": "feat/fresh-permanent-registration",
+        "authorized_endpoint": "published_unmerged",
+    }
+    result = case.store.submit(request)
+    assert case.store.submit(request) == result
+    spec = prepare_authority(case.store, case.store.effective_spec(request["run_id"]))
+    verify_native_spec(spec)
+    assert spec["policy"]["codex_bin"] == case.store.config.raw["codex_bin"]
+    assert spec["policy"]["capacity"] == 2
+    assert Path(spec["policy"]["codex_bin"]).is_relative_to(SOURCE / "runtime/.venv")
+    assert not str(spec["policy"]["codex_bin"]).startswith(case.old_root)
+    DeliveryBroker(case.store, spec).prepare()
+    assert RunResources(spec).finalize("blocked")["state"] == "confirmed"
+    return {"state": "prepared", "native_identity": "actual bundled permanent runtime"}
 
 
 async def actual_worker(case, current, recovery, response, patch):
@@ -881,6 +977,8 @@ def exercise(root, kind):
     }
     request = config.state_root / "operator-inputs/permanent-request.json"
     write_private(request, supplied)
+    if kind == "scope":
+        reject_proposal_drift(config, request, supplied, proposal, binary)
     rows = original_rows(config)
     preflight = control(config, "runtime-location-preflight", request)
     assert original_rows(config) == rows and config.path.read_bytes() == before
@@ -1047,6 +1145,7 @@ def exercise(root, kind):
             assert RunResources(current).finalize("blocked")["state"] == "confirmed"
     control(DeliveryConfig.load(config.path), "rollback-runtime-location", request, success=False)
     assert case.store.continue_repair("run-1", case.command) == response
+    fresh = fresh_admission(case) if kind == "scope" else None
     print(
         json.dumps(
             {
@@ -1061,6 +1160,7 @@ def exercise(root, kind):
                 "kind": kind,
                 "source": str(SOURCE),
                 "worker": worker_result,
+                "fresh_registration": fresh,
             }
         )
     )
