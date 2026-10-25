@@ -190,6 +190,38 @@ async def test_sdk_export_consumes_all_pages_and_preserves_workflow_envelope_sub
 
 
 @pytest.mark.asyncio
+async def test_sdk_export_canonicalizes_unordered_maps_for_exact_crash_replay():
+    from devflow_temporal.delivery_closures import history_json
+
+    history = payload_history(b"json/plain", [b"owned"])
+    payload = history.events[0].workflow_execution_completed_event_attributes.result.payloads[0]
+    payload.metadata.update({"z-last": b"value", "a-first": b"same"})
+    budget = {"pages": 0, "events": 0, "bytes": 0}
+    _history, raw = await capture._history(
+        handle(Pages([history.events])), time.monotonic() + 3, budget
+    )
+    assert raw == history_json(history)
+    assert raw != history.to_json().encode()
+
+
+@pytest.mark.asyncio
+async def test_sdk_pagination_tokens_count_toward_total_byte_limit(monkeypatch):
+    pages = Pages([[HistoryEvent(event_id=1)], [HistoryEvent(event_id=2)]])
+    original = pages.fetch_next_page
+
+    async def large_token():
+        await original()
+        pages.next_page_token = b"x" * 256
+
+    pages.fetch_next_page = large_token
+    monkeypatch.setattr(capture, "MAX_HISTORY", 128)
+    with pytest.raises(ValueError, match="byte/event bound"):
+        await capture._history(
+            handle(pages), time.monotonic() + 3, {"pages": 0, "events": 0, "bytes": 0}
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("limit", ["pages", "events", "bytes", "json", "time", "repeated"])
 async def test_sdk_export_excess_refuses_instead_of_truncating(monkeypatch, limit):
     pages = Pages(
@@ -291,6 +323,8 @@ def test_uncompressed_payloads_obey_same_total_bound(monkeypatch):
     monkeypatch.setattr(capture, "MAX_DECODED", 192)
     with pytest.raises(ValueError, match="bound"):
         capture._bounded_payloads(payload_history(b"json/plain", [b"x" * 100] * 2))
+    with pytest.raises(ValueError, match="bound"):
+        capture._bounded_payloads(payload_history(b"json/plain", [b"x" * 100]), consumed=100)
 
 
 def test_public_capture_route_authenticates_before_ordinary_missing_helper_store(

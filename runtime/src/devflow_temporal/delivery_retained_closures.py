@@ -961,9 +961,9 @@ def _payloads(message):
             yield from _payloads(value)
 
 
-def _bounded_payloads(history):
+def _bounded_payloads(history, consumed=0):
     """Prove expansion bounds BEFORE the unchanged workflow codec allocates it."""
-    total = 0
+    total = consumed
     for event in history.events:
         for payload in _payloads(event):
             encoding = payload.metadata.get("encoding")
@@ -1005,11 +1005,13 @@ def _bounded_payloads(history):
             total += size
             if size > MAX_PAYLOAD or total > MAX_DECODED:
                 raise ValueError("capture decoded history exceeds its payload/total bound")
-    return total
+    return total - consumed
 
 
 async def _history(handle, deadline, budget):
     from temporalio.client import WorkflowHistory, WorkflowHistoryEventFilterType
+
+    from .delivery_closures import history_json
 
     iterator = handle.fetch_history_events(
         page_size=128,
@@ -1027,7 +1029,7 @@ async def _history(handle, deadline, budget):
             raise ValueError("capture full history exceeds its total time bound")
         await asyncio.wait_for(iterator.fetch_next_page(), remaining)
         page = iterator.current_page or []
-        size = sum(event.ByteSize() for event in page)
+        size = sum(event.ByteSize() for event in page) + len(iterator.next_page_token or b"")
         budget["bytes"] += size
         budget["events"] += len(page)
         if budget["bytes"] > MAX_HISTORY or budget["events"] > MAX_EVENTS:
@@ -1035,11 +1037,15 @@ async def _history(handle, deadline, budget):
         events.extend(page)
         if iterator.next_page_token is None:
             break
-        if iterator.next_page_token in seen_tokens:
+        token_sha = _sha(iterator.next_page_token)
+        if token_sha in seen_tokens:
             raise ValueError("capture full history repeats a pagination token")
-        seen_tokens.add(iterator.next_page_token)
+        seen_tokens.add(token_sha)
     history = WorkflowHistory(handle.id, events)
-    raw = history.to_json().encode()
+    # Protobuf map field order varies between fresh SDK processes. Preserve
+    # canonical SDK JSON from the FIRST export, as the closure owner already
+    # does, so an identical full re-observation never rewrites staged evidence.
+    raw = history_json(history)
     budget["json_bytes"] = budget.get("json_bytes", 0) + len(raw)
     if budget["json_bytes"] > MAX_HISTORY:
         raise ValueError("capture full history JSON exceeds its byte bound")
@@ -1159,7 +1165,9 @@ async def _exports(config, reader, authority, selections, namespace_id, folder):
                 "capture described history exceeds or lacks its prefetch resource bound"
             )
         history, raw = await _history(exact, deadline, budget)
-        _bounded_payloads(history)
+        budget["decoded_bytes"] = budget.get("decoded_bytes", 0) + _bounded_payloads(
+            history, budget.get("decoded_bytes", 0)
+        )
         facts = await closure_facts(history)
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         if (
@@ -1220,11 +1228,13 @@ async def _bounded_exports(*args):
 
 
 def _publish_exports(folder, exports):
+    from .delivery_closures import history_json
+
     target = _folder(folder / "exports")
     for value in exports:
         envelope = value["envelope"]
         run = envelope["run_id"]
-        raw = value["history"].to_json().encode()
+        raw = history_json(value["history"])
         _immutable(target / (run + ".json"), raw)
         path = target / (run + ".envelope.json")
         if path.exists():
