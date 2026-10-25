@@ -854,6 +854,7 @@ _COMMANDS = (
     "reconcile-attempt",
     "filesystem-custody-preflight",
     "adopt-filesystem-custody",
+    "capture-retained-closures",
     "runtime-location-preflight",
     "adopt-runtime-location",
     "rollback-runtime-location",
@@ -894,6 +895,16 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
     if deployment is not None and args.command not in {"start", "worker"}:
         parser.error("worker deployment options apply only to start or worker")
+    if args.command == "capture-retained-closures":
+        if args.request is None:
+            parser.error("--request is required for explicit retained-history capture")
+        from .delivery_retained_closures import capture
+        from .delivery_runtime_location import private_bytes
+
+        config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
+        supplied = json.loads(private_bytes(args.request))
+        print(json.dumps(capture(config, supplied), sort_keys=True, indent=2))
+        return
     if args.command in {
         "runtime-location-preflight", "adopt-runtime-location", "rollback-runtime-location"
     }:

@@ -49,6 +49,67 @@ whose memo binds the run's request and recovery digests, whose inputs name the r
 and its recovery, and whose terminal result agrees with the run's projected outcome.
 It refuses while Temporal still retains the execution.
 
+An original six-run permanent-installation cohort can instead be blocked by two
+latest selected executions that closed while the controller was unavailable.
+When the original helper and program location are gone and retained Temporal is
+stopped, use the separate explicit local data-only owner:
+
+```sh
+devflow-delivery --config "$ORIGINAL_CONFIG" capture-retained-closures \
+  --request "$PRIVATE_CAPTURE_REQUEST"
+```
+
+This narrow native macOS operation requires the unchanged original owner, a
+private hash-bound six-member installation request, and exactly two current
+workflow/execution selections. Each selection supplies `run_id`, `workflow_id`,
+`execution_run_id`, `revision`, `protocol_revision`, `request_digest` and
+`recovery_digest`. The top-level request contains `command_id`, `migration_path`,
+`migration_sha256`, `captures`, `reader`, and `answer`. `answer` is the literal
+`Capture only the two selected closed histories from an owned copy; change no delivery.`
+The four other latest closures must already have valid authentic seals. The
+selected rows must still be the exact stopped, unprojected native executions;
+predecessor histories and terminal summaries cannot substitute.
+
+The `reader` explicitly binds the unchanged configured
+`/opt/homebrew/bin/temporal`, its resolved Homebrew CLI1.9.1/Server1.32.0
+installation, current executable SHA256, and `historical_start_binary_sha256:
+null`. Original startup version evidence and the fixed Homebrew installation
+receipts are checked. This is current copy-reader authority; it never adds an
+unrecorded historical executable hash. The original native Python3.12.13,
+framework SDK1.33 and frozen dependency proof remain required. Browser-test SDK
+and executable preparation receipts do not authorize this operation.
+
+The owner holds the original exclusive lifecycle inode and installation recovery
+lease, proves stopped service/native actors and complete original-data FD
+visibility, then streams a stable raw DB plus optional WAL into a private
+immutable master. It never opens the original Temporal SQLite connection or
+creates/checkpoints its sidecars. SHM is retained as forensic evidence and rebuilt
+locally in the working copy. A hot/unexpected journal, uncertain visibility,
+foreign FD, replaced name, changed source generation or insufficient bounded
+storage refuses capture.
+
+Only an identity-bound copy server runs, on fresh loopback endpoints with private
+HOME/cwd/tmp and no inherited original lock/data descriptors. The pinned SDK
+fetches both complete ALL_EVENT histories within total page/event/byte/time
+bounds. Full start, memo, recovery, current execution, native and failed terminal
+tracker/deadline authority must validate through the existing owners. Exceeding a
+bound refuses the whole history. The copy server is cleaned up before one atomic
+metadata acknowledgement appends both genuine `temporal_snapshot` closure seals.
+Immutable provenance binds the snapshot, reader, namespace, explicit workflow and
+execution IDs, raw exports and full canonical history hashes. It is not a new
+execution transport or installation permission.
+
+The same exact command replays safely after an interrupted capture or lost
+acknowledgement. A child without durable GO authorization is never signalable;
+unknown actor/cwd/port ownership refuses replacement. A complete file-only
+receipt is inert until the two seals and command/audit acknowledgement commit.
+All `delivery_runs` fields, claims, provider outcomes, original unknowns, frozen
+specifications, gates, models, capacity and allowances remain unchanged. The
+expired-history import still requires genuine NOT_FOUND. After capture, rerun
+the ordinary all-six installation preflight. Following installation, the existing
+authentic closed-projection reconciliation, public cleanup and fresh finite
+continuation preflight still apply; capture itself grants no retry or iteration.
+
 The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. The default endpoint is a **published, unmerged PR**. A fresh native run can instead explicitly authorize `merged`. That endpoint keeps all original checks, independent roles and required CI, then confirms owned cleanup before requesting a head-pinned squash merge. It independently verifies the actual merged commit/tree and closes only the admitted issue before reconciling Done and releasing the claim. A divergent base, uncertain effect or failed gate blocks completion; a lost response is reconciled through the original intent without blindly repeating the mutation. Existing unmerged histories retain their endpoint. Release, deployment and personal production data remain separate authority.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.
