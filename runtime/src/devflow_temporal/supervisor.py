@@ -75,19 +75,50 @@ def activity_retry_pending() -> bool:
                 and info.attempt >= policy.maximum_attempts)
 
 
-def _process_identity(pid: int, *, canonical: bool = False) -> str | None:
+class ProcessObservationUnknown(RuntimeError):
+    """A recorded process cannot currently be proved present or absent."""
+
+
+def _process_identity(
+    pid: int, *, canonical: bool = False, require_observation: bool = False,
+) -> str | None:
     """The process start time as ``ps`` prints it.
 
     ``canonical`` fixes the locale and time zone, so an identity recorded for
     a long-lived member still matches after either changes on the host.
+    Lifecycle callers require a third outcome: failed inspection is not proof
+    that a recorded process exited. A signal-zero probe can prove absence but
+    never establishes its identity or grants permission to signal it.
     """
     env = {**os.environ, "LC_ALL": "C", "TZ": "UTC0"} if canonical else None
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False,
-        env=env,
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True, text=True, check=False, env=env,
+            **({"timeout": 5} if require_observation else {}),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        if not require_observation:
+            raise
+    else:
+        value = result.stdout.strip()
+        if result.returncode == 0 and value and (
+            not require_observation or not result.stderr.strip()
+        ):
+            return value
+        if not require_observation:
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        raise ProcessObservationUnknown(
+            f"process {pid} identity observation is unavailable; ownership remains unknown"
+        ) from exc
+    raise ProcessObservationUnknown(
+        f"process {pid} identity observation is unavailable; ownership remains unknown"
     )
-    value = result.stdout.strip()
-    return value if result.returncode == 0 and value else None
 
 
 def _private_json(path: Path, value: dict[str, Any]) -> None:

@@ -207,7 +207,7 @@ def _lifecycle_lock(config: DeliveryConfig, deadline: float, *, pending_stop: bo
 
 def _process_identity(pid: int) -> str | None:
     """A member's start identity, independent of the controller's locale and zone."""
-    identity = _local_identity(pid, canonical=True)
+    identity = _local_identity(pid, canonical=True, require_observation=True)
     if identity is None:
         return None
     # A different launcher may own the exited child and not have reaped it yet.
@@ -242,7 +242,9 @@ def _owned(process: dict) -> bool:
     live = _process_identity(process["pid"])
     # Manifests written before identities were canonical hold the local form.
     return live is not None and (
-        live == recorded or _local_identity(process["pid"]) == recorded
+        live == recorded or _local_identity(
+            process["pid"], require_observation=True
+        ) == recorded
     )
 
 
@@ -363,13 +365,13 @@ def _stopped_marker(config: DeliveryConfig) -> Path:
 
 def service_stop(config: DeliveryConfig) -> dict:
     with _lifecycle_lock(config, _deadline(config), pending_stop=True):
-        results = _stop(config, _read_manifest(config) or {"processes": {}})
-        # A supervisor's periodic start must not undo this; the next explicit
-        # start, restart or write-triggered start lifts it.
+        # Keep the owner's intent even if observation fails after a member has
+        # stopped. This marker requests a stop; it does not prove settlement.
+        # The next explicit start, restart or write-triggered start lifts it.
         descriptor = os.open(_stopped_marker(config), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump({"command": "stop", "stopped_at": time.time()}, stream)
-        return results
+            json.dump({"command": "stop", "requested_at": time.time()}, stream)
+        return _stop(config, _read_manifest(config) or {"processes": {}})
 
 
 def _registered_worker(config: DeliveryConfig, processes: dict) -> dict | None:
