@@ -353,6 +353,8 @@ worker registration until observation proves exit or a different generation.
 result; any `observation_unknown` result makes the command unsuccessful and
 retains the inventory for reconciliation.
 They never signal a PID whose recorded identity could not be matched. An
+exited leader is reaped only after its matching identity and settled process
+group are observed, preserving custody while its descendants remain alive. An
 explicit `stop` records its intent before settlement, so periodic supervision
 cannot restart a partially stopped stack while visibility recovers. A retained
 `service-stopped.json` records that request, not proof that every member exited;

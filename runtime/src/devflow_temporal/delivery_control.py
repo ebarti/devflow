@@ -244,21 +244,28 @@ def _process_identity(pid: int) -> str | None:
 def _owned(process: dict) -> bool:
     if not isinstance(process, dict) or not isinstance(process.get("pid"), int):
         return False
-    try:
-        # Reap a directly launched child if it exited, including after SIGKILL.
-        os.waitpid(process["pid"], os.WNOHANG)
-    except ChildProcessError:
-        pass
     recorded = process.get("identity")
     if not recorded:
         return False
     live = _process_identity(process["pid"])
+    # A zombie leader still authenticates its live group descendants. Reaping
+    # it before that observation would erase the only recorded start identity.
+    observed = (live if live is not None else _local_identity(
+        process["pid"], canonical=True, require_observation=True
+    ))
     # Manifests written before identities were canonical hold the local form.
-    return live is not None and (
-        live == recorded or _local_identity(
+    matched = observed is not None and (
+        observed == recorded or _local_identity(
             process["pid"], require_observation=True
         ) == recorded
     )
+    if live is None and matched:
+        try:
+            # Reap only a matched, settled leader after its group is observed.
+            os.waitpid(process["pid"], os.WNOHANG)
+        except ChildProcessError:
+            pass
+    return live is not None and matched
 
 
 def _free(host: str, port: int) -> bool:

@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,6 +77,23 @@ def test_legacy_identity_fallback_does_not_convert_observation_failure_to_replac
         {"canonical": True, "require_observation": True},
         {"require_observation": True},
     ]
+
+
+@pytest.mark.parametrize("observation", ["unknown", "foreign_generation"])
+def test_unverified_or_foreign_generation_is_never_reaped(monkeypatch, observation):
+    def identity(_pid):
+        if observation == "unknown":
+            raise ProcessObservationUnknown("identity observation unavailable")
+        return None
+
+    monkeypatch.setattr(control, "_process_identity", identity)
+    monkeypatch.setattr(control, "_local_identity", lambda *_args, **_kwargs: "foreign-start")
+    monkeypatch.setattr(control.os, "waitpid", lambda *_args: pytest.fail("reaped unverified PID"))
+    if observation == "unknown":
+        with pytest.raises(ProcessObservationUnknown):
+            control._owned({"pid": 7001, "identity": "recorded-start"})
+    else:
+        assert not control._owned({"pid": 7001, "identity": "recorded-start"})
 
 
 def _configuration(tmp_path: Path) -> DeliveryConfig:
@@ -282,3 +300,53 @@ def test_public_mixed_stack_reports_unknown_member_and_stops_later_known_members
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
             child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("leader_exits_first", [False, True])
+def test_direct_parent_keeps_zombie_identity_until_live_descendants_settle(
+    tmp_path, leader_exits_first,
+):
+    ready = tmp_path / "descendant.pid"
+    release = tmp_path / "release"
+    descendant = (
+        "import os,signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    leader = subprocess.Popen([
+        sys.executable, "-B", "-c",
+        "import subprocess,sys,time; from pathlib import Path; "
+        "subprocess.Popen([sys.executable,'-B','-c',sys.argv[1]]); "
+        "release=Path(sys.argv[2]); "
+        "exec('while not release.exists(): time.sleep(.01)')",
+        descendant, str(release),
+    ], start_new_session=True)
+    try:
+        receipt = {"pid": leader.pid, "identity": control._process_identity(leader.pid)}
+        assert receipt["identity"]
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert ready.exists()
+        if leader_exits_first:
+            release.touch()
+            while time.monotonic() < deadline:
+                state = subprocess.run(["ps", "-p", str(leader.pid), "-o", "stat="],
+                                       capture_output=True, text=True, timeout=5)
+                if state.stdout.strip().startswith("Z"):
+                    break
+                time.sleep(.01)
+            assert state.stdout.strip().startswith("Z")
+        assert control._owned(receipt)
+        assert control._terminate("fixture", receipt) == "stopped"
+        leader.wait(timeout=5)
+        assert not control._owned(receipt)
+        state = subprocess.run(["ps", "-p", ready.read_text(), "-o", "stat="],
+                               capture_output=True, text=True, timeout=5)
+        assert state.returncode != 0 or state.stdout.strip().startswith("Z")
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        leader.wait(timeout=5)
