@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -28,7 +29,79 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def fetch_release_metadata(repository, tag, destination, token=None):
+    """Fetch only a pinned GitHub API release; never expose credentials in argv or errors."""
+    if (repository, tag) not in {(pin["repository"], pin["tag"]) for pin in TOOLS.values()}:
+        raise ValueError("Temporal release metadata target is not pinned")
+    if token is not None and (not isinstance(token, str)
+                              or not re.fullmatch(r"[A-Za-z0-9_.-]{1,4096}", token)):
+        raise ValueError("Temporal release metadata credential is malformed")
+    url = f"https://api.github.com/repos/{repository}/releases/tags/{tag}"
+    destination = Path(destination)
+    if os.path.lexists(destination):
+        raise FileExistsError("Temporal release metadata destination already exists")
+    fd, name = tempfile.mkstemp(prefix=".release-metadata-", dir=destination.parent)
+    os.close(fd)
+    temporary = Path(name)
+    argv = [
+        "/usr/bin/curl", "--disable", "--fail-with-body", "--silent", "--show-error",
+        "--proto", "=https", "--connect-timeout", "15", "--max-time", "60",
+        "--max-filesize", "1048576", "--dump-header", "-", "--output", str(temporary),
+        "--write-out", "\n__DEVFLOW_HTTP_STATUS__%{http_code}\n",
+    ]
+    if token is not None:
+        argv.extend(["--header", "@-"])
+    argv.append(url)
+    try:
+        try:
+            environment = dict(os.environ)
+            environment.pop("DEVFLOW_TEMPORAL_GITHUB_TOKEN", None)
+            result = subprocess.run(
+                argv, input=f"Authorization: Bearer {token}\n" if token is not None else "",
+                capture_output=True, text=True, timeout=65, env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError("Temporal release metadata request did not complete") from None
+        headers, marker, status = result.stdout.rpartition("\n__DEVFLOW_HTTP_STATUS__")
+        status = status.strip()
+        status = status if marker and re.fullmatch(r"[0-9]{3}", status) else "unknown"
+        if result.returncode != 0 or status != "200":
+            facts = []
+            for line in headers.splitlines():
+                key, separator, value = line.partition(":")
+                key, value = key.strip().lower(), value.strip()
+                if (separator and key in {"x-ratelimit-limit", "x-ratelimit-remaining",
+                                          "x-ratelimit-reset", "retry-after"}
+                        and re.fullmatch(r"[0-9]{1,20}", value)):
+                    facts.append(f"{key}={value}")
+                elif (separator and key == "x-github-request-id"
+                      and re.fullmatch(r"[A-Fa-f0-9:]{1,64}", value)):
+                    facts.append(f"{key}={value}")
+            try:
+                body = json.loads(temporary.read_bytes())
+                public_message = body.get("message", "") if isinstance(body, dict) else ""
+            except (OSError, ValueError):
+                public_message = ""
+            public_message = public_message.lower() if isinstance(public_message, str) else ""
+            if "rate limit exceeded" in public_message or "secondary rate limit" in public_message:
+                facts.append("api-error=rate-limit")
+            elif "bad credentials" in public_message:
+                facts.append("api-error=bad-credentials")
+            elif "resource not accessible by integration" in public_message:
+                facts.append("api-error=integration-access")
+            detail = ", ".join(facts[:6]) or "no recognized public API details"
+            message = (f"Temporal release metadata request failed: HTTP {status}, "
+                       f"curl exit {result.returncode}; {detail}")
+            raise RuntimeError(message.replace(token, "[redacted]") if token else message)
+        if token is not None and token.encode() in temporary.read_bytes():
+            raise ValueError("Temporal release metadata unexpectedly contains its credential")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def build(root):
+    token = os.environ.pop("DEVFLOW_TEMPORAL_GITHUB_TOKEN", None)
     root = Path(root).resolve()
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise RuntimeError("The production Temporal prerequisite supports macOS arm64 only")
@@ -42,14 +115,7 @@ def build(root):
         url = (f"https://github.com/{pin['repository']}/releases/download/"
                f"{pin['tag']}/{pin['archive']}")
         metadata = root / f"{name}-release.json"
-        metadata_url = f"https://api.github.com/repos/{pin['repository']}/releases/tags/{pin['tag']}"
-        subprocess.run(
-            ["/usr/bin/curl", "--fail", "--silent", "--show-error", "--location",
-             "--proto", "=https", "--proto-redir", "=https", "--retry", "2",
-             "--connect-timeout", "15", "--max-time", "60", "--output", str(metadata),
-             metadata_url],
-            check=True,
-        )
+        fetch_release_metadata(pin["repository"], pin["tag"], metadata, token)
         release = json.loads(metadata.read_text())
         assets = [asset for asset in release["assets"] if asset["name"] == pin["archive"]]
         if (len(assets) != 1 or assets[0].get("digest") != "sha256:" + pin["archive_sha256"]

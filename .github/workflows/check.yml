@@ -84,6 +84,8 @@ jobs:
       - run: uv sync --locked --python python
         working-directory: runtime
       - name: Prepare disposable native SDK and official tool fixtures
+        env:
+          DEVFLOW_TEMPORAL_GITHUB_TOKEN: ${{ github.token }}
         run: |
           .venv/bin/python tests/portable_temporal_fixture.py "$RUNNER_TEMP/devflow-portable-temporal"
         working-directory: runtime
