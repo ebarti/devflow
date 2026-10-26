@@ -292,6 +292,8 @@ def _prepare(broker, pr, conflict, authorization):
 
 async def _role(broker, spec, workspace, context, authorization, role):
     from .delivery_merge_native_preparation import FIELD, prepare, recorded
+    from .delivery_merge_execution import FIELD as EXECUTION, identity
+    from .delivery_merge_execution import to_thread
     from .supervisor import DeliverySupervisor, get_supervisor
 
     key = "merge-resolution:" + spec["run_id"] + ":" + context["resolution_id"] + ":" + role
@@ -308,6 +310,8 @@ async def _role(broker, spec, workspace, context, authorization, role):
                    "merge_context": bound["merge_context"]}
         if bound.get("review_diff"):
             request["review_diff"] = bound["review_diff"]
+        if EXECUTION in bound:
+            request[EXECUTION] = bound[EXECUTION]
         if bound.get(FIELD):
             execution, _binding = recorded(spec, request, authorization, bound[FIELD])
             request['spec'] = execution
@@ -315,18 +319,18 @@ async def _role(broker, spec, workspace, context, authorization, role):
     else:
         request = {"spec": spec, "role": role, "iteration": 0,
                    "candidate": candidate_for(workspace), "workspace": str(workspace),
-                   "merge_context": {**context, "effect_key": key}}
+                   "merge_context": {**context, "effect_key": key}, EXECUTION: identity()}
         if role == "review":
             request["review_diff"] = review_diff(request)
-        execution, prepared = await asyncio.to_thread(
-            prepare, broker.store, spec, request, authorization)
+        execution, prepared = await to_thread(
+            broker.store, spec, prepare, broker.store, spec, request, authorization)
         request['spec'] = execution
         if prepared:
             request[FIELD] = prepared
         bound = {"merge_authorization": authorization, "spec_sha256": digest(spec),
                  "candidate": request["candidate"], "workspace": request["workspace"],
                  "merge_context": request["merge_context"],
-                 "job_key": DeliverySupervisor._job_key(request)}
+                 "job_key": DeliverySupervisor._job_key(request), EXECUTION: request[EXECUTION]}
         if prepared:
             bound.update({FIELD: prepared, 'execution_spec_sha256': digest(execution)})
         if request.get("review_diff"):
@@ -360,15 +364,16 @@ async def _role(broker, spec, workspace, context, authorization, role):
 async def resolve(store, spec, authorization, conflict):
     from .delivery_merge import MergeBroker
     from .delivery_merge_followup import authorize, record
+    from .delivery_merge_execution import to_thread
 
-    proof = await asyncio.to_thread(authorize, store, spec, authorization)
+    proof = await to_thread(store, spec, authorize, store, spec, authorization)
     pr = proof["pull_request"]
     broker = MergeBroker(store, spec)
     expected = {"state": "resolve_conflicts", "target": conflict["target"],
                 "original_head": pr["head"], "previous_head": conflict["previous_head"]}
     if conflict != expected:
         raise ValueError("merge resolver input changed its owned reconciliation")
-    _, workspace, context = await asyncio.to_thread(_prepare, broker, pr, conflict, authorization)
+    _, workspace, context = await to_thread(store, spec, _prepare, broker, pr, conflict, authorization)
     record(store, spec, "resolving_conflicts", {
         "state": "pending", "conflicts": context["conflicts"], "target": conflict["target"]})
     for role in ("implement", "review") if context["conflicts"] else ():
@@ -381,8 +386,8 @@ async def resolve(store, spec, authorization, conflict):
                       "decision": decision}
             record(store, spec, state, result, result["reason"])
             return result
-    await asyncio.to_thread(authorize, store, spec, authorization)
-    return await asyncio.to_thread(_publish, broker, spec, workspace, context, pr)
+    await to_thread(store, spec, authorize, store, spec, authorization)
+    return await to_thread(store, spec, _publish, broker, spec, workspace, context, pr)
 
 
 def _publish(broker, spec, workspace, context, pr):

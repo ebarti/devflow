@@ -54,12 +54,14 @@ def _artifacts(original, request):
 
 def _binding(original, request, authorization, workflow):
     from .delivery_resources import _identity
+    from .delivery_merge_execution import FIELD as EXECUTION
 
     _ancestors(Path(request["workspace"]) / "unused")
     return {
         "schema": SCHEMA,
         "grant_sha256": authorization,
         "workflow_id": workflow,
+        EXECUTION: request.get(EXECUTION),
         "original_spec_sha256": digest(original),
         "role": request["role"],
         "iteration": request["iteration"],
@@ -178,6 +180,15 @@ def authenticate(store, original, request, bound, effect):
     from .delivery_merge_followup import authorize, current
     from .delivery_preparation import verify_prepared_spec
     from .delivery_resources import _identity
+    from .delivery_merge_execution import FIELD as EXECUTION
+
+    if request.get(EXECUTION) != bound.get(EXECUTION):
+        raise ValueError("merge native execution changed its activity generation")
+    if effect["state"] != "complete" and EXECUTION in bound:
+        with store._connect() as db:
+            saved = current(db, original["run_id"])
+        if not saved or bound[EXECUTION]["workflow_id"] != saved["workflow_id"]:
+            raise ValueError("merge native launch belongs to an obsolete execution")
 
     reference = bound.get(FIELD)
     if request.get(FIELD) != reference:
@@ -273,6 +284,7 @@ def prelaunch_receipts(store, spec, saved):
     """
     from .delivery_merge_resolution import scratch_path
     from .supervisor import DeliverySupervisor
+    from .delivery_merge_execution import FIELD as EXECUTION
 
     with store._connect() as db:
         effects = [
@@ -352,6 +364,10 @@ def prelaunch_receipts(store, spec, saved):
             }
             if bound.get("review_diff"):
                 expected["review_diff"] = bound["review_diff"]
+            if EXECUTION in bound:
+                if bound[EXECUTION]["workflow_id"] != saved["workflow_id"]:
+                    raise ValueError("merge prelaunch belongs to an obsolete execution")
+                expected[EXECUTION] = bound[EXECUTION]
             native_binding = None
             if FIELD in bound:
                 execution, native_binding = recorded(
@@ -390,6 +406,7 @@ def prelaunch_receipts(store, spec, saved):
                 or (not missing_request and names - {"request.json", "native-environment.json"})
                 or request.get("spec") != expected["spec"]
                 or request.get(FIELD) != expected.get(FIELD)
+                or request.get(EXECUTION) != expected.get(EXECUTION)
                 or request.get("review_diff") != expected.get("review_diff")
                 or request.get("role") != attempt["role"]
                 or request.get("iteration") != attempt["iteration"]

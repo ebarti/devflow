@@ -364,6 +364,13 @@ def preflight(store, run_id):
     with ExitStack() as leases:
         with store._connect() as db:
             saved = current(db, run_id)
+        if saved:
+            if not _continuable(saved):
+                raise ValueError("merge already owns a request; read its current result")
+            from .delivery_merge_execution import existing_lease, predecessor_closure
+
+            leases.enter_context(existing_lease(store.config, exclusive=True))
+            predecessor_closure(store, spec, saved)
         prelaunch = None
         if saved and _continuable(saved) and saved['phase'] == 'unknown':
             from .delivery_merge_resolution import prelaunch_receipts
@@ -385,10 +392,14 @@ def preflight(store, run_id):
 
 def admit(store, run_id, request):
     from .delivery_interrupted_recovery import installation_recovery_lease
+    from .delivery_merge_execution import existing_lease
 
     # Closed-run maintenance holds the shared installation fence throughout its
     # finalization. Admission must not overlap its last historical projection.
-    with installation_recovery_lease(store.config, exclusive=True):
+    with store._connect() as db:
+        previous = current(db, run_id)
+    lease = existing_lease if previous else installation_recovery_lease
+    with lease(store.config, exclusive=True):
         return _admit(store, run_id, request)
 
 
@@ -488,6 +499,9 @@ def _admit(store, run_id, request):
             raise ValueError("merge continuation changed its original delivered evidence")
         grant = original
         response["grant_sha256"] = digest(original)
+        from .delivery_merge_execution import predecessor_closure
+
+        response["predecessor_merge"] = predecessor_closure(store, spec, previous_merge)
     with ExitStack() as leases:
         prelaunch = []
         if previous_merge and previous_merge["phase"] == "unknown":
@@ -567,7 +581,10 @@ def _admit(store, run_id, request):
 
 
 def authorize(store, spec, grant_sha256):
+    from .delivery_merge_execution import require_current
+
     with store._connect() as db:
+        require_current(db, spec)
         saved = current(db, spec["run_id"])
         if not saved:
             raise ValueError("merge follow-up has no durable authorization")
@@ -611,6 +628,9 @@ def record(store, spec, phase, result=None, error=None, *, only_if=None):
     """Merge progress is separate from the historical delivery projection."""
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
+        from .delivery_merge_execution import require_current
+
+        require_current(db, spec, required=True, phase=phase)
         saved = current(db, spec["run_id"])
         if only_if is not None and saved["phase"] != only_if:
             return
@@ -665,6 +685,9 @@ def step(store, spec, grant_sha256, cancel_event):
 
     try:
         with store._connect() as db:
+            from .delivery_merge_execution import require_current
+
+            require_current(db, spec, required=True)
             saved = current(db, spec["run_id"])
             if not saved or digest(json.loads(saved["grant_json"])) != grant_sha256:
                 raise ValueError("merge activity has no matching durable authorization")
@@ -718,6 +741,9 @@ def step(store, spec, grant_sha256, cancel_event):
 
 def failed(store, spec, grant_sha256, reason):
     with store._connect() as db:
+        from .delivery_merge_execution import require_current
+
+        require_current(db, spec, required=True)
         saved = current(db, spec["run_id"])
         if not saved or digest(json.loads(saved["grant_json"])) != grant_sha256:
             raise ValueError("failed merge activity has no matching durable authorization")
@@ -747,24 +773,28 @@ async def dispatch(service, client):
 
     pending = await asyncio.to_thread(pending_requests)
 
-    def acknowledge(run_id):
+    def acknowledge(selected):
         with service.store._connect() as db:
             db.execute(
                 "UPDATE delivery_merge_requests SET dispatched=1,"
-                "error=CASE WHEN phase='queued' THEN NULL ELSE error END WHERE run_id=?",
-                (run_id,),
+                "error=CASE WHEN phase='queued' THEN NULL ELSE error END "
+                "WHERE run_id=? AND workflow_id=? AND grant_json=?",
+                (selected["run_id"], selected["workflow_id"], selected["grant_json"]),
             )
 
     def rejected(item, exc):
+        from .delivery_merge_execution import dispatch_scope
+
         spec = service.store.effective_spec(item["run_id"])
-        record(
-            service.store,
-            spec,
-            "queued",
-            {"state": "pending", "reason": "merge_dispatch"},
-            f"Merge dispatch pending: {type(exc).__name__}: {str(exc)[:300]}",
-            only_if="queued",
-        )
+        with dispatch_scope(service.store, spec, item):
+            record(
+                service.store,
+                spec,
+                "queued",
+                {"state": "pending", "reason": "merge_dispatch"},
+                f"Merge dispatch pending: {type(exc).__name__}: {str(exc)[:300]}",
+                only_if="queued",
+            )
 
     for item in pending:
         try:
@@ -791,7 +821,7 @@ async def dispatch(service, client):
                 )
             elif await found.memo_value("merge_authorization", None) != bound:
                 raise ValueError("merge workflow ID belongs to another authorization")
-            await asyncio.to_thread(acknowledge, item["run_id"])
+            await asyncio.to_thread(acknowledge, item)
         except WorkflowAlreadyStartedError:
             # Lost start acknowledgement: the next pass reads the memo.
             continue
