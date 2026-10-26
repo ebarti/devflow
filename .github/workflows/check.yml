@@ -60,10 +60,10 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # All three Mac hosts start together; host 0 also qualifies native source tests.
+      # Six Mac hosts each run two partitions; host 0 also qualifies source tests.
       max-parallel: 3
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,8 +92,9 @@ jobs:
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
       - name: Run assigned runtime modules and host 0 Mac source qualification
-        # Three hosted Mac jobs, each with four module-atomic internal partitions.
+        # Keep two pytest parents per host and preserve all 12 partitions.
         run: |
+          result=0
           processes=()
           if [ '${{ matrix.shard }}' = 0 ]; then
             env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
@@ -105,14 +106,17 @@ jobs:
                 python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v
             ) &
             processes+=("$!")
+            for process in "${processes[@]}"; do
+              wait "$process" || result=1
+            done
+            processes=()
           fi
-          for lane in 0 1 2 3; do
-            index=$(( ${{ matrix.shard }} + lane * 3 ))
+          for lane in 0 1; do
+            index=$(( ${{ matrix.shard }} + lane * 6 ))
             .venv/bin/python runtime_ci.py --index "$index" --count 12 \
               --basetemp "$RUNNER_TEMP/devflow-pytest-$index" &
             processes+=("$!")
           done
-          result=0
           for process in "${processes[@]}"; do
             wait "$process" || result=1
           done

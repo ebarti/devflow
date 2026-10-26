@@ -28,11 +28,17 @@ async def owned_retained_case(root, old_template, new, environment, python):
         cwd=old / "runtime",
         env=environment,
     )
+    from portable_capture_reader import prepare as prepare_fixture_reader
+    from portable_temporal_fixture import fixture_root
+
+    reader = prepare_fixture_reader(root / "capture-reader", fixture_root())
     case = root / "capture"
     original = root / "retained-temporal.sqlite3"
-    async with local_temporal(dev_server_database_filename=str(original)) as temporal:
+    async with local_temporal(dev_server_existing_path=str(reader),
+                              dev_server_database_filename=str(original)) as temporal:
         address = temporal.client.service_client.config.target_host
-        bound = {**environment, "DEVFLOW_TEST_LOCATION_TEMPORAL_ADDRESS": address}
+        bound = {**environment, "DEVFLOW_TEST_LOCATION_TEMPORAL_ADDRESS": address,
+                 "DEVFLOW_OWNED_CAPTURE_READER": str(reader)}
         command(
             [old / "runtime/.venv/bin/python", "-I", SCENARIO, "seed", case], env=bound, timeout=180
         )

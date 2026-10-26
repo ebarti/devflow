@@ -213,7 +213,9 @@ def seed(root):
     def service(path):
         store, request = original(path)
         raw = copy.deepcopy(store.config.raw)
-        raw["temporal_bin"] = "/opt/homebrew/bin/temporal"
+        # This owned fixture uses the exact official CLI that started its
+        # synthetic Temporal server, not the historical Homebrew installation.
+        raw["temporal_bin"] = os.environ["DEVFLOW_OWNED_CAPTURE_READER"]
         dashboard, ui = fixture.ports()
         raw["dashboard_url"] = "http://127.0.0.1:" + str(dashboard)
         raw["temporal_ui_port"] = ui
@@ -339,8 +341,14 @@ def public(config, name, *, request=None, run=None, role=None, iteration=None):
 
 
 def capture(root, mode):
-    from devflow_temporal import delivery_retained_closures as owner
+    from portable_capture_reader import reader as fixture_reader
 
+    from devflow_temporal import delivery_retained_closures as owner
+    from devflow_temporal.delivery_temporal_prerequisites import TOOLS
+
+    # Fixture-only injection: the historical production Homebrew reader remains
+    # unchanged and is not qualified by this synthetic capture scenario.
+    owner._reader = fixture_reader
     case = fixture.restored(root)
     config = DeliveryConfig.load(Path(case.owner))
     assert not Path(case.old_root).exists()
@@ -356,9 +364,9 @@ def capture(root, mode):
         "captures": case.captures,
         "answer": owner.ANSWER,
         "reader": {
-            "configured_path": "/opt/homebrew/bin/temporal",
-            "resolved_path": "/opt/homebrew/Cellar/temporal/1.9.1/bin/temporal",
-            "sha256": owner.READER_SHA,
+            "configured_path": os.environ["DEVFLOW_OWNED_CAPTURE_READER"],
+            "resolved_path": os.environ["DEVFLOW_OWNED_CAPTURE_READER"],
+            "sha256": TOOLS["cli"]["binary_sha256"],
             "version": "1.9.1",
             "server_version": "1.32.0",
             "historical_start_binary_sha256": None,
