@@ -47,8 +47,9 @@ class TerminalClockFixture(terminal.ClosedTerminalFixture):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
 @pytest.mark.parametrize("outcome", ["blocked", "cancelled"])
+@pytest.mark.parametrize("bounded", [False, True], ids=["no-product-timer", "expired-timer"])
 async def test_expired_product_clock_preserves_terminal_checkpoint(
-    tmp_path, monkeypatch, legacy, outcome
+    tmp_path, monkeypatch, legacy, outcome, bounded
 ):
     # Root cause: the successor started the expired product timer before restoring
     # terminal settlement mode, allowing preflight to replace the sealed verdict.
@@ -57,7 +58,8 @@ async def test_expired_product_clock_preserves_terminal_checkpoint(
     config, request = native_configuration.__wrapped__(intake_fixture.__wrapped__(tmp_path))
     raw = json.loads(config.path.read_text())
     raw["execution_registry"] = str(tmp_path / "registry" / "registry.sqlite3")
-    raw["delivery_timeout_seconds"] = 2
+    if bounded:
+        raw["delivery_timeout_seconds"] = 2
     config.path.write_text(json.dumps(raw))
     config = DeliveryConfig.load(config.path)
     app = create_app(config.path)
@@ -65,7 +67,7 @@ async def test_expired_product_clock_preserves_terminal_checkpoint(
     service.store.submit(request)
     spec = service.store.spec(request["run_id"])
     monkeypatch.setattr(TerminalClockFixture, "fixture_outcome", outcome)
-    original_clock = spec["delivery_admitted_at"]
+    original_clock = spec.get("delivery_admitted_at")
     calls = []
 
     @activity.defn(name="delivery_finalize_resources")
@@ -140,7 +142,9 @@ async def test_expired_product_clock_preserves_terminal_checkpoint(
                 queued = service.store.pending_starts()
                 assert len(queued) == 1
                 assert json.loads(queued[0]["recovery_json"])["kind"] == "terminal_tracker_recovery"
-                assert service.store.spec(spec["run_id"])["delivery_admitted_at"] == original_clock
+                assert (
+                    service.store.spec(spec["run_id"]).get("delivery_admitted_at") == original_clock
+                )
                 await service.dispatch_once()
                 successor = env.client.get_workflow_handle(receipt.json()["workflow_id"])
                 final = await asyncio.wait_for(successor.result(), 20)
@@ -162,5 +166,10 @@ async def test_expired_product_clock_preserves_terminal_checkpoint(
                 assert final["error"] == "Preserved failed gate"
                 assert final["checks"]["terminal_tracker_checkpoint"]["outcome"] == outcome
                 assert final["roles"] == []
+                assert "delivery_limit" not in final["checks"]
+                if bounded:
+                    assert final["checks"]["delivery_clock"]["admitted_at"] == original_clock
                 assert calls == ["cleanup", "tracker", "tracker", "tracker", "tracker"]
-                assert service.store.spec(spec["run_id"])["delivery_admitted_at"] == original_clock
+                assert (
+                    service.store.spec(spec["run_id"]).get("delivery_admitted_at") == original_clock
+                )

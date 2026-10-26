@@ -48,7 +48,10 @@ finite tracker deadline. Ordinary active product work keeps its original deadlin
 `test_delivery_control_lineage.py` checks one automatic successor under concurrent
 retry, reconstruction of the store after accepted control and after admission,
 original policy/clock/spec preservation, rejection of caller carriers and uncertain
-control evidence, and authentication across multiple successors. Its public fixture
+control evidence, authentication across multiple successors, and the feature constructor across an
+operational capacity change without a repair-budget debit. The feature constructor
+fixture controls tracker and closure observers; it is not remote qualification.
+Its public fixture
 uses an owned Git repository, SQLite store, loopback Temporal service, authenticated
 HTTP update, actual resource finalization and sealed closure readback. Provider
 preparation is controlled, the fresh base is the owned fixture base, and a local
@@ -58,7 +61,7 @@ deadline with the exact accepted control.
 
 `test_delivery_terminal_clock.py` uses authentic closed terminal tails and public
 tracker reconciliation on modern and historical tracker admissions, with blocked
-and cancelled checkpoints. Tracker transport is controlled and the original
+and cancelled checkpoints, paired with no-product-timer controls. Tracker transport is controlled and the original
 tracker deadline is compressed to eight seconds. The elapsed product deadline is
 two seconds. It checks exact replay admits one successor, original verdict and
 error remain frozen, and preflight plus tracker execute without product roles.

@@ -258,3 +258,65 @@ async def test_public_disable_survives_closed_retry_and_service_restart(
             assert after["checks"]["delivery_clock"]["admitted_at"] == spec["delivery_admitted_at"]
             assert "delivery_limit" not in after["checks"]
             assert store.spec(spec["run_id"]) == spec
+
+
+def test_feature_constructor_preserves_control_and_budget_across_capacity_change(
+    service, monkeypatch
+):
+    """SQLite/registry constructor coverage; remote tracker/closure are controlled."""
+    from test_delivery_feature_execution import feature_service
+
+    from devflow_temporal.delivery_feature_execution import continue_feature, registry
+
+    original_store, request = service
+    raw = copy.deepcopy(original_store.config.raw)
+    raw["delivery_timeout_seconds"] = 3600
+    original_store.config.path.write_text(json.dumps(raw))
+    configured = DeliveryStore(DeliveryConfig.load(original_store.config.path))
+    store, request, _ = feature_service((configured, request), monkeypatch)
+    store.submit(request)
+    original = store.effective_spec(request["run_id"])
+    control = {
+        "disabled": True,
+        "command_id": "accepted-feature-disable",
+        "reason": "Keep the accepted operator timer control",
+        "recorded_at": "2026-10-26T00:00:00+00:00",
+        "protocol_revision": 1,
+    }
+    store.record_delivery_limits_disabled(
+        original["run_id"],
+        {"revision": 1, "checks": {"delivery_limits_control": control}},
+        control["command_id"],
+    )
+    registry(original).stop(original["feature_delivery"]["owner"], "stopped", {})
+    with store._connect() as db:
+        db.execute(
+            "UPDATE delivery_runs SET phase='cancelled',outcome='cancelled',"
+            "execution_state='terminal' WHERE run_id=?",
+            (original["run_id"],),
+        )
+        store.state.release_work(db, original["work_id"], "external:devflow:" + original["run_id"])
+    raw = json.loads(store.config.path.read_text())
+    raw["capacity"] = 6
+    store.config.path.write_text(json.dumps(raw))
+    restarted = DeliveryStore(DeliveryConfig.load(store.config.path))
+    monkeypatch.setattr(restarted, "_completed_temporal_result", lambda *_: {"result": {}})
+    with restarted._connect() as db:
+        revision = db.execute(
+            "SELECT revision FROM delivery_runs WHERE run_id=?", (original["run_id"],)
+        ).fetchone()[0]
+    result = continue_feature(
+        restarted,
+        original["run_id"],
+        {
+            "command_id": "feature-continue-control",
+            "expected_revision": revision,
+        },
+    )
+    successor = restarted.effective_spec(result["run_id"])
+    assert control_from_spec(successor) == control
+    assert successor["delivery_admitted_at"] == original["delivery_admitted_at"]
+    assert successor["policy"]["delivery_timeout_seconds"] == 3600
+    issue = successor["feature_delivery"]["owner"]["issue_id"]
+    assert registry(successor).budget(issue)["used"] == 0
+    assert restarted.spec(original["run_id"]) == original

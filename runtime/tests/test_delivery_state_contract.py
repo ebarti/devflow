@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -151,7 +151,8 @@ def test_persisted_status_remains_available_without_environment_proof(service, m
     assert status["state_contract"]["environment"]["verification"] == "not_reconstructed"
     assert status["state_contract"]["execution"]["verification"] == "recorded"
     assert status["state_contract"]["authorization"]["policy_digest"] == original["policy_digest"]
-    assert next(g for g in status["phase_gates"] if g["id"] == "local_checks")["state"] == "completed"
+    local = next(g for g in status["phase_gates"] if g["id"] == "local_checks")
+    assert local["state"] == "completed"
 
 
 def test_capacity_edit_changes_no_recorded_authorization_or_candidate(service):
@@ -169,6 +170,35 @@ def test_capacity_edit_changes_no_recorded_authorization_or_candidate(service):
     assert before == after
     assert after["candidate"] == candidate
     assert store.submitted_spec("run-1") == original
+
+
+@pytest.mark.asyncio
+async def test_public_recorded_status_reads_decision_without_launch_proof(service, monkeypatch):
+    store, request = service
+    store.submit(request)
+    decision = {"id": "owned-decision", "kind": "approval", "revision": 2}
+    store.project("run-1", phase="waiting_approval", execution_state="waiting",
+                  event_type="decision_pending", message="Owned decision",
+                  protocol_revision=2, decision=decision)
+    app = create_app(store.config.path)
+
+    def unavailable(*args, **kwargs):
+        raise AssertionError("public recorded status must not reconstruct launch proof")
+
+    monkeypatch.setattr(app.state.delivery.store, "effective_spec", unavailable)
+    monkeypatch.setattr(app.state.delivery.store, "detail", unavailable)
+    monkeypatch.setattr(app.state.delivery.store, "_connect", unavailable)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url=store.config.dashboard_url) as browser:
+        response = await browser.get("/api/runs/run-1/status")
+        missing = await browser.get("/api/runs/absent/status")
+    assert response.status_code == 200
+    assert missing.status_code == 404
+    result = response.json()
+    assert result["version"] == 1 and result["source"] == "persisted_projection"
+    assert result["run"]["decisions"] == [decision]
+    assert result["run"]["protocol_revision"] == 2
+    assert result["run"]["state_contract"]["environment"]["verification"] == "not_reconstructed"
 
 
 @pytest.mark.asyncio
@@ -191,7 +221,8 @@ async def test_real_failed_retry_reaches_public_gate_as_failed(service, tmp_path
     recovery = {"kind": "published_ci_retry", "execution_spec": spec, "state": previous,
                 "candidate": candidate, "publication": publication,
                 "command": {"additional_iterations": 0}, "seal": {"local_download_retry": True}}
-    async with local_temporal(dev_server_database_filename=str(tmp_path / "temporal.sqlite3")) as env:
+    database = str(tmp_path / "temporal.sqlite3")
+    async with local_temporal(dev_server_database_filename=database) as env:
         async with Worker(env.client, task_queue="owned-gate-contract", workflows=[OwnedCiRetry],
                           activities=[owned_gate_admission, failing_owned_command,
                                       delivery_project, delivery_tracker_start],

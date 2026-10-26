@@ -289,6 +289,10 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                "CREATE INDEX IF NOT EXISTS delivery_effects_run_state "
+                "ON delivery_effects(run_id,state)"
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_mutations (
                     command_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
@@ -4061,15 +4065,24 @@ class DeliveryStore:
                             "required_ci": checks.get("ci", {}).get("state"),
                             "tracker": tracker.get("state")}
             effects = {item["state"]: item["count"] for item in db.execute(
-                "SELECT state,COUNT(*) AS count FROM delivery_effects WHERE run_id=? GROUP BY state",
+                "SELECT state,COUNT(*) AS count FROM delivery_effects "
+                "WHERE run_id=? GROUP BY state",
                 (run_id,),
             )}
             return {
-                "run_id": run_id, "phase": row["phase"],
+                "run_id": run_id, "work_id": row["work_id"],
+                "issue_url": row["issue_url"], "title": self._display_title(spec),
+                "authorized_endpoint": spec["authorized_endpoint"], "phase": row["phase"],
                 "execution_state": row["execution_state"], "outcome": row["outcome"],
-                "revision": row["protocol_revision"], "projection_revision": row["revision"],
+                "revision": row["protocol_revision"], "protocol_revision": row["protocol_revision"],
+                "projection_revision": row["revision"],
                 "iteration": row["iteration"], "cleanup_recorded": row["cleanup"],
                 "state_contract": recorded(row, spec), "effects": effects,
+                "checks": checks, "tracker": tracker,
+                "decisions": [json.loads(row["decision_json"])] if row["decision_json"]
+                and json.loads(row["decision_json"]) is not None else [],
+                "intake": json.loads(row["intake_json"]) if row["intake_json"] else None,
+                "usage": json.loads(row["usage_json"] or "{}"),
                 "phase_gates": [{"id": name, "label": label,
                                  "state": state(name, completion, row=row,
                                                 observed=observations.get(name), latest=latest)}
@@ -4191,7 +4204,8 @@ class DeliveryStore:
         from .delivery_state_contract import gate_specs as recorded_gate_specs
 
         gate_specs = recorded_gate_specs(spec)
-        from .delivery_phase_gates import evidence as gate_evidence, state as gate_state
+        from .delivery_phase_gates import evidence as gate_evidence
+        from .delivery_phase_gates import state as gate_state
         with self._connect() as db:
             active = db.execute(
                 """SELECT COUNT(*) FROM delivery_attempts

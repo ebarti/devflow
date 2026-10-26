@@ -51,7 +51,10 @@ original frozen policy. The environment and execution fields explicitly report
 whether proof was reconstructed. Digests alone never replace their existing
 custody checks.
 
-`DeliveryStore.persisted_status()` opens a query-only SQLite read transaction.
+`GET /api/runs/{run_id}/status` returns a v1 `persisted_projection` envelope with
+the current recorded decision, protocol and projection revisions, checks, effect
+counts, candidate/publication and phase gates. `DeliveryStore.persisted_status()`
+opens a query-only SQLite read transaction.
 It reads the run, grouped effect states and a fixed set of indexed latest gate
 events. It does not call preparation, runtime installation verification, Git,
 Temporal, GitHub or effective-spec reconstruction. It remains available when an

@@ -1,8 +1,8 @@
 """Reduce persisted gate evidence for the current attempt without replaying work."""
+
 from __future__ import annotations
 
 from typing import Any
-
 
 _RESET = {
     "gates_retry_started", "gates_only_started", "publication_validation_started",
@@ -30,7 +30,8 @@ def evidence(db: Any, run_id: str, iteration: int, gate_specs: list[tuple]) -> d
     types.update(*(starts for starts in _STARTS.values()))
     latest = {}
     for event in sorted(types):
-        scope = "" if event == "tracker_start" else " AND json_extract(payload_json,'$.iteration')=?"
+        scope = ("" if event == "tracker_start"
+                 else " AND json_extract(payload_json,'$.iteration')=?")
         values = (run_id, event) if not scope else (run_id, event, iteration)
         row = db.execute(
             "SELECT sequence FROM delivery_events WHERE run_id=? AND type=?" + scope
@@ -48,7 +49,8 @@ def state(name: str, completion: str, *, row: dict[str, Any],
             return "failed"
         if observed == "unknown":
             return "unknown"
-        return "completed" if row["outcome"] == "delivered" and observed == "consistent" else "pending"
+        return ("completed" if row["outcome"] == "delivered" and observed == "consistent"
+                else "pending")
     completed = latest.get(completion, 0)
     # A CI-only continuation performs local checks then enters CI directly.
     if name == "local_checks" and completion == "ci_wait":
