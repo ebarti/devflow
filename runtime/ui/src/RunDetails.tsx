@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { api, ApiError, safeWebUrl } from './api'
 import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
@@ -273,27 +273,61 @@ function IntakeHistory({ run }: { run: RunDetail }) {
 
 function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
   const [reason, setReason] = useState('')
-  const [commandId, setCommandId] = useState(() => crypto.randomUUID())
+  const intent = useRef<Parameters<typeof api.cancel>[1] | null>(null)
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [uncertain, setUncertain] = useState(false)
+  const [settled, setSettled] = useState<{ acknowledged: boolean; revision: number } | null>(null)
+  const [observed, setObserved] = useState<RunDetail | null>(null)
   const [error, setError] = useState('')
-  if (run.execution_retired || run.outcome != null || run.checks?.terminal_tracker_checkpoint || ['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')) return null
+  const canRequest = !run.execution_retired && run.outcome == null && !run.checks?.terminal_tracker_checkpoint && !['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')
+  const observedCurrent = observed?.id === run.id && observed.protocol_revision === run.protocol_revision && observed.outcome === run.outcome && observed.execution_state === run.execution_state && Boolean(observed.execution_retired) === Boolean(run.execution_retired) && Boolean(observed.checks?.terminal_tracker_checkpoint) === Boolean(run.checks?.terminal_tracker_checkpoint)
+  const canStart = canRequest && (!settled || observedCurrent && (!settled.acknowledged || run.protocol_revision !== settled.revision))
+  const awaitingObservation = Boolean(settled) && !canStart
+  if (!canRequest && !intent.current) return null
+
+  async function refresh(observeResponse: boolean) {
+    if (observeResponse) {
+      // The parent refresh may resolve without a successful detail read.
+      // Bind a fresh command only to a post-response read displayed by the page.
+      try { setObserved(await api.getRun(run.id)) }
+      catch { setObserved(null); setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
+    }
+    try { await onRefresh() } catch { setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
+  }
+
   async function cancel() {
-    if (!reason.trim() || run.protocol_revision == null) return
+    if (busy || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))) return
+    intent.current ??= { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision!, reason: reason.trim() }
+    const request = intent.current
+    let knownResponse = false
+    setSettled(null); setObserved(null)
     setBusy(true); setError('')
     try {
-      await api.cancel(run.id, { command_id: commandId, expected_revision: run.protocol_revision, reason: reason.trim() })
-      setOpen(false)
-      await onRefresh()
+      await api.cancel(run.id, request)
+      knownResponse = true
+      intent.current = null
+      setSettled({ acknowledged: true, revision: request.expected_revision })
+      setUncertain(false); setOpen(false)
     } catch (cause) {
-      setError(cause instanceof ApiError && cause.status === 409 ? 'Run state changed. Review the latest state before cancelling.' : cause instanceof Error ? cause.message : 'Could not request cancellation.')
-      if (cause instanceof ApiError && cause.status === 409) await onRefresh()
-    } finally { setBusy(false) }
+      const unknown = !(cause instanceof ApiError) || cause.status === 0 || cause.status >= 500
+      setUncertain(unknown)
+      if (!unknown) {
+        knownResponse = true
+        intent.current = null
+        setSettled({ acknowledged: false, revision: request.expected_revision })
+      }
+      setError(unknown ? 'The cancellation outcome is unknown. Retry to confirm the same request.' : cause.status === 409 ? 'Run state changed. Review the latest state before cancelling.' : cause.message)
+    } finally {
+      await refresh(knownResponse)
+      setBusy(false)
+    }
   }
   return <div className="cancel-control">
-    {open ? <div className="cancel-form"><label htmlFor="cancel-reason">Reason for cancellation</label><input id="cancel-reason" value={reason} onChange={event => { setReason(event.target.value); setCommandId(crypto.randomUUID()) }} required />
-      <div className="button-row"><button type="button" className="danger-button" onClick={() => void cancel()} disabled={!reason.trim() || busy || run.protocol_revision == null}>{busy ? 'Requesting…' : 'Request cancellation'}</button><button type="button" className="text-button" onClick={() => setOpen(false)}>Keep run</button></div>
-    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={run.protocol_revision == null}>Cancel run</button>}
+    {settled?.acknowledged && awaitingObservation ? <p role="status">Cancellation requested. Waiting for the latest run state.</p> : open ? <div className="cancel-form"><label htmlFor="cancel-reason">Reason for cancellation</label><input id="cancel-reason" value={reason} disabled={busy || uncertain} onChange={event => setReason(event.target.value)} required />
+      <div className="button-row"><button type="button" className="danger-button" onClick={() => void cancel()} disabled={busy || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))}>{busy ? 'Requesting…' : uncertain ? 'Retry cancellation request' : 'Request cancellation'}</button><button type="button" className="text-button" disabled={busy || uncertain} onClick={() => setOpen(false)}>Keep run</button></div>
+    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={!canStart || run.protocol_revision == null}>Cancel run</button>}
+    {awaitingObservation ? <button type="button" className="text-button" disabled={busy} onClick={async () => { if (busy) return; setBusy(true); await refresh(true); setBusy(false) }}>Refresh run state</button> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
   </div>
 }
