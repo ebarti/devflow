@@ -139,6 +139,7 @@ sessions.mkdir(mode=0o700,parents=True,exist_ok=True)
 (sessions/(session+'.jsonl')).write_text('Owned neutral provider boundary\\n')
 Path(r['result_path']).write_text(json.dumps({'status':'pass','summary':'Owned neutral merge',
     'findings':[],'merge_decision':None,'session_id':session,'finish_reason':'done'}))
+Path(r['result_path']).chmod(0o600)
 """)
         adapter.chmod(0o600)
         real_process = process_module.NativeProcess
