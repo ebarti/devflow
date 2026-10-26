@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import UTC, datetime
 from importlib.metadata import distribution
 from pathlib import Path
 
@@ -199,8 +200,10 @@ def stopped_prerequisite(service, monkeypatch, tmp_path, request):
         "execution_run_id": "owned-closed-launched-prerequisite",
         "request_digest": case.spec["request_digest"],
         "recovery_digest": None,
+        "closed_at": datetime.now(UTC).isoformat(),
         "result": case.state,
     }
+    monkeypatch.setattr(case.store, "_completed_temporal_result", lambda *_a, **_k: closed)
     monkeypatch.setattr(DeliveryStore, "_completed_temporal_result", lambda *_a, **_k: closed)
     command = {
         "continuation_kind": "published_gate_retry",

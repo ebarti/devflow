@@ -137,6 +137,9 @@ def execution_retired(spec: dict) -> bool:
 def require_native_execution(spec: dict) -> None:
     if spec.get('native_diagnostic_resource_only'):
         raise PreparationError('diagnostic resource metadata cannot execute a delivery or role')
+    if 'native_preparation_resource_owner' in spec:
+        raise PreparationError(
+            'native measurement resource metadata cannot execute a delivery or role')
     if execution_retired(spec):
         raise PreparationError("Historical Docker execution is read-only and cannot be resumed")
 

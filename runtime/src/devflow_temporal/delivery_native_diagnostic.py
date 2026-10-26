@@ -464,11 +464,13 @@ def _saved(db, run_id, *, command_id=None, identity=None):
 
 def require_resource_idle(spec):
     """Fence ordinary file finalizers too, including a writer queued on its resource lease."""
-    if "config_path" not in spec or spec.get("native_diagnostic_resource_only"):
+    if "config_path" not in spec:
         return
     from .delivery_execution_config import load_execution_config
+    from .delivery_preparation_resources import canonical_owner
 
-    config = load_execution_config(spec)
+    parent = canonical_owner(spec)
+    config = load_execution_config(parent or spec)
     with closing(sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)) as db:
         try:
             active = db.execute(

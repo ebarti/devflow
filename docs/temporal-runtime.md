@@ -692,3 +692,16 @@ so zero active roles does not imply that a diagnostic is finished. An idle
 service does not repeatedly read diagnostic authority: an acknowledgement wake
 hint or startup recovery causes a fresh durable read, and every actual body
 rechecks all authority. The hint contains no proof and grants no execution.
+
+Native runtime measurement keeps its existing finite probe resources separate
+from the canonical delivery registry. Each new probe records its exact parent
+spec digest, private preparation intent and bounded attempt index. Resource
+writes rederive that parent through the admitted configuration and original
+run/database identity before querying the same diagnostic fence. Known retained
+probe attempts can be finalized through that authenticated owning context
+without rewriting their old specs. Unknown namespaces or self-declared flags
+grant nothing. Measurement and finalization also hold the original registry's
+existing exclusive lease in read-only mode; the diagnostic ACK's shared lease
+therefore cannot overlap a separate preparation registry. Both owner checks
+and FD/name authentication run after acquisition. The original configuration
+loader, run rows, claims and canonical resource bytes remain unchanged.

@@ -464,7 +464,9 @@ class RunResources:
         _ancestors(self.state)
 
     @contextmanager
-    def locked(self, *, read_only: bool = False):
+    def locked(self, *, read_only: bool = False, exclusive: bool = False):
+        if exclusive and not read_only:
+            raise ValueError('exclusive read-only observation requires read_only=True')
         if not read_only:
             from .delivery_native_diagnostic import require_resource_idle
 
@@ -483,7 +485,7 @@ class RunResources:
         try:
             if read_only:
                 authenticate()
-            fcntl.flock(descriptor, fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
+            fcntl.flock(descriptor, fcntl.LOCK_SH if read_only and not exclusive else fcntl.LOCK_EX)
             if read_only:
                 authenticate()
             else:

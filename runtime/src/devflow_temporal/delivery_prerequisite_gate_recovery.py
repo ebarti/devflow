@@ -231,9 +231,11 @@ def evidence(spec, state, attempts, previous, broker, *, resource_spec=None):
 def observe(store, spec, row, state, attempts, effects, closed, previous, broker):
     from .delivery_amendment_capacity import live_owner
     from .delivery_policy_recovery import _rows, work_binding
+    from .delivery_preparation import verify_prepared_spec
     from .delivery_resources import observe_completed_resources
     from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
 
+    verify_prepared_spec(spec)
     proof = evidence(spec, state, attempts, previous, broker)
     history = quarantine_history(previous)
     resources = observe_completed_resources(

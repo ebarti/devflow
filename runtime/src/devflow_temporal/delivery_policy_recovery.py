@@ -113,7 +113,11 @@ def amended_config(original, path, expected_hash):
 
 
 def _prepare(original, config, intent, intent_path):
+    from .delivery_native_diagnostic import require_resource_idle
     from .delivery_native_preparation import _measure, _validate, bind_native_spec, native_identity
+    from .delivery_preparation_resources import FIELD, binding, resource_scope
+
+    require_resource_idle(original)
 
     effective = deepcopy(original)
     effective.pop('preparation', None)
@@ -129,9 +133,11 @@ def _prepare(original, config, intent, intent_path):
     root = Path(effective['state_dir']).parents[1]
     # Preparation has its own finite, journalled resource generations. It cannot
     # recreate or rewrite the predecessor's finalized transient roots/manifest.
-    for attempt in intent['preparation_attempts']:
+    for index, attempt in enumerate(intent['preparation_attempts']):
         if attempt['state'] == 'started':
-            receipt = RunResources(attempt['spec']).finalize('blocked')
+            with resource_scope(
+                    attempt['spec'], effective['state_dir'], intent, intent_path, index):
+                receipt = RunResources(attempt['spec']).finalize('blocked')
             attempt.update(state='interrupted', cleanup=receipt)
             write_private(intent_path, intent)
             if receipt['state'] != 'confirmed':
@@ -155,19 +161,22 @@ def _prepare(original, config, intent, intent_path):
             probe = deepcopy(effective)
             probe['state_dir'] = str(intent_path.parent / 'probes'
                                     / str(len(intent['preparation_attempts'])) / original['run_id'])
+            index = len(intent['preparation_attempts'])
+            probe[FIELD] = binding(effective, intent, intent_path, index)
             attempt = {'spec': probe, 'state': 'started', 'cleanup': None}
             intent['preparation_attempts'].append(attempt)
             intent['state'] = 'preparing'
             write_private(intent_path, intent)
-            try:
-                proof = _measure(probe, identity, state_root=root)
-            except Exception as exc:
-                attempt['error'] = str(exc)[:500]
-                raise
-            finally:
-                receipt = RunResources(probe).finalize('blocked')
-                attempt.update(state='stopped', cleanup=receipt)
-                write_private(intent_path, intent)
+            with resource_scope(probe, effective['state_dir'], intent, intent_path, index):
+                try:
+                    proof = _measure(probe, identity, state_root=root)
+                except Exception as exc:
+                    attempt['error'] = str(exc)[:500]
+                    raise
+                finally:
+                    receipt = RunResources(probe).finalize('blocked')
+                    attempt.update(state='stopped', cleanup=receipt)
+                    write_private(intent_path, intent)
             if receipt['state'] != 'confirmed':
                 raise ValueError('policy preparation cleanup is unknown')
         _validate(proof, identity, root)
