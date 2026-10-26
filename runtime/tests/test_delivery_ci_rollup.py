@@ -11,7 +11,8 @@ import json
 
 import pytest
 
-from devflow_temporal import delivery_activities, delivery_broker, delivery_ci_inventory_io as io
+from devflow_temporal import delivery_activities, delivery_broker
+from devflow_temporal import delivery_ci_inventory_io as io
 
 HEAD = "a" * 40
 
@@ -22,13 +23,18 @@ def check(identity, conclusion="SUCCESS", *, name="Build", status="COMPLETED"):
             "detailsUrl": "https://github.com/example/fixture/actions/runs/10/job/" + identity}
 
 
-def response(nodes, *, more=False, cursor=None, head=HEAD):
+def response(nodes, *, more=False, cursor=None, head=HEAD, total=None, null_rollup=False):
     value = {"data": {"repository": {"pullRequest": {
         "number": 1, "state": "OPEN", "isDraft": False, "headRefName": "owned",
         "headRefOid": head,
         "commits": {"nodes": [{"commit": {"oid": head, "statusCheckRollup": {
-            "contexts": {"nodes": nodes, "pageInfo": {
+            "contexts": {"nodes": nodes,
+                         "totalCount": len(nodes) + int(more) if total is None else total,
+                         "pageInfo": {
                 "hasNextPage": more, "endCursor": cursor}}}}}]}}}}}
+    if null_rollup:
+        commit = value["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+        commit["statusCheckRollup"] = None
     raw = json.dumps(value).encode()
     return b"HTTP/2.0 200 OK\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw
 
@@ -57,7 +63,8 @@ async def activity(monkeypatch, pages):
 @pytest.mark.parametrize("conclusion", ["FAILURE", "SUCCESS", None])
 @pytest.mark.parametrize("reverse", [False, True])
 async def test_required_duplicate_identity_refuses_every_order(monkeypatch, conclusion, reverse):
-    nodes = [check("job-1", conclusion, status="IN_PROGRESS" if conclusion is None else "COMPLETED"),
+    status = "IN_PROGRESS" if conclusion is None else "COMPLETED"
+    nodes = [check("job-1", conclusion, status=status),
              check("job-2")]
     if reverse:
         nodes.reverse()
@@ -75,7 +82,8 @@ async def test_required_duplicate_identity_refuses_every_order(monkeypatch, conc
 async def test_duplicate_on_later_page_cannot_hide_behind_first_success(monkeypatch):
     first = [check("build-1")] + [check(str(i), name="Other-" + str(i)) for i in range(99)]
     result, commands = await activity(monkeypatch, [
-        response(first, more=True, cursor="owned-page-two"), response([check("build-2", "FAILURE")])])
+        response(first, more=True, cursor="owned-page-two", total=101),
+        response([check("build-2", "FAILURE")], total=101)])
     assert result["state"] == "failed" and result["ambiguous"] == ["Build"]
     assert len(result["observations"]) == 101
     assert len(commands) == 2 and "cursor=owned-page-two" in commands[1]
@@ -125,7 +133,16 @@ async def test_completed_without_a_known_conclusion_remains_unknown(monkeypatch)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["missing", "truncated", "repeat", "read_failure", "head"])
+async def test_explicit_null_rollup_is_observed_absence_without_policy_success(monkeypatch):
+    result, _ = await activity(monkeypatch, [response([], null_rollup=True)])
+    assert result["state"] == "pending" and result["missing"] == ["Build"]
+    assert result["observations"] == []
+    assert result["ci_assessment"]["execution"]["complete"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["missing", "truncated", "repeat", "read_failure", "head",
+                                  "changed_count", "omitted_tail", "null_later_page"])
 async def test_incomplete_or_changed_observations_never_pass(monkeypatch, mode):
     pages = {
         "missing": [response([])],
@@ -134,6 +151,11 @@ async def test_incomplete_or_changed_observations_never_pass(monkeypatch, mode):
                    response([check("only-build")])],
         "read_failure": [b"HTTP/2.0 503 Unavailable\r\n\r\n{}"],
         "head": [response([check("only-build")], head="b" * 40)],
+        "changed_count": [response([check("only-build")], more=True, cursor="second", total=2),
+                          response([check("other", name="Other")], total=3)],
+        "omitted_tail": [response([check("only-build")], total=2)],
+        "null_later_page": [response([check("only-build")], more=True, cursor="second", total=2),
+                            response([], null_rollup=True)],
     }
     result, _ = await activity(monkeypatch, pages[mode])
     assert result["state"] == ("stale" if mode == "head" else "pending")

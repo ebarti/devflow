@@ -858,7 +858,8 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None):
             'cleanup': (prerequisite_observation['resources'] if prerequisite_retry
                         else verification_observation['resources'] if verification_retry
                         else report_observation['resources'] if layout_report
-                        else historical_teardown or prelaunch_observation or _stopped_cleanup(spec)),
+                        else historical_teardown or prelaunch_observation
+                        or _stopped_cleanup(spec)),
             'work_binding': binding,
             'previous_digest': digest(previous) if previous else None,
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,

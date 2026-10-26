@@ -15,8 +15,8 @@ from test_delivery_store import service as service
 
 from devflow_temporal import delivery_activities, delivery_broker
 from devflow_temporal.contracts import digest
-from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
 from devflow_temporal.delivery_ci_inventory_io import GitHubRead, PRHeadChanged
+from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 

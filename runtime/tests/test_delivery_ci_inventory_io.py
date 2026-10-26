@@ -273,6 +273,7 @@ def test_remote_graphql_cursor_is_an_opaque_string_never_gh_local_file_input(tmp
                                         "oid": "a" * 40,
                                         "statusCheckRollup": {
                                             "contexts": {
+                                                "totalCount": 2,
                                                 "nodes": [
                                                     {
                                                         "__typename": "CheckRun",

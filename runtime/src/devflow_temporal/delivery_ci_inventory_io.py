@@ -26,7 +26,7 @@ MAX_HEADERS = 64 * 1024
 ROLLUP = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){
 repository(owner:$owner,name:$name){pullRequest(number:$number){
 number state isDraft headRefName headRefOid commits(last:1){nodes{commit{
-oid statusCheckRollup{contexts(first:100,after:$cursor){nodes{
+oid statusCheckRollup{contexts(first:100,after:$cursor){totalCount nodes{
 __typename ... on CheckRun{id name status conclusion detailsUrl}
 ... on StatusContext{id context state targetUrl}}
 pageInfo{hasNextPage endCursor}}}}}}}}}"""
@@ -434,7 +434,7 @@ class GitHubRead:
         ):
             raise ValueError("CI inventory canonical PR selector changed")
         owner, name = repository.split("/")
-        cursor, contexts, original = None, [], None
+        cursor, contexts, original, expected = None, [], None, None
         cursors = set()
         for _ in range(MAX_PAGES):
             command = [
@@ -496,12 +496,20 @@ class GitHubRead:
                 or (commits[0].get("commit") or {}).get("oid") != head
             ):
                 raise ValueError("CI inventory canonical PR commit changed")
-            page = (commits[0]["commit"].get("statusCheckRollup") or {}).get("contexts")
+            commit = commits[0]["commit"]
+            if "statusCheckRollup" in commit and commit["statusCheckRollup"] is None:
+                if cursor is not None:
+                    raise ValueError("CI inventory canonical PR rollup changed during pagination")
+                return {**original, "contexts": [], "complete": True}
+            page = (commit.get("statusCheckRollup") or {}).get("contexts")
             nodes = page.get("nodes") if isinstance(page, dict) else None
             info = page.get("pageInfo") if isinstance(page, dict) else None
+            count = page.get("totalCount") if isinstance(page, dict) else None
             if (
                 not isinstance(nodes, list)
                 or len(nodes) > 100
+                or type(count) is not int
+                or not 0 <= count <= MAX_PAGES * 100
                 or not isinstance(info, dict)
                 or type(info.get("hasNextPage")) is not bool
                 or any(
@@ -512,10 +520,16 @@ class GitHubRead:
                 )
             ):
                 raise ValueError("CI inventory canonical PR page is incomplete")
+            if expected is None:
+                expected = count
+            if count != expected:
+                raise ValueError("CI inventory canonical PR count changed during pagination")
             contexts.extend(nodes)
             if len({(x["__typename"], x["id"]) for x in contexts}) != len(contexts):
                 raise ValueError("CI inventory canonical PR contexts are duplicated")
             if not info["hasNextPage"]:
+                if len(contexts) != expected:
+                    raise ValueError("CI inventory canonical PR contexts are truncated")
                 return {**original, "contexts": contexts, "complete": True}
             cursor = info.get("endCursor")
             if (
@@ -523,6 +537,7 @@ class GitHubRead:
                 or not 1 <= len(cursor) <= 1024
                 or cursor in cursors
                 or not nodes
+                or len(contexts) >= expected
             ):
                 raise ValueError("CI inventory canonical PR pagination is incomplete")
             cursors.add(cursor)

@@ -17,11 +17,12 @@ def assessment(state, head, *, source, complete, required, execution_only=False)
             "state": "not_established" if execution_only else "unverified",
             "reason": (
                 "Dispatched execution evidence does not establish required PR checks."
-                if execution_only else "Check observations do not evaluate the current GitHub ruleset."
+                if execution_only else
+                "Check observations do not evaluate the current GitHub ruleset."
             ),
         },
         "merge_readiness": {
             "state": "unverified",
-            "reason": "The merge owner must verify the exact current candidate and all merge gates.",
+            "reason": "The merge owner must verify the current candidate and all merge gates.",
         },
     }

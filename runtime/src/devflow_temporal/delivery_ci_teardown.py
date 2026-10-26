@@ -124,7 +124,8 @@ def for_resources(spec):
     """An effectful resource reader requires the actual normal zero-CI ACK."""
     if not spec.get('config_path') or spec.get('gate_retry_stage') != 'ci':
         return None
-    from .delivery_ci_inventory import FIELD as INVENTORY, authority
+    from .delivery_ci_inventory import FIELD as INVENTORY
+    from .delivery_ci_inventory import authority
     from .delivery_execution_config import load_execution_config
     from .delivery_store import DeliveryStore
     from .delivery_unpublished_recovery import teardown_checkpoint

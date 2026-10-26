@@ -180,7 +180,8 @@ def historical_ci(service, monkeypatch):
     ]
     profile_sha = approve(monkeypatch, remote)
     path = store.config.state_root / "owned-historical-ci-profile.json"
-    write_private(path, remote.profile)
+    path.write_text(canonical_json(remote.profile))
+    path.chmod(0o600)
     monkeypatch.setattr(
         inventory, "GitHubRead", lambda **kw: GitHubRead(**kw, runner=remote.transport)
     )
@@ -238,11 +239,15 @@ async def test_public_ci_ack_and_admission_preserve_original_unknown(historical_
         ack = await client.post(prefix + "ack-ci-inventory", json=acknowledgement, headers=headers)
         assert ack.status_code == 200, ack.text
         assert ack.json()["delivery_acceptance"] is False
-        replay = await client.post(prefix + "ack-ci-inventory", json=acknowledgement, headers=headers)
+        replay = await client.post(
+            prefix + "ack-ci-inventory", json=acknowledgement, headers=headers
+        )
         assert replay.status_code == 200 and replay.json()["replayed"] is True, replay.text
         gate_preflight = await client.post(prefix + "repair-admission-preflight", json=c.gate)
         assert gate_preflight.status_code == 200, gate_preflight.text
-        admitted_response = await client.post(prefix + "continue-repair", json=c.gate, headers=headers)
+        admitted_response = await client.post(
+            prefix + "continue-repair", json=c.gate, headers=headers
+        )
         assert admitted_response.status_code == 200, admitted_response.text
     current = c.store.effective_spec("run-1")
     with c.store._connect() as db:

@@ -315,6 +315,7 @@ def fixture(
                                             "oid": head,
                                             "statusCheckRollup": {
                                                 "contexts": {
+                                                    "totalCount": 1,
                                                     "nodes": [copy.deepcopy(case.canonical)],
                                                     "pageInfo": {
                                                         "hasNextPage": False,
