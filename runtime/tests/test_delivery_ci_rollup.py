@@ -105,7 +105,7 @@ async def test_status_and_check_name_collision_is_also_ambiguous(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("conclusion", ["FAILURE", "CANCELLED", "TIMED_OUT", "SKIPPED",
-                                         "NEUTRAL", "ACTION_REQUIRED", "STALE", None])
+                                         "NEUTRAL", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"])
 async def test_completed_non_success_is_an_explicit_failed_gate(monkeypatch, conclusion):
     result, _ = await activity(monkeypatch, [response([check("only-build", conclusion)])])
     assert result["state"] == "failed" and result["failed"] == ["Build"]
@@ -115,6 +115,13 @@ async def test_completed_non_success_is_an_explicit_failed_gate(monkeypatch, con
 async def test_in_progress_success_is_not_completed_evidence(monkeypatch):
     result, _ = await activity(monkeypatch, [response([check("only-build", status="IN_PROGRESS")])])
     assert result["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_completed_without_a_known_conclusion_remains_unknown(monkeypatch):
+    result, _ = await activity(monkeypatch, [response([check("only-build", None)])])
+    assert result["state"] == "pending"
+    assert result["checks"]["Build"]["conclusion"] is None
 
 
 @pytest.mark.asyncio

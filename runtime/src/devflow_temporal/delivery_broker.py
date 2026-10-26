@@ -2008,7 +2008,10 @@ class DeliveryBroker:
 
         required = set(self.spec["policy"].get("required_ci", []))
         if not required:
-            return {"state": "unverified", "reason": "no required CI checks configured"}
+            return {"state": "unverified", "reason": "no required CI checks configured",
+                    "ci_assessment": assessment(
+                        "unverified", pr.get("head"), source="authenticated_PR_check_contexts",
+                        complete=False, required=required)}
         if getattr(self, "store", None) is not None:
             from .delivery_ci_inventory import result_for
 
@@ -2072,7 +2075,9 @@ class DeliveryBroker:
                 name
                 for name in sorted(required)
                 if (checks.get(name, {}).get("status") == "COMPLETED"
-                    and checks[name].get("conclusion") != "SUCCESS")
+                    and checks[name].get("conclusion") in {
+                        "FAILURE", "CANCELLED", "TIMED_OUT", "SKIPPED", "NEUTRAL",
+                        "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"})
             ]
             if failed:
                 return result("failed", complete=True, failed=failed,
