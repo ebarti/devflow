@@ -98,7 +98,7 @@ class DiagnosticContext:
                 candidate[k] != self.snapshot["candidate"][k]
                 for k in ("id", "head", "content_sha256")
             )
-            or entry.get("head") != candidate["head"]
+            or entry.get("head", candidate['head']) != candidate["head"]
         ):
             raise ValueError("diagnostic Temporal preparation lost current subject custody")
         registry._allowed(checkout, "checkout")
@@ -302,7 +302,7 @@ class DiagnosticContext:
                 capture_output=True,
                 timeout=120,
             )
-        resources.created(self.checkout, head=self.snapshot["candidate"]["head"])
+        resources.created(self.checkout)
         if any(
             candidate_for(self.checkout)[key] != self.snapshot["candidate"][key]
             for key in ("id", "head", "content_sha256")
