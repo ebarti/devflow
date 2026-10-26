@@ -103,6 +103,33 @@ class InstallationDependencies(unittest.TestCase):
         self.assertFalse(identity.same_identity(
             [before["device"], before["inode"], before["uid"]], renumbered))
 
+    @unittest.skipUnless(os.environ.get("DEVFLOW_PRODUCTION_FIXTURE_PARENT"),
+                         "set an owned durable parent for real configuration path policy")
+    def test_configuration_checks_explicit_and_default_execution_registry(self):
+        with tempfile.TemporaryDirectory(prefix="registry-dependency-",
+                dir=Path(os.environ["DEVFLOW_PRODUCTION_FIXTURE_PARENT"]).resolve()) as temporary:
+            home = Path(temporary).resolve()
+            helper, state = home / "helpers", home / "state"
+            helper.mkdir(mode=0o700)
+            state.mkdir(mode=0o700)
+            config = home / "owner.json"
+            raw = {"state_root": str(state), "tracking_db": str(state / "tracking.db"),
+                   "helpers_dir": str(helper), "codex_bin": "/usr/bin/false", "provider": "fake",
+                   "execution_registry": str(Path(tempfile.gettempdir()).resolve() / "lost-registry.db")}
+            config.write_text(json.dumps(raw))
+            config.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "execution registry.*temporary or managed"):
+                self.paths.configuration(config)
+            raw.pop("execution_registry")
+            config.write_text(json.dumps(raw))
+            default = home / ".local/state/devflow/execution-ownership/registry.sqlite3"
+            with patch.dict(os.environ, HOME=str(home),
+                    DEVFLOW_MANAGED_WORKTREE_ROOTS=json.dumps([str(default.parent)])):
+                with self.assertRaisesRegex(ValueError, "execution registry.*managed worktree root"):
+                    self.paths.configuration(config)
+            self.assertFalse(default.exists())
+            self.assertEqual(json.loads(config.read_text()), raw)
+
 
 @unittest.skipUnless(os.environ.get("DEVFLOW_PRODUCTION_FIXTURE_PARENT"),
                      "set an owned durable fixture parent to run real production provisioning")

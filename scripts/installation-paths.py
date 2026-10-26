@@ -498,6 +498,9 @@ def configuration(path):
     for name, dependency in (("configuration", path), ("state_root", Path(value["state_root"])),
                              ("tracking_db", Path(value["tracking_db"]))):
         persistence_path(dependency, name)
+    registry = Path(value.get("execution_registry", str(
+        Path.home() / ".local/state/devflow/execution-ownership/registry.sqlite3")))
+    persistence_path(registry, "execution registry")
     helpers = Path(value["helpers_dir"]).resolve(strict=True)
     protected_directory(helpers)
     if not helpers.is_dir() or any(item.is_symlink() for item in helpers.rglob("*")):
