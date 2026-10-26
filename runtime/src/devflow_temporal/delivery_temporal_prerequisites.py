@@ -379,14 +379,14 @@ def _transition(expected, actual):
         raise ValueError("Temporal prerequisite changed frozen execution authority")
 
 
-def custody(db, spec, recovery):
+def custody(db, spec, recovery, *, retained_memo=None):
     marker = spec.get(MARKER)
     if marker is None:
         from .delivery_feature_revision_recovery import retained_recovery
 
         previous = recovery
         while previous:
-            details = retained_recovery(previous)
+            details = retained_recovery(previous, memo=retained_memo)
             if FIELD in details.get("command", {}) or details.get("predecessor_spec", {}).get(
                 MARKER
             ):
@@ -399,7 +399,7 @@ def custody(db, spec, recovery):
 
     item = recovery
     while item:
-        details = retained_recovery(item)
+        details = retained_recovery(item, memo=retained_memo)
         if details.get("command_digest") == marker["command_digest"]:
             break
         item = details.get("original_recovery")
