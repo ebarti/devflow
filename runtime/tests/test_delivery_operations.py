@@ -1319,7 +1319,11 @@ async def test_feature_continuation_receipt_authenticates_the_original_predecess
             "UPDATE delivery_runs SET request_json=? WHERE run_id='run-1'", (json.dumps(spec),)
         )
         spec.update(run_id=successor)
-        spec["feature_delivery"]["owner"].update(run_id=successor, generation=2)
+        # A supported store relocation may change the operational path while
+        # the immutable issue and owner-generation lineage remain intact.
+        spec["feature_delivery"]["owner"].update(
+            run_id=successor, generation=2, store_path="relocated-store"
+        )
         db.execute(
             """INSERT INTO delivery_runs
             (run_id,request_digest,request_json,work_id,issue_url,repository_key,phase,

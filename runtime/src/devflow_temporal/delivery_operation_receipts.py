@@ -93,7 +93,7 @@ def receipt(store, operation):
                 or not predecessor.get("issue_id")
                 or not predecessor.get("store_path")
                 or successor_owner.get("issue_id") != predecessor.get("issue_id")
-                or successor_owner.get("store_path") != predecessor.get("store_path")
+                or not successor_owner.get("store_path")
                 or type(predecessor.get("generation")) is not int
                 or successor_owner.get("generation") != predecessor["generation"] + 1
             ):
