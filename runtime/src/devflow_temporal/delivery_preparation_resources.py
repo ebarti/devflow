@@ -80,11 +80,17 @@ def canonical_owner(spec):
         raise ValueError("native preparation changed its canonical database")
     state, path = Path(spec["state_dir"]), Path(supplied["intent_path"])
     canonical = Path(parent["state_dir"])
+    renewal_paths = {
+        canonical / "native-preparation-renewal/preparation.json",
+        canonical / "technical-successor/native-generation/preparation.json",
+        canonical / "resource-closure/native-generation/preparation.json",
+    }
+    renewal = path in renewal_paths
     if (
         not path.is_absolute()
         or path.resolve(strict=True) != path
         or not path.is_relative_to(canonical)
-        or path.name != "intent.json"
+        or (path.name != "intent.json" and not renewal)
         or state != path.parent / "probes" / str(supplied["attempt_index"]) / spec["run_id"]
         or ".." in state.parts
         or state.resolve() != state
@@ -92,6 +98,21 @@ def canonical_owner(spec):
         raise ValueError("native preparation left its exact finite resource generation")
     raw = private_bytes(path)
     intent = json.loads(raw)
+    authority_raw = None
+    authority_path = path.parent / "authority.json"
+    if renewal:
+        authority_raw = private_bytes(authority_path)
+        authority = json.loads(authority_raw)
+        predecessor = authority.get("original_spec") if isinstance(authority, dict) else None
+        if (
+            not isinstance(intent, dict)
+            or not isinstance(predecessor, dict)
+            or digest(authority) != intent.get("binding_sha256")
+            or predecessor.get("state_dir") != str(canonical)
+            or any(predecessor.get(key) != parent.get(key)
+                   for key in ("run_id", "work_id", "request_digest"))
+        ):
+            raise ValueError("native renewal lost its exact preparation authority")
     attempts = intent.get("preparation_attempts") if isinstance(intent, dict) else None
     if (
         not isinstance(attempts, list)
@@ -133,6 +154,7 @@ def canonical_owner(spec):
             )
         )
         or private_bytes(path) != raw
+        or (renewal and private_bytes(authority_path) != authority_raw)
     ):
         raise ValueError("native preparation lost its canonical admitted run")
     return parent

@@ -282,3 +282,36 @@ def test_probe_exclusive_parent_lease_serializes_the_diagnostic_ack_observation(
         assert registry.manifest.is_file()
     worker.join(5)
     assert finished.is_set() and not worker.is_alive()
+
+
+@pytest.mark.parametrize("namespace", [
+    "native-preparation-renewal",
+    "technical-successor/native-generation",
+    "resource-closure/native-generation",
+])
+@pytest.mark.parametrize("defect", [None, "wrong_namespace", "authority_changed", "intent_changed"])
+def test_renewal_probe_requires_exact_durable_namespace_and_authority(
+    measurement_owner, namespace, defect,
+):
+    store, original, registry, _, _ = measurement_owner
+    root = Path(original["state_dir"]) / namespace
+    if defect == "wrong_namespace":
+        root = root.parent / "foreign-generation"
+    path = root / "preparation.json"
+    authority = {"original_spec": original, "command_digest": digest("command")}
+    write_private(root / "authority.json", authority)
+    intent = {"binding_sha256": digest(authority), "preparation_attempts": []}
+    owner = (store, original, registry, intent, path)
+    probe = probe_for(owner)
+    if defect == "authority_changed":
+        write_private(root / "authority.json", {**authority, "command_digest": digest("changed")})
+    elif defect == "intent_changed":
+        intent["binding_sha256"] = digest("changed")
+        write_private(path, intent)
+    if defect:
+        with pytest.raises(ValueError):
+            canonical_owner(probe)
+    else:
+        assert canonical_owner(probe) == original
+        with resource_scope(probe, original["state_dir"], intent, path, 0):
+            assert RunResources(probe).finalize("blocked")["state"] == "confirmed"
