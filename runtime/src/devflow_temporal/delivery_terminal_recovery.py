@@ -8,18 +8,25 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
+from temporalio.service import RPCError
+
 from .contracts import canonical_json, digest
 from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
 from .delivery_closures import history_sha256
 from .delivery_codec import DELIVERY_DATA_CONVERTER
-from .delivery_lifecycle import require_transition
+from .delivery_lifecycle import (
+    RecoveryRefused,
+    evaluate_transition,
+    require_same_proof,
+    require_transition,
+)
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_resources import RunResources, read_private
 
 logger = logging.getLogger(__name__)
 
 
-async def _closed_execution(store, workflow_id, client, run_id):
+async def _closed_execution(store, workflow_id, client, run_id, *, preserve=True):
     """Describe the closed execution from Temporal, or from its sealed original."""
     from .delivery_closures import not_found, sealed_closure
 
@@ -49,7 +56,8 @@ async def _closed_execution(store, workflow_id, client, run_id):
         return closed, None
     history = await client.get_workflow_handle(
         description.id, run_id=description.run_id).fetch_history()
-    await _preserve(store, history, run_id)
+    if preserve:
+        await _preserve(store, history, run_id)
     return closed, history
 
 
@@ -67,9 +75,9 @@ async def _preserve(store, history, run_id):
                        run_id, type(exc).__name__, exc)
 
 
-async def closed_tail(store, run_id, client):
+async def closed_tail(store, run_id, client, *, preserve=True, workflow_id=None):
     closed, history = await _closed_execution(
-        store, store.active_workflow_id(run_id), client, run_id)
+        store, workflow_id or store.active_workflow_id(run_id), client, run_id, preserve=preserve)
     if (closed['status'] not in {'COMPLETED', 'TIMED_OUT'}
             or not closed['closed_at'] or history is None
             or closed['workflow_type'] != 'DevflowDeliveryWorkflow'):
@@ -159,7 +167,7 @@ def published_readback(store, spec, candidate, pr):
     return {'number': pr['number'], 'head': pr['head'], 'url': pr['url']}
 
 
-def snapshot(store, spec):
+def snapshot(store, spec, *, read_only=False):
     row, attempts, effects, claim = _rows(store, spec['run_id'])
     with store._connect() as db:
         work = store.state.row(db, 'works', spec['work_id'])
@@ -169,7 +177,7 @@ def snapshot(store, spec):
             or any(e['state'] != 'complete' for e in effects)
             or (claim is not None and claim['owner'] != f"external:devflow:{spec['run_id']}")):
         raise ValueError('terminal issue, attempt, effect or ownership changed')
-    cleanup = _stopped_cleanup(spec)
+    cleanup = _stopped_cleanup(spec, read_only=read_only)
     checks = json.loads(row['checks_json'] or '{}')
     if checks.get('resource_cleanup', {}).get('receipt_sha256') != cleanup['receipt_sha256']:
         raise ValueError('terminal cleanup proof differs from the frozen gate')
@@ -183,7 +191,7 @@ def snapshot(store, spec):
             if DeliveryBroker(store, spec).candidate() != candidate:
                 raise ValueError('terminal preserved candidate source changed')
         else:
-            resources = RunResources(spec)
+            resources = RunResources(spec, read_only=read_only)
             manifest = read_private(resources.manifest)
             receipt = read_private(resources.root / 'finalization.json')
             entry = manifest['roots'].get(spec['checkout'], {})
@@ -205,12 +213,11 @@ def snapshot(store, spec):
                  'candidate_sha256': digest(candidate), 'work_binding': binding}
 
 
-def _grant(store, run_id, payload, closed):
-    prior = receipt(store, run_id, payload)
-    if prior is not None:
-        return prior
+def _observe(store, run_id, closed, payload, *, read_only=False):
     spec = store.effective_spec(run_id)
-    row, observed = snapshot(store, spec)
+    if not store.owns_execution(spec):
+        raise ValueError('terminal recovery belongs to another service transport')
+    row, observed = snapshot(store, spec, read_only=read_only)
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     tail = closed['projection']
     checkpoint = tail.get('checks', {}).get('terminal_tracker_checkpoint', {})
@@ -239,7 +246,20 @@ def _grant(store, run_id, payload, closed):
                 if checkpoint['event'] == 'delivered' else 'blocked')
             or not checkpoint.get('release'))
     candidate = json.loads(row['candidate_json'] or 'null') or {}
-    require_transition({
+    with store._connect() as db:
+        mutation = db.execute(
+            'SELECT run_id,kind,request_digest,state FROM delivery_mutations WHERE command_id=?',
+            (payload['command_id'],),
+        ).fetchone()
+        command = db.execute(
+            'SELECT run_id,request_digest FROM delivery_commands WHERE command_id=?',
+            (payload['command_id'],),
+        ).fetchone()
+    mutation_ok = mutation is None or (tuple(mutation[:3]) ==
+        (run_id, 'reconcile_tracker', digest(payload)) and mutation['state'] != 'rejected')
+    command_ok = command is None or tuple(command) == (
+        run_id, digest({'kind': 'terminal_tracker_recovery', 'run_id': run_id, **payload}))
+    facts = {
         'operation': 'terminal_tracker_recovery', 'owner': 'terminal_tracker',
         'owner_proof': True, 'normalized_lifecycle': 'stopped',
         'revision': row['protocol_revision'], 'iteration': row['iteration'],
@@ -250,8 +270,49 @@ def _grant(store, run_id, payload, closed):
             'code': 'terminal_projection_changed', 'satisfied': not invalid_projection,
             'missing_or_unknown_fact': 'authenticated terminal projection and custody',
             'next_action': 'inspect the terminal tracker recovery preflight',
+        }, {
+            'code': 'command_identity_conflict', 'satisfied': mutation_ok and command_ok,
+            'missing_or_unknown_fact': 'unchanged reconciliation command identity',
+            'next_action': 'inspect the existing reconciliation command',
         }],
-    }, payload)
+    }
+    return spec, row, observed, previous, tail, facts
+
+
+def unknown_assessment(request=None):
+    """A missing closed history or custody observation is never eligibility."""
+    return evaluate_transition({
+        'operation': 'terminal_tracker_recovery', 'owner': 'terminal_tracker',
+        'comparisons': [], 'predicates': [{
+            'code': 'terminal_history_or_custody_unknown', 'satisfied': None,
+            'missing_or_unknown_fact': 'authenticated closed tracker history and custody',
+            'next_action': 'inspect the closed tracker history and current custody',
+        }],
+    }, request if isinstance(request, dict) else {})
+
+
+async def assess(store, run_id, request, client):
+    """Observe the real predecessor without sealing, mutating, or granting a successor."""
+    if (not isinstance(request, dict) or set(request) != {'command_id', 'expected_revision'}
+            or not isinstance(request['command_id'], str)):
+        return unknown_assessment(request)
+    try:
+        closed = await closed_tail(store, run_id, client, preserve=False)
+        *_, facts = await asyncio.to_thread(
+            _observe, store, run_id, closed, request, read_only=True)
+        return evaluate_transition(facts, request)
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError, subprocess.SubprocessError):
+        return unknown_assessment(request)
+    except RPCError:
+        return unknown_assessment(request)
+
+
+def _grant(store, run_id, payload, closed, refresh_closed):
+    prior = receipt(store, run_id, payload)
+    if prior is not None:
+        return prior
+    spec, row, observed, previous, tail, facts = _observe(store, run_id, closed, payload)
+    require_transition(facts, payload)
     while previous and previous.get('kind') == 'terminal_tracker_recovery':
         previous = previous['original_recovery']
     state = {key: deepcopy(value) for key, value in tail.items() if key not in (
@@ -293,6 +354,17 @@ def _grant(store, run_id, payload, closed):
             return json.loads(prior['response_json'])
         if dict(current) != row:
             raise ValueError('terminal recovery lost its frozen projection')
+        try:
+            current_closed = refresh_closed()
+        except (ValueError, RuntimeError, OSError, TimeoutError, RPCError) as exc:
+            raise RecoveryRefused(unknown_assessment(payload)) from exc
+        current_spec, current_row, current_observed, _, _, current_facts = _observe(
+            store, run_id, current_closed, payload, read_only=True)
+        require_transition(current_facts, payload)
+        require_same_proof('terminal_tracker_recovery', 'terminal_tracker',
+                           current_facts['proof_digest'], facts['proof_digest'])
+        if current_spec != spec or current_row != row or current_observed != observed:
+            raise ValueError('terminal recovery lost its frozen projection or custody')
         db.execute("UPDATE delivery_runs SET phase='terminal_tracker_recovery_queued',"
                    "execution_state='queued',revision=revision+1,workflow_id=?,recovery_json=?,"
                    'updated_at=? WHERE run_id=?',
@@ -311,7 +383,21 @@ def _grant(store, run_id, payload, closed):
 
 async def recover(store, run_id, payload, client):
     closed = await closed_tail(store, run_id, client)
-    return await asyncio.to_thread(_grant, store, run_id, payload, closed)
+    loop = asyncio.get_running_loop()
+
+    def refresh_closed():
+        # The transaction fences local admission while the exact Temporal
+        # execution is read again; a timeout never authorizes the successor.
+        future = asyncio.run_coroutine_threadsafe(
+            closed_tail(store, run_id, client, preserve=False,
+                        workflow_id=closed['workflow_id']), loop)
+        try:
+            return future.result(timeout=30)
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    return await asyncio.to_thread(_grant, store, run_id, payload, closed, refresh_closed)
 
 
 def preflight(store, spec, recovery):

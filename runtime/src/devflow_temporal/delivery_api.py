@@ -799,8 +799,19 @@ def create_app(config_path: Path) -> FastAPI:
         from .delivery_lifecycle import assess_transition as assess
 
         payload = await request.json()
-        if not isinstance(payload, dict) or set(payload) != {'kind', 'request'}:
-            raise HTTPException(400, 'expected kind and request')
+        if (not isinstance(payload, dict) or set(payload) != {'kind', 'request'}
+                or not isinstance(payload['kind'], str)
+                or not isinstance(payload['request'], dict)):
+            raise HTTPException(400, 'expected kind and request object')
+        if payload['kind'] == 'reconcile_tracker':
+            from .delivery_terminal_recovery import assess as assess_tracker
+            from .delivery_terminal_recovery import unknown_assessment
+
+            try:
+                client = await service.client()
+            except (*TRANSPORT_FAILURES, RPCError):
+                return unknown_assessment(payload['request'])
+            return await assess_tracker(service.store, run_id, payload['request'], client)
         return await asyncio.to_thread(assess, service.store, run_id,
                                        payload['kind'], payload['request'])
 
