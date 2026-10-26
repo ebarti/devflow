@@ -194,7 +194,8 @@ def readonly_registry_database(path, *, require_rollback=False):
             if (signature(before) != signature(os.fstat(fd))
                     or signature(before) != signature(path.lstat()) or journals_present()):
                 raise ValueError("feature registry changed during observation")
-            db = sqlite3.connect(target.as_uri() + "?mode=ro&immutable=1", uri=True)
+            db = sqlite3.connect(target.as_uri() + "?mode=ro&immutable=1", uri=True,
+                                 check_same_thread=False)
             db.row_factory = sqlite3.Row
             try:
                 db.execute("PRAGMA query_only=ON")
@@ -477,7 +478,7 @@ def _observe_handoff(store, run_id, request, *, operation, revision_admission=No
                                 json.loads(snapshot["input_json"]))):
                         preparation_replay = True
                         facts = handoff_facts(db, replay_token, operation=operation)
-                        facts["normalized_lifecycle"] = "active"
+                        facts["normalized_lifecycle"] = "recovering"
                         facts["proof_digest"] = digest({
                             "registry": facts["proof_digest"], "preparation_replay": saved,
                             "successor_snapshot": snapshot["input_digest"]})

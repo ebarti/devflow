@@ -82,3 +82,36 @@ def test_dangling_registry_sidecar_is_unknown(feature, suffix, reader):
             with _ReadOnlyRegistry(shared.path).connect():
                 pytest.fail('a dangling journal cannot be treated as absent')
     assert sidecar.is_symlink()
+
+
+def test_revision_readers_share_snapshot_and_reject_source_drift(feature):
+    from devflow_temporal.delivery_execution_config import observation_mode
+    from devflow_temporal.delivery_feature_revision_subject import FeatureRegistryObservationError
+    from devflow_temporal.delivery_stopped_resume import _observation_registry
+
+    _store, shared, _snapshot, token = feature
+    spec = {'feature_delivery': {'registry': str(shared.path)}}
+    with pytest.raises(FeatureRegistryObservationError):
+        with observation_mode():
+            first = _ReadOnlyRegistry(shared.path).current(token['issue_id'])
+            with shared.connect() as db:
+                db.execute('UPDATE execution_claims SET generation=generation+1 WHERE issue_id=?',
+                           (token['issue_id'],))
+            second = _observation_registry(spec).current(token['issue_id'])
+            assert second == first
+    assert shared.current(token['issue_id'])['generation'] == token['generation'] + 1
+
+
+def test_revision_registry_scope_closes_after_threaded_observation(feature):
+    import asyncio
+
+    from devflow_temporal.delivery_execution_config import observation_mode
+
+    _store, shared, _snapshot, token = feature
+
+    async def observe():
+        return await asyncio.to_thread(_ReadOnlyRegistry(shared.path).current, token['issue_id'])
+
+    with observation_mode():
+        current = asyncio.run(observe())
+        assert current['generation'] == token['generation']

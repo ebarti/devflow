@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import stat
+import sys
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +27,52 @@ CANDIDATE_FIELDS = ("id", "head", "content_sha256", "base_sha", "environment_dig
 ROLE_FIELDS = {"role", "iteration", "candidate", "attempt_id", "input_candidate_id", "provider"}
 
 
+class FeatureRegistryObservationError(sqlite3.OperationalError):
+    """An outer observation could not retain stable feature registry evidence."""
+
+
+class _ScopedRegistryObservation:
+    """Retain one authenticated source and private copy through outer observation."""
+
+    def __init__(self, path):
+        from .delivery_feature_handoff import readonly_registry_database
+
+        self.lock = threading.RLock()
+        self.closed = False
+        self.manager = readonly_registry_database(path, require_rollback=True)
+        self.anchor = self.manager.__enter__()
+        try:
+            self.target = Path(self.anchor.execute("PRAGMA database_list").fetchone()[2])
+        except BaseException:
+            self.manager.__exit__(*sys.exc_info())
+            raise
+
+    @contextmanager
+    def connect(self):
+        with self.lock:
+            if self.closed:
+                raise FeatureRegistryObservationError("feature observation scope is closed")
+            db = sqlite3.connect(self.target.as_uri() + "?mode=ro&immutable=1", uri=True)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            yield db
+        finally:
+            db.close()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self.manager.__exit__(None, None, None)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                raise FeatureRegistryObservationError(
+                    "feature registry changed during observation") from exc
+
+
 class _ReadOnlyRegistry(ExecutionRegistry):
     """An existing registry view: no schema, directory, lock or journal creation."""
     def __init__(self, path):
@@ -34,11 +83,19 @@ class _ReadOnlyRegistry(ExecutionRegistry):
         _ancestors(self.path)
         if not self.path.is_absolute() or self.path.resolve(strict=True) != self.path:
             raise ValueError("retained observation requires the existing canonical registry")
+        from .delivery_execution_config import observation_scope
         from .delivery_feature_handoff import readonly_registry_database
 
-        with readonly_registry_database(self.path, require_rollback=True) as db:
-            db.execute("BEGIN")
-            yield db
+        scope = observation_scope()
+        if scope is None:
+            with readonly_registry_database(self.path, require_rollback=True) as db:
+                db.execute("BEGIN")
+                yield db
+        else:
+            snapshot = scope.resource(
+                ("feature_registry", str(self.path)), lambda: _ScopedRegistryObservation(self.path))
+            with snapshot.connect() as db:
+                yield db
 
     def checkpoints(self, issue_id):
         with self.connect() as db:

@@ -153,6 +153,7 @@ async def test_public_preparation_retry_replays_partial_claim(pending_preparatio
             json={'kind': 'continue_feature', 'request': command},
         )
         assert preview.json()['eligible'], preview.json()
+        assert preview.json()['normalized_lifecycle'] == 'recovering'
         other = {**command, 'command_id': 'different-partial-claim'}
         stale = await client.post(
             f"/api/runs/{spec['run_id']}/assess-transition",
