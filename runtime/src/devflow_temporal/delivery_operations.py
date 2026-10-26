@@ -125,10 +125,11 @@ def _lock(store, operation_id):
 def _set(store, operation_id, state, *, result=None, error=None):
     with store._connect() as db:
         row = db.execute(
-            "SELECT kind,run_id,request_json FROM delivery_operations WHERE operation_id=?",
+            "SELECT kind,run_id,request_json,effect_refs FROM delivery_operations "
+            "WHERE operation_id=?",
             (operation_id,),
         ).fetchone()
-        refs = []
+        refs = json.loads(row["effect_refs"]) if row["effect_refs"] else []
         run_id = row["run_id"]
         command_id = json.loads(row["request_json"]).get("command_id")
         if state == "succeeded" and command_id:
@@ -208,9 +209,15 @@ def _execute(service, endpoints, operation_id):
         request = _request(service, operation["request"])
 
         async def invoke():
-            if operation["kind"] == "submit":
-                return await endpoint(request)
-            return await endpoint(request, operation["run_id"])
+            from .delivery_operation_temporal import enter, leave
+
+            token = enter(service, operation)
+            try:
+                if operation["kind"] == "submit":
+                    return await endpoint(request)
+                return await endpoint(request, operation["run_id"])
+            finally:
+                leave(token)
 
         try:
             result = asyncio.run(invoke())
@@ -372,6 +379,7 @@ def register_operations(app, service, hostguard, mutationguard):
         command_id = payload.get("command_id")
         result = None
         refusal = None
+        temporal_pending = False
         with service.store._connect() as db:
             if kind == "ack-native-diagnostic" and isinstance(command_id, str):
                 row = db.execute(
@@ -421,6 +429,8 @@ def register_operations(app, service, hostguard, mutationguard):
                     result = json.loads(row[2])
                 elif valid and row[1] == "rejected":
                     refusal = json.loads(row[2])["error"]
+                elif valid and row[1] in ("pending", "unknown"):
+                    temporal_pending = True
             else:
                 valid = False
         if valid and kind == "ack-native-diagnostic":
@@ -431,6 +441,10 @@ def register_operations(app, service, hostguard, mutationguard):
             from .delivery_ci_inventory import info
 
             result = await asyncio.to_thread(info, service.store, run_id)
+        if temporal_pending:
+            from .delivery_operation_temporal import reconcile
+
+            result, refusal = await reconcile(service, operation)
         if result is not None:
             await asyncio.to_thread(_set, service.store, operation_id, "succeeded", result=result)
         elif refusal is not None:

@@ -5,12 +5,32 @@ import threading
 
 import httpx
 import pytest
+from temporalio import workflow
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_ci_inventory import ci_case as ci_case
 from test_delivery_native_diagnostic import stopped_diagnostic as stopped_diagnostic
 from test_delivery_store import service as service
 
 from devflow_temporal.delivery_api import create_app
+
+
+@workflow.defn(sandboxed=False)
+class OwnedUpdateWorkflow:
+    def __init__(self):
+        self.updates = 0
+
+    @workflow.run
+    async def run(self):
+        await workflow.wait_condition(lambda: False)
+
+    @workflow.update(name="decision")
+    async def decision(self, _request: dict) -> dict:
+        self.updates += 1
+        return {"phase": "investigating", "revision": 7}
+
+    @workflow.query(name="update_count")
+    def update_count(self) -> int:
+        return self.updates
 
 
 @pytest.mark.asyncio
@@ -545,3 +565,139 @@ async def test_network_response_loss_before_and_after_completion(api_fixture, mo
         server.should_exit = True
         await asyncio.wait_for(serving, 10)
         listener.close()
+
+
+@pytest.mark.asyncio
+async def test_original_temporal_update_is_reconciled_after_local_receipt_loss(
+    api_fixture, monkeypatch, tmp_path
+):
+    import json
+    import os
+    from pathlib import Path
+
+    from temporal_test_server import local_temporal
+    from temporalio.worker import Worker
+
+    stage = Path(os.environ["DEVFLOW_TEST_TEMPORAL_PREREQUISITES"])
+    binary = (
+        stage
+        / "tools/sha256-33c298d41f6eefebf01a28a3511f444480e939e21d3518cb0c12a4abad467c4b/temporal"
+    )
+    path, submit = api_fixture
+    async with local_temporal(
+        dev_server_existing_path=str(binary),
+        dev_server_database_filename=str(tmp_path / "temporal.sqlite3"),
+    ) as env:
+        config = json.loads(path.read_text())
+        config["temporal_address"] = env.client.service_client.config.target_host
+        path.write_text(json.dumps(config))
+        app = create_app(path)
+        service = app.state.delivery
+        service.store.submit(submit)
+        original_finish = service.store.finish_mutation
+
+        def lose_local_receipt(*_args):
+            raise OSError("simulated process loss after remote update")
+
+        monkeypatch.setattr(service.store, "finish_mutation", lose_local_receipt)
+        async with Worker(
+            env.client, task_queue="operation-update", workflows=[OwnedUpdateWorkflow]
+        ):
+            original_workflow = await env.client.start_workflow(
+                OwnedUpdateWorkflow.run, id="delivery-run-1", task_queue="operation-update"
+            )
+            transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://127.0.0.1:18770"
+            ) as client:
+                token = (await client.get("/api/session")).json()["csrf_token"]
+                headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+                body = {
+                    "command_id": "original-decision",
+                    "expected_revision": 1,
+                    "decision_id": "decision-1",
+                    "decision_revision": 1,
+                    "candidate_revision": 1,
+                    "answer": "continue",
+                }
+                envelope = {
+                    "operation_id": "decision-op",
+                    "run_id": "run-1",
+                    "kind": "decision",
+                    "request": body,
+                }
+                assert (
+                    await client.post("/api/operations", json=envelope, headers=headers)
+                ).status_code in (200, 202)
+                for _ in range(500):
+                    operation = (await client.get("/api/operations/decision-op")).json()
+                    if operation["state"] not in ("pending", "running"):
+                        break
+                    await asyncio.sleep(0.02)
+                assert operation["state"] == "unknown", operation
+                assert len(operation["effect_refs"]) == 1
+                reference = operation["effect_refs"][0]
+                assert reference["type"] == "temporal_update"
+                assert reference["workflow_id"] == "delivery-run-1"
+                assert reference["workflow_run_id"]
+                assert reference["command_id"] == "original-decision"
+                assert reference["name"] == "decision"
+                assert reference["request_digest"] == operation["request_digest"]
+                # The current projection may subsequently identify a different
+                # workflow; the recorded original execution remains the only
+                # authorized receipt to query.
+                with service.store._connect() as db:
+                    db.execute(
+                        "UPDATE delivery_runs SET workflow_id='delivery-successor' "
+                        "WHERE run_id='run-1'"
+                    )
+                monkeypatch.setattr(service.store, "finish_mutation", original_finish)
+                recovered = (
+                    await client.post("/api/operations/decision-op/reconcile", headers=headers)
+                ).json()
+                assert recovered["state"] == "succeeded", recovered
+                assert recovered["result"] == {
+                    "run_id": "run-1",
+                    "phase": "investigating",
+                    "revision": 7,
+                }
+                with service.store._connect() as db:
+                    row = db.execute(
+                        "SELECT state,response_json FROM delivery_mutations "
+                        "WHERE command_id='original-decision'"
+                    ).fetchone()
+                    assert row["state"] == "complete"
+                assert await original_workflow.query("update_count") == 1
+
+                # An absent original update is not proof that an effect is safe
+                # to replay. Querying it leaves the new operation unknown.
+                from devflow_temporal.contracts import digest
+
+                missing_body = {**body, "command_id": "missing-decision"}
+                missing_digest = digest(
+                    {
+                        "run_id": "run-1",
+                        "kind": "decision",
+                        "request": missing_body,
+                    }
+                )
+                missing_ref = {
+                    **reference,
+                    "command_id": "missing-decision",
+                    "request_digest": missing_digest,
+                }
+                service.store.begin_mutation("run-1", "missing-decision", "decision", missing_body)
+                with service.store._connect() as db:
+                    db.execute(
+                        "INSERT INTO delivery_operations "
+                        "(operation_id,run_id,kind,stage,request_digest,request_json,state,"
+                        "created_at,updated_at,progress,effect_refs) "
+                        "VALUES ('missing-op','run-1','decision','execution',?,?,'unknown',"
+                        "'2026','2026','unknown',?)",
+                        (missing_digest, json.dumps(missing_body), json.dumps([missing_ref])),
+                    )
+                missing = (
+                    await client.post("/api/operations/missing-op/reconcile", headers=headers)
+                ).json()
+                assert missing["state"] == "unknown"
+                assert await original_workflow.query("update_count") == 1

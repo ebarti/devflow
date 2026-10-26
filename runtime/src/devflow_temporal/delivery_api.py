@@ -188,11 +188,14 @@ class DeliveryService:
         self.dispatch_task: asyncio.Task | None = None
 
     async def client(self) -> Client:
-        return await Client.connect(
+        from .delivery_operation_temporal import wrap_client
+
+        client = await Client.connect(
             self.config.temporal_address,
             namespace=self.config.raw.get("temporal_namespace", "default"),
             data_converter=DELIVERY_DATA_CONVERTER,
         )
+        return wrap_client(self, client)
 
     async def healthy_client(self) -> Client:
         try:
