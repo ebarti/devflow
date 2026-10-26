@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 
-def assessment(state, head, *, source, complete, required, execution_only=False):
+def assessment(state, head, *, source, complete, required, present=None, execution_only=False):
     """Report the four independent questions; unknown never means eligible."""
     return {
         "execution": {
-            "state": "observed" if complete else "unknown",
+            "state": "observed" if present is True else "absent" if present is False else "unknown",
             "source": source,
             "head": head,
-            "complete": complete,
+            "read_complete": complete,
+            "required_checks": sorted(required),
         },
         "delivery_policy": {"state": state, "required_checks": sorted(required)},
         "pr_eligibility": {

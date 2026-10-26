@@ -265,6 +265,8 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
         assert pre.status_code == 200, pre.text
         assert pre.json()["delivery_acceptance"] is False
         assert pre.json()["ci_assessment"]["execution"]["state"] == "observed"
+        assert pre.json()["ci_assessment"]["execution"]["read_complete"] is True
+        assert pre.json()["ci_assessment"]["execution"]["source"] == owner.METHOD
         assert pre.json()["ci_assessment"]["delivery_policy"]["state"] == "not_evaluated"
         assert not (await client.get(path + "ci-inventory")).status_code == 200
         ack = {

@@ -260,7 +260,7 @@ def preflight(store, run_id, payload):
         "additional_iterations": 0,
         "ci_assessment": assessment(
             "not_evaluated", profile["subject"]["head"], source=METHOD,
-            complete=True, required=profile["required_ci"], execution_only=True),
+            complete=True, required=profile["required_ci"], present=True, execution_only=True),
     }
 
 
@@ -354,7 +354,7 @@ def acknowledge(store, run_id, payload):
         "additional_iterations": 0,
         "ci_assessment": assessment(
             "not_evaluated", profile["subject"]["head"], source=METHOD,
-            complete=True, required=profile["required_ci"], execution_only=True),
+            complete=True, required=profile["required_ci"], present=True, execution_only=True),
     }
     from .delivery_gate_retry import _sealed_row
     from .delivery_policy_recovery import work_binding
@@ -727,7 +727,7 @@ def result_for(broker, pr, *, timeout_seconds=None):
         "checks": facts["checks"],
         "ci_assessment": assessment(
             "passed", profile["subject"]["head"], source=METHOD,
-            complete=True, required=profile["required_ci"], execution_only=True),
+            complete=True, required=profile["required_ci"], present=True, execution_only=True),
         "execution_inventory": {
             "method": METHOD,
             "receipt": reference,

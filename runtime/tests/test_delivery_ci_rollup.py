@@ -17,6 +17,19 @@ from devflow_temporal import delivery_ci_inventory_io as io
 HEAD = "a" * 40
 
 
+class Clock:
+    def __init__(self):
+        self.seconds = 0
+        self.delays = []
+
+    def time(self):
+        return self.seconds
+
+    async def sleep(self, seconds):
+        self.delays.append(seconds)
+        self.seconds += seconds
+
+
 def check(identity, conclusion="SUCCESS", *, name="Build", status="COMPLETED", run=10):
     return {"__typename": "CheckRun", "id": identity, "name": name,
             "status": status, "conclusion": conclusion,
@@ -39,18 +52,29 @@ def response(nodes, *, more=False, cursor=None, head=HEAD, total=None, null_roll
     return b"HTTP/2.0 200 OK\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw
 
 
-async def activity(monkeypatch, pages):
+async def activity(monkeypatch, pages, *, legacy=False, clock=None, cycle=False):
     commands = []
 
     def transport(command, _limit, _remaining):
         commands.append(command)
-        return pages[min(len(commands) - 1, len(pages) - 1)]
+        index = ((len(commands) - 1) % len(pages) if cycle
+                 else min(len(commands) - 1, len(pages) - 1))
+        return pages[index]
 
     reader = io.GitHubRead
     monkeypatch.setattr(io, "GitHubRead", lambda **kwargs: reader(**kwargs, runner=transport))
     broker = object.__new__(delivery_broker.DeliveryBroker)
     spec = {"github_repo": "example/fixture", "run_id": "owned-ci",
-            "policy": {"required_ci": ["Build"], "ci_wait_seconds": 0}}
+            "policy": {"required_ci": ["Build"]}}
+    if not legacy:
+        spec["policy"]["ci_wait_seconds"] = 0
+    if clock is not None:
+        async def off_loop(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        monkeypatch.setattr(delivery_broker.asyncio, "get_running_loop", lambda: clock)
+        monkeypatch.setattr(delivery_broker.asyncio, "sleep", clock.sleep)
+        monkeypatch.setattr(delivery_broker.asyncio, "to_thread", off_loop)
     broker.spec = spec
     monkeypatch.setattr(delivery_activities, "_context", lambda _spec: (None, broker))
     monkeypatch.setattr(delivery_activities.activity, "heartbeat", lambda *_: None)
@@ -96,7 +120,7 @@ async def test_unique_complete_success_only_satisfies_delivery_policy(monkeypatc
     assert result["checks"]["Build"]["id"] == "only-build"
     states = result["ci_assessment"]
     assert states["execution"]["state"] == "observed"
-    assert states["execution"]["complete"] is True
+    assert states["execution"]["read_complete"] is True
     assert states["delivery_policy"]["state"] == "passed"
     assert states["pr_eligibility"]["state"] == "unverified"
     assert states["merge_readiness"]["state"] == "unverified"
@@ -133,17 +157,35 @@ async def test_completed_without_a_known_conclusion_remains_unknown(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_explicit_null_rollup_is_observed_absence_without_policy_success(monkeypatch):
-    result, _ = await activity(monkeypatch, [response([], null_rollup=True)])
+@pytest.mark.parametrize("mode", ["null", "empty", "unrelated_check", "unrelated_status",
+                                  "required_status"])
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_complete_read_can_establish_only_scoped_execution_absence(monkeypatch, mode, legacy):
+    nodes = {
+        "null": [], "empty": [], "unrelated_check": [check("other", name="Unrelated")],
+        "unrelated_status": [{"__typename": "StatusContext", "id": "other-status",
+                              "context": "Unrelated", "state": "SUCCESS"}],
+        "required_status": [{"__typename": "StatusContext", "id": "required-status",
+                             "context": "Build", "state": "SUCCESS"}],
+    }[mode]
+    clock = Clock() if legacy else None
+    result, _ = await activity(monkeypatch, [response(nodes, null_rollup=mode == "null")],
+                               legacy=legacy, clock=clock)
     assert result["state"] == "pending" and result["missing"] == ["Build"]
-    assert result["observations"] == []
-    assert result["ci_assessment"]["execution"]["complete"] is True
+    assert result["observations"] == nodes
+    assert result["ci_assessment"]["execution"] == {
+        "state": "absent", "read_complete": True, "required_checks": ["Build"],
+        "source": "authenticated_PR_check_contexts", "head": HEAD}
+    assert result["ci_assessment"]["delivery_policy"]["state"] == "pending"
+    if legacy:
+        assert clock.seconds == 1200 and set(clock.delays) == {15}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["missing", "truncated", "repeat", "read_failure", "head",
                                   "changed_count", "omitted_tail", "null_later_page"])
-async def test_incomplete_or_changed_observations_never_pass(monkeypatch, mode):
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_incomplete_or_changed_observations_never_pass(monkeypatch, mode, legacy):
     pages = {
         "missing": [response([])],
         "truncated": [response([check("only-build")], more=True)],
@@ -157,17 +199,24 @@ async def test_incomplete_or_changed_observations_never_pass(monkeypatch, mode):
         "null_later_page": [response([check("only-build")], more=True, cursor="second", total=2),
                             response([], null_rollup=True)],
     }
-    result, _ = await activity(monkeypatch, pages[mode])
+    clock = Clock() if legacy else None
+    result, _ = await activity(monkeypatch, pages[mode], legacy=legacy, clock=clock, cycle=True)
     assert result["state"] == ("stale" if mode == "head" else "pending")
     if mode not in {"missing", "head"}:
         assert result["ci_assessment"]["execution"]["state"] == "unknown"
+        assert result["ci_assessment"]["execution"]["read_complete"] is False
+    if legacy and mode != "head":
+        assert clock.seconds == 1200 and set(clock.delays) == {15}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["data", "repository", "commits", "commit", "head", "number",
                                   "rollup", "context_type", "context_id", "context_name",
                                   "context_status", "conclusion"])
-async def test_malformed_graphql_is_unknown_readback_not_a_controller_exception(monkeypatch, mode):
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_malformed_graphql_is_unknown_readback_not_a_controller_exception(
+    monkeypatch, mode, legacy,
+):
     value = json.loads(response([check("only-build")]).split(b"\r\n\r\n", 1)[1])
     pr = value["data"]["repository"]["pullRequest"]
     commit = pr["commits"]["nodes"][0]["commit"]
@@ -192,8 +241,37 @@ async def test_malformed_graphql_is_unknown_readback_not_a_controller_exception(
         node[key] = {"unproven": True}
     raw = json.dumps(value).encode()
     framed = b"HTTP/2.0 200 OK\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw
-    result, _ = await activity(monkeypatch, [framed])
+    clock = Clock() if legacy else None
+    result, _ = await activity(monkeypatch, [framed], legacy=legacy, clock=clock)
     assert result["state"] == "pending"
     assert result["ci_assessment"]["execution"]["state"] == "unknown"
+    assert result["ci_assessment"]["execution"]["read_complete"] is False
     assert "diagnostic" in result
+    if legacy:
+        assert clock.seconds == 1200 and set(clock.delays) == {15}
+
+
+@pytest.mark.asyncio
+async def test_legacy_failed_read_can_reconcile_under_the_same_allowance(monkeypatch):
+    clock = Clock()
+    result, commands = await activity(monkeypatch, [
+        b"HTTP/2.0 503 Unavailable\r\n\r\n{}", response([check("only-build")])],
+        legacy=True, clock=clock)
+    assert result["state"] == "passed" and clock.seconds == 15 and len(commands) == 2
+    assert result["ci_assessment"]["execution"]["state"] == "observed"
+    assert result["ci_assessment"]["execution"]["read_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_lost_readback_preserves_prior_observation_without_promoting_it(monkeypatch):
+    clock = Clock()
+    previous = check("only-build", None, status="IN_PROGRESS")
+    result, _ = await activity(monkeypatch, [
+        response([previous]), b"HTTP/2.0 503 Unavailable\r\n\r\n{}"],
+        legacy=True, clock=clock)
+    assert result["state"] == "pending" and clock.seconds == 1200
+    assert set(clock.delays) == {15}
+    assert result["observations"] == [previous]
+    assert result["ci_assessment"]["execution"]["state"] == "unknown"
+    assert result["ci_assessment"]["execution"]["read_complete"] is False
 

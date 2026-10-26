@@ -196,6 +196,7 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
             assert ci["execution_inventory"]["PR_ruleset_eligibility"] is False
             assert ci["execution_inventory"]["merge_context_verified"] is False
             assert ci["ci_assessment"]["execution"]["state"] == "observed"
+            assert ci["ci_assessment"]["execution"]["read_complete"] is True
             assert ci["ci_assessment"]["delivery_policy"]["state"] == "passed"
             assert ci["ci_assessment"]["pr_eligibility"]["state"] == "not_established"
             assert ci["ci_assessment"]["merge_readiness"]["state"] == "unverified"

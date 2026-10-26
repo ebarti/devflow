@@ -107,13 +107,16 @@ async def test_old_frozen_policy_keeps_twenty_minute_behavior(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_github_read_does_not_block_worker_event_loop(monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_github_read_does_not_block_worker_event_loop(monkeypatch, legacy):
     import threading
 
     started, release = threading.Event(), threading.Event()
     broker = object.__new__(delivery_broker.DeliveryBroker)
-    broker.spec = {"policy": {"required_ci": ["Build"], "ci_wait_seconds": 60},
+    broker.spec = {"policy": {"required_ci": ["Build"]},
                    "github_repo": "example/fixture"}
+    if not legacy:
+        broker.spec["policy"]["ci_wait_seconds"] = 60
 
     def readback(*args, **kwargs):
         started.set()

@@ -2029,7 +2029,10 @@ class DeliveryBroker:
             return {"state": state, "checks": checks, "observations": observations,
                     "ci_assessment": assessment(
                         state, pr["head"], source="authenticated_PR_check_contexts",
-                        complete=complete, required=required), **details}
+                        complete=complete, required=required,
+                        present=(any(item.get("__typename") == "CheckRun"
+                                     and item.get("name") in required for item in observations)
+                                 if complete else None)), **details}
 
         def readback(remaining):
             reader = GitHubRead(repositories={self.spec["github_repo"]},
@@ -2039,21 +2042,17 @@ class DeliveryBroker:
         while True:
             try:
                 remaining = deadline - asyncio.get_running_loop().time()
-                if patient:
-                    found = await asyncio.to_thread(readback, remaining)
-                else:
-                    found = readback(remaining)
+                found = await asyncio.to_thread(readback, remaining)
             except PRHeadChanged:
                 return result("stale", reason="PR head changed while checks were pending")
             except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
-                if not patient:
-                    raise
                 diagnostic = str(exc)[:500]
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     return result("pending", reason="CI deadline reached", diagnostic=diagnostic)
                 await asyncio.sleep(min(delay, remaining))
-                delay = min(delay * 2, 60)
+                if patient:
+                    delay = min(delay * 2, 60)
                 continue
             observations = found["contexts"]
             matches = {}
@@ -2091,6 +2090,6 @@ class DeliveryBroker:
                               missing=sorted(required - checks.keys()),
                               next_action="observe_required_CI_on_the_same_candidate")
             remaining = deadline - asyncio.get_running_loop().time()
-            await asyncio.sleep(min(delay, remaining) if patient else 15)
+            await asyncio.sleep(min(delay, remaining))
             if patient:
                 delay = min(delay * 2, 60)
