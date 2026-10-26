@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import sqlite3
 
 import pytest
 from test_delivery_feature_revision_settlement import _stopped_feature
@@ -108,7 +109,8 @@ def test_tracking_change_during_remote_observation_cannot_become_eligible(featur
 
     def changing_snapshot(*args):
         snapshot = original_snapshot(*args)
-        with store._connect() as db:
+        # This is an independent writer, outside the observer snapshot.
+        with sqlite3.connect(store.config.tracking_db) as db:
             db.execute("UPDATE delivery_runs SET revision=revision+1 WHERE run_id=?",
                        (spec["run_id"],))
         return snapshot
@@ -120,7 +122,14 @@ def test_tracking_change_during_remote_observation_cannot_become_eligible(featur
         count = db.execute("SELECT count(*) FROM delivery_commands").fetchone()[0]
     assessment = assess_transition(store, spec["run_id"], "continue_feature", request)
     assert not assessment["eligible"]
-    assert "feature_tracking_changed" in {item["code"] for item in assessment["blockers"]}
+    assert assessment["proof_digest"] is None
+    assert {item["code"] for item in assessment["blockers"]} == {
+        "owner_proof_unknown", "tracking_store_unavailable"
+    }
+    assert all(item["satisfied"] is None for item in assessment["blockers"])
+    with sqlite3.connect(store.config.tracking_db) as db:
+        assert db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                          (spec["run_id"],)).fetchone()[0] == row["revision"] + 1
     with pytest.raises(ValueError):
         continue_feature(store, spec["run_id"], request)
     with store._connect() as db:
