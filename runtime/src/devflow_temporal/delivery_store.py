@@ -3453,6 +3453,7 @@ class DeliveryStore:
         key: str | None = None,
         expected_revision: int | None = None,
         expected_row: dict[str, Any] | None = None,
+        expected_workflow_id: str | None = None,
     ) -> dict[str, Any]:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -3463,6 +3464,11 @@ class DeliveryStore:
                 raise ValueError("projection row revision changed")
             if expected_row is not None and dict(row) != expected_row:
                 raise ValueError("projection row changed")
+            if (expected_workflow_id is not None and row["workflow_id"] is not None
+                    and expected_workflow_id != row["workflow_id"]):
+                # Authentication before a SQL wait cannot authorize a projection
+                # after a successor has become the durable workflow owner.
+                return dict(row)
             if (protocol_revision is not None
                     and protocol_revision < (row["protocol_revision"] or 0)):
                 # A completed activity can arrive after a newer accepted control

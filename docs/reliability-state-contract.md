@@ -30,6 +30,23 @@ already in flight may arrive after a newer accepted control. A lower protocol
 revision must be ignored as a stale observation, while equal-revision projections
 remain usable for compatible cleanup and readback settlement. This preserves
 the separate SQLite projection sequence and deterministic protocol revision.
+The projection activity also captures its actual Temporal workflow ID. The store
+compares it to a non-null current workflow owner under the write transaction, so
+an old body that authenticated before a SQL wait cannot overwrite a newly queued
+successor even at the same protocol revision. Historical initial rows without an
+explicit successor owner retain their original projection behavior.
+
+A separate owned combination probe found automatic unpublished retry still
+compared capacity inside the full policy after service reconstruction. A live
+capacity-only edit therefore produced `fresh attempt changed frozen execution
+policy` while the equivalent feature continuation was compatible. The retry was
+refused because policy equality included scheduling; that comparison lived at
+the successor transaction; only a restarted service using the changed capacity
+exposed it; authority and scheduling were expected to remain separate. The fix
+belongs in that transaction's policy comparison: compare every field except
+capacity, then retain the predecessor's exact full policy and digest. Current
+capacity continues to come from `operational_config`; it grants no new scope,
+command, role, timer or repair allowance.
 
 ## Ownership contract, version 1
 

@@ -151,8 +151,10 @@ def test_control_carrier_authenticates_origin_through_multiple_successors(servic
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("capacity_change", [False, True],
+                         ids=["original-capacity", "new-capacity"])
 async def test_public_disable_survives_closed_retry_and_service_restart(
-    service, tmp_path, monkeypatch
+    service, tmp_path, monkeypatch, capacity_change
 ):
     # First principles: the accepted update belongs to the logical delivery;
     # replacing its execution must preserve its receipt and original frozen clock.
@@ -220,6 +222,10 @@ async def test_public_disable_survives_closed_retry_and_service_restart(
                 assert response.status_code == 200, response.text
             # Reconstruct the service store after the accepted receipt, and again
             # after successor admission: neither process-local state is authority.
+            if capacity_change:
+                current = json.loads(store.config.path.read_text())
+                current["capacity"] = 1
+                store.config.path.write_text(json.dumps(current))
             api.store = store = DeliveryStore(DeliveryConfig.load(store.config.path))
             await asyncio.sleep(4.5)
             active = await handle.query("status")

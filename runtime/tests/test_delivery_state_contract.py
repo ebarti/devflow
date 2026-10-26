@@ -4,18 +4,24 @@ import asyncio
 import json
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import httpx
 import pytest
 from temporal_test_server import local_temporal
 from temporalio import activity, workflow
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+from test_delivery_automatic_retry import stopped
 from test_delivery_store import service as service
 
+from devflow_temporal import delivery_automatic_retry
 from devflow_temporal.delivery_activities import delivery_project, delivery_tracker_start
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow, _initial_controller_state
 
 
@@ -43,6 +49,15 @@ class OwnedCiRetry:
     async def run(self, request):
         return await DeliveryWorkflow()._resume_ci(
             request["spec"], request["recovery"], recheck_local=True,
+        )
+
+
+@workflow.defn
+class OwnedProjection:
+    @workflow.run
+    async def run(self, request):
+        return await workflow.execute_activity(
+            "delivery_project", request, start_to_close_timeout=timedelta(seconds=15),
         )
 
 
@@ -135,6 +150,41 @@ def test_stale_projection_preserves_all_current_persisted_fields(service):
     assert json.loads(after["checks_json"])["ci"]["state"] == "unknown"
 
 
+def test_old_workflow_projection_cannot_overwrite_queued_successor(service):
+    store, request = service
+    store.submit(request)
+    project(store, "current", phase="blocked", state="blocked", revision=9)
+    admitted = threading.Event()
+
+    def old_projection():
+        # This body already authenticated its immutable input before admission.
+        assert admitted.wait(5)
+        return store.project(
+            "run-1", phase="checks", execution_state="running", event_type="late_old_owner",
+            message="Late body from the closed predecessor", protocol_revision=9,
+            expected_workflow_id="delivery-run-1", checks={"local": {"state": "passed"}},
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        old = pool.submit(old_projection)
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE delivery_runs SET phase='repair_continuation_queued',"
+                       "execution_state='queued',workflow_id='delivery-run-1-new-owner',"
+                       "revision=revision+1 WHERE run_id='run-1'")
+            queued = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
+        admitted.set()
+        assert old.result() == queued
+    assert store.persisted_status("run-1")["phase"] == "repair_continuation_queued"
+    assert "late_old_owner" not in {event["type"] for event in store.events("run-1")}
+    current = store.project(
+        "run-1", phase="checks", execution_state="running", event_type="new_owner",
+        message="Current workflow", protocol_revision=10,
+        expected_workflow_id="delivery-run-1-new-owner",
+    )
+    assert current["phase"] == "checks"
+
+
 def test_persisted_status_remains_available_without_environment_proof(service, monkeypatch):
     store, request = service
     store.submit(request)
@@ -172,6 +222,41 @@ def test_capacity_edit_changes_no_recorded_authorization_or_candidate(service):
     assert store.submitted_spec("run-1") == original
 
 
+def test_automatic_retry_after_capacity_edit_preserves_original_policy(service, monkeypatch):
+    store, request, _closed = stopped(service, monkeypatch)
+    original = store.submitted_spec("run-1")
+    raw = json.loads(store.config.path.read_text())
+    raw["capacity"] = 1
+    store.config.path.write_text(json.dumps(raw))
+    restarted = DeliveryStore(DeliveryConfig.load(store.config.path))
+    admitted = delivery_automatic_retry.retry_once(restarted)
+    assert len(admitted) == 1
+    successor = restarted.spec(admitted[0]["run_id"])
+    assert successor["policy"] == original["policy"]
+    assert restarted.submitted_spec(request["run_id"]) == original
+
+
+@pytest.mark.parametrize("authority", ["scope", "roles", "commands", "budget"])
+def test_capacity_compatibility_does_not_admit_changed_authority(service, monkeypatch, authority):
+    store, request, _closed = stopped(service, monkeypatch)
+    original = store.submitted_spec("run-1")
+    raw = json.loads(store.config.path.read_text())
+    raw["capacity"] = 1
+    if authority == "scope":
+        raw["repositories"]["fixture"]["allowed_paths"].append("unaccepted.py")
+    elif authority == "roles":
+        raw["roles"]["implement"]["model"] = "unaccepted-model"
+    elif authority == "commands":
+        raw["repositories"]["fixture"]["checks"] = [{"id": "unaccepted", "argv": ["false"]}]
+    else:
+        raw["max_repairs"] = 1
+    store.config.path.write_text(json.dumps(raw))
+    restarted = DeliveryStore(DeliveryConfig.load(store.config.path))
+    assert delivery_automatic_retry.retry_once(restarted) == []
+    assert restarted.submitted_spec(request["run_id"]) == original
+    assert len(restarted.list_runs()) == 1
+
+
 @pytest.mark.asyncio
 async def test_public_recorded_status_reads_decision_without_launch_proof(service, monkeypatch):
     store, request = service
@@ -199,6 +284,57 @@ async def test_public_recorded_status_reads_decision_without_launch_proof(servic
     assert result["run"]["decisions"] == [decision]
     assert result["run"]["protocol_revision"] == 2
     assert result["run"]["state_contract"]["environment"]["verification"] == "not_reconstructed"
+
+
+@pytest.mark.asyncio
+async def test_real_late_activity_cannot_project_over_successor_owner(
+    service, monkeypatch, tmp_path,
+):
+    store, request = service
+    store.submit(request)
+    spec = store.spec("run-1")
+    entered, release = threading.Event(), threading.Event()
+    original_project = DeliveryStore.project
+
+    def held_projection(self, run_id, **values):
+        if values.get("event_type") == "old_owner":
+            entered.set()
+            assert release.wait(10)
+        return original_project(self, run_id, **values)
+
+    monkeypatch.setattr(DeliveryStore, "project", held_projection)
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET workflow_id='owned-old-owner' WHERE run_id='run-1'")
+    payload = {"spec": spec, "phase": "checks", "execution_state": "running",
+               "event_type": "old_owner", "message": "Old body already passed custody check",
+               "key": "old-owner:0:2", "iteration": 0, "protocol_revision": 2}
+    database = str(tmp_path / "temporal.sqlite3")
+    async with local_temporal(dev_server_database_filename=database) as env:
+        async with Worker(env.client, task_queue="owned-projection-owner",
+                          workflows=[OwnedProjection], activities=[delivery_project],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                OwnedProjection.run, payload, id="owned-old-owner",
+                task_queue="owned-projection-owner",
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 10)
+                with store._connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("UPDATE delivery_runs SET workflow_id='owned-new-owner',"
+                               "phase='repair_continuation_queued',execution_state='queued',"
+                               "protocol_revision=2,revision=revision+1 WHERE run_id='run-1'")
+                release.set()
+                assert (await asyncio.wait_for(handle.result(), 10))["phase"] == (
+                    "repair_continuation_queued")
+            finally:
+                release.set()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store.config.path)),
+                                 base_url=store.config.dashboard_url) as browser:
+        public = await browser.get("/api/runs/run-1/status")
+    assert public.status_code == 200
+    assert public.json()["run"]["phase"] == "repair_continuation_queued"
+    assert "old_owner" not in {event["type"] for event in store.events("run-1")}
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 from test_delivery_store import _git
@@ -102,7 +101,8 @@ async def test_cancelled_activity_waiter_cannot_admit_a_second_publication_body(
         assert result == {'state': 'pending', 'reason': 'publication_execution_active'}
     assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
     with store._connect() as db:
-        assert db.execute("SELECT state FROM delivery_effects WHERE kind='publish'").fetchone()[0] == 'pending'
+        row = db.execute("SELECT state FROM delivery_effects WHERE kind='publish'").fetchone()
+        assert row[0] == 'pending'
     await until(root, 'create-end')
     # The original body can still be acknowledging the exact receipt.
     for _ in range(100):
@@ -137,7 +137,8 @@ async def test_lost_waiter_then_proven_pre_mutation_failure_can_restart_original
     assert result['number'] == 1
     assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
     with store._connect() as db:
-        assert db.execute("SELECT state FROM delivery_effects WHERE kind='publish'").fetchone()[0] == 'complete'
+        row = db.execute("SELECT state FROM delivery_effects WHERE kind='publish'").fetchone()
+        assert row[0] == 'complete'
 
 
 @pytest.mark.asyncio
@@ -219,7 +220,8 @@ def test_actual_missing_executable_can_retry_creation_without_repeating_push(
         broker.publish(0, checked)
     assert events(root) == []
     head = _git(broker.checkout, 'rev-parse', 'HEAD')
-    assert _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + broker.spec['branch']).split()[0] == head
+    remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + broker.spec['branch'])
+    assert remote.split()[0] == head
     assert broker.reconcile_publish(0, checked, create_missing=True)['head'] == head
     assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
 
@@ -233,7 +235,8 @@ def test_legacy_pending_without_executor_journal_requires_readback(publication):
     assert events(root) == []
     assert _git(broker.checkout, 'rev-parse', 'HEAD') == checked['head']
     with store._connect() as db:
-        assert db.execute('SELECT legacy_unknown FROM delivery_publication_executors').fetchone()[0] == 1
+        row = db.execute('SELECT legacy_unknown FROM delivery_publication_executors').fetchone()
+        assert row[0] == 1
 
 
 @pytest.mark.asyncio

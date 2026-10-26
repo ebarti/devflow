@@ -21,7 +21,7 @@ _ACTIVE_PHASE = {
 
 
 def evidence(db: Any, run_id: str, iteration: int, gate_specs: list[tuple]) -> dict[str, int]:
-    """One aggregate per known event type, even for arbitrarily long histories.
+    """One indexed latest lookup per known type, even for long histories.
 
     Preparation is run-wide; all other evidence is candidate-iteration scoped.
     An attempt can repeat in one iteration, so ordering is retained as well.

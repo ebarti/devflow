@@ -455,8 +455,15 @@ def validate_transaction(store, db, spec, expected):
         raise ValueError('predecessor no longer eligible')
     if unavailable(store, db, old) or expected.get('stopped', lambda: False)():
         raise ValueError('predecessor is no longer the latest safe issue attempt')
-    if spec['policy'] != old['policy']:
+    # Capacity is current scheduling policy, not authority to change this
+    # delivery. Keep the admitted bytes while operational_config selects the
+    # scheduler's current limit. Every other policy field remains exact.
+    incoming_policy = {key: value for key, value in spec['policy'].items() if key != 'capacity'}
+    retained_policy = {key: value for key, value in old['policy'].items() if key != 'capacity'}
+    if incoming_policy != retained_policy:
         raise ValueError('fresh attempt changed frozen execution policy')
+    spec['policy'] = deepcopy(old['policy'])
+    spec['policy_digest'] = old['policy_digest']
     if spec['base_sha'] != expected['base_sha']:
         raise ValueError('fresh base changed after readback')
     spec['accepted_plan'] = previous['accepted_plan_text'] or old['accepted_plan']
