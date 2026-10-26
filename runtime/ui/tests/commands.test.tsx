@@ -9,7 +9,9 @@ import { mockRun, mockService } from './fixtures'
 import realBackendProjection from './real-backend-projection.json'
 import waitingDecisionProjection from './waiting-decision-projection.json'
 
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
+const completedOperation = (result: unknown = {}) => ({ operation_id: 'fixture-op', run_id: 'fixture-run', kind: 'fixture', stage: 'execution', state: 'succeeded' as const, progress: 'succeeded', next_action: 'inspect_result', result, error: null, authority: 'current_authority_unverified' })
+
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear() })
 
 describe('dashboard commands', () => {
   it('shows semantic adjudication separately while retaining failed QA and all raw findings', () => {
@@ -77,7 +79,7 @@ describe('dashboard commands', () => {
   })
 
   it.each(['question', 'plan'] as const)('keeps a retired nonterminal %s readable without action controls', kind => {
-    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const answer = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation())
     const cancel = vi.spyOn(api, 'cancel').mockResolvedValue(undefined)
     render(<RunDetails run={{
       ...mockRun, execution_retired: true, outcome: null, execution_state: 'waiting',
@@ -104,7 +106,7 @@ describe('dashboard commands', () => {
     // Mirrors DeliveryWorkflow's projected options and DeliveryStore.detail's public run shape.
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => waitingDecisionProjection })))
     const run = await api.getRun('fixture-run')
-    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const answer = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation())
     const refresh = vi.fn().mockResolvedValue(undefined)
     const user = userEvent.setup()
     render(<RunDetails run={run} onRefresh={refresh} />)
@@ -118,7 +120,7 @@ describe('dashboard commands', () => {
     expect(submit.disabled).toBe(false)
     await user.click(submit)
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
-    expect(answer.mock.calls[0][1]).toMatchObject({
+    expect(answer.mock.calls[0][0].request).toMatchObject({
       expected_revision: 3, decision_id: 'fixture-run:initial', decision_revision: 1,
       candidate_revision: 1, answer: 'proceed',
     })
@@ -160,7 +162,7 @@ describe('dashboard commands', () => {
 
   it('does not resubmit a stale decision after a 409 and refreshes the run', async () => {
     const user = userEvent.setup()
-    const answer = vi.spyOn(api, 'answer').mockRejectedValue(new ApiError('revision conflict', 409))
+    const answer = vi.spyOn(api, 'createOperation').mockRejectedValue(new ApiError('revision conflict', 409))
     const refresh = vi.fn().mockResolvedValue(undefined)
     render(<RunDetails run={mockRun} onRefresh={refresh} />)
     await user.click(screen.getByRole('radio', { name: 'Yes' }))
@@ -169,7 +171,7 @@ describe('dashboard commands', () => {
     expect(screen.getByRole('alert').textContent).toMatch(/decision changed/i)
     expect((screen.getByRole('button', { name: 'Submit decision' }) as HTMLButtonElement).disabled).toBe(true)
     expect(answer).toHaveBeenCalledTimes(1)
-    expect(answer.mock.calls[0][1]).toMatchObject({ expected_revision: 5, decision_id: 'fixture-decision', decision_revision: 3, candidate_revision: 2, answer: 'yes' })
+    expect(answer.mock.calls[0][0].request).toMatchObject({ expected_revision: 5, decision_id: 'fixture-decision', decision_revision: 3, candidate_revision: 2, answer: 'yes' })
   })
 
   it('uses the workflow revision for cancellation and disables commands until it is observed', async () => {
@@ -307,7 +309,7 @@ describe('dashboard commands', () => {
 
   it('submits a detailed goal and separate publication summary with the allowlisted endpoint', async () => {
     const user = userEvent.setup()
-    const submit = vi.spyOn(api, 'newRun').mockResolvedValue({ run_id: 'fixture-new', dashboard_url: '/runs/fixture-new', existing: false, phase: 'queued' })
+    const submit = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation({ run_id: 'fixture-new', dashboard_url: '/runs/fixture-new', existing: false, phase: 'queued' }))
     const onCreated = vi.fn()
     render(<NewRun service={mockService} onCreated={onCreated} onBack={vi.fn()} />)
     await user.type(screen.getByLabelText('Work ID'), 'fixture-work')
@@ -319,7 +321,7 @@ describe('dashboard commands', () => {
     await user.type(screen.getByLabelText('Publication summary'), 'docs: investigate fixture behavior')
     await user.click(screen.getByRole('button', { name: 'Start investigation' }))
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith('fixture-new'))
-    const body = submit.mock.calls[0][0]
+    const body = submit.mock.calls[0][0].request
     expect(body).toMatchObject({ repository_key: 'fixture-repo', base_ref: 'main', authorized_endpoint: 'published_unmerged', goal, publication_summary: 'docs: investigate fixture behavior' })
     expect(body).not.toHaveProperty('accepted_plan')
     expect(body).not.toHaveProperty('repo_path')
@@ -330,7 +332,7 @@ describe('dashboard commands', () => {
   it('shows admission errors and keeps the goal and summary available for correction', async () => {
     const user = userEvent.setup()
     const message = 'publication_summary must use Conventional Commit syntax'
-    const submit = vi.spyOn(api, 'newRun').mockRejectedValue(new Error(message))
+    const submit = vi.spyOn(api, 'createOperation').mockResolvedValue({ ...completedOperation(), state: 'refused', result: null, error: message, next_action: 'inspect_error', authority: null })
     const onCreated = vi.fn()
     render(<NewRun service={mockService} onCreated={onCreated} onBack={vi.fn()} />)
     await user.type(screen.getByLabelText('Work ID'), 'fixture-work')
@@ -342,15 +344,16 @@ describe('dashboard commands', () => {
     await user.type(screen.getByLabelText('Publication summary'), 'Plain prose')
     await user.click(screen.getByRole('button', { name: 'Start investigation' }))
     expect((await screen.findByRole('alert')).textContent).toBe(message)
-    expect(submit.mock.calls[0][0]).toMatchObject({ goal, publication_summary: 'Plain prose' })
+    expect(submit.mock.calls[0][0].request).toMatchObject({ goal, publication_summary: 'Plain prose' })
     expect((screen.getByLabelText('Goal') as HTMLTextAreaElement).value).toBe(goal)
+    expect((screen.getByLabelText('Goal') as HTMLTextAreaElement).disabled).toBe(false)
     expect((screen.getByLabelText('Publication summary') as HTMLInputElement).value).toBe('Plain prose')
     expect(onCreated).not.toHaveBeenCalled()
   })
 
   it('requires and submits the accepted plan for a service without intake', async () => {
     const user = userEvent.setup()
-    const submit = vi.spyOn(api, 'newRun').mockResolvedValue({ run_id: 'legacy-new', dashboard_url: '/runs/legacy-new', existing: false, phase: 'queued' })
+    const submit = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation({ run_id: 'legacy-new', dashboard_url: '/runs/legacy-new', existing: false, phase: 'queued' }))
     const onCreated = vi.fn()
     render(<NewRun service={{ ...mockService, policy: { ...mockService.policy, intake_enabled: false } }} onCreated={onCreated} onBack={vi.fn()} />)
     await user.type(screen.getByLabelText('Work ID'), 'legacy-work')
@@ -362,14 +365,14 @@ describe('dashboard commands', () => {
     await user.type(screen.getByLabelText('Accepted plan'), 'Implement the previously accepted scope')
     await user.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith('legacy-new'))
-    expect(submit.mock.calls[0][0]).toMatchObject({
+    expect(submit.mock.calls[0][0].request).toMatchObject({
       goal: 'Legacy task', accepted_plan: 'Implement the previously accepted scope',
     })
-    expect(submit.mock.calls[0][0]).not.toHaveProperty('publication_summary')
+    expect(submit.mock.calls[0][0].request).not.toHaveProperty('publication_summary')
   })
 
   it('sends a free-text clarification and renders the retained answer', async () => {
-    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const answer = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation())
     const user = userEvent.setup()
     render(<RunDetails run={{
       ...mockRun, protocol_revision: 4,
@@ -389,13 +392,13 @@ describe('dashboard commands', () => {
     await user.type(screen.getByLabelText('Your answer (or choose a suggestion)'), 'Include both paths')
     await user.click(screen.getByRole('button', { name: 'Submit answer' }))
     await waitFor(() => expect(answer).toHaveBeenCalledTimes(1))
-    expect(answer.mock.calls[0][1]).toMatchObject({
+    expect(answer.mock.calls[0][0].request).toMatchObject({
       expected_revision: 4, decision_id: 'fixture:question:0:scope', answer: 'Include both paths',
     })
   })
 
   it('shows the exact proposed plan and sends a requested revision', async () => {
-    const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+    const answer = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation())
     const user = userEvent.setup()
     render(<RunDetails run={{
       ...mockRun, protocol_revision: 8,
@@ -413,8 +416,98 @@ describe('dashboard commands', () => {
     await user.type(screen.getByLabelText('What should change in the plan?'), 'Include API verification')
     await user.click(screen.getByRole('button', { name: 'Submit plan response' }))
     await waitFor(() => expect(answer).toHaveBeenCalledTimes(1))
-    expect(answer.mock.calls[0][1]).toMatchObject({
+    expect(answer.mock.calls[0][0].request).toMatchObject({
       expected_revision: 8, decision_id: 'fixture:plan:2', answer: 'change', response: 'Include API verification',
     })
   })
+})
+
+it('keeps submitted run intent and never navigates while the operation is pending', async () => {
+  const operation = vi.spyOn(api, 'createOperation').mockImplementation(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null }))
+  const onCreated = vi.fn()
+  const user = userEvent.setup()
+  render(<NewRun service={mockService} onCreated={onCreated} onBack={vi.fn()} />)
+  await user.type(screen.getByLabelText('Work ID'), 'fixture-work')
+  await user.type(screen.getByLabelText('GitHub issue URL'), 'https://github.com/example/repository/issues/1')
+  await user.selectOptions(screen.getByLabelText('Repository'), 'fixture-repo')
+  await user.type(screen.getByLabelText('Branch'), 'feat/fixture')
+  await user.type(screen.getByLabelText('Goal'), 'Investigate fixture')
+  await user.click(screen.getByRole('button', { name: 'Start investigation' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  expect(onCreated).not.toHaveBeenCalled()
+  expect((screen.getByLabelText('Goal') as HTMLTextAreaElement).disabled).toBe(true)
+  await user.click(screen.getByRole('button', { name: 'Check submitted operation' }))
+  expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
+})
+
+it('keeps the original decision while its durable operation is pending', async () => {
+  const operation = vi.spyOn(api, 'createOperation').mockResolvedValue({ ...completedOperation(), state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null })
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const refresh = vi.fn().mockResolvedValue(undefined)
+  const run: RunDetail = { ...mockRun, decisions: [{ id: 'pending-decision', revision: 1, kind: 'question', candidate_revision: 1, prompt: 'Choose a scope', options: ['Proceed'], state: 'pending' }] }
+  const user = userEvent.setup()
+  const { rerender } = render(<RunDetails run={run} onRefresh={refresh} />)
+  await user.click(screen.getByRole('radio', { name: 'Proceed' }))
+  await user.click(screen.getByRole('button', { name: 'Submit answer' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  expect(refresh).not.toHaveBeenCalled()
+  rerender(<RunDetails run={{ ...run, protocol_revision: 99 }} onRefresh={refresh} />)
+  await user.click(screen.getByRole('button', { name: 'Check submitted decision' }))
+  expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
+})
+
+
+it('restores a submitted operation handle after the form is reopened', async () => {
+  sessionStorage.setItem('devflow.pending-submit-operation', 'submit:retained')
+  const inspect = vi.spyOn(api, 'getOperation')
+    .mockResolvedValueOnce({ ...completedOperation(), operation_id: 'submit:retained', state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null })
+    .mockResolvedValueOnce({ ...completedOperation({ run_id: 'restored-run' }), operation_id: 'submit:retained' })
+  const onCreated = vi.fn()
+  render(<NewRun service={mockService} onCreated={onCreated} onBack={vi.fn()} />)
+  expect(await screen.findByText(/Operation submit:retained: running/)).toBeTruthy()
+  expect((screen.getByRole('button', { name: 'Start investigation' }) as HTMLButtonElement).disabled).toBe(true)
+  expect(onCreated).not.toHaveBeenCalled()
+  await userEvent.click(screen.getByRole('button', { name: 'Refresh operation status' }))
+  await userEvent.click(await screen.findByRole('button', { name: 'Open submitted run' }))
+  expect(onCreated).toHaveBeenCalledWith('restored-run')
+  expect(inspect).toHaveBeenCalledTimes(2)
+})
+
+it('restores the exact submitted request after reopening and retries the same operation', async () => {
+  const operation = vi.spyOn(api, 'createOperation')
+    .mockImplementationOnce(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null }))
+    .mockResolvedValueOnce(completedOperation({ run_id: 'restored-exact' }))
+  const onCreated = vi.fn()
+  const user = userEvent.setup()
+  const view = render(<NewRun service={mockService} onCreated={onCreated} onBack={vi.fn()} />)
+  await user.type(screen.getByLabelText('Work ID'), 'retained-work')
+  await user.type(screen.getByLabelText('GitHub issue URL'), 'https://github.com/example/repository/issues/1')
+  await user.selectOptions(screen.getByLabelText('Repository'), 'fixture-repo')
+  await user.type(screen.getByLabelText('Branch'), 'feat/retained')
+  await user.type(screen.getByLabelText('Goal'), 'Retain this exact goal')
+  await user.click(screen.getByRole('button', { name: 'Start investigation' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  view.unmount()
+  render(<NewRun service={null} onCreated={onCreated} onBack={vi.fn()} />)
+  expect((screen.getByLabelText('Goal') as HTMLTextAreaElement).value).toBe('Retain this exact goal')
+  expect((screen.getByLabelText('Goal') as HTMLTextAreaElement).disabled).toBe(true)
+  await user.click(screen.getByRole('button', { name: 'Check submitted operation' }))
+  expect(JSON.stringify(operation.mock.calls[1])).toBe(JSON.stringify(operation.mock.calls[0]))
+  expect(onCreated).toHaveBeenCalledWith('restored-exact')
+})
+
+it('restores the exact decision after reopening while its operation is pending', async () => {
+  const operation = vi.spyOn(api, 'createOperation').mockImplementation(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null }))
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const run: RunDetail = { ...mockRun, decisions: [{ id: 'retained-decision', revision: 1, kind: 'question', candidate_revision: 1, prompt: 'Choose a scope', options: ['Proceed'], state: 'pending' }] }
+  const user = userEvent.setup()
+  const view = render(<RunDetails run={run} onRefresh={vi.fn()} />)
+  await user.click(screen.getByRole('radio', { name: 'Proceed' }))
+  await user.click(screen.getByRole('button', { name: 'Submit answer' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  view.unmount()
+  render(<RunDetails run={{ ...run, protocol_revision: 99 }} onRefresh={vi.fn()} />)
+  expect(screen.getByText(/previous decision request is retained/i)).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: 'Check submitted decision' }))
+  expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
 })

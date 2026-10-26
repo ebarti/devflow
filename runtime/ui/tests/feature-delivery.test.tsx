@@ -6,7 +6,9 @@ import { RunDetails } from '../src/RunDetails'
 import type { RunDetail } from '../src/model'
 import { mockRun } from './fixtures'
 
-afterEach(() => vi.restoreAllMocks())
+const completedOperation = (result: unknown = {}) => ({ operation_id: 'fixture-op', run_id: 'fixture-run', kind: 'fixture', stage: 'execution', state: 'succeeded' as const, progress: 'succeeded', next_action: 'inspect_result', result, error: null, authority: 'current_authority_unverified' })
+
+afterEach(() => { vi.restoreAllMocks(); sessionStorage.clear() })
 
 const feature: RunDetail = {
   ...mockRun, projection_revision: 12, decisions: [], outcome: 'blocked',
@@ -29,24 +31,24 @@ it('shows GitHub definition, cumulative repairs, and complete chunk evidence', (
 })
 
 it('retries a lost continuation response with the original identity and revision', async () => {
-  const continueFeature = vi.spyOn(api, 'continueFeature')
+  const continueFeature = vi.spyOn(api, 'createOperation')
     .mockRejectedValueOnce(new ApiError('Response unavailable', 503))
-    .mockResolvedValueOnce({ run_id: 'next-run', phase: 'queued' })
+    .mockResolvedValueOnce(completedOperation({ run_id: 'next-run', phase: 'queued' }))
   const refresh = vi.fn().mockResolvedValue(undefined)
   const user = userEvent.setup()
   const { rerender } = render(<RunDetails run={feature} onRefresh={refresh} />)
   await user.click(screen.getByRole('button', { name: 'Continue this feature' }))
   await screen.findByRole('alert')
   rerender(<RunDetails run={{ ...feature, projection_revision: 14 }} onRefresh={refresh} />)
-  await user.click(screen.getByRole('button', { name: 'Continue this feature' }))
+  await user.click(screen.getByRole('button', { name: 'Check feature continuation' }))
   await waitFor(() => expect(refresh).toHaveBeenCalledOnce())
   expect(continueFeature.mock.calls[1]).toEqual(continueFeature.mock.calls[0])
-  expect(continueFeature.mock.calls[0][1].expected_revision).toBe(12)
+  expect((continueFeature.mock.calls[0][0].request as { expected_revision: number }).expected_revision).toBe(12)
   expect(screen.getByRole('link', { name: 'Open the coordinating run' }).getAttribute('href')).toBe('/runs/next-run')
 })
 
 it('requires a selected merge instruction for the displayed stack revision', async () => {
-  const answer = vi.spyOn(api, 'answer').mockResolvedValue(undefined)
+  const answer = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation())
   const refresh = vi.fn().mockResolvedValue(undefined)
   const user = userEvent.setup()
   render(<RunDetails run={{ ...feature, outcome: null, phase: 'awaiting_merge',
@@ -62,5 +64,34 @@ it('requires a selected merge instruction for the displayed stack revision', asy
   await user.click(screen.getByRole('radio', { name: 'Merge' }))
   await user.click(screen.getByRole('button', { name: 'Merge this feature' }))
   await waitFor(() => expect(refresh).toHaveBeenCalledOnce())
-  expect(answer.mock.calls[0][1]).toMatchObject({ answer: 'merge', decision_id: 'fixture-run:merge:4', decision_revision: 4, candidate_revision: 1 })
+  expect(answer.mock.calls[0][0].request).toMatchObject({ answer: 'merge', decision_id: 'fixture-run:merge:4', decision_revision: 4, candidate_revision: 1 })
+})
+
+it('does not announce a successor while feature continuation is pending', async () => {
+  const operation = vi.spyOn(api, 'createOperation').mockResolvedValue({ ...completedOperation(), state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null })
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const refresh = vi.fn().mockResolvedValue(undefined)
+  const user = userEvent.setup()
+  const { rerender } = render(<RunDetails run={feature} onRefresh={refresh} />)
+  await user.click(screen.getByRole('button', { name: 'Continue this feature' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  expect(screen.queryByRole('link', { name: 'Open the coordinating run' })).toBeNull()
+  expect(refresh).not.toHaveBeenCalled()
+  rerender(<RunDetails run={{ ...feature, projection_revision: 99 }} onRefresh={refresh} />)
+  await user.click(screen.getByRole('button', { name: 'Check feature continuation' }))
+  expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
+})
+
+it('restores the exact feature continuation after reopening', async () => {
+  const operation = vi.spyOn(api, 'createOperation').mockImplementation(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null }))
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const user = userEvent.setup()
+  const view = render(<RunDetails run={feature} onRefresh={vi.fn()} />)
+  await user.click(screen.getByRole('button', { name: 'Continue this feature' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  view.unmount()
+  render(<RunDetails run={{ ...feature, projection_revision: 99 }} onRefresh={vi.fn()} />)
+  expect(screen.getByText(/previous feature request is retained/i)).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: 'Check feature continuation' }))
+  expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
 })

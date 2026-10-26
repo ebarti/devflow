@@ -40,7 +40,7 @@ it('preserves backlog when its refresh fails and never starts work from a board 
   vi.spyOn(api, 'getService').mockResolvedValue(mockService)
   vi.spyOn(api, 'listRunsPage').mockResolvedValue({ runs: [], next_cursor: null })
   vi.spyOn(api, 'getProjectBoard').mockResolvedValueOnce(project).mockRejectedValue(new Error('Project unavailable'))
-  const submit = vi.spyOn(api, 'newRun')
+  const submit = vi.spyOn(api, 'createOperation')
   render(<App />)
   await screen.findByRole('link', { name: /Unstarted backlog work/ })
   await userEvent.setup().click(screen.getByRole('button', { name: 'Refresh board' }))

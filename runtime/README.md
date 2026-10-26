@@ -296,3 +296,9 @@ Routine CLI `run --id RUN` and MCP `get_run` read the versioned persisted
 status projection. They do not reconstruct current execution authority. Use
 CLI `run-detail --id RUN` or MCP `get_run_detail` for explicit full-detail
 and evidence reconstruction.
+
+The dashboard retains an uncertain submitted run, decision, or feature request
+in tab-scoped session storage so reopening the form keeps the original command
+and request. It clears that intent only after a durable success or known
+refusal. The operation panel exposes the recorded status; a pending response
+never creates a successor link or navigates to an undefined run.

@@ -5,6 +5,7 @@ import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, IntakePlan, PhaseGate, RoleState, RunDetail } from './model'
 import { RunControls } from './RunControls'
 import { DurableOperations } from './DurableOperations'
+import { loadIntent, saveIntent } from './operationIntent'
 import { FeatureDelivery } from './FeatureDelivery'
 import { runStatus } from './runStatus'
 
@@ -193,11 +194,14 @@ function UsageSection({ run }: { run: RunDetail }) {
 }
 
 function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: Decision; onRefresh: () => Promise<void> }) {
-  const [choice, setChoice] = useState('')
-  const [freeText, setFreeText] = useState('')
-  const [commandId, setCommandId] = useState(() => crypto.randomUUID())
+  const intentKey = `devflow.decision:${run.id}:${decision.id}:${decision.revision}`
+  const [saved] = useState(() => loadIntent<Parameters<typeof api.answer>[1]>(intentKey))
+  const [choice, setChoice] = useState(() => decision.kind === 'question' ? '' : saved?.answer ?? '')
+  const [freeText, setFreeText] = useState(() => decision.kind === 'question' ? saved?.answer ?? '' : saved?.response ?? '')
+  const [commandId, setCommandId] = useState(() => saved?.command_id ?? crypto.randomUUID())
+  const [intent, setIntent] = useState<Parameters<typeof api.answer>[1] | null>(saved)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState(saved ? 'A previous decision request is retained. Check its operation.' : '')
   const [stale, setStale] = useState(false)
 
   const plan = decision.kind === 'plan' ? run.intake?.plans.find(item => item.revision === decision.plan_revision)?.content : null
@@ -206,19 +210,31 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   const valid = Boolean(answerText) && (decision.kind !== 'plan' || choice !== 'change' || Boolean(freeText.trim()))
 
   async function answer() {
-    if (run.execution_retired || !valid || run.protocol_revision == null || decision.candidate_revision == null || busy || stale) return
-    setBusy(true); setError('')
+    if (run.execution_retired || busy || stale || (!intent && (!valid || run.protocol_revision == null || decision.candidate_revision == null))) return
+    const request = intent ?? {
+      command_id: commandId, expected_revision: run.protocol_revision!,
+      decision_id: decision.id, decision_revision: decision.revision,
+      candidate_revision: decision.candidate_revision!, answer: answerText,
+      ...(decision.kind === 'plan' && choice === 'change' ? { response: freeText.trim() } : {}),
+    }
+    saveIntent(intentKey, request); setIntent(request); setBusy(true); setError('')
     try {
-      await api.answer(run.id, {
-        command_id: commandId, expected_revision: run.protocol_revision,
-        decision_id: decision.id, decision_revision: decision.revision,
-        candidate_revision: decision.candidate_revision, answer: answerText,
-        ...(decision.kind === 'plan' && choice === 'change' ? { response: freeText.trim() } : {}),
+      const operation = await api.createOperation({
+        operation_id: `decision:${request.command_id}`, run_id: run.id, kind: 'decision', request,
       })
-      await onRefresh()
+      if (operation.state === 'succeeded') {
+        saveIntent(intentKey, null); setIntent(null)
+        await onRefresh()
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        saveIntent(intentKey, null); setIntent(null); setStale(true)
+        setError(operation.error || 'The decision was refused; review the latest run.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 409) {
-        setStale(true)
+        saveIntent(intentKey, null); setIntent(null); setStale(true)
         setError('The decision changed. The latest run is loading; review it before responding.')
         await onRefresh()
       } else setError(cause instanceof Error ? cause.message : 'Could not submit the decision.')
@@ -234,7 +250,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
     {plan ? <div className="intake-plan"><h3>Scope</h3><p>{plan.scope}</p><h3>Steps</h3><ol>{plan.steps.map((item, index) => <li key={index}>{item}</li>)}</ol><h3>Verification</h3><ul>{plan.verification.map((item, index) => <li key={index}>{item}</li>)}</ul><h3>Acceptance</h3><ul>{plan.acceptance.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
     {plan ? <Workstreams plan={plan} /> : null}
     {decision.candidate_revision != null ? <p className="subtle">Candidate revision {decision.candidate_revision}</p> : null}
-    {run.execution_retired ? <p className="subtle">Saved decision · read-only</p> : <><fieldset disabled={busy || stale}>
+    {run.execution_retired ? <p className="subtle">Saved decision · read-only</p> : <><fieldset disabled={busy || stale || intent !== null}>
       <legend className="sr-only">Choose a response</legend>
       {decision.options.map(option => {
         const value = typeof option === 'string' ? option : option.value
@@ -246,9 +262,9 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
         </label>
       })}
     </fieldset>
-    {decision.kind === 'question' || (decision.kind === 'plan' && choice === 'change') ? <label className="field-wide">{decision.kind === 'question' ? 'Your answer (or choose a suggestion)' : 'What should change in the plan?'}<textarea value={freeText} onChange={event => { setFreeText(event.target.value); if (decision.kind === 'question') setChoice(''); setCommandId(crypto.randomUUID()) }} rows={3} maxLength={4000} disabled={busy || stale} /></label> : null}
+    {decision.kind === 'question' || (decision.kind === 'plan' && choice === 'change') ? <label className="field-wide">{decision.kind === 'question' ? 'Your answer (or choose a suggestion)' : 'What should change in the plan?'}<textarea value={freeText} onChange={event => { setFreeText(event.target.value); if (decision.kind === 'question') setChoice(''); setCommandId(crypto.randomUUID()) }} rows={3} maxLength={4000} disabled={busy || stale || intent !== null} /></label> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
-    <button className="primary-button" type="button" disabled={!valid || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : decision.kind === 'merge' ? 'Merge this feature' : 'Submit decision'}</button>
+    <button className="primary-button" type="button" disabled={busy || stale || (!intent && (!valid || run.protocol_revision == null || decision.candidate_revision == null))} onClick={() => void answer()}>{busy ? 'Submitting…' : intent ? 'Check submitted decision' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : decision.kind === 'merge' ? 'Merge this feature' : 'Submit decision'}</button>
     </>}
   </section>
 }
