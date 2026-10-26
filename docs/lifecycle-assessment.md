@@ -1,7 +1,8 @@
 # Recovery transition assessments
 
-`POST /api/runs/{id}/assess-transition` takes `{ "kind": ..., "request": ... }` and
-performs the selected owner's explicit observation. It is not a grant, a lock,
+`POST /api/runs/{id}/assess-transition` takes `{ "kind": ..., "request": ... }`.
+The same operation is available from the `assess-transition` CLI command and
+MCP `assess_transition` tool. It performs the selected owner's explicit observation. It is not a grant, a lock,
 or an instruction to execute. Admission reobserves its own evidence and retains
 its existing command identity, ownership, scope and budget checks. A digest binds
 an assessment to observed evidence; it does not authorize a subsequent admission.
@@ -22,8 +23,9 @@ from a free-form error or a dashboard phase.
 | Investigation gates-only | Stopped seal, requested authority and native readiness | Same seal comparison under the existing lock; original authority and custody validation remains in force |
 | Merge follow-up | Delivered proof and merge command | Current proof and exclusive owner are reobserved under the existing admission fence |
 | CI inventory and native diagnostic | Owner-specific preflight evidence | Acknowledgement rechecks the selected owner facts; execution authorization remains separate |
-| Publication recovery, prelaunch retry and scope amendment | Where their owner can make a read-only proof, the existing admission guards are evaluated without issuing a command | The transaction rechecks owner, candidate, effects, cleanup and the original grant |
+| Publication recovery, prelaunch retry and scope amendment | Where their owner can make a read-only proof, the existing admission guards are evaluated without issuing a command. Pending publication inspects the existing executor lease and exact remote head without changing its journal | The transaction rechecks owner, candidate, effects, cleanup and the original grant |
 | Feature continuation and plan revision | Read-only complete settlement proof is not yet available; assessment reports unknown | Existing execution guards continue to apply |
+| Offline filesystem custody and runtime location | The local owner reports the same assessment vocabulary alongside its existing explicit preflight; filesystem adoption still requires a separate operator decision | Existing offline locks and ownership remain in force; execution rechecks the evidence hash |
 | Other owners | Unsupported or unavailable proof reports unknown | Their existing recovery entry points and guards remain authoritative |
 
 Some retained-history checks still report their original aggregate refusal. An

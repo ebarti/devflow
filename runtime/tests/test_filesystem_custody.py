@@ -168,6 +168,11 @@ def test_public_grant_preserves_originals_and_unlocks_exact_native_resource_read
 @pytest.mark.parametrize("drift", ["revision", "source", "journal", "manifest"])
 def test_preflight_is_observation_and_stale_evidence_never_grants_authority(reboot, drift):
     case = reboot
+    from devflow_temporal.delivery_lifecycle import RecoveryRefused
+
+    preview = custody.preflight(case.store, case.spec["run_id"])
+    assert preview["lifecycle_assessment"]["blockers"][0]["code"] == (
+        "filesystem_adoption_authorization_required")
     supplied = command(case)
     if drift == "revision":
         with case.store._connect() as db:
@@ -182,8 +187,11 @@ def test_preflight_is_observation_and_stale_evidence_never_grants_authority(rebo
         manifest = read_private(case.resources.manifest)
         manifest["roots"][case.spec["checkout"]]["generation"] = 99
         write_private(case.resources.manifest, manifest)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as failure:
         custody.adopt(case.store, case.spec["run_id"], supplied)
+    if drift == "revision":
+        assert isinstance(failure.value, RecoveryRefused)
+        assert failure.value.assessment["blockers"][0]["code"] == "revision_changed"
     with case.store._connect() as db:
         assert (
             db.execute("SELECT 1 FROM delivery_events WHERE type=?", (custody.KIND,)).fetchone()

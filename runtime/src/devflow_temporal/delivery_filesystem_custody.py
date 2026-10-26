@@ -447,13 +447,35 @@ def _collect(store, run_id, leases):
     return spec, evidence, originals, descriptors
 
 
+def _lifecycle_facts(evidence, request):
+    evidence_sha256 = digest(evidence)
+    return {
+        "operation": "adopt_filesystem_custody", "owner": "filesystem_custody",
+        "owner_proof": True, "normalized_lifecycle": "stopped", "proof_digest": evidence_sha256,
+        "revision": evidence["row"]["revision"], "evidence_sha256": evidence_sha256,
+        "comparisons": [("revision", "expected_revision", "revision_changed"),
+                        ("evidence_sha256", "expected_evidence_sha256", "custody_changed")],
+        "predicates": [{"code": "filesystem_adoption_authorization_required",
+                        "satisfied": request.get("answer") == ANSWER,
+                        "missing_or_unknown_fact": "explicit current-object adoption decision",
+                        "next_action": "provide the explicit adoption decision",
+                        "new_authorization_required": True}],
+    }
+
+
 def preflight(store, run_id):
     from .delivery_interrupted_recovery import installation_recovery_lease
 
     with installation_recovery_lease(store.config, exclusive=True), ExitStack() as leases:
         _, evidence, _, _ = _collect(store, run_id, leases)
+        from .delivery_lifecycle import evaluate_transition
+
+        request = {"expected_revision": evidence["row"]["revision"],
+                   "expected_evidence_sha256": digest(evidence)}
         return {
             "run_id": run_id,
+            "lifecycle_assessment": evaluate_transition(
+                _lifecycle_facts(evidence, request), request),
             "expected_revision": evidence["row"]["revision"],
             "expected_evidence_sha256": digest(evidence),
             "objects": evidence["objects"],
@@ -551,11 +573,9 @@ def adopt(store, run_id, supplied):
         return json.loads(prior[1])
     with installation_recovery_lease(store.config, exclusive=True), ExitStack() as leases:
         spec, evidence, originals, descriptors = _collect(store, run_id, leases)
-        if (
-            evidence["row"]["revision"] != supplied["expected_revision"]
-            or digest(evidence) != supplied["expected_evidence_sha256"]
-        ):
-            raise ValueError("filesystem custody preflight evidence or revision changed")
+        from .delivery_lifecycle import require_transition
+
+        require_transition(_lifecycle_facts(evidence, supplied), supplied)
         folder = Path(spec["state_dir"]) / "filesystem-custody"
         receipt = {
             "kind": KIND,

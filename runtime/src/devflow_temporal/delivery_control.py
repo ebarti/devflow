@@ -967,6 +967,10 @@ def main() -> None:
     try:
         _run(args, parser)
     except (ValueError, OSError, RuntimeError) as exc:
+        from .delivery_lifecycle import RecoveryRefused
+
+        if isinstance(exc, RecoveryRefused):
+            parser.exit(1, json.dumps({"state": "refused", "assessment": exc.assessment}) + "\n")
         parser.exit(1, f"devflow-delivery: {exc}\n")
 
 
@@ -1061,6 +1065,11 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             result = (preflight(store, args.id) if args.command == "filesystem-custody-preflight"
                       else adopt(store, args.id, json.loads(args.request.read_text())))
         except (ValueError, OSError, RuntimeError) as exc:
+            from .delivery_lifecycle import RecoveryRefused
+
+            if isinstance(exc, RecoveryRefused):
+                parser.exit(1, json.dumps(
+                    {"state": "refused", "assessment": exc.assessment}) + "\n")
             parser.exit(1, f"devflow-delivery: {exc}\n")
         print(json.dumps(result, sort_keys=True, indent=2))
         return

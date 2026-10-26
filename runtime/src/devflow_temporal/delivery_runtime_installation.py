@@ -1088,6 +1088,16 @@ def _native_inputs(store, db):
     return values
 
 
+def _lifecycle_facts(authority):
+    proof = digest(authority)
+    return {
+        "operation": "adopt_runtime_location", "owner": "runtime_installation",
+        "owner_proof": True, "normalized_lifecycle": "stopped", "proof_digest": proof,
+        "evidence_sha256": proof,
+        "comparisons": [("evidence_sha256", "expected_evidence_sha256", "custody_changed")],
+    }
+
+
 def preflight(config, supplied):
     from .delivery_interrupted_recovery import installation_recovery_lease
 
@@ -1099,9 +1109,14 @@ def preflight(config, supplied):
         _store, authority, observations = _authority(
             config, supplied, inputs, leases, service_descriptor=descriptor
         )
+        from .delivery_lifecycle import evaluate_transition
+
+        expected = supplied.get("expected_evidence_sha256", digest(authority))
         return {
             "kind": SCHEMA,
             "preflight": True,
+            "lifecycle_assessment": evaluate_transition(
+                _lifecycle_facts(authority), {"expected_evidence_sha256": expected}),
             "authority": authority,
             "observations": observations,
             "expected_evidence_sha256": digest(authority),
@@ -1389,8 +1404,9 @@ def apply(config, supplied):
             store, authority, observations = _authority(
                 config, supplied, inputs, leases, service_descriptor=service_descriptor
             )
-            if digest(authority) != supplied["expected_evidence_sha256"]:
-                raise ValueError("installation preflight authority changed")
+            from .delivery_lifecycle import require_transition
+
+            require_transition(_lifecycle_facts(authority), supplied)
             candidate = {
                 "schema": SCHEMA,
                 "command": supplied,
