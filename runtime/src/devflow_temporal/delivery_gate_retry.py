@@ -1507,6 +1507,7 @@ def prepare_runtime(spec, root, command_digest, seal_digest, *, handoff=None):
     require_preparation_location(spec, binary.resolve())
     execution = deepcopy(spec)
     execution['policy']['codex_bin'] = str(binary.resolve())
+    execution['policy_digest'] = digest(execution['policy'])
     with _lock(root / 'runtime-preparation'):
         original_path = root / 'runtime-preparation' / 'intent.json'
         raw = read_private(original_path, raw=True) if original_path.exists() else None

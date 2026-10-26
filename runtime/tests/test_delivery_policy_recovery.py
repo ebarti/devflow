@@ -171,7 +171,8 @@ def preserved(native_configuration, monkeypatch):
     config_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     payload = {'config_path': str(path), 'config_sha256': config_hash}
     intent_path = Path(spec['state_dir']) / 'policy-recovery' / 'intent.json'
-    intent = {'preparation_attempts': [], 'effective_spec': None}
+    intent = {'command_digest': digest(payload), 'seal_digest': digest(state),
+              'preparation_attempts': [], 'effective_spec': None}
     predecessor = Path(spec['state_dir']) / 'policy-recovery' / 'predecessor'
     for name in ('manifest.json', 'finalization.json'):
         write_private(predecessor / name, read_private(RunResources(spec).root / name))
