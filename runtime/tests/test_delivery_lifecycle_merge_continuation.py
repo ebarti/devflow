@@ -131,3 +131,40 @@ async def test_public_merge_assessment_authenticates_leased_prelaunch_without_mu
             effect = db.execute('SELECT state FROM delivery_effects WHERE effect_key=?',
                                 (b.effect['effect_key'],)).fetchone()
             assert effect['state'] == 'complete'
+
+
+@pytest.mark.asyncio
+async def test_first_merge_assessment_respects_existing_installation_fence(delivered):
+    from devflow_temporal.delivery_feature_execution import registry_path
+    from devflow_temporal.delivery_interrupted_recovery import installation_recovery_lease
+
+    d = delivered
+    lease_path = registry_path(d.store.config).parent / 'installation-recovery.lock'
+    async with _client(d.store) as client:
+        session = (await client.get('/api/session')).json()
+        headers = {'X-Devflow-CSRF': session['csrf_token'], 'Origin': d.store.config.dashboard_url}
+        # This is a disposable fixture; simulate a genuinely absent witness.
+        if lease_path.exists():
+            lease_path.unlink()
+        before = _rows(d.store)
+        request = {'kind': 'merge_run', 'request': d.command}
+        missing = await client.post('/api/runs/run-1/assess-transition', json=request)
+        assert missing.status_code == 200 and not missing.json()['eligible']
+        assert not lease_path.exists()
+        assert _rows(d.store) == before
+
+        # A closed-run maintenance owner holds the shared lease while the
+        # first merge needs an exclusive admission fence.
+        with installation_recovery_lease(d.store.config):
+            held = await client.post('/api/runs/run-1/assess-transition', json=request)
+            assert held.status_code == 200 and not held.json()['eligible']
+            assert 'owner_proof_unknown' in {b['code'] for b in held.json()['blockers']}
+            refused = await client.post('/api/runs/run-1/merge', json=d.command, headers=headers)
+            assert refused.status_code in {409, 503}
+            assert _rows(d.store) == before
+
+        allowed = await client.post('/api/runs/run-1/assess-transition', json=request)
+        assert allowed.status_code == 200 and allowed.json()['eligible'], allowed.text
+        assert _rows(d.store) == before
+        admitted = await client.post('/api/runs/run-1/merge', json=d.command, headers=headers)
+        assert admitted.status_code == 200, admitted.text

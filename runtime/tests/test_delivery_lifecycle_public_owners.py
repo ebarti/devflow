@@ -18,6 +18,11 @@ async def _client(store):
 @pytest.mark.asyncio
 async def test_merge_assessment_and_execution_agree_and_keep_legacy_replay(delivered, monkeypatch):
     d = delivered
+    from devflow_temporal.delivery_interrupted_recovery import installation_recovery_lease
+
+    # Establish the existing installation fence outside the observation.
+    with installation_recovery_lease(d.store.config):
+        pass
     calls = []
     original = d.store._completed_temporal_result
     def observed(*args, **kwargs):

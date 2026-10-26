@@ -428,12 +428,13 @@ def assess(store, run_id, request):
             if prior and (prior['run_id'] != run_id or prior['request_digest'] != digest({
                     'kind': 'merge_run', 'run_id': run_id, 'request': request})):
                 raise ValueError('merge command ID belongs to different inputs')
-            if previous:
-                if not _continuable(previous):
-                    raise ValueError('merge already owns a request')
-                from .delivery_merge_execution import existing_lease
+            if previous and not _continuable(previous):
+                raise ValueError('merge already owns a request')
+            from .delivery_merge_execution import existing_lease
 
-                leases.enter_context(existing_lease(store.config, exclusive=True))
+            # Both first admission and continuation use this same fence. A
+            # read-only assessment cannot create a missing lease witness.
+            leases.enter_context(existing_lease(store.config, exclusive=True))
             spec, proof, _ = _observe_merge(store, run_id, request, previous)
             if previous:
                 original = json.loads(previous['grant_json'])
