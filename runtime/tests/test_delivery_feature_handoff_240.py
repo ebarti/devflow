@@ -42,6 +42,8 @@ def feature(tmp_path):
     spec = {"run_id": "run-1", "feature_delivery": {"owner": token, "registry": str(shared.path)}}
     store = ObservationStore(tracking)
     with store._connect() as db:
+        db.execute("CREATE TABLE delivery_commands (command_id TEXT, run_id TEXT, "
+                   "request_digest TEXT, response_json TEXT)")
         db.execute(
             "CREATE TABLE delivery_runs (run_id TEXT, revision INTEGER, outcome TEXT, "
             "cleanup TEXT, request_json TEXT, recovery_json TEXT, accepted_plan_text TEXT)"

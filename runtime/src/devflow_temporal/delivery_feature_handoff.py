@@ -78,6 +78,11 @@ class _RegistryView:
     def budget(self, issue_id):
         return self._budget(self.db, issue_id)
 
+    def require_unspent_budget(self, issue_id, recorded):
+        from .delivery_execution_registry import ExecutionRegistry
+
+        return ExecutionRegistry.require_unspent_budget(self, issue_id, recorded)
+
     @staticmethod
     def _budget(db, issue_id):
         from .delivery_execution_registry import ExecutionRegistry
@@ -401,9 +406,87 @@ def _observe_handoff(store, run_id, request, *, operation, revision_admission=No
             store.config.tracking_db
         ):
             return evaluate_transition(unknown, request)
+        if operation == "continue_feature" and isinstance(request, dict):
+            from .delivery_config import COMMAND_RE
+            from .delivery_feature_scope import FIELDS as SCOPE_FIELDS
+
+            keys = set(request)
+            abandon = request.get("abandon_revision")
+            if ({"command_id", "expected_revision"} <= keys
+                    and not keys - {"command_id", "expected_revision", "abandon_revision",
+                                    *SCOPE_FIELDS}
+                    and (not keys & SCOPE_FIELDS or SCOPE_FIELDS <= keys)
+                    and not (keys & SCOPE_FIELDS and abandon is not None)
+                    and isinstance(request["command_id"], str)
+                    and COMMAND_RE.fullmatch(request["command_id"])
+                    and type(request["expected_revision"]) is int
+                    and ("abandon_revision" not in request
+                         or isinstance(abandon, str) and 1 <= len(abandon) <= 128)):
+                with store._connect() as tracking:
+                    receipt = tracking.execute(
+                        "SELECT * FROM delivery_commands WHERE command_id=?",
+                        (request["command_id"],)).fetchone()
+                if receipt:
+                    response = json.loads(receipt["response_json"])
+                    successor = "run-feature-" + digest({"run": run_id, "command": request})[:20]
+                    matches = (isinstance(response, dict) and response.get("run_id") == successor
+                               and receipt["run_id"] == successor)
+                    facts = {"operation": operation, "owner": "feature_command_receipt",
+                             "owner_proof": True, "proof_digest": digest(dict(receipt)),
+                             "normalized_lifecycle": "unknown", "comparisons": [],
+                             "predicates": [{
+                                 "code": ("already_admitted" if matches
+                                          else "feature_command_conflict"),
+                                 "satisfied": None if matches else False,
+                                 "missing_or_unknown_fact": "fresh successor admission",
+                                 "next_action": "read original continuation receipt" if matches
+                                                else "use a different continuation command",
+                             }]}
+                    assessment = evaluate_transition(facts, request)
+                    if matches:
+                        assessment["disposition"] = "already_admitted"
+                    return assessment
         with readonly_registry(spec) as shared:
             db = shared.db
             facts = handoff_facts(db, token, operation=operation)
+            preparation_replay = False
+            if (operation == "continue_feature" and isinstance(request, dict)
+                    and set(request) == {"command_id", "expected_revision"}
+                    and request.get("expected_revision") == row["revision"]):
+                from .delivery_execution_registry import preparation_lineage
+                from .delivery_feature_revisions import revision_request
+
+                view = _RegistryView(db)
+                current = view.current(token["issue_id"])
+                successor_id = "run-feature-" + digest({"run": run_id, "command": request})[:20]
+                public = revision_request(spec, shared=view)
+                if public and current and current["state"] == "active":
+                    chain = preparation_lineage(db, public)
+                    saved = chain[-1][1] if chain else None
+                    replay_token = {**token, "run_id": successor_id,
+                                    "generation": token["generation"] + 1}
+                    snapshot = db.execute(
+                        "SELECT input_json,input_digest FROM execution_snapshots "
+                        "WHERE run_id=? AND store_path=?", (successor_id, token["store_path"])
+                    ).fetchone()
+                    if (saved and saved["predecessor"] == token
+                            and saved["successor_id"] == successor_id
+                            and saved["command"] == request
+                            and view.token(current) == replay_token and snapshot
+                            and snapshot["input_digest"] == digest(
+                                json.loads(snapshot["input_json"]))):
+                        preparation_replay = True
+                        facts = handoff_facts(db, replay_token, operation=operation)
+                        facts["normalized_lifecycle"] = "active"
+                        facts["proof_digest"] = digest({
+                            "registry": facts["proof_digest"], "preparation_replay": saved,
+                            "successor_snapshot": snapshot["input_digest"]})
+                        for predicate in facts["predicates"]:
+                            if predicate["code"] == "feature_owner_not_stopped":
+                                predicate.update(code="feature_replay_owner_changed",
+                                                 satisfied=True,
+                                                 missing_or_unknown_fact=
+                                                 "exact active replay owner")
             if operation == "continue_feature":
                 plan_proven = None
                 config_proven = None
@@ -428,7 +511,8 @@ def _observe_handoff(store, run_id, request, *, operation, revision_admission=No
                             and COMMAND_RE.fullmatch(request["command_id"])
                             and type(request["expected_revision"]) is int
                             and request["expected_revision"] == row["revision"]
-                            and facts["normalized_lifecycle"] == "stopped"):
+                            and (facts["normalized_lifecycle"] == "stopped"
+                                 or preparation_replay)):
                         original = readonly_feature_spec(store, run_id)
                         successor = "run-feature-" + digest(
                             {"run": run_id, "command": request})[:20]
@@ -554,10 +638,29 @@ def _observe_handoff(store, run_id, request, *, operation, revision_admission=No
                         view = _RegistryView(db)
                         from .delivery_feature_revisions import revision_request
 
+                        pending_preparation = None
                         if (revision_admission is None
                                 and revision_request(original, shared=view) is not None):
-                            raise ValueError(
-                                "feature revision preparation requires its own proof")
+                            from .delivery_feature_revisions import (
+                                _preparation_retry_key,
+                                continue_pending_preparation,
+                            )
+
+                            pending_preparation = continue_pending_preparation(
+                                store, original, row, request, successor, shared=view, observe=True)
+                            public = pending_preparation["admission"]
+                            retry = pending_preparation["preparation_retry"]
+                            initial = {**public["owner"], "run_id": public["successor_id"],
+                                       "generation": public["owner"]["generation"] + 1}
+                            retry_key = _preparation_retry_key(
+                                public["revision_id"], token if token != initial else None)
+                            admitted["feature_plan_revision_preparation_retry"] = {
+                                "checkpoint_key": retry_key, "sha256": digest(retry)}
+                            admitted["feature_plan_revision_request"] = deepcopy(public)
+                            admitted["feature_plan_revision"] = {
+                                key: public["old_identity"][key]
+                                for key in ("plan_revision", "plan_digest")}
+                            admitted["plan_approval"] = original.get("plan_approval", "required")
                         revision_proven = True
                         source = str(store.config.tracking_db)
                         _require_migrated_store(view, admitted, source)
@@ -568,13 +671,41 @@ def _observe_handoff(store, run_id, request, *, operation, revision_admission=No
                                     admitted["issue_url"], admitted["github_repo"])
                         candidate = deepcopy(admitted)
                         predecessor = candidate.pop("feature_predecessor", None)
-                        _validate_preparation_successor(view, candidate, snapshot, predecessor)
-                        _prepare_snapshot_plan(candidate, snapshot)
-                        view.validate_claim(snapshot, successor, source,
-                                            maximum_repairs=candidate["policy"]["max_repairs"],
-                                            predecessor=predecessor)
+                        if pending_preparation is not None:
+                            # Exercise the actual claim validator with the prospective receipt in a
+                            # private in-memory copy; no reservation is written by observation.
+                            from .contracts import canonical_json
+
+                            virtual = sqlite3.connect(":memory:")
+                            virtual.row_factory = sqlite3.Row
+                            try:
+                                db.backup(virtual)
+                                virtual.execute(
+                                    "INSERT OR IGNORE INTO execution_checkpoints "
+                                    "VALUES (?,?,?,?,?,?)",
+                                    (token["issue_id"], retry_key, token["generation"],
+                                     digest(retry),
+                                     canonical_json(retry), "observation"))
+                                virtual_view = _RegistryView(virtual)
+                                _validate_preparation_successor(
+                                    virtual_view, candidate, snapshot, predecessor)
+                                _prepare_snapshot_plan(candidate, snapshot)
+                                virtual_view.validate_claim(
+                                    snapshot, successor, source,
+                                    maximum_repairs=candidate["policy"]["max_repairs"],
+                                    predecessor=predecessor)
+                            finally:
+                                virtual.close()
+                        else:
+                            _validate_preparation_successor(view, candidate, snapshot, predecessor)
+                            _prepare_snapshot_plan(candidate, snapshot)
+                            view.validate_claim(snapshot, successor, source,
+                                                maximum_repairs=candidate["policy"]["max_repairs"],
+                                                predecessor=predecessor)
                         registry_proven = True
-                        if original.get("provider") == "fake":
+                        if preparation_replay:
+                            allowance = {"mode": "existing_replay"}
+                        elif original.get("provider") == "fake":
                             allowance = {"mode": "not_required"}
                         else:
                             from .delivery_feature_execution import _observe_repair_allowance
@@ -584,6 +715,7 @@ def _observe_handoff(store, run_id, request, *, operation, revision_admission=No
                         submission_seal = digest({"admitted": admitted, "snapshot": snapshot,
                                                   "allowance": allowance, "predecessor": token,
                                                   "scope_receipt": scope_receipt,
+                                                  "preparation": pending_preparation,
                                                   "revision": row["revision"]})
                 except (AttributeError, OSError, RuntimeError, ValueError, KeyError, TypeError,
                         sqlite3.Error, subprocess.SubprocessError):
@@ -636,7 +768,8 @@ def _observe_handoff(store, run_id, request, *, operation, revision_admission=No
             facts.update(owner=owner, revision=projection["revision"],
                          comparisons=projection["comparisons"])
             facts["predicates"].extend(projection["predicates"])
-            if facts["owner_proof"] and facts["normalized_lifecycle"] == "stopped":
+            if facts["owner_proof"] and (facts["normalized_lifecycle"] == "stopped"
+                                          or preparation_replay):
                 try:
                     from .delivery_feature_closure import closed_coordinator
 

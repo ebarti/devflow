@@ -766,11 +766,11 @@ def _preparation_lineage(shared, public, values):
     return chain
 
 
-def _preparation_retry(store, spec, public, values):
+def _preparation_retry(store, spec, public, values, *, shared=None):
     reference = spec.get("feature_plan_revision_preparation_retry")
     if reference is None:
         return None
-    shared = _registry(spec)
+    shared = _registry(spec, shared)
     chain = _preparation_lineage(shared, public, values)
     key = reference.get("checkpoint_key")
     saved = next((receipt for name, receipt in chain if name == key), None)
@@ -783,8 +783,16 @@ def _preparation_retry(store, spec, public, values):
                 "generation": saved["predecessor"]["generation"] + 1}):
         raise OwnershipConflict("preparation continuation lost its sealed reservation lineage")
     for name, receipt in chain:
-        authenticate_adopted_plan_custody(store, spec, {"owner": receipt["predecessor"]})
-        previous = store.effective_spec(receipt["predecessor"]["run_id"])
+        authenticate_adopted_plan_custody(
+            store, spec, {"owner": receipt["predecessor"]}, shared=shared)
+        from .delivery_execution_config import is_observation_mode
+
+        if is_observation_mode():
+            from .delivery_feature_handoff import readonly_feature_spec
+
+            previous = readonly_feature_spec(store, receipt["predecessor"]["run_id"])
+        else:
+            previous = store.effective_spec(receipt["predecessor"]["run_id"])
         with store._connect() as db:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
                              (previous["run_id"],)).fetchone()
@@ -841,7 +849,7 @@ def _current_runtime_selectors(selectors):
                      "expected_runtime_payload_sha256": current["runtime_payload_sha256"]}
 
 
-def _refresh_preparation_reconsideration(store, original, public, values):
+def _refresh_preparation_reconsideration(store, original, public, values, *, shared=None):
     from .delivery_feature_review_context import compatible_external_guards
 
     receipt = public.get("reconsideration")
@@ -851,11 +859,14 @@ def _refresh_preparation_reconsideration(store, original, public, values):
     if (current["context_sha256"] != receipt["current_runtime"]["context_sha256"]
             or not compatible_external_guards(receipt["current_runtime"], current)):
         raise OwnershipConflict("preparation retry changed its normalized review context")
+    from .delivery_execution_config import is_observation_mode
+
     proof, findings = _reconsideration_proof(
         store, original, selectors, public["record"], public["predecessor_closure"], values,
+        **({"shared": shared} if is_observation_mode() and shared is not None else {}),
     )
     if proof["original_repair_budget"] != receipt["original_repair_budget"]:
-        shared = _registry(original)
+        shared = _registry(original, shared)
         current_budget = shared.require_unspent_budget(
             original["feature_delivery"]["owner"]["issue_id"], receipt["original_repair_budget"])
         if proof["original_repair_budget"] != current_budget:
@@ -869,11 +880,15 @@ def _refresh_preparation_reconsideration(store, original, public, values):
 
 def _preparation_observation(store, spec, row, *, custodian=None):
     from .delivery_broker import DeliveryBroker, _git
+    from .delivery_execution_config import is_observation_mode
     from .delivery_feature_closure import closed_coordinator
     from .delivery_policy_recovery import _remote, _stopped_cleanup, work_binding
     from .delivery_resources import RunResources, _identity, read_private
 
-    closed = closed_coordinator(store, spec["run_id"])
+    if is_observation_mode():
+        closed = closed_coordinator(store, spec["run_id"], preserve=False)
+    else:
+        closed = closed_coordinator(store, spec["run_id"])
     state = closed["result"]
     candidate = json.loads(row["candidate_json"] or "null")
     if (state.get("roles") != [] or state.get("iteration") != 0
@@ -934,16 +949,25 @@ def _preparation_observation(store, spec, row, *, custodian=None):
                 "checkout": spec["checkout"], "candidate": candidate,
                 "provenance": None, "continuation": None}):
         raise OwnershipConflict("preparation effects differ from the completed checkout receipt")
+    if is_observation_mode():
+        from .delivery_github_contract import bounded_github_observation
+
+        with bounded_github_observation(spec["github_repo"]):
+            remote = _remote(broker)
+    else:
+        remote = _remote(broker)
     return closed, {"cleanup": cleanup, "work_binding": binding, "effects_sha256": digest(effects),
-                    "remote": _remote(broker)}
+                    "remote": remote}
 
 
-def continue_pending_preparation(store, spec, row, request, successor_id):
+def continue_pending_preparation(
+    store, spec, row, request, successor_id, *, shared=None, observe=False
+):
     """Transport one unstarted reservation through at most three preparation continuations."""
     from .delivery_config import DeliveryConfig
     from .delivery_execution_registry import PREPARATION_CONTINUATION_LIMIT
 
-    shared = _registry(spec)
+    shared = _registry(spec, shared)
     token = spec["feature_delivery"]["owner"]
     values = _values(spec, shared)
     public = revision_request(spec, shared)
@@ -952,6 +976,8 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     revision_id = public["revision_id"]
     replay = "; replay continue-feature " + request["command_id"] + " to continue without it"
     if _started_reservation(shared, token, revision_id, values):
+        if observe:
+            raise OwnershipConflict("started revision requires owner settlement")
         # A begun (or charged) attempt belongs to the generation that began it: no
         # continuation can transport it and no later begin may resume it, so this
         # refusal is final. Unstarted reservations are never closed here; their
@@ -972,8 +998,9 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         # An unstarted reservation has spent nothing and nothing is written before
         # this. A stopped feature publishes nothing, so it proceeds only after the
         # owner changes the record.
+        record = _readonly_revision_record(spec, shared) if observe else current_record(spec)
         require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
-                                     current_record(spec)["manifest"],
+                                     record["manifest"],
                                      trunk=spec.get("publication_base_ref"),
                                      head_width=len(spec["base_sha"]))
     except ValueError as exc:
@@ -994,10 +1021,13 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     # before appending a transport receipt. Existing execution stays frozen.
     if digest(DeliveryConfig.load(store.config.path).raw) != digest(store.config.raw):
         raise OwnershipConflict("preparation admission configuration changed")
-    incoming = _preparation_retry(store, spec, public, values)
+    incoming = _preparation_retry(
+        store, spec, public, values, **({"shared": shared} if observe else {}))
     sequence = next((index + 2 for index, (_, receipt) in enumerate(chain)
                      if receipt == incoming), 1)
     if sequence > PREPARATION_CONTINUATION_LIMIT:
+        if observe:
+            raise OwnershipConflict("preparation continuation limit requires owner settlement")
         _abandon_reservation(
             store, spec, shared, public, values,
             "preparation continuation limit reached after " + str(len(chain))
@@ -1028,8 +1058,14 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     closed, observation = _preparation_observation(store, spec, row)
     state = closed["result"]
     candidate = json.loads(row["candidate_json"])
-    original = store.effective_spec(public["predecessor_run_id"])
-    proof, selectors = _refresh_preparation_reconsideration(store, original, public, values)
+    if observe:
+        from .delivery_feature_handoff import readonly_feature_spec
+
+        original = readonly_feature_spec(store, public["predecessor_run_id"])
+    else:
+        original = store.effective_spec(public["predecessor_run_id"])
+    proof, selectors = _refresh_preparation_reconsideration(
+        store, original, public, values, shared=shared)
     shared.require_unspent_budget(token["issue_id"], proof["original_repair_budget"])
     receipt = {
         "version": 1, "revision_id": revision_id, "admission_sha256": digest(public),
@@ -1052,6 +1088,8 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         # its normalized review context is unchanged, so the receipt stands as written
         # and the replay spends nothing and adds no continuation.
         receipt = saved
+    if observe:
+        return {"admission": deepcopy(public), "preparation_retry": receipt}
     with shared.serialized(token["issue_id"]):
         if _preparation_lineage(shared, public, _values(spec, shared)) != chain:
             raise OwnershipConflict("preparation continuation lineage changed before admission")
