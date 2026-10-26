@@ -308,10 +308,48 @@ def test_renewal_probe_requires_exact_durable_namespace_and_authority(
     elif defect == "intent_changed":
         intent["binding_sha256"] = digest("changed")
         write_private(path, intent)
+    with pytest.raises(ValueError):
+        require_resource_idle(probe)
     if defect:
         with pytest.raises(ValueError):
-            canonical_owner(probe)
+            with resource_scope(probe, original["state_dir"], intent, path, 0,
+                                renewal_binding=authority, renewal_parent=original):
+                pytest.fail("changed renewal authority was admitted")
     else:
-        assert canonical_owner(probe) == original
-        with resource_scope(probe, original["state_dir"], intent, path, 0):
+        with resource_scope(probe, original["state_dir"], intent, path, 0,
+                            renewal_binding=authority, renewal_parent=original):
+            assert canonical_owner(probe) == original
+            require_resource_idle(probe)
             assert RunResources(probe).finalize("blocked")["state"] == "confirmed"
+
+
+@pytest.mark.parametrize("namespace", [
+    "native-preparation-renewal", "technical-successor/native-generation",
+    "resource-closure/native-generation",
+])
+@pytest.mark.parametrize("defect", ["coherent_authority", "coherent_parent"])
+def test_renewal_probe_refuses_coherent_record_substitution(measurement_owner, namespace, defect):
+    store, original, registry, _, _ = measurement_owner
+    root = Path(original["state_dir"]) / namespace
+    path = root / "preparation.json"
+    authority = {"original_spec": original, "command_digest": digest("original")}
+    write_private(root / "authority.json", authority)
+    intent = {"binding_sha256": digest(authority), "preparation_attempts": []}
+    probe = probe_for((store, original, registry, intent, path))
+    parent = copy.deepcopy(original)
+    if defect == "coherent_authority":
+        changed = {**authority, "command_digest": digest("foreign")}
+        write_private(root / "authority.json", changed)
+        intent["binding_sha256"] = digest(changed)
+    else:
+        parent["policy"]["max_repairs"] += 1
+        parent["policy_digest"] = digest(parent["policy"])
+        probe["policy"] = parent["policy"]
+        probe["policy_digest"] = parent["policy_digest"]
+    probe[FIELD] = binding(parent, intent, path, 0)
+    intent["preparation_attempts"][0]["spec"] = probe
+    write_private(path, intent)
+    with pytest.raises(ValueError):
+        with resource_scope(probe, original["state_dir"], intent, path, 0,
+                            renewal_binding=authority, renewal_parent=original):
+            pytest.fail("coherent substituted renewal was admitted")

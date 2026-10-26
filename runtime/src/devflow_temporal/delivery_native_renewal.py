@@ -232,7 +232,7 @@ def renew(spec, payload, command_digest, *, technical=None, supplemental=None):
             intent = {'binding_sha256': digest(binding), 'state': 'sealed',
                       'preparation_attempts': [], 'effective_spec': None}
             write_private(path, intent)
-        effective = _prepare(spec, config, intent, path)
+        effective = _prepare(spec, config, intent, path, renewal_binding=binding)
         _same_execution(spec, effective)
         verify_native_spec(effective)
         # The sealed configuration cannot drift between readiness and renewal.

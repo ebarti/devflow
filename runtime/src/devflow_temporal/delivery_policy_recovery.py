@@ -112,12 +112,23 @@ def amended_config(original, path, expected_hash):
     return config
 
 
-def _prepare(original, config, intent, intent_path):
+def _prepare(original, config, intent, intent_path, *, renewal_binding=None):
     from .delivery_native_diagnostic import require_resource_idle
     from .delivery_native_preparation import _measure, _validate, bind_native_spec, native_identity
     from .delivery_preparation_resources import FIELD, binding, resource_scope
 
     require_resource_idle(original)
+    if renewal_binding is not None:
+        technical = 'technical_predecessor' in renewal_binding
+        supplemental = 'supplemental_predecessor' in renewal_binding
+        if technical and supplemental:
+            raise ValueError('native preparation has conflicting renewal ancestry')
+        relative = ('resource-closure/native-generation/preparation.json' if supplemental else
+                    'technical-successor/native-generation/preparation.json' if technical else
+                    'native-preparation-renewal/preparation.json')
+        if (renewal_binding.get('original_spec') != original
+                or intent_path != Path(original['state_dir']) / relative):
+            raise ValueError('native preparation lost its exact renewal parent')
 
     effective = deepcopy(original)
     effective.pop('preparation', None)
@@ -136,7 +147,8 @@ def _prepare(original, config, intent, intent_path):
     for index, attempt in enumerate(intent['preparation_attempts']):
         if attempt['state'] == 'started':
             with resource_scope(
-                    attempt['spec'], effective['state_dir'], intent, intent_path, index):
+                    attempt['spec'], effective['state_dir'], intent, intent_path, index,
+                    renewal_binding=renewal_binding, renewal_parent=effective):
                 receipt = RunResources(attempt['spec']).finalize('blocked')
             attempt.update(state='interrupted', cleanup=receipt)
             write_private(intent_path, intent)
@@ -167,7 +179,8 @@ def _prepare(original, config, intent, intent_path):
             intent['preparation_attempts'].append(attempt)
             intent['state'] = 'preparing'
             write_private(intent_path, intent)
-            with resource_scope(probe, effective['state_dir'], intent, intent_path, index):
+            with resource_scope(probe, effective['state_dir'], intent, intent_path, index,
+                                renewal_binding=renewal_binding, renewal_parent=effective):
                 try:
                     proof = _measure(probe, identity, state_root=root)
                 except Exception as exc:

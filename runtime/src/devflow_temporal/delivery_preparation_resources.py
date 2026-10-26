@@ -103,14 +103,15 @@ def canonical_owner(spec):
     if renewal:
         authority_raw = private_bytes(authority_path)
         authority = json.loads(authority_raw)
-        predecessor = authority.get("original_spec") if isinstance(authority, dict) else None
+        # The operation must supply its independently reconstructed complete
+        # authority, not merely two locally consistent mutable files.
+        expected_renewal = (legacy[2] if legacy is not None
+                            and legacy[0] == digest(spec) and len(legacy) == 3 else None)
         if (
             not isinstance(intent, dict)
-            or not isinstance(predecessor, dict)
+            or expected_renewal is None
+            or authority != expected_renewal
             or digest(authority) != intent.get("binding_sha256")
-            or predecessor.get("state_dir") != str(canonical)
-            or any(predecessor.get(key) != parent.get(key)
-                   for key in ("run_id", "work_id", "request_digest"))
         ):
             raise ValueError("native renewal lost its exact preparation authority")
     attempts = intent.get("preparation_attempts") if isinstance(intent, dict) else None
@@ -161,7 +162,8 @@ def canonical_owner(spec):
 
 
 @contextmanager
-def resource_scope(spec, canonical_state, intent, path, index):
+def resource_scope(spec, canonical_state, intent, path, index, *,
+                   renewal_binding=None, renewal_parent=None):
     """Re-observe old attempts without changing their recorded specs or journals."""
     parent = deepcopy(spec)
     parent.pop(FIELD, None)
@@ -169,7 +171,9 @@ def resource_scope(spec, canonical_state, intent, path, index):
     expected = binding(parent, intent, path, index)
     if FIELD in spec and spec[FIELD] != expected:
         raise ValueError("native preparation changed its recorded canonical parent")
-    token = _LEGACY.set((digest(spec), expected))
+    if renewal_binding is not None and parent != renewal_parent:
+        raise ValueError("native renewal probe changed its exact effective parent")
+    token = _LEGACY.set((digest(spec), expected, deepcopy(renewal_binding)))
     try:
         parent = canonical_owner(spec)
         if parent is None:

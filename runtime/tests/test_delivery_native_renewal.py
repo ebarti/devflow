@@ -194,3 +194,32 @@ def test_readonly_native_readiness_rejects_authority_without_sealing(payload_upd
     assert Path(spec['preparation']['environment']['path']).read_bytes() == old
     assert renewal.readiness(spec, payload)['required'] is True
     assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
+
+
+def test_native_generation_recovers_a_recorded_started_attempt(payload_update, monkeypatch):
+    _store, spec, payload, _old, _package = payload_update
+    original = native._measure
+    calls = []
+
+    def interrupted(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(result)
+        if len(calls) == 1:
+            raise RuntimeError('Controlled interrupted owner')
+        return result
+
+    monkeypatch.setattr(native, '_measure', interrupted)
+    with pytest.raises(RuntimeError, match='interrupted owner'):
+        renewal.renew(spec, payload, digest(payload))
+    path = Path(spec['state_dir']) / 'native-preparation-renewal/preparation.json'
+    journal = read_private(path)
+    # Recreate the lost acknowledgement window while preserving real probe evidence.
+    journal['preparation_attempts'][0]['state'] = 'started'
+    journal['preparation_attempts'][0]['cleanup'] = None
+    write_private(path, journal)
+    after, reference = renewal.renew(spec, payload, digest(payload))
+    native.verify_native_spec(after)
+    history = read_private(Path(reference['path']))['preparation_history']
+    assert [item['state'] for item in history] == ['interrupted', 'stopped']
+    assert all(item['cleanup']['state'] == 'confirmed' for item in history)
+    assert len(calls) == 2
