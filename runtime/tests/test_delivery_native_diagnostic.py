@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -98,7 +99,7 @@ def test_complete_structural_inventory(value):
 
 
 @pytest.fixture
-def stopped_diagnostic(service, monkeypatch):
+def stopped_diagnostic(service, monkeypatch, request):
     assert digest(CHECK) == diagnostic.CHECK_SHA256
     source = STAGE / "immutable-source/workers/automation"
     extra = {
@@ -106,7 +107,14 @@ def stopped_diagnostic(service, monkeypatch):
     }
     for name in ("pyproject.toml", "uv.lock"):
         extra["workers/automation/" + name] = source.joinpath(name).read_text()
-    extra.update(owned_controls(source))
+    controls = owned_controls(source)
+    if (
+        getattr(request.node, "callspec", None)
+        and request.node.callspec.params.get("mode") == "short"
+    ):
+        name = "workers/automation/tests/test_owned_invariants.py"
+        controls[name] = controls[name].replace("range(1008)", "range(8)")
+    extra.update(controls)
     case = scope_case(
         service,
         monkeypatch,
@@ -458,6 +466,52 @@ def test_unrelated_tracker_metadata_can_refresh_while_authority_fields_are_fence
         )
     with pytest.raises(ValueError, match=diagnostic.ERROR), case.store._connect() as db:
         db.execute("UPDATE works SET issue='https://github.com/example/fixture/issues/99'")
+
+
+@pytest.mark.parametrize("drift", ["missing", "replaced", "linked", "mode"])
+def test_acknowledged_generation_is_never_recreated_or_reattributed(stopped_diagnostic, drift):
+    case = stopped_diagnostic
+    context, row, _command, _response = running_context(case)
+    path = context.root / "execution.lock"
+    if drift == "missing":
+        path.unlink()
+    elif drift == "replaced":
+        path.rename(path.with_name("saved-execution.lock"))
+        path.touch(mode=0o600)
+    elif drift == "linked":
+        os.link(path, path.with_name("unrelated-link"))
+    else:
+        path.chmod(0o644)
+    with pytest.raises((OSError, ValueError)):
+        context.guard()
+    from devflow_temporal.delivery_native_diagnostic_execution import execution_lease
+
+    with pytest.raises((OSError, ValueError)), execution_lease(case.spec, row):
+        pytest.fail("changed diagnostic generation cannot grant an execution or replay lease")
+    assert diagnostic.active(case.store, "run-1")
+    assert not (context.root / "receipt.json").exists()
+
+
+def test_unjournaled_launch_never_grants_replacement_or_finalizer_cleanup(stopped_diagnostic):
+    case = stopped_diagnostic
+    context, row, command, _response = running_context(case)
+    context.create_subject()
+    context.attach()
+    process = context.broker._native_process(
+        context.state / "checks/3/worker-regressions/native",
+        argv=CHECK["argv"],
+        cwd=context.checkout,
+        timeout=2700,
+        environment={"PLAYWRIGHT_BROWSERS_PATH": context.snapshot["controller_browser_binding"]},
+    )
+    context.process(process)  # Durable plan; no Popen or process.run in this control.
+    diagnostic.record_unknown(case.store, row, RuntimeError("owned interrupted launch boundary"))
+    with pytest.raises(ValueError, match="launch remains unknown"):
+        diagnostic.acknowledge(case.store, "run-1", command)
+    assert diagnostic.info(case.store, "run-1", command["command_id"])["state"] == "unknown"
+    assert not process.journal.exists()
+    assert not (context.root / "receipt.json").exists()
+    assert diagnostic.active(case.store, "run-1")
 
 
 @pytest.mark.asyncio

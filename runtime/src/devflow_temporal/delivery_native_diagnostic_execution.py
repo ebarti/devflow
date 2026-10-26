@@ -89,7 +89,7 @@ class DiagnosticContext:
         entry = manifest["roots"].get(str(checkout), {})
         candidate = candidate_for(checkout)
         if (
-            entry.get("kind") != "gate"
+            entry.get("kind") != "checkout"
             or not entry.get("identity")
             or entry.get("receipt", {}).get("state") in {"removed", "already_absent"}
             or not same_object(self.resource_spec, checkout, entry["identity"])
@@ -101,7 +101,7 @@ class DiagnosticContext:
             or entry.get("head") != candidate["head"]
         ):
             raise ValueError("diagnostic Temporal preparation lost current subject custody")
-        registry._allowed(checkout, "gate")
+        registry._allowed(checkout, "checkout")
         key = _native_check_key(self.spec, evidence, check["id"])
         home = self.state / "transient/checks" / key
         recipe = read_private(home / "codex/native-environment.json")
@@ -132,7 +132,7 @@ class DiagnosticContext:
             "claim": None,
             "subject": {
                 "path": str(checkout),
-                "kind": "gate",
+                "kind": "checkout",
                 "identity": entry["identity"],
                 "generation": entry.get("generation", 0),
                 "candidate": candidate,
@@ -257,7 +257,10 @@ class DiagnosticContext:
         self.state.mkdir(mode=0o700)
         resources = self.resources()
         private_directory(self.checkout.parent)
-        resources.register(self.checkout, "gate")
+        # This is an independent primary clone. The existing checkout owner
+        # retains blocked source; a disposable Git worktree/gate owner would
+        # correctly refuse trying to remove the primary clone as a worktree.
+        resources.register(self.checkout, "checkout")
         environment = {
             **os.environ,
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -348,6 +351,8 @@ class DiagnosticContext:
             or process.register_resources
             or not process.folder.is_relative_to(self.state)
             or process.folder.resolve() != process.folder
+            or process.environment.get("PLAYWRIGHT_BROWSERS_PATH")
+            != self.snapshot["controller_browser_binding"]
         ):
             raise ValueError("native diagnostic process left its exact scoped generation")
         process.diagnostic_context = self
@@ -550,6 +555,7 @@ def readiness_argv(context):
         "const value=process.env.PYTEST_ADDOPTS||'';"
         "if(!value.startsWith('--basetemp='))throw Error('controller artifact path missing');"
         "const root=value.slice(11).replace(/^'|'$/g,'');"
+        "fs.mkdirSync(root,{recursive:true});"
         "const report=" + json.dumps(str(report)) + ";"
         "fs.mkdirSync(path.dirname(report),{recursive:true});"
         "const env={...process.env,PYTHONPATH:path.join(process.cwd(),'workers/automation/src')};"

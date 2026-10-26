@@ -29,13 +29,19 @@ from devflow_temporal.delivery_resources import RunResources, read_private
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["pass_ackloss", "missing_browser", "short"])
 async def test_real_public_diagnostic_runs_same_native_readiness_and_complete_frozen_recipe(
     stopped_diagnostic,
     monkeypatch,
     tmp_path,
+    mode,
 ):
     case = stopped_diagnostic
     restore_native_observers(monkeypatch)
+    if mode == "missing_browser":
+        home = tmp_path / "empty-controller-home"
+        home.mkdir(mode=0o700)
+        monkeypatch.setenv("HOME", str(home))
     original_files = {
         p: p.read_bytes()
         for p in (
@@ -69,7 +75,7 @@ async def test_real_public_diagnostic_runs_same_native_readiness_and_complete_fr
     lost = []
 
     def lose_one_ack(*args):
-        if not lost:
+        if mode == "pass_ackloss" and not lost:
             lost.append(True)
             raise RuntimeError("owned crash after immutable diagnostic receipt fsync")
         return original_ack(*args)
@@ -103,7 +109,11 @@ async def test_real_public_diagnostic_runs_same_native_readiness_and_complete_fr
         await asyncio.wait_for(asyncio.shield(task), timeout=300)
         response = await client.get(path + "native-diagnostics/" + command["command_id"])
         assert response.status_code == 200, response.text
-        assert response.json()["state"] == "unknown", response.text
+        observed = response.json()
+        if output := os.environ.get("DEVFLOW_TEST_NATIVE_DIAGNOSTIC_RESULT"):
+            with open(output + "." + mode + ".initial.json", "x") as stream:
+                json.dump(observed, stream, indent=2)
+        assert observed["state"] == ("unknown" if mode == "pass_ackloss" else "complete"), observed
         # Replay acknowledges the SAME completed receipt; it never executes the
         # worker recipe twice or acquires a new diagnostic/resource generation.
         response = await client.post(path + "ack-native-diagnostic", json=command, headers=headers)
@@ -111,36 +121,44 @@ async def test_real_public_diagnostic_runs_same_native_readiness_and_complete_fr
         value = response.json()
         assert value["state"] == "complete", value
         receipt = value["receipt"]
-        assert receipt["result"]["state"] == "passed", receipt
-        assert receipt["result"]["stage"] == "frozen_check"
+        assert receipt["result"]["state"] == ("passed" if mode == "pass_ackloss" else "failed"), (
+            receipt
+        )
         readiness = receipt["result"]["readiness"]
-        assert readiness["state"] == "passed" and readiness["acceptance_gate"] is False
+        assert readiness["state"] == ("failed" if mode == "missing_browser" else "passed")
+        assert readiness["acceptance_gate"] is False
         assert len(readiness["junit"]["test_cases"]) == 4
-        check = receipt["result"]["check"]
-        assert check["state"] == "passed" and check["results"][0]["test_count"] == 1012
-        assert check["results"][0]["argv"] == diagnostic._check(case.spec)["argv"]
-        assert check["results"][0]["junit"]["passed"] == 1012
-        assert not check["results"][0]["junit"]["errors"]
-        assert not check["results"][0]["junit"]["failures"]
         assert receipt["cleanup"]["resources"]["state"] == "confirmed"
         assert receipt["delivery_acceptance"] is False and receipt["provider_turns"] == 0
         root = diagnostic._root(case.spec, value["identity"])
-        native_journal = read_private(
-            root / "run-1/checks/3/worker-regressions/native/native-process.json"
-        )
-        assert native_journal["intent"]["argv"] == diagnostic._check(case.spec)["argv"]
-        assert native_journal["intent"]["timeout"] == 2700
-        assert native_journal["monitoring_complete"] is True
-        assert (
-            len(list(root.glob("run-1/checks/3/worker-regressions/native*/native-process.json")))
-            == 1
-        )
+        if mode == "missing_browser":
+            assert receipt["result"]["stage"] == "readiness"
+            assert not (root / "run-1/checks/3/worker-regressions/native").exists()
+        else:
+            assert receipt["result"]["stage"] == "frozen_check"
+            check = receipt["result"]["check"]
+            assert check["state"] == ("passed" if mode == "pass_ackloss" else "failed")
+            count = 1012 if mode == "pass_ackloss" else 12
+            assert check["results"][0]["test_count"] == count
+            assert check["results"][0]["argv"] == diagnostic._check(case.spec)["argv"]
+            assert check["results"][0]["junit"]["passed"] == count
+            assert not check["results"][0]["junit"]["errors"]
+            assert not check["results"][0]["junit"]["failures"]
+            native_journal = read_private(
+                root / "run-1/checks/3/worker-regressions/native/native-process.json"
+            )
+            assert native_journal["intent"]["argv"] == diagnostic._check(case.spec)["argv"]
+            assert native_journal["intent"]["timeout"] == 2700
+            assert native_journal["monitoring_complete"] is True
+        assert len(
+            list(root.glob("run-1/checks/3/worker-regressions/native*/native-process.json"))
+        ) == (0 if mode == "missing_browser" else 1)
         assert not (root / "run-1/checks/3/worker-regressions/native-retry").exists()
         replay = await client.post(path + "ack-native-diagnostic", json=command, headers=headers)
         assert replay.status_code == 200 and replay.json() == value
         (tmp_path / "native-diagnostic-result.json").write_text(json.dumps(value, indent=2) + "\n")
         if output := os.environ.get("DEVFLOW_TEST_NATIVE_DIAGNOSTIC_RESULT"):
-            with open(output, "x") as stream:
+            with open(output + "." + mode + ".json", "x") as stream:
                 json.dump(value, stream, indent=2)
     with case.store._connect() as db:
         assert diagnostic._rows(db, "run-1") == before_rows

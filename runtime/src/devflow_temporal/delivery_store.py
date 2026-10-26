@@ -4316,10 +4316,13 @@ class DeliveryStore:
                     (run_id,)).fetchall()
             for diagnostic in diagnostics:
                 identity = diagnostic['identity']
-                for name in ('intent.json', 'readiness.json', 'receipt.json'):
+                for name in ('intent.json', 'readiness.json', 'receipt.json',
+                             run_id + '/resources/manifest.json',
+                             run_id + '/resources/finalization.json'):
                     path = diagnostic_root / identity / name
                     if path.is_file() and not path.is_symlink():
-                        indexed.append({'id': 'native-diagnostic-' + identity + '-' + name,
+                        indexed.append({'id': 'native-diagnostic-' + identity + '-'
+                                        + name.replace('/', '-'),
                                         'label': 'Diagnostic only; no delivery acceptance: ' + name,
                                         'path': path, 'limit': 4 * 1024 * 1024})
         context_root = root / "issue-context"

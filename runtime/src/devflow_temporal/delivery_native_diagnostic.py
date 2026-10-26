@@ -292,6 +292,7 @@ def snapshot(store, run_id, command):
         "temporal_marker": marker,
         "work_binding": binding,
         "operational_owner": operational,
+        "controller_browser_binding": str(Path.home() / "Library/Caches/ms-playwright"),
         "claim": None,
         "cleanup_digest": seal["cleanup_digest"],
         "physical_resources": physical,
@@ -380,6 +381,7 @@ def generation_lease(root, *, create=False, expected=None):
         }
         if (
             not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(root.lstat().st_mode) != 0o700
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_nlink != 1
@@ -409,6 +411,7 @@ def require_generation(root, expected):
         info, name = os.fstat(fd), path.lstat()
         if (
             not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(root.lstat().st_mode) != 0o700
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_nlink != 1
