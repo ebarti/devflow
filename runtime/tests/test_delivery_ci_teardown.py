@@ -25,6 +25,8 @@ from test_delivery_store import service as service
 
 from devflow_temporal import delivery_ci_inventory as inventory
 from devflow_temporal import delivery_ci_teardown as teardown
+from devflow_temporal import delivery_gate_retry as gates
+from devflow_temporal import delivery_policy_recovery as policy
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_activities import delivery_repair_preflight
@@ -61,6 +63,9 @@ def historical_ci(service, monkeypatch):
     initial.config.path.write_text(canonical_json(config))
     store = DeliveryStore(DeliveryConfig.load(initial.config.path))
     historical = native_case((store, request), monkeypatch)
+    # The oldest legacy fixture replaces this consumer. Restore its actual
+    # owner so the pre-ACK refusal and the purpose-specific bridge are tested.
+    monkeypatch.setattr(gates, "_stopped_cleanup", policy._stopped_cleanup)
     monkeypatch.setattr(resume, "prepare_runtime", lambda value, *_args: prepared_spec(value))
     response, current, previous = admitted(historical)
     assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": previous})) == {
