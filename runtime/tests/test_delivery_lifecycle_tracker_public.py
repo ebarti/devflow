@@ -103,6 +103,19 @@ async def test_public_tracker_closed_history_assessment_and_fenced_admission(
                 assert good['observed_revision'] == payload['expected_revision']
                 assert records() == original_records
                 assert closures.sealed_record(service.store, handle.id) is None
+
+                # A read-only assessment must not repair configuration modes.
+                snapshots = config.state_root / 'configuration-snapshots'
+                assert snapshots.is_dir()
+                original_mode = snapshots.stat().st_mode & 0o777
+                try:
+                    snapshots.chmod(0o755)
+                    configuration = await assess(payload)
+                    assert not configuration['eligible']
+                    assert snapshots.stat().st_mode & 0o777 == 0o755
+                finally:
+                    snapshots.chmod(original_mode)
+
                 with service.store._connect() as db:
                     existing_command = db.execute(
                         'SELECT command_id FROM delivery_commands LIMIT 1').fetchone()[0]
@@ -116,10 +129,24 @@ async def test_public_tracker_closed_history_assessment_and_fenced_admission(
                     return _Expired(environment.client, handle.id)
 
                 monkeypatch.setattr(service, 'client', expired_client)
+                closure_root = config.state_root / 'closures'
+                if closure_root.exists():
+                    assert not list(closure_root.iterdir())
+                    closure_root.rmdir()
+                # A retained index with missing bytes must not recreate the root.
+                with service.store._connect() as db:
+                    db.execute(
+                        'INSERT INTO delivery_closures VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (handle.id, handle.result_run_id, request['run_id'], 'COMPLETED',
+                         '2026-01-01T00:00:00+00:00', spec['request_digest'], None,
+                         '0' * 64, 1, 'temporal', None, '2026-01-01T00:00:00+00:00'))
                 missing = await assess(payload)
                 assert not missing['eligible']
                 assert 'terminal_history_or_custody_unknown' in {
                     item['code'] for item in missing['blockers']}
+                assert not closure_root.exists()
+                with service.store._connect() as db:
+                    db.execute('DELETE FROM delivery_closures WHERE workflow_id=?', (handle.id,))
                 assert records() == original_records
                 monkeypatch.setattr(service, 'client', client)
 
@@ -168,22 +195,51 @@ async def test_public_tracker_closed_history_assessment_and_fenced_admission(
                 assert 'revision_changed' in {
                     item['code'] for item in refused.json()['detail']['blockers']}
 
-                # A different closed execution discovered during admission cannot
-                # inherit the earlier observation's successor authority.
-                original_tail = terminal.closed_tail
-                async def changed_tail(*args, **kwargs):
-                    result = await original_tail(*args, **kwargs)
-                    if kwargs.get('preserve') is False:
-                        return {**result, 'execution_run_id': 'changed-execution'}
-                    return result
+                # Tampering with the database-selected closure after its bytes
+                # were authenticated cannot authorize a successor.
+                original_capture = terminal._capture_closure
+                async def changed_capture(store, run_id, closed):
+                    proof = await original_capture(store, run_id, closed)
+                    with store._connect() as db:
+                        db.execute('UPDATE delivery_closures SET source_sha256=? '
+                                   'WHERE workflow_id=? AND execution_run_id=?',
+                                   ('changed', closed['workflow_id'], closed['execution_run_id']))
+                    return proof
 
-                monkeypatch.setattr(terminal, 'closed_tail', changed_tail)
+                monkeypatch.setattr(terminal, '_capture_closure', changed_capture)
                 changed_closure = {**payload, 'command_id': 'tracker-closure-race'}
                 response = await browser.post(execute_url, json=changed_closure, headers=headers)
                 assert response.status_code == 409, response.text
                 assert 'checkpoint_changed' in {
                     item['code'] for item in response.json()['detail']['blockers']}
-                monkeypatch.setattr(terminal, 'closed_tail', original_tail)
+                with service.store._connect() as db:
+                    db.execute('UPDATE delivery_closures SET source_sha256=NULL '
+                               'WHERE workflow_id=?', (handle.id,))
+                monkeypatch.setattr(terminal, '_capture_closure', original_capture)
+
+                # A second, unselected run under the same workflow identity is
+                # ambiguous and cannot inherit the captured run's proof.
+                async def changed_selection(store, run_id, closed):
+                    proof = await original_capture(store, run_id, closed)
+                    with store._connect() as db:
+                        db.execute(
+                            'INSERT INTO delivery_closures SELECT workflow_id,?,run_id,status,'
+                            'closed_at,request_digest,recovery_digest,history_sha256,event_count,'
+                            'source,source_sha256,sealed_at FROM delivery_closures '
+                            'WHERE workflow_id=? AND execution_run_id=?',
+                            ('different-run', closed['workflow_id'], closed['execution_run_id']))
+                    return proof
+
+                monkeypatch.setattr(terminal, '_capture_closure', changed_selection)
+                changed_run = {**payload, 'command_id': 'tracker-run-race'}
+                response = await browser.post(execute_url, json=changed_run, headers=headers)
+                assert response.status_code == 409, response.text
+                assert 'terminal_history_or_custody_unknown' in {
+                    item['code'] for item in response.json()['detail']['blockers']}
+                with service.store._connect() as db:
+                    db.execute('DELETE FROM delivery_closures WHERE workflow_id=? '
+                               'AND execution_run_id=?', (handle.id, 'different-run'))
+                monkeypatch.setattr(terminal, '_capture_closure', original_capture)
 
                 # An ownership change after initial observation is rechecked under
                 # the actual SQLite admission fence, before the successor is queued.
@@ -210,20 +266,22 @@ async def test_public_tracker_closed_history_assessment_and_fenced_admission(
                                                           'issue': spec['issue_url']}, None)
                 monkeypatch.setattr(terminal, 'snapshot', original_snapshot)
 
-                # While the closed execution is re-read, a competing writer is
-                # fenced. Losing the caller does not create a second successor.
-                entered, release = asyncio.Event(), asyncio.Event()
-                async def delayed_tail(*args, **kwargs):
-                    result = await original_tail(*args, **kwargs)
-                    if kwargs.get('preserve') is False:
+                # A slow Temporal observation holds no SQLite writer fence.
+                # Timeout refuses the successor and allows an unrelated writer.
+                original_tail = terminal.closed_tail
+                entered = asyncio.Event()
+                async def slow_tail(*args, **kwargs):
+                    if kwargs.get('preserve', True):
                         entered.set()
-                        await release.wait()
-                    return result
+                        await asyncio.sleep(5)
+                    return await original_tail(*args, **kwargs)
 
-                monkeypatch.setattr(terminal, 'closed_tail', delayed_tail)
-                command_task = asyncio.create_task(
-                    browser.post(execute_url, json=payload, headers=headers))
-                await asyncio.wait_for(entered.wait(), 10)
+                monkeypatch.setattr(terminal, 'closed_tail', slow_tail)
+                monkeypatch.setattr(terminal, 'CLOSED_HISTORY_TIMEOUT_SECONDS', 3)
+                slow = {**payload, 'command_id': 'tracker-slow'}
+                timed_out = asyncio.create_task(
+                    browser.post(execute_url, json=slow, headers=headers))
+                await asyncio.wait_for(entered.wait(), 3)
                 started = Event()
                 def competing_writer():
                     with service.store._connect() as db:
@@ -233,14 +291,29 @@ async def test_public_tracker_closed_history_assessment_and_fenced_admission(
                                    (request['run_id'],))
 
                 writer = asyncio.create_task(asyncio.to_thread(competing_writer))
-                assert await asyncio.to_thread(started.wait, 3)
-                await asyncio.sleep(0.2)
-                assert not writer.done()
+                assert await asyncio.to_thread(started.wait, 2)
+                await asyncio.wait_for(writer, 2)
+                assert not timed_out.done()
+                refused = await timed_out
+                assert refused.status_code == 409, refused.text
+                assert 'terminal_history_or_custody_unknown' in {
+                    item['code'] for item in refused.json()['detail']['blockers']}
+                with service.store._connect() as db:
+                    assert (db.execute('SELECT count(*) FROM delivery_commands').fetchone()[0]
+                            == original_records['delivery_commands'])
+
+                # Canceling a slow observation does not queue an operation. The
+                # same command can be retried after observation is available.
+                monkeypatch.setattr(terminal, 'CLOSED_HISTORY_TIMEOUT_SECONDS', 30)
+                entered.clear()
+                command_task = asyncio.create_task(
+                    browser.post(execute_url, json=payload, headers=headers))
+                await asyncio.wait_for(entered.wait(), 3)
+                writer = asyncio.create_task(asyncio.to_thread(competing_writer))
+                await asyncio.wait_for(writer, 1)
                 command_task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await command_task
-                release.set()
-                await asyncio.wait_for(writer, 15)
                 monkeypatch.setattr(terminal, 'closed_tail', original_tail)
 
                 result = await browser.post(execute_url, json=payload, headers=headers)
@@ -248,7 +321,10 @@ async def test_public_tracker_closed_history_assessment_and_fenced_admission(
                 assert result.json()['reconciliation_only']
                 saved = service.store.pending_starts()[0]
                 recovery = json.loads(saved['recovery_json'])
-                assert recovery['closed']['history_sha256']
+                proof = recovery['closure_proof']
+                assert proof['record']['execution_run_id'] == handle.result_run_id
+                assert proof['record']['history_sha256'] == recovery['closed']['history_sha256']
+                assert proof['transport_sha256'] and proof['projection_sha256']
                 assert closures.sealed_record(service.store, handle.id) is not None
                 replay = await browser.post(execute_url, json=payload, headers=headers)
                 assert replay.json() == result.json()

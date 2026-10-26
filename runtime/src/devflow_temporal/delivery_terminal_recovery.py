@@ -4,6 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
+import stat
 import subprocess
 from copy import deepcopy
 from pathlib import Path
@@ -24,6 +27,8 @@ from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_resources import RunResources, read_private
 
 logger = logging.getLogger(__name__)
+CLOSED_HISTORY_TIMEOUT_SECONDS = 30
+_UNOBSERVED = object()
 
 
 async def _closed_execution(store, workflow_id, client, run_id, *, preserve=True):
@@ -36,7 +41,7 @@ async def _closed_execution(store, workflow_id, client, run_id, *, preserve=True
     except Exception as exc:
         if not not_found(exc):
             raise
-        sealed = await sealed_closure(store, workflow_id)
+        sealed = await sealed_closure(store, workflow_id, read_only=not preserve)
         if sealed is None:
             raise ValueError('terminal predecessor history is no longer retained and was '
                              'never sealed') from exc
@@ -167,7 +172,7 @@ def published_readback(store, spec, candidate, pr):
     return {'number': pr['number'], 'head': pr['head'], 'url': pr['url']}
 
 
-def snapshot(store, spec, *, read_only=False):
+def snapshot(store, spec, *, read_only=False, captured_published=_UNOBSERVED):
     row, attempts, effects, claim = _rows(store, spec['run_id'])
     with store._connect() as db:
         work = store.state.row(db, 'works', spec['work_id'])
@@ -184,8 +189,9 @@ def snapshot(store, spec, *, read_only=False):
     published = None
     candidate = json.loads(row['candidate_json'] or 'null')
     if checks.get('terminal_tracker_checkpoint', {}).get('outcome') == 'delivered':
-        published = published_readback(store, spec, candidate,
-                                      json.loads(row['pr_json'] or 'null'))
+        published = (published_readback(store, spec, candidate,
+                                       json.loads(row['pr_json'] or 'null'))
+                     if captured_published is _UNOBSERVED else captured_published)
     elif candidate is not None:
         if Path(spec['checkout']).exists():
             if DeliveryBroker(store, spec).candidate() != candidate:
@@ -213,11 +219,13 @@ def snapshot(store, spec, *, read_only=False):
                  'candidate_sha256': digest(candidate), 'work_binding': binding}
 
 
-def _observe(store, run_id, closed, payload, *, read_only=False):
+def _observe(store, run_id, closed, payload, *, read_only=False,
+             captured_published=_UNOBSERVED):
     spec = store.effective_spec(run_id)
     if not store.owns_execution(spec):
         raise ValueError('terminal recovery belongs to another service transport')
-    row, observed = snapshot(store, spec, read_only=read_only)
+    row, observed = snapshot(store, spec, read_only=read_only,
+                             captured_published=captured_published)
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     tail = closed['projection']
     checkpoint = tail.get('checks', {}).get('terminal_tracker_checkpoint', {})
@@ -296,18 +304,89 @@ async def assess(store, run_id, request, client):
     if (not isinstance(request, dict) or set(request) != {'command_id', 'expected_revision'}
             or not isinstance(request['command_id'], str)):
         return unknown_assessment(request)
+    from .delivery_execution_config import observation_mode
+
     try:
-        closed = await closed_tail(store, run_id, client, preserve=False)
-        *_, facts = await asyncio.to_thread(
-            _observe, store, run_id, closed, request, read_only=True)
-        return evaluate_transition(facts, request)
+        with observation_mode():
+            closed = await closed_tail(store, run_id, client, preserve=False)
+            *_, facts = await asyncio.to_thread(
+                _observe, store, run_id, closed, request, read_only=True)
+            return evaluate_transition(facts, request)
     except (ValueError, RuntimeError, OSError, KeyError, TypeError, subprocess.SubprocessError):
         return unknown_assessment(request)
     except RPCError:
         return unknown_assessment(request)
 
 
-def _grant(store, run_id, payload, closed, refresh_closed):
+def _closure_custody(store, record):
+    """Bind the already-verified content address to its owned file identity."""
+    if not re.fullmatch(r'[0-9a-f]{64}', str(record.get('history_sha256', ''))):
+        raise ValueError('terminal closure content address is invalid')
+    root = Path(store.config.state_root) / 'closures'
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root_info = os.fstat(root_fd)
+        path_info = root.lstat()
+        if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid()
+                or stat.S_IMODE(root_info.st_mode) != 0o700
+                or (root_info.st_dev, root_info.st_ino) != (path_info.st_dev, path_info.st_ino)):
+            raise ValueError('terminal closure directory custody changed')
+        fd = os.open(record['history_sha256'] + '.json.xz',
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                raise ValueError('terminal closure file custody changed')
+            keys = ('st_dev', 'st_ino', 'st_uid', 'st_mode', 'st_nlink', 'st_size',
+                    'st_mtime_ns', 'st_ctime_ns')
+            return {'root': [root_info.st_dev, root_info.st_ino],
+                    'file': [getattr(info, key) for key in keys]}
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+
+
+async def _capture_closure(store, run_id, closed):
+    """Authenticate and preserve one immutable, database-selected execution."""
+    from .delivery_closures import sealed_closure, sealed_record
+
+    record = await asyncio.to_thread(sealed_record, store, closed['workflow_id'])
+    if (record is None or record['run_id'] != run_id
+            or record['execution_run_id'] != closed['execution_run_id']
+            or record['history_sha256'] != closed['history_sha256']
+            or any(record[key] != closed[key] for key in
+                   ('status', 'request_digest', 'recovery_digest'))):
+        raise ValueError('terminal closed execution is not the selected sealed history')
+    before = await asyncio.to_thread(_closure_custody, store, record)
+    sealed = await sealed_closure(store, closed['workflow_id'],
+                                  execution_run_id=closed['execution_run_id'])
+    after = await asyncio.to_thread(_closure_custody, store, record)
+    if (sealed is None or before != after
+            or history_sha256(sealed['history']) != closed['history_sha256']):
+        raise ValueError('terminal sealed history changed during authentication')
+    from .delivery_execution_config import transport_digest
+
+    return {'record': record, 'custody': after,
+            'transport_sha256': transport_digest(store.config),
+            'projection_sha256': digest(closed['projection'])}
+
+
+def _current_closure_proof(store, closed):
+    from .delivery_closures import sealed_record
+
+    record = sealed_record(store, closed['workflow_id'])
+    if record is None:
+        raise ValueError('terminal selected sealed history is unavailable')
+    from .delivery_execution_config import transport_digest
+
+    return {'record': record, 'custody': _closure_custody(store, record),
+            'transport_sha256': transport_digest(store.config),
+            'projection_sha256': digest(closed['projection'])}
+
+
+def _grant(store, run_id, payload, closed, closure_proof):
     prior = receipt(store, run_id, payload)
     if prior is not None:
         return prior
@@ -337,6 +416,7 @@ def _grant(store, run_id, payload, closed, refresh_closed):
         'kind': 'terminal_tracker_recovery', 'original_recovery': previous,
         'state': state, 'spec_sha256': digest(spec), 'closed': closed,
         'seal': observed, 'command_id': payload['command_id'],
+        'closure_proof': closure_proof,
     }
     workflow_id = f"delivery-{run_id}-terminal-tracker-{digest(payload['command_id'])}"
     response = {'run_id': run_id, 'phase': 'terminal_tracker_recovery_queued',
@@ -355,11 +435,14 @@ def _grant(store, run_id, payload, closed, refresh_closed):
         if dict(current) != row:
             raise ValueError('terminal recovery lost its frozen projection')
         try:
-            current_closed = refresh_closed()
-        except (ValueError, RuntimeError, OSError, TimeoutError, RPCError) as exc:
+            current_closure = _current_closure_proof(store, closed)
+        except (ValueError, OSError, KeyError) as exc:
             raise RecoveryRefused(unknown_assessment(payload)) from exc
+        require_same_proof('terminal_tracker_recovery', 'terminal_tracker',
+                           digest(current_closure), digest(closure_proof))
         current_spec, current_row, current_observed, _, _, current_facts = _observe(
-            store, run_id, current_closed, payload, read_only=True)
+            store, run_id, closed, payload, read_only=True,
+            captured_published=observed['published'])
         require_transition(current_facts, payload)
         require_same_proof('terminal_tracker_recovery', 'terminal_tracker',
                            current_facts['proof_digest'], facts['proof_digest'])
@@ -382,22 +465,14 @@ def _grant(store, run_id, payload, closed, refresh_closed):
 
 
 async def recover(store, run_id, payload, client):
-    closed = await closed_tail(store, run_id, client)
-    loop = asyncio.get_running_loop()
-
-    def refresh_closed():
-        # The transaction fences local admission while the exact Temporal
-        # execution is read again; a timeout never authorizes the successor.
-        future = asyncio.run_coroutine_threadsafe(
-            closed_tail(store, run_id, client, preserve=False,
-                        workflow_id=closed['workflow_id']), loop)
-        try:
-            return future.result(timeout=30)
-        except TimeoutError:
-            future.cancel()
-            raise
-
-    return await asyncio.to_thread(_grant, store, run_id, payload, closed, refresh_closed)
+    try:
+        closed = await asyncio.wait_for(
+            closed_tail(store, run_id, client), timeout=CLOSED_HISTORY_TIMEOUT_SECONDS)
+        closure_proof = await asyncio.wait_for(
+            _capture_closure(store, run_id, closed), timeout=CLOSED_HISTORY_TIMEOUT_SECONDS)
+    except (ValueError, RuntimeError, OSError, TimeoutError, RPCError) as exc:
+        raise RecoveryRefused(unknown_assessment(payload)) from exc
+    return await asyncio.to_thread(_grant, store, run_id, payload, closed, closure_proof)
 
 
 def preflight(store, spec, recovery):
