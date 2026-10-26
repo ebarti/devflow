@@ -900,8 +900,10 @@ def create_app(config_path: Path) -> FastAPI:
         if set(payload) != expected:
             raise HTTPException(400, "mutation fields do not match the contract")
         try:
+            from .delivery_operations import begin_temporal_mutation
+
             prior = await asyncio.to_thread(
-                service.store.begin_mutation, run_id, command_id, name, payload
+                begin_temporal_mutation, service, run_id, command_id, name, payload
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc

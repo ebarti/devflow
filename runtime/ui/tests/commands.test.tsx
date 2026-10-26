@@ -26,9 +26,9 @@ describe('dashboard commands', () => {
   })
 
   it.each([false, true])('offers tracker reconciliation with frozen cancellation (closed=%s)', async closed => {
-    const reconcile = vi.spyOn(api, 'reconcileTracker')
+    const reconcile = vi.spyOn(api, 'createOperation')
       .mockRejectedValueOnce(new ApiError('receipt unavailable', 503))
-      .mockResolvedValue(undefined)
+      .mockResolvedValue({ operation_id: 'tracker:fixture', run_id: 'run-1', kind: 'reconcile-tracker', stage: 'execution', state: 'succeeded', progress: 'succeeded', next_action: 'inspect_result', result: {}, error: null, authority: 'current_authority_unverified' })
     const refresh = vi.fn().mockResolvedValue(undefined)
     const user = userEvent.setup()
     const run: RunDetail = { ...mockRun, decisions: [], outcome: null,
@@ -42,8 +42,8 @@ describe('dashboard commands', () => {
     expect(screen.getByText(/terminal transition is fixed/i)).toBeTruthy()
     await user.click(screen.getByRole('button', { name: 'Reconcile tracker' }))
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
-    expect(reconcile.mock.calls[0][1]).toMatchObject({ expected_revision: 5 })
-    expect(reconcile.mock.calls[0][1].command_id).toBeTruthy()
+    expect(reconcile.mock.calls[0][0].request).toMatchObject({ expected_revision: 5 })
+    expect((reconcile.mock.calls[0][0].request as { command_id: string }).command_id).toBeTruthy()
     // The accepted cycle arrives over SSE before the lost HTTP ACK is retried.
     rerender(<RunDetails run={{ ...run, protocol_revision: 9,
       checks: { terminal_tracker_checkpoint: { ...run.checks?.terminal_tracker_checkpoint,
@@ -51,6 +51,20 @@ describe('dashboard commands', () => {
     }} onRefresh={refresh} />)
     await user.click(screen.getByRole('button', { name: 'Retry same reconciliation' }))
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
+    expect(reconcile.mock.calls[1]).toEqual(reconcile.mock.calls[0])
+  })
+
+  it('retains tracker intent when the durable operation is still running', async () => {
+    const reconcile = vi.spyOn(api, 'createOperation').mockResolvedValue({ operation_id: 'tracker:fixture', run_id: 'run-1', kind: 'reconcile-tracker', stage: 'execution', state: 'running', progress: 'running', next_action: 'wait', result: null, error: null, authority: null })
+    vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const run: RunDetail = { ...mockRun, decisions: [], outcome: null, phase: 'waiting_tracker',
+      checks: { terminal_tracker_checkpoint: { waiting: true } } }
+    render(<RunDetails run={run} onRefresh={refresh} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Reconcile tracker' }))
+    expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+    expect(refresh).not.toHaveBeenCalled()
+    await userEvent.click(screen.getByRole('button', { name: 'Retry same reconciliation' }))
     expect(reconcile.mock.calls[1]).toEqual(reconcile.mock.calls[0])
   })
 

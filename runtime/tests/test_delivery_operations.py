@@ -658,6 +658,43 @@ async def test_original_temporal_update_is_reconciled_after_local_receipt_loss(
                         "UPDATE delivery_runs SET workflow_id='delivery-successor' "
                         "WHERE run_id='run-1'"
                     )
+                aliases = await asyncio.gather(
+                    *[
+                        client.post(
+                            "/api/operations",
+                            json={**envelope, "operation_id": f"alias-{i}"},
+                            headers=headers,
+                        )
+                        for i in range(4)
+                    ]
+                )
+                assert all(item.status_code == 202 for item in aliases)
+                assert all(item.json()["operation_id"] == "decision-op" for item in aliases)
+                changed = {
+                    **envelope,
+                    "operation_id": "changed-op",
+                    "request": {**body, "answer": "changed"},
+                }
+                assert (
+                    await client.post("/api/operations", json=changed, headers=headers)
+                ).status_code == 409
+                other_kind = await client.post(
+                    "/api/operations",
+                    headers=headers,
+                    json={
+                        "operation_id": "other-kind",
+                        "run_id": "run-1",
+                        "kind": "cancel",
+                        "request": {
+                            "command_id": body["command_id"],
+                            "expected_revision": 1,
+                            "reason": "stop",
+                        },
+                    },
+                )
+                assert other_kind.status_code == 409
+                direct = await client.post("/api/runs/run-1/decision", json=body, headers=headers)
+                assert direct.status_code == 409
                 monkeypatch.setattr(service.store, "finish_mutation", original_finish)
                 recovered = (
                     await client.post("/api/operations/decision-op/reconcile", headers=headers)
@@ -765,3 +802,195 @@ async def test_terminal_tracker_receipt_reconciles_without_another_update(api_fi
             ).fetchone()[0]
             == "complete"
         )
+
+
+@pytest.mark.asyncio
+async def test_running_owner_loss_is_discovered_by_status_and_run_list(api_fixture):
+    import os
+
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_operations import _lock
+
+    path, _ = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    with store._connect() as db:
+        for op in ("lost-status", "lost-list"):
+            db.execute(
+                """INSERT INTO delivery_operations
+                (operation_id,run_id,kind,stage,request_digest,request_json,state,
+                 created_at,updated_at,progress)
+                VALUES (?,'run-1','merge-preflight','observation',?,'{}','running',
+                        '2026','2026','running')""",
+                (op, digest({"run_id": "run-1", "kind": "merge-preflight", "request": {}})),
+            )
+    first, second = _lock(store, "lost-status"), _lock(store, "lost-list")
+    assert first is not None and second is not None
+    try:
+        await app.state.delivery.resume_pending_operations()
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1:18770"
+        ) as client:
+            assert (await client.get("/api/operations/lost-status")).json()["state"] == "running"
+            os.close(first)
+            first = None
+            assert (await client.get("/api/operations/lost-status")).json()["state"] == "unknown"
+            os.close(second)
+            second = None
+            records = (await client.get("/api/runs/run-1/operations")).json()["operations"]
+            assert {item["state"] for item in records} == {"unknown"}
+    finally:
+        if first is not None:
+            os.close(first)
+        if second is not None:
+            os.close(second)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_operation_aliases_share_one_domain_command(api_fixture, monkeypatch):
+    path, submit = api_fixture
+    app = create_app(path)
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def slow(request):
+        calls.append(request)
+        entered.set()
+        assert release.wait(10)
+        return {"run_id": request["run_id"], "phase": "accepted"}
+
+    monkeypatch.setattr(app.state.delivery.store, "submit", slow)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as client:
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+
+        async def create(index):
+            return await client.post(
+                "/api/operations",
+                headers=headers,
+                json={
+                    "operation_id": f"submit-alias-{index}",
+                    "run_id": None,
+                    "kind": "submit",
+                    "request": submit,
+                },
+            )
+
+        try:
+            responses = await asyncio.gather(*[create(i) for i in range(5)])
+            assert all(response.status_code == 202 for response in responses)
+            assert len({response.json()["operation_id"] for response in responses}) == 1
+            assert await asyncio.to_thread(entered.wait, 5)
+            changed = await client.post(
+                "/api/operations",
+                headers=headers,
+                json={
+                    "operation_id": "submit-changed",
+                    "run_id": None,
+                    "kind": "submit",
+                    "request": {**submit, "goal": "different"},
+                },
+            )
+            assert changed.status_code == 409
+            assert len(calls) == 1
+        finally:
+            release.set()
+        selected = responses[0].json()["operation_id"]
+        for _ in range(200):
+            operation = (await client.get("/api/operations/" + selected)).json()
+            if operation["state"] == "succeeded":
+                break
+            await asyncio.sleep(0.02)
+        assert operation["state"] == "succeeded" and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_new_operation_cannot_resend_prior_unowned_temporal_mutation(api_fixture):
+    path, submit = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    store.submit(submit)
+    body = {
+        "command_id": "old-uncertain",
+        "expected_revision": 1,
+        "decision_id": "decision-1",
+        "decision_revision": 1,
+        "candidate_revision": 1,
+        "answer": "continue",
+    }
+    store.begin_mutation("run-1", body["command_id"], "decision", body)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as client:
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+        envelope = {
+            "operation_id": "new-op",
+            "run_id": "run-1",
+            "kind": "decision",
+            "request": body,
+        }
+        await client.post("/api/operations", json=envelope, headers=headers)
+        for _ in range(200):
+            operation = (await client.get("/api/operations/new-op")).json()
+            if operation["state"] not in ("pending", "running"):
+                break
+            await asyncio.sleep(0.02)
+        assert operation["state"] == "unknown"
+        assert "prior domain mutation is uncertain" in operation["error"]
+        assert operation["effect_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_existing_operation_journal_backfills_domain_command_binding(api_fixture):
+    import json
+
+    from devflow_temporal.contracts import digest
+
+    path, _ = api_fixture
+    store = create_app(path).state.delivery.store
+    body = {
+        "command_id": "retained-command",
+        "expected_revision": 1,
+        "decision_id": "decision-1",
+        "decision_revision": 1,
+        "candidate_revision": 1,
+        "answer": "continue",
+    }
+    with store._connect() as db:
+        db.execute("DROP TABLE delivery_operations")
+        db.execute("""CREATE TABLE delivery_operations (
+            operation_id TEXT PRIMARY KEY, run_id TEXT, kind TEXT NOT NULL,
+            stage TEXT NOT NULL, request_digest TEXT NOT NULL, request_json TEXT NOT NULL,
+            state TEXT NOT NULL, owner_generation TEXT, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            progress TEXT NOT NULL, result_json TEXT, error TEXT, effect_refs TEXT)""")
+        db.execute(
+            """INSERT INTO delivery_operations
+            (operation_id,run_id,kind,stage,request_digest,request_json,state,
+             created_at,updated_at,progress)
+            VALUES ('retained-op','run-1','decision','execution',?,?,'unknown',
+                    '2026','2026','unknown')""",
+            (digest({"run_id": "run-1", "kind": "decision", "request": body}), json.dumps(body)),
+        )
+    app = create_app(path)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as client:
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+        envelope = {
+            "operation_id": "new-op",
+            "run_id": "run-1",
+            "kind": "decision",
+            "request": body,
+        }
+        alias = await client.post("/api/operations", json=envelope, headers=headers)
+        assert alias.status_code == 202
+        assert alias.json()["operation_id"] == "retained-op"
+        conflict = await client.post(
+            "/api/operations",
+            json={**envelope, "request": {**body, "answer": "changed"}},
+            headers=headers,
+        )
+        assert conflict.status_code == 409

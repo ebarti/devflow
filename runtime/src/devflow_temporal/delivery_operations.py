@@ -60,21 +60,58 @@ NO_START = {
 }
 
 
+def _domain_namespaces(kind):
+    # These are the existing owners' command journals. A preflight is never
+    # bound here, so its ID may be reused by its distinct acknowledgement.
+    if kind == "issue-context":
+        return {"issue-context"}
+    if kind in {"decision", "cancel", "disable-limits"}:
+        return {"temporal-mutations"}
+    if kind == "reconcile-tracker":
+        return {"temporal-mutations", "delivery-commands"}
+    return {"delivery-commands"}
+
+
 def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
 def initialize(store) -> None:
     with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         db.execute("""CREATE TABLE IF NOT EXISTS delivery_operations (
             operation_id TEXT PRIMARY KEY, run_id TEXT, kind TEXT NOT NULL,
             stage TEXT NOT NULL, request_digest TEXT NOT NULL, request_json TEXT NOT NULL,
             state TEXT NOT NULL, owner_generation TEXT, created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
             progress TEXT NOT NULL, result_json TEXT, error TEXT, effect_refs TEXT)""")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(delivery_operations)")}
+        if "domain_command_id" not in columns:
+            db.execute("ALTER TABLE delivery_operations ADD COLUMN domain_command_id TEXT")
+        # Older journals retain their exact requests; backfill the domain key
+        # without rewriting or interpreting historical domain receipts.
+        rows = db.execute(
+            "SELECT operation_id,request_json FROM delivery_operations "
+            "WHERE domain_command_id IS NULL AND stage != 'observation'"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["request_json"])
+            except (TypeError, ValueError):
+                continue
+            command_id = payload.get("command_id") if isinstance(payload, dict) else None
+            if isinstance(command_id, str) and command_id:
+                db.execute(
+                    "UPDATE delivery_operations SET domain_command_id=? WHERE operation_id=?",
+                    (command_id, row["operation_id"]),
+                )
         db.execute(
             "CREATE INDEX IF NOT EXISTS delivery_operations_run "
             "ON delivery_operations(run_id, created_at)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS delivery_operations_domain_id "
+            "ON delivery_operations(domain_command_id)"
         )
 
 
@@ -120,6 +157,37 @@ def _lock(store, operation_id):
         os.close(fd)
         return None
     return fd
+
+
+def begin_temporal_mutation(service, run_id, command_id, name, payload):
+    """Serialize domain admission against facade and legacy update callers."""
+    from .delivery_operation_temporal import current_operation
+
+    fd = _lock(service.store, "\x00domain:" + command_id)
+    if fd is None:
+        raise ValueError("this command is being admitted; inspect its original operation")
+    try:
+        current = current_operation(service)
+        with service.store._connect() as db:
+            rows = db.execute(
+                "SELECT operation_id,state FROM delivery_operations WHERE domain_command_id=? "
+                "AND kind IN ('decision','cancel','disable-limits','reconcile-tracker')",
+                (command_id,),
+            ).fetchall()
+            prior = db.execute(
+                "SELECT state FROM delivery_mutations WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+        for row in rows:
+            if row["state"] in ("pending", "running", "unknown") and (
+                current is None or current["operation_id"] != row["operation_id"]
+            ):
+                raise ValueError("command belongs to an unresolved durable operation; inspect it")
+        if current is not None and prior is not None and prior["state"] in ("pending", "unknown"):
+            raise ValueError("prior domain mutation is uncertain; reconcile it before another send")
+        return service.store.begin_mutation(run_id, command_id, name, payload)
+    finally:
+        os.close(fd)
 
 
 def _set(store, operation_id, state, *, result=None, error=None):
@@ -313,20 +381,49 @@ def register_operations(app, service, hostguard, mutationguard):
         if KINDS[kind][1] != "observation" or kind == "issue-context":
             mutationguard(request)
         request_digest = digest({"run_id": run_id, "kind": kind, "request": payload})
+        command_id = payload.get("command_id")
+        if KINDS[kind][1] == "observation" or not isinstance(command_id, str) or not command_id:
+            command_id = None
+        selected_id = op
         with service.store._connect() as db:
+            # This transaction serializes aliases across processes. The domain
+            # command is distinct from the transport operation ID and is only
+            # bound within the owner's domain; preflight/ACK can legally reuse it.
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute(
-                "SELECT request_digest FROM delivery_operations WHERE operation_id=?",
+                "SELECT operation_id,request_digest,state FROM delivery_operations "
+                "WHERE operation_id=?",
                 (op,),
             ).fetchone()
-            if prior and prior[0] != request_digest:
+            if prior and prior["request_digest"] != request_digest:
                 raise HTTPException(409, "operation ID already belongs to a different request")
-            if not prior:
+            if prior is None and command_id is not None:
+                candidates = db.execute(
+                    "SELECT operation_id,kind,request_digest,state FROM delivery_operations "
+                    "WHERE domain_command_id=? ORDER BY created_at,operation_id",
+                    (command_id,),
+                ).fetchall()
+                aliases = [
+                    row
+                    for row in candidates
+                    if _domain_namespaces(kind) & _domain_namespaces(row["kind"])
+                ]
+                if len(aliases) > 1:
+                    raise HTTPException(409, "multiple prior operations require reconciliation")
+                if aliases:
+                    prior = aliases[0]
+                    if prior["kind"] != kind or prior["request_digest"] != request_digest:
+                        raise HTTPException(
+                            409, "domain command ID already belongs to a different request"
+                        )
+                    selected_id = prior["operation_id"]
+            if prior is None:
                 timestamp = now()
                 db.execute(
                     """INSERT INTO delivery_operations
-                    (operation_id,run_id,kind,stage,request_digest,request_json,state,created_at,updated_at,progress)
-                    VALUES (?,?,?,?,?,?,'pending',?,?,'queued')""",
+                    (operation_id,run_id,kind,stage,request_digest,request_json,state,
+                     created_at,updated_at,progress,domain_command_id)
+                    VALUES (?,?,?,?,?,?,'pending',?,?,'queued',?)""",
                     (
                         op,
                         run_id,
@@ -336,11 +433,15 @@ def register_operations(app, service, hostguard, mutationguard):
                         json.dumps(payload, sort_keys=True),
                         timestamp,
                         timestamp,
+                        command_id,
                     ),
                 )
-        if not prior:
-            dispatch(op)
-        operation = await asyncio.to_thread(read, service.store, op)
+                pending = True
+            else:
+                pending = prior["state"] == "pending"
+        if pending:
+            dispatch(selected_id)
+        operation = await asyncio.to_thread(read, service.store, selected_id)
         return JSONResponse(
             operation,
             status_code=200 if operation["state"] in ("succeeded", "refused", "failed") else 202,
@@ -349,18 +450,34 @@ def register_operations(app, service, hostguard, mutationguard):
     @app.get("/api/operations/{operation_id}")
     async def operation_status(request: Request, operation_id: str):
         hostguard(request)
-        return await asyncio.to_thread(read, service.store, operation_id)
+        operation = await asyncio.to_thread(read, service.store, operation_id)
+        if operation["state"] == "running":
+            await asyncio.to_thread(_recover_abandoned, service.store, operation_id)
+            operation = await asyncio.to_thread(read, service.store, operation_id)
+        return operation
 
     @app.get("/api/runs/{run_id}/operations")
     async def list_operations(request: Request, run_id: str):
         hostguard(request)
-        with service.store._connect() as db:
-            rows = db.execute(
-                "SELECT * FROM delivery_operations WHERE run_id=? "
-                "ORDER BY created_at DESC LIMIT 100",
-                (run_id,),
-            ).fetchall()
-        return {"operations": [_row(row) for row in rows]}
+
+        def read_page():
+            def rows_for_run():
+                with service.store._connect() as db:
+                    return db.execute(
+                        "SELECT * FROM delivery_operations WHERE run_id=? "
+                        "ORDER BY created_at DESC LIMIT 100",
+                        (run_id,),
+                    ).fetchall()
+
+            rows = rows_for_run()
+            running = [row["operation_id"] for row in rows if row["state"] == "running"]
+            for operation_id in running:
+                _recover_abandoned(service.store, operation_id)
+            if running:
+                rows = rows_for_run()
+            return {"operations": [_row(row) for row in rows]}
+
+        return await asyncio.to_thread(read_page)
 
     @app.post("/api/operations/{operation_id}/reconcile")
     async def reconcile_operation(request: Request, operation_id: str):
@@ -404,7 +521,8 @@ def register_operations(app, service, hostguard, mutationguard):
                 )
                 row = db.execute(
                     "SELECT request_digest,response_json FROM delivery_commands "
-                    "WHERE run_id=? AND command_id=?", (domain_run, command_id),
+                    "WHERE run_id=? AND command_id=?",
+                    (domain_run, command_id),
                 ).fetchone()
                 valid = row is not None and row[0] == expected
                 if valid:

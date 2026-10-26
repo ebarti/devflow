@@ -29,6 +29,11 @@ def leave(token):
         _operation.reset(token)
 
 
+def current_operation(service):
+    current = _operation.get()
+    return current[1] if current is not None and current[0] is service else None
+
+
 def _transport(service):
     return digest(
         {

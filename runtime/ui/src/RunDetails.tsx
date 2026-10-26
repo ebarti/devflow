@@ -342,13 +342,24 @@ function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => 
   const available = run.phase === 'waiting_tracker' && (checkpoint.waiting || checkpoint.closed)
 
   async function reconcile() {
-    if (busy || run.protocol_revision == null || (!body && !available)) return
-    const request = body ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision }
+    if (busy || (!body && (run.protocol_revision == null || !available))) return
+    const request = body ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision! }
     setBody(request); setBusy(true); setError('')
     try {
-      await api.reconcileTracker(run.id, request)
-      await onRefresh()
-      setBody(null)
+      const operation = await api.createOperation({
+        operation_id: `tracker:${request.command_id}`, run_id: run.id,
+        kind: 'reconcile-tracker', request,
+      })
+      if (operation.state === 'succeeded') {
+        setBody(null)
+        await onRefresh()
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        setBody(null)
+        setError(operation.error || 'Tracker reconciliation was refused.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Tracker readback could not be confirmed.')
       await onRefresh()
@@ -360,7 +371,7 @@ function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => 
     <h2 id="tracker-recovery-heading">Confirm terminal tracker</h2>
     <p>The terminal transition is fixed. Reconciliation confirms the issue, assignee and Project readback without rerunning development.</p>
     <p className="subtle">{available ? 'Readback is waiting for explicit reconciliation.' : 'The current bounded reconciliation is running or queued.'}</p>
-    <button type="button" className="primary-button" disabled={busy || run.protocol_revision == null || (!body && !available)} onClick={() => void reconcile()}>{busy ? 'Reconciling…' : error && body ? 'Retry same reconciliation' : 'Reconcile tracker'}</button>
+    <button type="button" className="primary-button" disabled={busy || (!body && (run.protocol_revision == null || !available))} onClick={() => void reconcile()}>{busy ? 'Reconciling…' : error && body ? 'Retry same reconciliation' : 'Reconcile tracker'}</button>
     {error ? <p className="form-error" role="alert">{error} {body ? 'The request identity is retained while its response is unconfirmed.' : 'Review the refreshed run before reconciling again.'}</p> : null}
   </section>
 }

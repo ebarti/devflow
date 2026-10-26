@@ -271,7 +271,10 @@ unchanged after a timeout. The response is the operation record: pending or
 running means the original work continues, not that its result is available.
 The operation and per-run operation list are available from
 `GET /api/operations/{id}` and `GET /api/runs/{id}/operations`. A different
-request with the same operation ID is refused.
+request with the same operation ID is refused. For effectful commands, a second
+operation ID carrying the same domain command and request returns the original
+operation; a conflicting command ID is refused. Observations retain separate
+identities so a fresh preflight can be followed by its distinct acknowledgement.
 
 The service dispatches persisted pending work on restart. A previously running
 operation is unknown once its exclusive owner is gone; it is not launched
