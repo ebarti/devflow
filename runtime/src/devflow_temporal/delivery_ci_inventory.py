@@ -51,7 +51,8 @@ def _request(value, acknowledged=False):
     if (
         not isinstance(value, dict)
         or set(value) != FIELDS | extra
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", str(value.get("command_id")))
+        or not isinstance(value.get("command_id"), str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value["command_id"])
         or any(
             type(value.get(k)) is not int or value[k] < 0
             for k in ("expected_revision", "expected_projection_revision", "expected_iteration")

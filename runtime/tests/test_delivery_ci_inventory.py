@@ -236,6 +236,35 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
     assert all(x["limit"] < 4 * 1024 * 1024 for x in owner.indexed_evidence(c.store, "run-1"))
 
 
+@pytest.mark.asyncio
+async def test_public_wrong_type_command_id_refuses_before_observation_or_any_write(ci_case):
+    c = ci_case
+    with c.store._connect() as db:
+        before = {
+            table: [dict(row) for row in db.execute("SELECT * FROM " + table)]
+            for table in ("delivery_runs", "delivery_events", "delivery_commands")
+        }
+    async with public(c) as (client, headers):
+        for command_id in (123, True, 1.5, None, [], {}):
+            body = {**c.command, "command_id": command_id}
+            preflight = await client.post("/api/runs/run-1/ci-inventory-preflight", json=body)
+            assert preflight.status_code == 409, preflight.text
+            acknowledgement = await client.post(
+                "/api/runs/run-1/ack-ci-inventory",
+                json={**body, "preflight_key": "a" * 64, "acknowledgement": owner.ACK},
+                headers=headers,
+            )
+            assert acknowledgement.status_code == 409, acknowledgement.text
+            for response in (preflight, acknowledgement):
+                assert "exact reviewed purpose and selection" in response.json()["detail"]
+    assert not c.remote.calls
+    with c.store._connect() as db:
+        for table, rows in before.items():
+            assert [dict(row) for row in db.execute("SELECT * FROM " + table)] == rows
+        assert not db.execute("SELECT 1 FROM delivery_ci_inventories").fetchone()
+        assert not db.execute("SELECT 1 FROM delivery_ci_inventory_audit").fetchone()
+
+
 @pytest.mark.parametrize(
     "drift", ["profile", "source", "claim", "role", "unknown", "candidate", "request"]
 )
