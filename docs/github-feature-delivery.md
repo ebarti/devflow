@@ -205,7 +205,10 @@ native evidence and required GitHub checks, and requires strict trunk protection
 without bypass actors. A non-stack single PR uses a head-bound `gh pr merge`.
 New native-stack merge submissions currently refuse with
 `stack_member_head_condition_unavailable` before creating a merge intent or
-changing a branch. GitHub's documented asynchronous API can condition the selected
+changing a branch. The public run's `checks.feature_merge` retains the typed
+blocker, affected PRs and `mutation_started: false` across both coordinator paths;
+the blocked explanation states that no merge was submitted. GitHub's documented
+asynchronous API can condition the selected
 PR head, but it cannot condition every lower member and stack membership
 ([documented request fields](https://github.com/github/gh-stack/blob/main/docs/src/content/docs/reference/merge-api.md)). A
 selected-head condition or another preflight read is insufficient to authenticate
