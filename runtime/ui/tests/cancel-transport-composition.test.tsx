@@ -86,7 +86,7 @@ it('restores the exact cancellation after unmount and replays the same durable o
   await user.click(screen.getByRole('button', { name: 'Retry cancellation request' }))
   await waitFor(() => expect(create).toHaveBeenCalledTimes(2))
   expect(create.mock.calls[1]).toEqual(create.mock.calls[0])
-  expect(sessionStorage.getItem(`devflow.cancel:${run.id}`)).toBeNull()
+  expect(sessionStorage.getItem(`devflow.cancel:${run.id}`)).not.toBeNull()
 })
 
 it('does not send a cancellation when the request cannot be retained', async () => {
@@ -102,4 +102,28 @@ it('does not send a cancellation when the request cannot be retained', async () 
   expect(await screen.findByText(/could not be retained/i)).toBeTruthy()
   expect(create).not.toHaveBeenCalled()
   write.mockRestore()
+})
+
+
+it('retains a successful receipt through failed refresh and reload until terminal state is observed', async () => {
+  const create = vi.spyOn(api, 'createOperation').mockImplementation(async envelope => reply(envelope, 'succeeded'))
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const run = { ...mockRun, decisions: [] }
+  const read = vi.spyOn(api, 'getRun').mockRejectedValueOnce(new ApiError('read failed', 503))
+    .mockResolvedValue({ ...run, execution_state: 'cancelling' })
+  const refresh = vi.fn().mockRejectedValueOnce(new Error('refresh failed')).mockResolvedValue(undefined)
+  const user = userEvent.setup()
+  const view = render(<RunDetails run={run} onRefresh={refresh} />)
+  await user.click(screen.getByRole('button', { name: 'Cancel run' }))
+  await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
+  await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+  await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+  expect(sessionStorage.getItem(`devflow.cancel:${run.id}`)).not.toBeNull()
+  view.unmount()
+  render(<RunDetails run={run} onRefresh={refresh} />)
+  await user.click(screen.getByRole('button', { name: 'Retry cancellation request' }))
+  await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
+  expect(create.mock.calls[1]).toEqual(create.mock.calls[0])
+  expect(read).toHaveBeenCalledTimes(2)
+  expect(sessionStorage.getItem(`devflow.cancel:${run.id}`)).toBeNull()
 })

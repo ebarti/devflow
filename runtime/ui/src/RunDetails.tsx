@@ -309,18 +309,28 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   const [error, setError] = useState(saved.blocked ? 'The retained cancellation request is unavailable. Resolve it before starting another cancellation.' : saved.request ? 'A previous cancellation request is retained. Retry to confirm the same request.' : '')
   const canRequest = !run.execution_retired && run.outcome == null && !run.checks?.terminal_tracker_checkpoint && !['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')
   const observedCurrent = observed?.id === run.id && observed.protocol_revision === run.protocol_revision && observed.outcome === run.outcome && observed.execution_state === run.execution_state && Boolean(observed.execution_retired) === Boolean(run.execution_retired) && Boolean(observed.checks?.terminal_tracker_checkpoint) === Boolean(run.checks?.terminal_tracker_checkpoint)
-  const canStart = canRequest && (!settled || observedCurrent && (!settled.acknowledged || run.protocol_revision !== settled.revision))
+  const canStart = canRequest && (!settled || !settled.acknowledged && observedCurrent)
   const awaitingObservation = Boolean(settled) && !canStart
   if (!canRequest && !intent.current && !saved.blocked) return null
 
-  async function refresh(observeResponse: boolean) {
+  async function refresh(observeResponse: boolean, acknowledged = false) {
+    let terminalObserved = false
     if (observeResponse) {
       // The parent refresh may resolve without a successful detail read.
       // Bind a fresh command only to a post-response read displayed by the page.
-      try { setObserved(await api.getRun(run.id)) }
+      try {
+        const latest = await api.getRun(run.id)
+        setObserved(latest)
+        terminalObserved = latest.id === run.id && (latest.execution_state === 'cancelling' || latest.outcome != null || Boolean(latest.execution_retired))
+      }
       catch { setObserved(null); setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
     }
-    try { await onRefresh() } catch { setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
+    try {
+      await onRefresh()
+      if (acknowledged && terminalObserved) {
+        try { sessionStorage.removeItem(intentKey) } catch { /* A retained receipt is safe to replay. */ }
+      }
+    } catch { setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
   }
 
   async function cancel() {
@@ -332,12 +342,13 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
       intent.current = request
     }
     let knownResponse = false
+    let acknowledged = false
     setSettled(null); setObserved(null)
     setBusy(true); setError('')
     try {
       await api.cancel(run.id, request)
       knownResponse = true
-      try { sessionStorage.removeItem(intentKey) } catch { /* A retained receipt is safe to replay. */ }
+      acknowledged = true
       intent.current = null
       setSettled({ acknowledged: true, revision: request.expected_revision })
       setUncertain(false); setOpen(false)
@@ -352,7 +363,7 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
       }
       setError(unknown ? 'The cancellation outcome is unknown. Retry to confirm the same request.' : cause.status === 409 ? 'Run state changed. Review the latest state before cancelling.' : cause.message)
     } finally {
-      await refresh(knownResponse)
+      await refresh(knownResponse, acknowledged)
       setBusy(false)
     }
   }
