@@ -149,13 +149,19 @@ def test_warm_read_client_uses_get_without_session_or_start(config, monkeypatch)
 
     def request(_caller, method, path):
         calls.append((method, path))
+        if path == '/api/runs/run%2Fone/status':
+            return {'version': 1, 'source': 'persisted_projection',
+                    'run': {'run_id': 'run/one', 'protocol_revision': 7}}
         return {'fixture': path}
 
     monkeypatch.setattr(DeliveryClient, '_request', request)
     caller = read_only_client(config.path)
     assert caller.service() == {'fixture': '/api/service'}
     caller.runs()
-    caller.status('run/one')
+    assert caller.status('run/one') == {
+        'version': 1, 'source': 'persisted_projection',
+        'run': {'run_id': 'run/one', 'protocol_revision': 7},
+    }
     caller.detail('run/one')
     caller.operation('operation/one')
     caller.run_operations('run/one')
