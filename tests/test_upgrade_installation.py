@@ -17,18 +17,21 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 V022 = "e966cf89e057abc9a2629faf957a2ec175599b53"
 GUARDED = "115d17d"
-INSTALLERS = ("install.sh", "install-agents.py", "install-service-entry.py", "install-migration.py", "install-rollback.py")
+INSTALLERS = ("install.sh", "install-agents.py", "install-service-entry.py", "install-migration.py", "install-rollback.py", "installation-paths.py", "install-production.py")
 
 
 class UpgradeInstallation(unittest.TestCase):
     def setUp(self):
+        environment = mock.patch.dict(os.environ, DEVFLOW_INSTALL_MODE="development")
+        environment.start()
+        self.addCleanup(environment.stop)
         temporary = tempfile.TemporaryDirectory(prefix="devflow-upgrade-test-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         self.source = self.root / "source"
         self.skills, self.home = self.root / "skills", self.root / "codex"
         self.home.mkdir()
-        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable,
+        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development",
                         GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
         self.git("clone", "--shared", str(ROOT), str(self.source), cwd=self.root)
         self.data = self.home / "user.sqlite3"
@@ -194,11 +197,12 @@ class UpgradeInstallation(unittest.TestCase):
         python = self.root / "python-old"
         subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--copies", str(python)], check=True)
         # Relocatable CPython builds need their shared library and stdlib base.
-        for library in (Path(sys.base_prefix) / "lib").glob("libpython3.12*"):
+        version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        for library in (Path(sys.base_prefix) / "lib").glob(f"libpython{version}*"):
             destination = python / "lib" / library.name
             if not destination.exists():
                 destination.symlink_to(library)
-        binary = python / "bin/python3.12"
+        binary = python / "bin" / f"python{version}"
         if canonical_name:
             canonical = python / "bin" / canonical_name
             canonical.unlink(missing_ok=True)

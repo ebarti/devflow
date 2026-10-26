@@ -36,7 +36,7 @@ class DeliveryWorkers(unittest.TestCase):
         package.mkdir(parents=True)
         (package / "__init__.py").write_text("")
         (package / "delivery_control.py").write_text("import time\ntime.sleep(60)\n")
-        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, GIT_CONFIG_GLOBAL=os.devnull,
+        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development", GIT_CONFIG_GLOBAL=os.devnull,
                         GIT_CONFIG_NOSYSTEM="1")
         self.worker = subprocess.Popen(
             [sys.executable, "-m", "devflow_temporal.delivery_control", "--config", str(self.config),
@@ -88,9 +88,17 @@ class DeliveryWorkers(unittest.TestCase):
         # A marker written before identities were canonical still proves the worker.
         self.register(identity=start_identity(self.worker.pid, canonical=False))
         self.assertEqual(self.running(self.source / "runtime").returncode, 3)
-        # A different process behind the recorded PID is not this worker.
+        # A mismatched generation cannot prove that the visible worker is safe
+        # to overwrite; preserve custody until its registration is reconciled.
         self.register(identity="Thu Jan  1 00:00:00 1970")
-        self.assertEqual(self.running(self.source / "runtime").stdout.strip(), "[]")
+        unknown = self.running(self.source / "runtime")
+        self.assertEqual(unknown.returncode, 1)
+        self.assertIn("does not match", unknown.stderr)
+
+    def test_visible_worker_with_unavailable_registration_remains_unknown(self):
+        unknown = self.running(self.source / "runtime")
+        self.assertEqual(unknown.returncode, 1)
+        self.assertIn("registration is unavailable", unknown.stderr)
 
 
 if __name__ == "__main__":

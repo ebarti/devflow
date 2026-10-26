@@ -409,7 +409,7 @@ class InstallRollback(unittest.TestCase):
         self.assertTrue((backup / "snapshot.json").is_file())
 
     def test_aliased_install_and_canonical_replay_record_every_effect(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         alias = self.root / "alias"
         alias.symlink_to(self.root)
@@ -418,18 +418,18 @@ class InstallRollback(unittest.TestCase):
         for location in (alias, self.root):
             installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"),
                                         str(location / "fresh-skills"), str(location / "fresh-codex")],
-                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"), capture_output=True, text=True)
             self.assertEqual(installed.returncode, 0, installed.stderr)
         self.assertTrue((self.root / "fresh-skills/devflow/scripts/state.py").is_file())
         self.assertTrue((self.root / "fresh-skills/devflow-local-delivery/SKILL.md").is_file())
 
     def test_umask002_install_replay_uses_protected_backup_ancestor(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         skills, home = self.root / "fresh-skills", self.root / "fresh-codex"
         for _ in range(2):
             installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
-                                       umask=0o002, env=dict(os.environ, DEVFLOW_PYTHON=sys.executable),
+                                       umask=0o002, env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"),
                                        capture_output=True, text=True)
             self.assertEqual(installed.returncode, 0, installed.stderr)
             self.assertEqual(home.stat().st_mode & 0o777, 0o775)
@@ -447,7 +447,7 @@ class InstallRollback(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in home.iterdir()), before)
 
     def test_symlinked_agent_directory_installs_and_refuses_foreign_drift(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         skills, home, agents = self.root / "fresh-skills", self.root / "fresh-codex", self.root / "agents-real"
         home.mkdir()
@@ -457,13 +457,13 @@ class InstallRollback(unittest.TestCase):
         foreign.write_bytes(b"foreign agent data")
         for _ in range(2):
             installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
-                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"), capture_output=True, text=True)
             self.assertEqual(installed.returncode, 0, installed.stderr)
         self.assertEqual(len(list(agents.glob("devflow-*.toml"))), 4)
         target = agents / "devflow-implementer.toml"
         target.write_bytes(b"user changed the installed agent")
         refused = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
-                                 env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+                                 env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"), capture_output=True, text=True)
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertEqual(target.read_bytes(), b"user changed the installed agent")
         self.assertEqual(foreign.read_bytes(), b"foreign agent data")
@@ -533,7 +533,7 @@ class InstallRollback(unittest.TestCase):
         self.assertTrue((self.backup / "snapshot.json").is_file())
 
     def test_group_backup_recovery_restores_public_old_updater_checkout(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         for key, value in (("core.hooksPath", "/dev/null"), ("commit.gpgsign", "false"),
                            ("gc.auto", "0"), ("maintenance.auto", "false"),
@@ -549,7 +549,7 @@ class InstallRollback(unittest.TestCase):
         skills, home = self.root / "old-skills", self.root / "old-codex"
         home.mkdir(mode=0o775)
         home.chmod(0o775)
-        env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
         installed = subprocess.run(["sh", str(checkout / "scripts/install.sh"), str(skills), str(home)],
                                    env=env, capture_output=True, text=True)
         self.assertEqual(installed.returncode, 0, installed.stderr)

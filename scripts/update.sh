@@ -1,6 +1,10 @@
 #!/bin/sh
 # Select a published release in the existing installation checkout.
 set -eu
+if [ "${DEVFLOW_INSTALL_MODE:-production}" != "development" ]; then
+    source_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+    exec "${DEVFLOW_PYTHON:-python3.12}" -B "$source_root/scripts/update-production.py" "$@"
+fi
 
 upgrade() {
     if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then

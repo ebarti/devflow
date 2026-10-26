@@ -12,6 +12,7 @@ while one would relaunch a worker from the changed source.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -122,8 +123,11 @@ def supervised_runtime(entry, config, explicit=None):
     journal = entry.parent.parent / "manifest.json"
     if entry.parent.name == "entries" and journal.is_file():
         # install-delivery-launchers.py journals {"request": <request>, "bin_identity": ...}.
-        request = json.loads(journal.read_text(encoding="utf-8")).get("request")
+        metadata = json.loads(journal.read_text(encoding="utf-8"))
+        request = metadata.get("request")
         recorded = request.get("runtime_dir") if isinstance(request, dict) else None
+        if recorded is None and "controller_sha256" in metadata:
+            recorded = metadata.get("runtime_dir")
         if isinstance(recorded, str) and recorded:
             return Path(recorded).resolve()
     head = entry.read_bytes()[:4096]
@@ -150,6 +154,34 @@ def agent(args, name, config, data, state_root):
     runtime = supervised_runtime(entry, config, args.runtime)
     temporal = executable(args.temporal or data.get("temporal_bin") or shutil.which("temporal"),
                           "Temporal CLI")
+    spec = importlib.util.spec_from_file_location("installation_paths", ROOT / "scripts/installation-paths.py")
+    paths = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(paths)
+    production = not paths.development(args.launch_agents, config, state_root)
+    if production:
+        paths.registration_lease(runtime.parent)
+        paths.runtime(runtime.parent)
+        paths.configuration(config)
+        paths.durable(temporal, "Temporal CLI")
+        paths.durable(Path(args.launch_agents), "launch agent registration")
+        paths.durable(entry, "service executable")
+        paths.execution_dependency(entry, os.environ.get("PATH", ""))
+        paths.execution_dependency(temporal, os.environ.get("PATH", ""))
+        stable_entry = paths.published_entry(runtime.parent, "devflow-delivery")
+        if entry not in {runtime / ".venv/bin/devflow-delivery", stable_entry}:
+            manifest = entry.parent.parent / "manifest.json"
+            if entry.parent.name != "entries" or entry.name not in {"devflow", "devflow-delivery"}:
+                raise ValueError("production service entry must be the owned environment entry or canonical launcher")
+            launcher_spec = importlib.util.spec_from_file_location("delivery_launchers", ROOT / "scripts/install-delivery-launchers.py")
+            launchers = importlib.util.module_from_spec(launcher_spec)
+            launcher_spec.loader.exec_module(launchers)
+            request = json.loads(launchers.read(manifest, mode=0o600))["request"]
+            if (request["runtime_dir"] != str(runtime) or request["config_path"] != str(config)
+                    or launchers.read(entry, mode=0o755) != launchers.wrapper(request, entry.name)):
+                raise ValueError("production launcher does not bind the declared runtime and configuration")
+        # Persist the immutable outer entry; uv can replace files in .venv while
+        # updating. No mutable console script may run before the ownership lease.
+        entry = stable_entry
     private_directory(state_root)
     out = state_root / "launchd.log"
     err = state_root / "launchd.error.log"
@@ -160,11 +192,20 @@ def agent(args, name, config, data, state_root):
     search = [str(entry.parent), str(temporal.parent)]
     search += [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
     search += ["/usr/bin", "/bin"]
+    if production:
+        search = [str(Path(value).resolve()) for value in search]
+        for value in search:
+            paths.durable(Path(value).resolve(), "service PATH entry")
+        for tool_name in ("git", "gh", "node", "pnpm"):
+            executable_path = shutil.which(tool_name, path=os.pathsep.join(search))
+            if executable_path:
+                paths.execution_dependency(Path(executable_path), os.pathsep.join(search))
     return {"Label": name, "DevflowManaged": True, "DevflowConfig": str(config),
             # The checkout this agent would relaunch a worker from; upgrades of
             # that checkout refuse while the agent is active.
             "DevflowRuntime": str(runtime),
             "ProgramArguments": [str(entry), "--config", str(config), "supervise"],
+            "WorkingDirectory": str(state_root),
             "EnvironmentVariables": {"PATH": os.pathsep.join(dict.fromkeys(search))},
             "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False},
             "StartInterval": args.interval, "ThrottleInterval": 30,

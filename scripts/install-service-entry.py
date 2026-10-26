@@ -112,15 +112,18 @@ def helper_upgrade(compatibility, source, guard, migration):
         raise ValueError(f"Retained helper preserved: {link}: {exc}") from exc
 
 
-def install(skills, home, force, backup=None):
+def install(skills, home, force, backup=None, *, migration_source=None, lease_fd=None):
     global MUTATING
     agents = load("install-agents")
     rollback = load("install-rollback")
     rollback.exchange_function()
     guard = load("install-delivery-launchers")
+    if migration_source is None:
+        if not load("installation-paths").development(skills, home):
+            raise ValueError("production registrations require scripts/install.sh adoption")
     agents.check_skills_destination(str(skills))
     migration_helper = load("install-migration")
-    migration = migration_helper.plan(ROOT, skills, home, guard)
+    migration = migration_helper.plan(migration_source or ROOT, skills, home, guard)
     _, _, actions, obsolete, _ = agents.plan(ROOT, skills, home, force)
     service = skills / "devflow-local-delivery"
     source = ROOT / "runtime/desktop/devflow-local-delivery"
@@ -137,7 +140,12 @@ def install(skills, home, force, backup=None):
         "type": "symlink",
         "target": str(source),
     }:
-        raise ValueError("foreign service entry preserved")
+        if migration_source is None or guard.link_state(service) != {
+            "type": "symlink", "target": str(migration_source / "runtime/desktop/devflow-local-delivery")
+        }:
+            raise ValueError("foreign service entry preserved")
+        if hashes(service.resolve(), guard) != hashes(source, guard):
+            raise ValueError("previous service source differs; use its supported installation migration")
     compatibility = skills / "devflow"
     children = [
         p
@@ -145,6 +153,7 @@ def install(skills, home, force, backup=None):
         if p.name not in {"SKILL.md", "__pycache__"}
     ]
     scripts_upgrade = None
+    adopted = []
     if os.path.lexists(compatibility) and not (
         migration and compatibility in migration["links"]
     ):
@@ -167,15 +176,42 @@ def install(skills, home, force, backup=None):
             # before changing only their public child registration.
             if child.name == "scripts":
                 scripts_upgrade = helper_upgrade(compatibility, child, guard, migration_helper)
+            if migration_source is not None and target != child:
+                # A production adoption must retire every checkout dependency,
+                # including documentation links. Only authenticated historical
+                # Git bytes and canonical child links may move automatically.
+                if not registered.is_symlink():
+                    raise ValueError("production adoption requires an owned helper child link")
+                old = target.parents[2]
+                if target != old / "skills/devflow" / child.name:
+                    raise ValueError("helper child does not identify a source checkout")
+                git = load("installation-paths").git
+                if git(old, "remote", "get-url", "origin") != git(ROOT, "remote", "get-url", "origin"):
+                    raise ValueError("helper source origin differs from production source")
+                inventory = migration_helper.inventory(ROOT, git(old, "rev-parse", "HEAD"))
+                prefix = "skills/devflow/" + child.name + "/"
+                expected = {name[len(prefix):]: digest for name, digest in inventory.items()
+                            if name.startswith(prefix)}
+                if hashes(target, guard) != expected:
+                    raise ValueError("modified historical helper preserved during production adoption")
+                adopted.append((registered, child))
     MUTATING = True
     migration_helper.apply(migration, ROOT, skills, agents, rollback, backup)
-    if scripts_upgrade:
+    if scripts_upgrade and not adopted:
         # Staging stays inside the existing protected snapshot; no public
         # temporary file is removed after an uncertain creation/exchange.
         stage = Path(backup) / "helper-scripts-new"
         stage.symlink_to(ROOT / "skills/devflow/scripts")
         rollback.effect(backup, scripts_upgrade, stage)
-    if obsolete or any(action == "copy" for action in actions.values()):
+    for registered, child in adopted:
+        stage = Path(backup) / ("adopt-" + child.name)
+        stage.symlink_to(child)
+        rollback.effect(backup, registered, stage)
+    if migration_source is not None and os.path.lexists(service) and service.resolve() != source:
+        stage = Path(backup) / "adopt-service"
+        stage.symlink_to(source)
+        rollback.effect(backup, service, stage)
+    if migration_source is not None or obsolete or any(action == "copy" for action in actions.values()):
         subprocess.run(
             [
                 sys.executable,
@@ -189,6 +225,7 @@ def install(skills, home, force, backup=None):
                 *([str(backup)] if backup else []),
             ],
             check=True,
+            pass_fds=(() if lease_fd is None else (lease_fd,)),
         )
     skills.mkdir(parents=True, exist_ok=True)
     if not os.path.lexists(compatibility):

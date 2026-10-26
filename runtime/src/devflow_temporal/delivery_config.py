@@ -127,7 +127,11 @@ class DeliveryConfig:
 
     @classmethod
     def load(cls, path: Path) -> DeliveryConfig:
-        return cls._from_raw(path, json.loads(path.read_text(encoding="utf-8")))
+        config = cls._from_raw(path, json.loads(path.read_text(encoding="utf-8")))
+        from .delivery_installation_owner import observe_configuration
+
+        observe_configuration(config)
+        return config
 
     @classmethod
     def _from_raw(cls, path: Path, value: dict[str, Any]) -> DeliveryConfig:

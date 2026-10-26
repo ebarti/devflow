@@ -6,6 +6,11 @@ It reuses `runtime/.venv/bin/devflow-delivery` and `devflow-delivery-mcp` and th
 existing service configuration. It creates no runtime, environment, controller
 or service actor. The migrated `devflow` command aliases `devflow-delivery`;
 it does not preserve the removed legacy CLI API.
+Production wrappers enter a separately retained bootstrap with a durable base
+Python before importing the mutable environment. That bootstrap holds shared
+installation custody for the process lifetime; updates require exclusive custody.
+Service registration uses the same immutable outer entry. An unfinished update
+must be reconciled by its retained recovery command before operational startup.
 
 Prepare a private (0600) JSON request with these exact fields:
 

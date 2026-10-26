@@ -22,12 +22,20 @@ LAUNCH = " -m devflow_temporal.delivery_control --config "
 def start_identities(pid):
     """The start identity as the lifecycle records it, and as older markers did."""
     forms = []
-    for env in ({**os.environ, "LC_ALL": "C", "TZ": "UTC0"}, None):
+    for index, env in enumerate(({**os.environ, "LC_ALL": "C", "TZ": "UTC0"}, None)):
         result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], capture_output=True,
                                 text=True, check=False, env=env)
         value = result.stdout.strip()
         if result.returncode == 0 and value:
             forms.append(value)
+        elif index == 0:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return []
+            except PermissionError as exc:
+                raise ValueError(f"worker {pid} custody is unknown: identity observation unavailable") from exc
+            raise ValueError(f"worker {pid} custody is unknown: identity observation unavailable")
     return forms
 
 
@@ -57,18 +65,21 @@ def registered_workers(runtime):
         try:
             state_root = Path(json.loads(config.read_text(encoding="utf-8"))["state_root"])
             registered = json.loads((state_root / "worker-ready.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"possible delivery worker {pid} registration is unavailable: {config}") from exc
         if (not isinstance(registered, dict) or registered.get("pid") != int(pid)
                 or registered.get("config_path") != str(config)):
-            continue
+            raise ValueError(f"possible delivery worker {pid} registration does not bind its live generation: {config}")
         # Markers that predate the recorded interpreter fall back to argv[0].
         interpreter = registered.get("interpreter", head)
         if not (under(interpreter, runtime, parent=True)
                 or under(registered.get("source_root"), runtime)):
             continue
-        if registered.get("identity") not in start_identities(int(pid)):
-            continue
+        identities = start_identities(int(pid))
+        if not identities:
+            continue  # Independent signal-zero observation proved it exited.
+        if registered.get("identity") not in identities:
+            raise ValueError(f"possible delivery worker {pid} start identity does not match its registration: {config}")
         entry = Path(interpreter).parent / "devflow-delivery" if interpreter else "devflow-delivery"
         live.append({"pid": int(pid), "config": str(config),
                      "stop": [str(entry), "--config", str(config), "stop"]})
@@ -82,7 +93,7 @@ def main():
     args = parser.parse_args()
     try:
         workers = registered_workers(args.runtime)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"delivery-workers: {exc}", file=sys.stderr)
         sys.exit(1)
     print(json.dumps(workers, sort_keys=True))

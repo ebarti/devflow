@@ -697,6 +697,9 @@ class DeliveryStore:
             from .delivery_runtime_location import require_not_pending
 
             require_not_pending(self.config)
+            from .delivery_installation_owner import before_store_write
+
+            before_store_write(self.config)
             db = self.state.connect(self.config.tracking_db)
         db.execute("PRAGMA foreign_keys=ON")
         feature_event = False
