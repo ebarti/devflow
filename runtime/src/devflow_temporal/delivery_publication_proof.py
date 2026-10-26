@@ -1,13 +1,15 @@
 """Owner-authenticated publication stop evidence; display text grants nothing.
 
-The caller supplies the closed result it has just authenticated through the
-existing closure owner. Legacy histories are read explicitly and without sealing
-or changing a projection, executor journal, source checkout or admission.
+The bounded closure reader authenticates independent admission and server
+history before result decoding. Legacy stage observation changes no durable
+state; explicit execution preservation publishes bounded history without
+replacing an existing artifact or bypassing closure-index conflict checks.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import lzma
 import os
 import stat
@@ -17,6 +19,7 @@ from contextvars import copy_context
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHistory
 
@@ -27,7 +30,7 @@ from .delivery_execution_config import is_observation_mode, observation_mode
 from .delivery_lifecycle import RecoveryRefused, require_transition
 from .delivery_publication import PUBLICATION_PROOF_VERSION
 from .delivery_publication import publication_stop_proof_matches as matches
-from .delivery_resources import _ancestors
+from .delivery_resources import _ancestors, private_directory
 
 __all__ = ['matches', 'observe', 'read_closed', 'reduce_history']
 
@@ -102,6 +105,28 @@ def _binding(spec, closed):
         'iteration': state['iteration'],
         'candidate_id': candidate['id'], 'stop_state_sha256': digest(state),
     }
+
+
+def _require_start(store, spec, closed, facts):
+    """Bind server-written start bytes to independent immutable admission owners."""
+    with store._connect() as db:
+        row = db.execute('SELECT request_digest,request_json,recovery_json,workflow_id '
+                         'FROM delivery_runs WHERE run_id=?', (spec['run_id'],)).fetchone()
+    if row is None:
+        _refuse('publication_start_owner_unknown', closed)
+    previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    effective = store.effective_spec(spec['run_id'])
+    starts = [effective] if previous is not None else [json.loads(row['request_json']),
+                                                     store.spec(spec['run_id']), effective]
+    inputs = facts['inputs']
+    recovery = inputs[1] if len(inputs) > 1 else None
+    if (spec != effective or len(inputs) not in {1, 2}
+            or inputs[0] not in starts or recovery != previous
+            or row['request_digest'] != closed['request_digest']
+            or closed['workflow_id'] != (row['workflow_id'] or 'delivery-' + spec['run_id'])
+            or closed.get('recovery_digest') != (digest(previous) if previous is not None else None)
+            or (len(inputs) == 1 and previous is not None)):
+        _refuse('publication_start_input_changed', closed, satisfied=False)
 
 
 async def _checked_facts(history, closed):
@@ -197,6 +222,12 @@ def _sealed_history(store, closed):
         from .delivery_retained_closures import verify_record
 
         verify_record(store, record)
+    raw = _sealed_bytes(store, record['history_sha256'], closed)
+    return WorkflowHistory.from_json(closed['workflow_id'], raw.decode('utf-8'))
+
+
+def _sealed_bytes(store, sha256, closed, *, missing_ok=False):
+    """Bounded validation also applies to orphan files with no closure index."""
     root = Path(store.config.state_root) / 'closures'
     _ancestors(root / 'history')
     info = root.lstat()
@@ -204,8 +235,13 @@ def _sealed_history(store, closed):
             or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700):
         raise ValueError('sealed publication history directory is not its private owner')
     root_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
-    path = root / (record['history_sha256'] + '.json.xz')
-    before = path.lstat()
+    path = root / (sha256 + '.json.xz')
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
@@ -231,9 +267,75 @@ def _sealed_history(store, closed):
     raw = decoder.decompress(compressed, max_length=MAX_HISTORY_BYTES + 1)
     if len(raw) > MAX_HISTORY_BYTES or not decoder.eof or decoder.unused_data:
         _refuse('publication_history_bound_exceeded', closed)
-    if hashlib.sha256(raw).hexdigest() != record['history_sha256']:
+    if hashlib.sha256(raw).hexdigest() != sha256:
         raise ValueError('sealed publication history changed its recorded bytes')
-    return WorkflowHistory.from_json(closed['workflow_id'], raw.decode('utf-8'))
+    return raw
+
+
+def _preserve_bounded(store, history, facts, closed):
+    """Publish without replacement; every existing/racing orphan is bounded."""
+    data = closures.history_json(history)
+    if len(data) > MAX_HISTORY_BYTES:
+        _refuse('publication_history_bound_exceeded', closed)
+    sha256 = hashlib.sha256(data).hexdigest()
+    root = Path(store.config.state_root) / 'closures'
+    private_directory(root)
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    stage = '.publication-' + sha256 + '-' + uuid4().hex + '.new'
+    target = sha256 + '.json.xz'
+    descriptor = None
+    try:
+        existing = _sealed_bytes(store, sha256, closed, missing_ok=True)
+        if existing is None:
+            compressed = lzma.compress(data)
+            if len(compressed) > MAX_COMPRESSED_BYTES:
+                _refuse('publication_history_bound_exceeded', closed)
+            descriptor = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory)
+            with os.fdopen(descriptor, 'wb', closefd=False) as stream:
+                stream.write(compressed)
+                stream.flush()
+                os.fsync(descriptor)
+            try:
+                os.link(stage, target, src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False)
+            except FileExistsError:
+                # Existence/open races never enter the general unbounded reader.
+                pass
+            own = os.fstat(descriptor)
+            named = os.stat(stage, dir_fd=directory, follow_symlinks=False)
+            if (own.st_dev, own.st_ino) != (named.st_dev, named.st_ino):
+                raise ValueError('owned publication history stage changed') from None
+            os.unlink(stage, dir_fd=directory)
+            os.fsync(directory)
+            os.close(descriptor)
+            descriptor = None
+            existing = _sealed_bytes(store, sha256, closed)
+        if existing != data:
+            raise ValueError('publication history orphan differs from authenticated history')
+        opened, named_root = os.fstat(directory), root.lstat()
+        if (opened.st_dev, opened.st_ino) != (named_root.st_dev, named_root.st_ino):
+            raise ValueError('publication history namespace changed during preservation')
+        record = {key: facts[key] for key in ('workflow_id', 'execution_run_id', 'status',
+                                            'closed_at', 'request_digest', 'recovery_digest',
+                                            'event_count')}
+        record.update(run_id=closed['result']['run_id'], history_sha256=sha256,
+                      source='temporal', source_sha256=None,
+                      sealed_at=closures._now().isoformat())
+        with store._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            return closures.insert_seal(db, record)
+    finally:
+        if descriptor is not None:
+            try:
+                own = os.fstat(descriptor)
+                named = os.stat(stage, dir_fd=directory, follow_symlinks=False)
+                if (own.st_dev, own.st_ino) == (named.st_dev, named.st_ino):
+                    os.unlink(stage, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            os.close(descriptor)
+        os.close(directory)
 
 
 async def _history(store, closed):
@@ -328,11 +430,7 @@ def read_closed(store, spec, *, workflow_id=None, preserve=False):
         closed = {key: facts[key] for key in ('workflow_id', 'execution_run_id', 'closed_at',
                                              'request_digest', 'recovery_digest', 'result')}
         _binding(spec, closed)
-        recovery = facts['inputs'][1] if len(facts['inputs']) > 1 else None
-        if (not facts['inputs'] or facts['inputs'][0].get('run_id') != spec['run_id']
-                or (digest(recovery) if recovery is not None else None)
-                != closed['recovery_digest']):
-            _refuse('publication_history_identity_changed', closed, satisfied=False)
+        _require_start(store, spec, closed, facts)
         return closed, history, facts, fresh
 
     with observation_mode():
@@ -340,7 +438,12 @@ def read_closed(store, spec, *, workflow_id=None, preserve=False):
             _refuse('publication_execution_transport_unknown', context)
         closed, history, facts, fresh = _run(read, context)
     if preserve and fresh:
-        closures.seal(store, history, facts, run_id=spec['run_id'], source='temporal')
+        try:
+            _preserve_bounded(store, history, facts, closed)
+        except RecoveryRefused:
+            raise
+        except Exception:
+            _refuse('publication_history_custody_unknown', closed)
     return closed, history
 
 

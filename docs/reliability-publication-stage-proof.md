@@ -36,7 +36,10 @@ cannot be classified as publication. A completed exact publication belongs to
 its subsequent recovery route. No diagnostic text supplies these decisions.
 
 Both constructors use the bounded initial closure reader before the general
-closure/result decoder. It bounds any indexed sealed candidate before connecting,
+closure/result decoder. Every start input must equal an independently persisted
+submitted, prepared or effective admission; a recovery start must also equal the
+current effective spec and the exact durable recovery record. A copied request
+memo does not authorize changed scope, policy or recovery inputs. It bounds any indexed sealed candidate before connecting,
 checks live exact execution identity, and selects retained evidence only on
 Temporal NotFound. It reads live history in twenty-event pages with finite RPC
 and operation deadlines. Execution alone may explicitly preserve a newly
@@ -55,7 +58,13 @@ result and applies expansion bounds before decoding it.
 Sealed reads require canonical existing ancestors, private owned root, a regular
 0600 file with one link, a bounded descriptor read, unchanged descriptor/path
 identity and metadata before and after reading, and the recorded content hash.
-They do not heal permissions during assessment.
+They do not heal permissions during assessment. Execution preservation uses the
+same bounded reader for an existing unindexed orphan and for a file that races
+with publication. It writes a private owned stage, atomically links the final
+content address without replacement, validates the resulting artifact, and only
+then inserts the closure index through its existing conflict/reset checks. A
+corrupt or oversized orphan remains untouched; no generic unbounded sealing
+helper is reached.
 
 New admissions seal the proof alongside their existing source, candidate,
 publication, effect, cleanup and budget evidence. Admission reobserves that
@@ -73,6 +82,14 @@ tracker and cleanup boundaries are controlled, and GitHub reads are local fixtur
 responses. They prove a genuine legacy stage remains eligible after display text
 changes and that the old prefix after a check-stage stop is refused. Before/after
 SQLite dumps and empty closure inventory establish read-only assessment. A
+same-run workflow with a copied memo and altered start scope is refused even
+when its closed result contains the modern typed publication failure. Public
+execution controls retain a real live history while injecting a small
+high-expansion unindexed orphan, both before preservation and at atomic
+publication; both refuse before ordinary decoding, preserve the artifact and
+leave the closure index unchanged. An artifact removed by the fixture between
+initial stat and open produces unknown custody, with no replacement or index. Exact submitted/prepared/intake/recovery
+constructor controls preserve those legitimate start variants. A
 separate current-controller fixture confirms its actual typed stage field.
 Older component tests explicitly control the stage-proof boundary and are not
 counted as authentication qualification.

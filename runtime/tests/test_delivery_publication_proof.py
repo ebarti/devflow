@@ -77,6 +77,85 @@ def closed_fixture(spec):
             'closed_at': '2026-10-26T00:00:00+00:00', 'result': state}
 
 
+def expanded_fixture():
+    compressor, checksum = lzma.LZMACompressor(), hashlib.sha256()
+    remaining, parts = proof.MAX_HISTORY_BYTES + 1, []
+    while remaining:
+        chunk = b'a' * min(1024 * 1024, remaining)
+        checksum.update(chunk)
+        parts.append(compressor.compress(chunk))
+        remaining -= len(chunk)
+    parts.append(compressor.flush())
+    compressed = b''.join(parts)
+    assert len(compressed) < 20_000
+    return compressed, checksum.hexdigest()
+
+
+async def assert_orphan_preservation_is_bounded(store, spec, history, command, app, monkeypatch):
+    compressed, _ = expanded_fixture()
+    root = store.config.state_root / 'closures'
+    root.mkdir(mode=0o700, exist_ok=True)
+    artifact = root / (closures.history_sha256(history) + '.json.xz')
+    old_link, old_open, calls = os.link, os.open, []
+
+    def unbounded(*_args, **_kwargs):
+        calls.append('unexpected general sealer/decoder')
+        raise AssertionError('orphan validation must not enter an unbounded helper')
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url=store.config.dashboard_url) as browser:
+        session = await browser.get('/api/session')
+        headers = {'Origin': store.config.dashboard_url,
+                   'X-Devflow-CSRF': session.json()['csrf_token']}
+        with store._connect() as db:
+            before = list(db.iterdump())
+        for variant in ('existing', 'open-race', 'publication-race'):
+            if variant in {'existing', 'open-race'}:
+                artifact.write_bytes(compressed)
+                artifact.chmod(0o600)
+
+            def racing_link(source, target, **kwargs):
+                if target == artifact.name:
+                    assert not artifact.exists()
+                    artifact.write_bytes(compressed)
+                    artifact.chmod(0o600)
+                return old_link(source, target, **kwargs)
+
+            def disappearing_orphan(path, *args, **kwargs):
+                if Path(path) == artifact:
+                    artifact.unlink()
+                return old_open(path, *args, **kwargs)
+
+            with monkeypatch.context() as bounded:
+                bounded.setattr(closures, 'seal', unbounded)
+                bounded.setattr(closures, '_read_sealed', unbounded)
+                bounded.setattr(closures, '_write_sealed', unbounded)
+                if variant == 'publication-race':
+                    bounded.setattr(proof.os, 'link', racing_link)
+                if variant == 'open-race':
+                    bounded.setattr(proof.os, 'open', disappearing_orphan)
+                executed = await browser.post(
+                    '/api/runs/run-1/recover-publication', headers=headers,
+                    json={**command, 'command_id': 'orphan-' + variant})
+            assert executed.status_code == 409, executed.text
+            assert executed.json()['detail']['blockers'][0]['code'] == (
+                'publication_history_custody_unknown' if variant == 'open-race'
+                else 'publication_history_bound_exceeded')
+            assert calls == []
+            if variant == 'open-race':
+                assert not artifact.exists()
+            else:
+                assert artifact.read_bytes() == compressed
+                assert artifact.stat().st_mode & 0o777 == 0o600
+            assert not list(root.glob('.publication-*.new'))
+            with store._connect() as db:
+                assert list(db.iterdump()) == before
+                assert not db.execute('SELECT 1 FROM delivery_closures').fetchone()
+            # The test owns this injected corrupt artifact; production left it intact.
+            if artifact.exists():
+                artifact.unlink()
+
+
 def test_typed_closed_proof_binds_current_stage_without_history(service, monkeypatch):
     store, request = service
     store.submit(request)
@@ -114,6 +193,52 @@ def test_matching_english_prefix_without_evidence_stays_typed_unknown(service, m
     blocker = rejected.value.assessment['blockers'][0]
     assert blocker['code'] == 'publication_stage_unproven'
     assert blocker['satisfied'] is None
+
+
+def test_start_binding_preserves_preparation_intake_and_exact_recovery(service, monkeypatch):
+    store, request = service
+    raw = json.loads(store.config.path.read_text())
+    raw['roles']['intake'] = copy.deepcopy(raw['roles']['implement'])
+    store.config.path.write_text(json.dumps(raw))
+    store = DeliveryStore(DeliveryConfig.load(store.config.path))
+    original_admit = DeliveryConfig.admit
+
+    def prepared_admit(self, value, **kwargs):
+        return {**original_admit(self, value, **kwargs), 'preparation_version': 1}
+
+    monkeypatch.setattr(DeliveryConfig, 'admit', prepared_admit)
+    store.submit({key: value for key, value in request.items() if key != 'accepted_plan'})
+    submitted = store.submitted_spec('run-1')
+    prepared = copy.deepcopy(submitted)
+    prepared['policy']['native_identity'] = {'fixture': 'owned measurement'}
+    prepared['policy_digest'] = digest(prepared['policy'])
+    prepared['preparation'] = {'state': 'ready'}
+    store.freeze_preparation(submitted, prepared)
+    # Constructor scope: accepted-plan owner has persisted the completed intake.
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET accepted_plan_text=? WHERE run_id=?',
+                   ('Approved intake plan', 'run-1'))
+    effective = store.effective_spec('run-1')
+    closed = closed_fixture(effective)
+    for admitted in (submitted, prepared, effective):
+        proof._require_start(store, effective, closed, {'inputs': [admitted, None]})
+    foreign = copy.deepcopy(submitted)
+    foreign['policy']['allowed_paths'].append('not-admitted.py')
+    with pytest.raises(RecoveryRefused) as refused:
+        proof._require_start(store, effective, closed, {'inputs': [foreign, None]})
+    assert refused.value.assessment['blockers'][0]['code'] == 'publication_start_input_changed'
+    # Even a caller supplying the same altered spec cannot make it an owner.
+    foreign['policy_digest'] = digest(foreign['policy'])
+    with pytest.raises(RecoveryRefused):
+        proof._require_start(store, foreign, closed, {'inputs': [foreign, None]})
+    recovery = {'kind': 'owned-recovery-fixture', 'execution_spec': effective}
+    closed.update(workflow_id='delivery-run-1-fixture-recovery', recovery_digest=digest(recovery))
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET workflow_id=?,recovery_json=? WHERE run_id=?',
+                   (closed['workflow_id'], json.dumps(recovery), 'run-1'))
+    proof._require_start(store, effective, closed, {'inputs': [effective, recovery]})
+    with pytest.raises(RecoveryRefused):
+        proof._require_start(store, effective, closed, {'inputs': [submitted, recovery]})
 
 
 @pytest.mark.parametrize('encoding,compress', [(b'binary/zlib', zlib.compress),
@@ -192,19 +317,10 @@ async def test_public_read_rejects_small_sealed_expansion_before_upstream_decode
     monkeypatch.setattr(closures, 'sealed_closure', unbounded)
     monkeypatch.setattr(closures, 'closure_facts', unbounded)
     monkeypatch.setattr(store, '_completed_temporal_result', old_reader)
-    compressor, checksum = lzma.LZMACompressor(), hashlib.sha256()
-    remaining, parts = proof.MAX_HISTORY_BYTES + 1, []
-    while remaining:
-        chunk = b'a' * min(1024 * 1024, remaining)
-        checksum.update(chunk)
-        parts.append(compressor.compress(chunk))
-        remaining -= len(chunk)
-    parts.append(compressor.flush())
-    compressed = b''.join(parts)
-    assert len(compressed) < 20_000
+    compressed, checksum = expanded_fixture()
     root = store.config.state_root / 'closures'
     root.mkdir(mode=0o700)
-    artifact = root / (checksum.hexdigest() + '.json.xz')
+    artifact = root / (checksum + '.json.xz')
     artifact.write_bytes(compressed)
     artifact.chmod(0o600)
     spec = store.spec('run-1')
@@ -212,7 +328,7 @@ async def test_public_read_rejects_small_sealed_expansion_before_upstream_decode
     with store._connect() as db:
         db.execute('INSERT INTO delivery_closures VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                    ('delivery-run-1', 'owned-expanded-closure', 'run-1', 'COMPLETED', stamp,
-                    spec['request_digest'], None, checksum.hexdigest(), 1, 'temporal', None, stamp))
+                    spec['request_digest'], None, checksum, 1, 'temporal', None, stamp))
     app = create_app(store.config.path)
     app.state.delivery.store = store
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
@@ -237,10 +353,11 @@ async def test_public_read_rejects_small_sealed_expansion_before_upstream_decode
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('later_check', [False, True], ids=['genuine-legacy-stop', 'false-prefix'])
+@pytest.mark.parametrize('case', ['genuine-legacy-stop', 'false-prefix', 'copied-memo'])
 async def test_public_assessment_uses_real_closed_stage_without_mutation(
-    service, monkeypatch, later_check,
+    service, monkeypatch, case,
 ):
+    later_check = case == 'false-prefix'
     original, request = service
     async with local_temporal() as env:
         raw = json.loads(original.config.path.read_text())
@@ -256,6 +373,9 @@ async def test_public_assessment_uses_real_closed_stage_without_mutation(
         state['checks'].pop('failure', None)
         state['error'] = ('publication unresolved: ActivityError' if later_check
                           else 'Changed display wording on a genuine publication stop')
+        if case == 'copied-memo':
+            state['checks']['failure'] = {'classification': 'transient',
+                'cause_type': 'publication_deadline', 'stage': 'publishing_pending'}
         store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
                       message=state['error'], candidate=state['candidate'], checks=state['checks'],
                       iteration=state['iteration'], protocol_revision=state['revision'],
@@ -272,8 +392,12 @@ async def test_public_assessment_uses_real_closed_stage_without_mutation(
                           workflows=[RetainedPublicationHistory],
                           activities=[owned_failed_publication, owned_failed_check],
                           workflow_runner=UnsandboxedWorkflowRunner()):
+            start_spec = copy.deepcopy(spec)
+            if case == 'copied-memo':
+                start_spec['policy']['allowed_paths'].append('not-admitted.py')
+                start_spec['policy_digest'] = digest(start_spec['policy'])
             handle = await env.client.start_workflow(
-                RetainedPublicationHistory.run, args=[spec, None], id='delivery-run-1',
+                RetainedPublicationHistory.run, args=[start_spec, None], id='delivery-run-1',
                 task_queue='publication-stage-proof',
                 memo={'request_digest': spec['request_digest']})
             assert await asyncio.wait_for(handle.result(), 15) == state
@@ -287,9 +411,10 @@ async def test_public_assessment_uses_real_closed_stage_without_mutation(
                 'kind': 'recover_publication', 'request': command})
         assert response.status_code == 200
         assessed = response.json()
-        if later_check:
+        if later_check or case == 'copied-memo':
             assert not assessed['eligible']
-            assert assessed['blockers'][0]['code'] == 'publication_stage_changed'
+            assert assessed['blockers'][0]['code'] == (
+                'publication_stage_changed' if later_check else 'publication_start_input_changed')
             assert assessed['blockers'][0]['satisfied'] is False
         else:
             assert assessed['eligible'], assessed
@@ -297,13 +422,13 @@ async def test_public_assessment_uses_real_closed_stage_without_mutation(
         with store._connect() as db:
             assert list(db.iterdump()) == before
             assert not db.execute('SELECT 1 FROM delivery_closures').fetchone()
-        if not later_check:
-            # Sealing is an explicit owner operation after the read-only assertion.
+        if case == 'genuine-legacy-stop':
             history = await handle.fetch_history()
-            facts = await closures.closure_facts(history)
-            closures.seal(store, history, facts, run_id='run-1', source='temporal')
-            closed = await asyncio.to_thread(store._completed_temporal_result, 'run-1',
-                                            preserve=False)
+            await assert_orphan_preservation_is_bounded(
+                store, spec, history, command, app, monkeypatch)
+            # Successful preservation uses the same bounded owner after corrupt
+            # orphan refusal, never the general unbounded sealing helper.
+            closed, _ = await asyncio.to_thread(proof.read_closed, store, spec, preserve=True)
             observed = await asyncio.to_thread(proof.observe, store, spec, closed)
             assert observed['source'] == 'closed_history'
             assert observed['history_sha256'] == closures.history_sha256(history)
