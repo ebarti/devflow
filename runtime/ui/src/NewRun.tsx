@@ -57,7 +57,7 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
   }
 
   useEffect(() => {
-    if (storedId && !intent) void inspectStored()
+    if (storedId && (!intent || saved?.operation_id === storedId)) void inspectStored()
   // A saved handle is inspected on mount; the button below explicitly refreshes it.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storedId, intent])
@@ -95,6 +95,7 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
         rememberPendingSubmit({ operation_id: operation.operation_id, request })
         setStoredId(operation.operation_id)
       }
+      setStoredOperation(operation); setStoredError('')
       if (operation.state === 'succeeded') {
         const result = operation.result as { run_id?: unknown } | null
         if (!result || typeof result.run_id !== 'string' || !result.run_id) {
@@ -117,14 +118,14 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
   const restoredRunId = storedOperation?.state === 'succeeded' && storedOperation.result && typeof storedOperation.result === 'object' ? (storedOperation.result as { run_id?: unknown }).run_id : null
 
   return <div className="form-page">
-    {restored ? <section aria-label="Previously submitted operation">
+    {storedId ? <section aria-label="Previously submitted operation">
       <h2>Previously submitted operation</h2>
-      <p>Operation {storedId}: {storedOperation?.state ?? 'status unavailable'}.</p>
+      <p>Saved submission {storedId}: {storedOperation?.state ?? 'status unavailable'}.</p>
       {storedError ? <p role="status">{storedError}</p> : null}
       <button type="button" onClick={() => void inspectStored()}>Refresh operation status</button>
       {storedOperation?.state === 'unknown' ? <button type="button" onClick={() => void api.reconcileOperation(storedId).then(setStoredOperation).catch(cause => setStoredError(String(cause)))}>Reconcile original operation</button> : null}
       {typeof restoredRunId === 'string' && restoredRunId ? <button type="button" onClick={() => { clearStored(); onCreated(restoredRunId) }}>Open submitted run</button> : null}
-      {storedOperation?.state === 'refused' || storedOperation?.state === 'failed' ? <button type="button" onClick={clearStored}>Review a new request</button> : null}
+      {storedOperation?.state === 'refused' || storedOperation?.state === 'failed' ? <button type="button" onClick={() => { setIntent(null); clearStored(); setCommandId(crypto.randomUUID()) }}>Review a new request</button> : null}
     </section> : null}
     <div className="form-page__heading"><h1>New run</h1><p>{intakeEnabled ? 'Devflow investigates your goal, asks for needed clarification, and records a plan before continuing implementation automatically.' : 'Submit a goal with its already accepted plan.'}</p></div>
     {repositories.length || intent ? <form onSubmit={event => void submit(event)} className="run-form">
