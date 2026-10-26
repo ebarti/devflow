@@ -95,11 +95,13 @@ def test_closure_preflight_reads_live_result_without_sealing(service, monkeypatc
 
     from temporalio.client import WorkflowExecutionStatus
 
-    from devflow_temporal import delivery_store
+    from devflow_temporal import delivery_execution_config, delivery_store
 
     store, _request = service
     sealed = []
+    observed_context = []
     monkeypatch.setattr(store, "effective_spec", lambda _run_id: {})
+    monkeypatch.setattr(store, "submitted_spec", lambda _run_id: {})
     monkeypatch.setattr(store, "owns_execution", lambda _spec: True)
     monkeypatch.setattr(store, "_preserve_closure", lambda *args: sealed.append(args))
 
@@ -124,12 +126,15 @@ def test_closure_preflight_reads_live_result_without_sealing(service, monkeypatc
             return Handle()
 
     async def connect(*_args, **_kwargs):
+        observed_context.append(delivery_execution_config._observation_mode.get())
         return Client()
 
     monkeypatch.setattr(delivery_store.Client, "connect", connect)
-    assert store._completed_temporal_result("run-1", preserve=False)["result"] == {
-        "run_id": "run-1"
-    }
+    with delivery_execution_config.observation_mode():
+        assert store._completed_temporal_result("run-1", preserve=False)["result"] == {
+            "run_id": "run-1"
+        }
+    assert observed_context == [True]
     assert sealed == []
     store.read_only = True
     store._completed_temporal_result("run-1")
@@ -151,3 +156,25 @@ def test_readonly_preflight_does_not_open_write_transaction(service, monkeypatch
     assessment = getattr(store, method)("run-1", {}, preflight=True)["lifecycle_assessment"]
     assert not assessment["eligible"]
     assert "locked_proof_unavailable" in {item["code"] for item in assessment["blockers"]}
+
+
+def test_default_repair_preflight_and_admission_share_checkpoint(service, monkeypatch):
+    from test_delivery_store import _failed_published_repair_fixture
+
+    from devflow_temporal.delivery_lifecycle import RecoveryRefused, assess_transition
+
+    store, request = service
+    spec, state, command = _failed_published_repair_fixture(store, request, monkeypatch)
+    before = _counts(store)
+    preview = assess_transition(store, request['run_id'], 'repair_continuation', command)
+    assert preview['eligible'] and preview['candidate']['id'] == command['expected_candidate_id']
+    assert _counts(store) == before
+    stale = {**command, 'expected_revision': command['expected_revision'] + 1}
+    refusal = assess_transition(store, request['run_id'], 'repair_continuation', stale)
+    with pytest.raises(RecoveryRefused) as failure:
+        store.continue_repair(request['run_id'], stale)
+    assert refusal == failure.value.assessment
+    assert refusal['blockers'][0]['code'] == 'revision_changed'
+    response = store.continue_repair(request['run_id'], command)
+    assert response['authorized_through_iteration'] == state['iteration'] + 2
+    assert store.spec(request['run_id']) == spec

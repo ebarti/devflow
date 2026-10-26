@@ -7,6 +7,7 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 
 from .contracts import digest
@@ -178,7 +179,7 @@ def preparation_observe(store, spec, row, attempts, effects, closed):
     if any(authenticated[key] != closed.get(key) for key in closed):
         raise ValueError('published preparation closure changed')
     with ThreadPoolExecutor(max_workers=1) as pool:
-        proof = pool.submit(lambda: asyncio.run(
+        proof = pool.submit(copy_context().run, lambda: asyncio.run(
             _preparation_history(store, spec, previous, closed))).result(35)
     if proof['history_sha256'] != authenticated['history_sha256']:
         raise ValueError('published preparation history changed during readback')
@@ -255,7 +256,7 @@ def preparation_validate(store, spec, recovery, *, resource_spec=None):
 
     previous, before, proof = preparation_authority(spec, recovery)
     with ThreadPoolExecutor(max_workers=1) as pool:
-        observed = pool.submit(lambda: asyncio.run(_preparation_history(
+        observed = pool.submit(copy_context().run, lambda: asyncio.run(_preparation_history(
             store, before, previous, recovery['seal']['closed']))).result(35)
     if observed != {key: proof[key] for key in observed}:
         raise ValueError('published preparation predecessor history changed')

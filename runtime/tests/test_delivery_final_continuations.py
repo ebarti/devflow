@@ -294,7 +294,7 @@ def test_controller_admission_is_atomic_replayable_and_preserves_original_bytes(
         seal["claim"] = None
     calls = []
 
-    def snapshot(*_args):
+    def snapshot(*_args, **_kwargs):
         calls.append("preflight")
         locked_call = 3 if kind == closure.KIND else 2
         if failure == "preflight" or (failure == "locked-recheck" and len(calls) == locked_call):
@@ -600,7 +600,7 @@ def test_pending_abandonment_preserves_history_checkpoint_and_is_replayable(
     fresh['controller']['source_revision'] = 'old' if case == 'same-source' else 'new'
     if case == 'claim':
         fresh['claim'] = None
-    monkeypatch.setattr(closure, '_snapshot', lambda *_a: (deepcopy(fresh), {}))
+    monkeypatch.setattr(closure, '_snapshot', lambda *_a, **_kw: (deepcopy(fresh), {}))
     command = {**payload, 'continuation_kind': closure.ABANDON, 'command_id': 'abandon-1'}
     if case in {'queued', 'claim', 'same-source'}:
         with pytest.raises(ValueError):

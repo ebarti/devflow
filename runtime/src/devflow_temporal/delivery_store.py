@@ -17,6 +17,7 @@ import subprocess
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import copy_context
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -970,11 +971,17 @@ class DeliveryStore:
         was never sealed must be imported from its authentic exported history.
         """
         preserve = preserve and not self.read_only
-        if not self.owns_execution(self.effective_spec(run_id)):
+        if not preserve and self.submitted_spec(run_id).get("feature_delivery"):
+            from .delivery_feature_handoff import readonly_feature_spec
+
+            observation_spec = readonly_feature_spec(self, run_id)
+        else:
+            observation_spec = self.effective_spec(run_id)
+        if not self.owns_execution(observation_spec):
             raise ValueError("continuation service transport ownership differs from frozen run")
 
         def coordinator_failure(closed: dict[str, Any]) -> None:
-            spec = self.effective_spec(run_id)
+            spec = self.effective_spec(run_id) if preserve else observation_spec
             if spec.get("feature_delivery") and not spec.get("feature_worker"):
                 from .delivery_feature_closure import FailedFeatureCoordinator
 
@@ -1041,7 +1048,7 @@ class DeliveryStore:
             # submit() is shared by synchronous CLI and the async API route.
             with ThreadPoolExecutor(max_workers=1) as pool:
                 closed, sealed = pool.submit(
-                    lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
+                    copy_context().run, lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
                 ).result(timeout=35)
         except Exception as exc:
             from .delivery_feature_closure import FailedFeatureCoordinator
@@ -1661,7 +1668,9 @@ class DeliveryStore:
         load_execution_config(spec)
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
         previous_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-        closed = self._completed_temporal_result(run_id, workflow_id=current_workflow_id)
+        closed = (self._completed_temporal_result(run_id, workflow_id=current_workflow_id,
+                                                   preserve=False) if preflight else
+                  self._completed_temporal_result(run_id, workflow_id=current_workflow_id))
         state = closed["result"]
         if not isinstance(state, dict):
             raise ValueError("closed Temporal result has no terminal state")
@@ -1670,6 +1679,27 @@ class DeliveryStore:
         roles = state.get("roles")
         checks = state.get("checks")
         iteration = state.get("iteration")
+        from .delivery_lifecycle import require_transition
+
+        facts = {
+            "operation": "repair_continuation", "owner": "repair_admission",
+            "owner_proof": True, "normalized_lifecycle": "stopped",
+            "proof_digest": digest({"row": dict(row), "closed": closed}),
+            "revision": state.get("revision"), "iteration": iteration,
+            "candidate_id": candidate.get("id") if isinstance(candidate, dict) else None,
+            "candidate_head": pr.get("head") if isinstance(pr, dict) else None,
+            "head_request_field": "expected_pr_head", "publication_required": True,
+            "publication_number": pr.get("number") if isinstance(pr, dict) else None,
+            "predicates": [{
+                "code": "product_budget_exhausted",
+                "satisfied": type(iteration) is int and
+                             iteration + supplied["additional_iterations"]
+                             <= spec["policy"]["max_repairs"] + 2,
+                "missing_or_unknown_fact": "remaining original finite repair allowance",
+                "next_action": "inspect the original repair budget",
+            }],
+        }
+        assessment = require_transition(facts, supplied)
         if (
             closed["workflow_id"] != current_workflow_id
             or closed["request_digest"] != row["request_digest"]
@@ -1739,7 +1769,12 @@ class DeliveryStore:
             raise ValueError("failed gate supplied no repair diagnostics")
         broker = DeliveryBroker(self, spec)
         observed_pr = published_identity(broker, candidate, pr)
-        cleanup_digest = confirmed_native_cleanup(spec)
+        if preflight:
+            from .delivery_stopped_resume import observed_native_cleanup
+
+            cleanup_digest = observed_native_cleanup(spec, read_only=True)
+        else:
+            cleanup_digest = confirmed_native_cleanup(spec)
         workflow_id = f"delivery-{run_id}-repair-continuation-1"
         recovery = {
             "kind": "repair_continuation",
@@ -1776,7 +1811,7 @@ class DeliveryStore:
                         claim is None or claim["owner"] != f"external:devflow:{run_id}"):
                     raise ValueError("repair preflight claim authority changed")
             return {**response, "preflight": True, "diagnostics": findings,
-                    "title_constraint_sha256": None}
+                    "lifecycle_assessment": assessment, "title_constraint_sha256": None}
         if finalized:
             from .delivery_gate_retry import prepare_runtime
             from .delivery_metadata_recovery import _immutable, preserve_resources

@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 from datetime import UTC
 from pathlib import Path
@@ -198,7 +199,7 @@ def _original_progress(store, spec, row, state, attempts, closed, *, resource_sp
                          'publication_sha256': digest(publication_result)}, proofs[-1]
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(read())).result(35)
+        return pool.submit(copy_context().run, lambda: asyncio.run(read())).result(35)
 
 
 def _gate_ancestor(store, transport, spec, observation):

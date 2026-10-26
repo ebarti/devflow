@@ -179,6 +179,9 @@ def history_sha256(history: WorkflowHistory) -> str:
 
 
 def _private_root(store, *, read_only: bool = False) -> Path:
+    from .delivery_execution_config import is_observation_mode
+
+    read_only = read_only or is_observation_mode()
     root = Path(store.config.state_root) / "closures"
     if not read_only:
         try:

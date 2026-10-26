@@ -8,12 +8,30 @@ import os
 import re
 import stat
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_config import DeliveryConfig
 
 TRANSPORT_FIELDS = ("tracking_db", "state_root", "temporal_address", "temporal_namespace", "queue")
+
+_observation_mode = ContextVar("execution_configuration_observation", default=False)
+
+
+def is_observation_mode() -> bool:
+    return _observation_mode.get()
+
+
+@contextmanager
+def observation_mode():
+    """Authenticate configuration without repairing or publishing any filesystem state."""
+    token = _observation_mode.set(True)
+    try:
+        yield
+    finally:
+        _observation_mode.reset(token)
 
 
 def transport_binding(config: DeliveryConfig) -> tuple:
@@ -50,6 +68,8 @@ def _owned_directory(path: Path, *, create: bool = False) -> None:
     non-directories never do.
     """
     if create:
+        if _observation_mode.get():
+            raise ValueError("configuration observation cannot create directories")
         path.mkdir(mode=0o700, exist_ok=True)
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -63,6 +83,8 @@ def _owned_directory(path: Path, *, create: bool = False) -> None:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError("execution configuration requires an owned private directory")
         if stat.S_IMODE(info.st_mode) != 0o700:
+            if _observation_mode.get():
+                raise ValueError("execution configuration directory permissions are not private")
             os.fchmod(descriptor, 0o700)
             if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
                 raise ValueError("execution configuration requires an owned private directory")
@@ -105,6 +127,8 @@ def _read_snapshot(path: Path, expected: str) -> dict:
         if not isinstance(raw, dict) or digest(raw) != expected:
             raise ValueError("immutable admitted configuration changed")
         if stat.S_IMODE(info.st_mode) != 0o600:
+            if _observation_mode.get():
+                raise ValueError("admitted configuration snapshot permissions are not private")
             # Content-authenticated, owner-owned mode drift is repaired in place.
             # A reader never republishes, replaces or widens an inode.
             os.fchmod(descriptor, 0o600)
@@ -117,6 +141,8 @@ def _read_snapshot(path: Path, expected: str) -> dict:
 
 def preserve_execution_config(config: DeliveryConfig) -> None:
     """Only admission/service initialization publishes immutable private snapshots."""
+    if _observation_mode.get():
+        raise ValueError("configuration observation cannot publish snapshots")
     # Authenticate the same complete schema as a live config, without rereading a
     # mutable path after a service has already loaded it.
     DeliveryConfig._from_raw(config.path, config.raw)

@@ -20,6 +20,10 @@ class ObservationStore:
         db.row_factory = sqlite3.Row
         return db
 
+    @staticmethod
+    def _prepared_original(_db, spec):
+        return spec
+
 
 @pytest.fixture
 def feature(tmp_path):
@@ -35,16 +39,16 @@ def feature(tmp_path):
         "plan": None,
     }
     token = shared.claim(snapshot, "run-1", str(tracking), maximum_repairs=3)
-    spec = {"feature_delivery": {"owner": token, "registry": str(shared.path)}}
+    spec = {"run_id": "run-1", "feature_delivery": {"owner": token, "registry": str(shared.path)}}
     store = ObservationStore(tracking)
     with store._connect() as db:
         db.execute(
             "CREATE TABLE delivery_runs (run_id TEXT, revision INTEGER, outcome TEXT, "
-            "cleanup TEXT, request_json TEXT)"
+            "cleanup TEXT, request_json TEXT, recovery_json TEXT, accepted_plan_text TEXT)"
         )
         db.execute(
-            "INSERT INTO delivery_runs VALUES (?, ?, ?, ?, ?)",
-            ("run-1", 7, "blocked", "confirmed", json.dumps(spec)),
+            "INSERT INTO delivery_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("run-1", 7, "blocked", "confirmed", json.dumps(spec), None, None),
         )
     return store, shared, snapshot, token
 
@@ -152,3 +156,69 @@ def test_revision_reports_exhausted_product_budget_without_new_debit(feature):
     assessment = _observe(store, "revise_feature_plan")
     assert "feature_product_budget_exhausted" in _codes(assessment)
     assert shared.budget("feature") == before
+
+
+def test_closed_coordinator_proof_is_observed_without_sealing(feature, monkeypatch):
+    from devflow_temporal.delivery_feature_handoff import readonly_feature_spec
+
+    store, shared, _snapshot, token = feature
+    shared.stop(token, "stop-1", {})
+    before = hashlib.sha256(shared.path.read_bytes()).hexdigest()
+    assert readonly_feature_spec(store, "run-1")["feature_delivery"]["owner"] == token
+    calls = []
+
+    def closure(_store, run_id, *, preserve):
+        calls.append((run_id, preserve))
+        return {"workflow_id": "delivery-run-1", "result": {"run_id": run_id}}
+
+    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator", closure)
+    assessment = _observe(store)
+    assert calls == [("run-1", False)]
+    assert "feature_coordinator_closure_unknown" not in _codes(assessment)
+    assert "feature_successor_admission_proof_unknown" in _codes(assessment)
+    assert hashlib.sha256(shared.path.read_bytes()).hexdigest() == before
+
+
+def test_unreadable_coordinator_closure_stays_unknown(feature, monkeypatch):
+    store, shared, _snapshot, token = feature
+    shared.stop(token, "stop-1", {})
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("closure unavailable")
+
+    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator", unavailable)
+    assessment = _observe(store)
+    assert "feature_coordinator_closure_unknown" in _codes(assessment)
+    assert not assessment["eligible"]
+
+
+def test_stopped_continuation_observes_shared_plan_validator(feature):
+    store, shared, _snapshot, token = feature
+    shared.stop(token, "stop-1", {})
+    before = hashlib.sha256(shared.path.read_bytes()).hexdigest()
+    assessment = assess_transition(
+        store, "run-1", "continue_feature", {"command_id": "continue-1", "expected_revision": 7}
+    )
+    assert "feature_plan_authority_unknown" not in _codes(assessment)
+    assert "feature_successor_admission_proof_unknown" in _codes(assessment)
+    assert hashlib.sha256(shared.path.read_bytes()).hexdigest() == before
+
+
+def test_changed_adopted_plan_is_unknown_without_mutation(feature):
+    store, shared, _snapshot, token = feature
+    shared.stop(token, "stop-1", {})
+    with store._connect() as db:
+        spec = json.loads(db.execute("SELECT request_json FROM delivery_runs").fetchone()[0])
+        spec["accepted_plan"] = "{}"
+        db.execute("UPDATE delivery_runs SET request_json=?", (json.dumps(spec),))
+    with shared.connect() as db:
+        shared._checkpoint(db, token, "plan-revision:adopted:1", {
+            "identity": {"plan_revision": 1, "plan_digest": "different"},
+        })
+    before = hashlib.sha256(shared.path.read_bytes()).hexdigest()
+    assessment = assess_transition(
+        store, "run-1", "continue_feature", {"command_id": "continue-1", "expected_revision": 7}
+    )
+    assert "feature_plan_authority_unknown" in _codes(assessment)
+    assert not assessment["eligible"]
+    assert hashlib.sha256(shared.path.read_bytes()).hexdigest() == before

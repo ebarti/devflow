@@ -695,10 +695,12 @@ def create_app(config_path: Path) -> FastAPI:
     @app.get("/api/runs/{run_id}/merge-preflight")
     async def merge_preflight(request: Request, run_id: str):
         _host(request)
+        from .delivery_execution_config import observation_mode
         from .delivery_merge_followup import preflight
 
         try:
-            return await asyncio.to_thread(preflight, service.store, run_id)
+            with observation_mode():
+                return await asyncio.to_thread(preflight, service.store, run_id)
         except ValueError as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
@@ -718,8 +720,11 @@ def create_app(config_path: Path) -> FastAPI:
     @app.get("/api/runs/{run_id}/gates-only-preflight")
     async def gates_only_preflight(request: Request, run_id: str) -> dict[str, Any]:
         _host(request)
+        from .delivery_execution_config import observation_mode
+
         try:
-            return await asyncio.to_thread(service.store.gates_only_preflight, run_id)
+            with observation_mode():
+                return await asyncio.to_thread(service.store.gates_only_preflight, run_id)
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
@@ -737,9 +742,12 @@ def create_app(config_path: Path) -> FastAPI:
     async def ci_inventory_preflight(request: Request, run_id: str):
         _host(request)
         from .delivery_ci_inventory import preflight
+        from .delivery_execution_config import observation_mode
 
         try:
-            return await asyncio.to_thread(preflight, service.store, run_id, await request.json())
+            with observation_mode():
+                return await asyncio.to_thread(
+                    preflight, service.store, run_id, await request.json())
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
@@ -766,10 +774,13 @@ def create_app(config_path: Path) -> FastAPI:
     @app.post('/api/runs/{run_id}/native-diagnostic-preflight')
     async def native_diagnostic_preflight(request: Request, run_id: str):
         _host(request)
+        from .delivery_execution_config import observation_mode
         from .delivery_native_diagnostic import preflight
 
         try:
-            return await asyncio.to_thread(preflight, service.store, run_id, await request.json())
+            with observation_mode():
+                return await asyncio.to_thread(
+                    preflight, service.store, run_id, await request.json())
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
@@ -818,8 +829,11 @@ def create_app(config_path: Path) -> FastAPI:
     @app.post("/api/runs/{run_id}/repair-admission-preflight")
     async def repair_admission_preflight(request: Request, run_id: str) -> dict[str, Any]:
         _host(request)
+        from .delivery_execution_config import observation_mode
+
         try:
-            return await asyncio.to_thread(service.store.repair_admission_preflight,
+            with observation_mode():
+                return await asyncio.to_thread(service.store.repair_admission_preflight,
                                            run_id, await request.json())
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc

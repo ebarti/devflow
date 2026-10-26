@@ -1022,7 +1022,14 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "adopt-runtime-location": installation.apply,
             "rollback-runtime-location": installation.rollback,
         }[args.command]
-        print(json.dumps(operation(config, supplied), sort_keys=True, indent=2))
+        if args.command == "runtime-location-preflight":
+            from .delivery_execution_config import observation_mode
+
+            with observation_mode():
+                result = operation(config, supplied)
+        else:
+            result = operation(config, supplied)
+        print(json.dumps(result, sort_keys=True, indent=2))
         return
     read_commands = {"merge-preflight",
         'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
@@ -1062,8 +1069,13 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         try:
             store = DeliveryStore(
                 config, read_only=args.command == "filesystem-custody-preflight")
-            result = (preflight(store, args.id) if args.command == "filesystem-custody-preflight"
-                      else adopt(store, args.id, json.loads(args.request.read_text())))
+            if args.command == "filesystem-custody-preflight":
+                from .delivery_execution_config import observation_mode
+
+                with observation_mode():
+                    result = preflight(store, args.id)
+            else:
+                result = adopt(store, args.id, json.loads(args.request.read_text()))
         except (ValueError, OSError, RuntimeError) as exc:
             from .delivery_lifecycle import RecoveryRefused
 

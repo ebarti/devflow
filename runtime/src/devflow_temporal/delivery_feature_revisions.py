@@ -866,9 +866,14 @@ def authenticate_continued_plan(store, spec):
     if not predecessor:
         return
     original = store.effective_spec(predecessor["run_id"])
+    _validate_continued_plan(store, spec, original, _registry(original))
+
+
+def _validate_continued_plan(store, spec, original, shared):
+    """Authenticate accepted-plan lineage using an owning or read-only registry view."""
+    predecessor = spec.get("feature_predecessor")
     if original.get("feature_delivery", {}).get("owner") != predecessor:
         raise OwnershipConflict("feature continuation changed its original owner custody")
-    shared = _registry(original)
     with shared.connect() as db:
         current = shared.current(predecessor["issue_id"])
         retry = next((item for key, item in shared.checkpoints(predecessor["issue_id"]).items()

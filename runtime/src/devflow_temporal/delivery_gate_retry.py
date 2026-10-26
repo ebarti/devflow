@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 from importlib.metadata import distribution
 from pathlib import Path
@@ -208,7 +209,7 @@ def _report_layout_closed(store, spec, row, closed, previous):
         return authenticated['history_sha256']
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(read())).result(35)
+        return pool.submit(copy_context().run, lambda: asyncio.run(read())).result(35)
 
 
 def _report_layout_evidence(spec, state, broker, *, resource_spec=None):

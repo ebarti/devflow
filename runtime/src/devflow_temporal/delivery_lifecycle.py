@@ -31,13 +31,15 @@ def evaluate_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) ->
     owner = facts.get('owner', 'unknown')
     blockers = []
 
-    def block(code, fact, action, authorization=False):
+    def block(code, fact, action, authorization=False, satisfied=None):
         blockers.append({'code': code, 'owner': owner, 'missing_or_unknown_fact': fact,
-                         'next_action': action, 'new_authorization_required': authorization})
+                         'next_action': action, 'new_authorization_required': authorization,
+                         'satisfied': satisfied})
 
     if facts.get('owner_proof') is not True:
         block('owner_proof_unknown', 'authenticated owner and custody proof',
-              'inspect the owning recovery preflight')
+              'inspect the owning recovery preflight',
+              satisfied=False if facts.get('owner_proof') is False else None)
     elif not facts.get('proof_digest'):
         block('proof_digest_unknown', 'authenticated proof binding',
               'obtain a fresh authenticated checkpoint')
@@ -59,7 +61,7 @@ def evaluate_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) ->
             block(code.replace('_changed', '_unknown'), observed_key,
                   'obtain a fresh authenticated checkpoint')
         elif observed != requested:
-            block(code, observed_key, 'obtain a fresh authenticated checkpoint')
+            block(code, observed_key, 'obtain a fresh authenticated checkpoint', satisfied=False)
     for predicate in facts.get('predicates', ()):
         if predicate.get('satisfied') is not True:
             blockers.append({
@@ -67,6 +69,7 @@ def evaluate_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) ->
                 'missing_or_unknown_fact': predicate['missing_or_unknown_fact'],
                 'next_action': predicate['next_action'],
                 'new_authorization_required': predicate.get('new_authorization_required', False),
+                'satisfied': predicate.get('satisfied'),
             })
     observed = {key: facts.get(key) for key in (
         'revision', 'iteration', 'candidate_id', 'candidate_head', 'publication_number')}
@@ -103,6 +106,13 @@ def require_same_proof(operation: str, owner: str, observed_digest: str,
 
 
 def assess_transition(store, run_id: str, kind: str, request: dict[str, Any]) -> dict[str, Any]:
+    from .delivery_execution_config import observation_mode
+
+    with observation_mode():
+        return _assess_transition(store, run_id, kind, request)
+
+
+def _assess_transition(store, run_id: str, kind: str, request: dict[str, Any]) -> dict[str, Any]:
     """Run the owner's complete preflight; do not turn unknown proof into eligibility.
 
     Currently only exact-checkpoint repair owners provide this contract. Other
@@ -117,6 +127,18 @@ def assess_transition(store, run_id: str, kind: str, request: dict[str, Any]) ->
                  'published_ci_retry', 'published_controller_retry'}
     if not isinstance(kind, str) or not isinstance(request, dict):
         return unknown('unknown')
+    if kind in {'stopped_resource_closure', 'abandon_pending_resource_closure'}:
+        from .delivery_resource_closure import assess
+
+        return assess(store, run_id, kind, request)
+    if kind == 'investigation_assessment_adjudication':
+        from .delivery_investigation_adjudication import assess
+
+        return assess(store, run_id, request)
+    if kind == 'published_head_validation':
+        from .delivery_publication_validation import assess
+
+        return assess(store, run_id, request)
     if kind == 'investigation_gates_only':
         from .delivery_gates_admission import assess
 
@@ -133,7 +155,9 @@ def assess_transition(store, run_id: str, kind: str, request: dict[str, Any]) ->
         from .delivery_feature_revisions import assess_feature_revision
 
         return assess_feature_revision(store, run_id, request)
-    if kind in {'recover_publication', 'retry_prelaunch', 'amend_scope'}:
+    if kind == 'repair_continuation' and 'continuation_kind' not in request:
+        preflight = store.repair_admission_preflight
+    elif kind in {'recover_publication', 'retry_prelaunch', 'amend_scope'}:
         preflight = partial(getattr(store, kind), preflight=True)
     elif kind in supported and request.get('continuation_kind') == kind:
         preflight = store.repair_admission_preflight

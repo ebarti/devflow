@@ -38,6 +38,8 @@ def test_stale_assessment_and_execution_report_same_predicate(
     assessment = assess_transition(store, 'run-1', command['continuation_kind'], changed)
     assert not assessment['eligible']
     assert code in [blocker['code'] for blocker in assessment['blockers']]
+    assert next(blocker for blocker in assessment['blockers']
+                if blocker['code'] == code)['satisfied'] is False
     with pytest.raises(RecoveryRefused) as failure:
         store.continue_repair('run-1', changed)
     assert failure.value.assessment == assessment
@@ -53,6 +55,7 @@ def test_owner_custody_failure_stays_unknown(stopped):  # noqa: F811
     assessment = assess_transition(store, 'run-1', command['continuation_kind'], command)
     assert not assessment['eligible'] and assessment['proof_digest'] is None
     assert assessment['blockers'][0]['code'] == 'owner_proof_unknown'
+    assert assessment['blockers'][0]['satisfied'] is None
     with pytest.raises(ValueError):
         store.continue_repair('run-1', command)
 

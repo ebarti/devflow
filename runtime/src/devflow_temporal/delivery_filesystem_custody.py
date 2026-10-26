@@ -22,6 +22,7 @@ import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from contextvars import copy_context
 from pathlib import Path
 
 from .contracts import canonical_json, digest
@@ -265,7 +266,8 @@ def _workflow(store, row):
         }
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), 20))).result()
+        return pool.submit(
+            copy_context().run, lambda: asyncio.run(asyncio.wait_for(read(), 20))).result()
 
 
 def _rows(store, run_id):
