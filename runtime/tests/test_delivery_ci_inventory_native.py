@@ -228,7 +228,7 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
             async with public(c) as (client, _headers):
                 detail = await client.get("/api/runs/run-1")
                 assert detail.status_code == 200, detail.text
-                assert detail.json()["checks"]["ci"]["ci_assessment"] == ci["ci_assessment"]
+                assert detail.json()["run"]["checks"]["ci"]["ci_assessment"] == ci["ci_assessment"]
                 evidence_ids = {item["id"] for item in detail.json()["evidence"]}
                 assert {
                     "ordinary-ci-inventory-acknowledgement",

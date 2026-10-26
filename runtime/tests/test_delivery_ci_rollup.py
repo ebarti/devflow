@@ -17,10 +17,10 @@ from devflow_temporal import delivery_ci_inventory_io as io
 HEAD = "a" * 40
 
 
-def check(identity, conclusion="SUCCESS", *, name="Build", status="COMPLETED"):
+def check(identity, conclusion="SUCCESS", *, name="Build", status="COMPLETED", run=10):
     return {"__typename": "CheckRun", "id": identity, "name": name,
             "status": status, "conclusion": conclusion,
-            "detailsUrl": "https://github.com/example/fixture/actions/runs/10/job/" + identity}
+            "detailsUrl": f"https://github.com/example/fixture/actions/runs/{run}/job/" + identity}
 
 
 def response(nodes, *, more=False, cursor=None, head=HEAD, total=None, null_rollup=False):
@@ -60,12 +60,12 @@ async def activity(monkeypatch, pages):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("conclusion", ["FAILURE", "SUCCESS", None])
+@pytest.mark.parametrize("conclusion", ["FAILURE", "SUCCESS", "SKIPPED", None])
 @pytest.mark.parametrize("reverse", [False, True])
 async def test_required_duplicate_identity_refuses_every_order(monkeypatch, conclusion, reverse):
     status = "IN_PROGRESS" if conclusion is None else "COMPLETED"
     nodes = [check("job-1", conclusion, status=status),
-             check("job-2")]
+             check("job-2", run=20)]
     if reverse:
         nodes.reverse()
     original = copy.deepcopy(nodes)

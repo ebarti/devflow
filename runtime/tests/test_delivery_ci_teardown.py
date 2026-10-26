@@ -29,7 +29,7 @@ from devflow_temporal import delivery_gate_retry as gates
 from devflow_temporal import delivery_policy_recovery as policy
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json, digest
-from devflow_temporal.delivery_activities import delivery_repair_preflight
+from devflow_temporal.delivery_activities import delivery_gates_readback, delivery_repair_preflight
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_ci_inventory_io import GitHubRead
 from devflow_temporal.delivery_config import DeliveryConfig
@@ -256,9 +256,9 @@ async def test_public_ci_ack_and_admission_preserve_original_unknown(historical_
     assert recovery["command"]["additional_iterations"] == 0
     assert teardown.FIELD in recovery["seal"]
     assert inventory.FIELD in recovery["seal"]
-    assert await delivery_repair_preflight({"spec": current, "recovery": recovery}) == {
-        "state": "confirmed"
-    }
+    assert await delivery_gates_readback({"spec": current, "recovery": recovery}) == recovery[
+        "publication"
+    ]
     assert teardown.for_resources(current)["journal_sha256"]
     registry = RunResources(current)
     with registry.locked() as manifest:
