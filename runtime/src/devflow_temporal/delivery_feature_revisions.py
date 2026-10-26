@@ -184,11 +184,24 @@ def _readonly_revision_worker_spec(store, parent, run_id):
     with store._connect() as db:
         row = db.execute("SELECT request_json,recovery_json,accepted_plan_text "
                          "FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-        if row is None or row["recovery_json"] is not None:
-            raise ValueError("retained worker recovery authority needs separate observation")
+        if row is None:
+            raise ValueError("retained worker input is unavailable")
+        recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         original = store._prepared_original(db, json.loads(row["request_json"]))
     if row["accepted_plan_text"] is not None:
         original["accepted_plan"] = row["accepted_plan_text"]
+    if recovery is not None:
+        from .delivery_execution_config import observation_mode
+        from .delivery_feature_revision_recovery import retained_recovery
+
+        if (not isinstance(recovery, dict)
+                or recovery.get("kind") != "stopped_delivery_resume"
+                or (retained_recovery(recovery) or {}).get("feature_plan_revision")):
+            raise ValueError("retained worker recovery authority needs separate observation")
+        # The ordinary stopped-worker reader verifies its command, immutable
+        # admission, budget, session and policy custody in observation mode.
+        with observation_mode():
+            original = store.effective_spec(run_id)
     owner = original.get("feature_delivery", {}).get("owner", {})
     if (not original.get("feature_worker") or original.get("run_id") != run_id
             or owner.get("issue_id") != parent["feature_delivery"]["owner"]["issue_id"]

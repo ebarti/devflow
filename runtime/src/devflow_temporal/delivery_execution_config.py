@@ -6,8 +6,10 @@ import errno
 import json
 import os
 import re
+import sqlite3
 import stat
 import tempfile
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -18,20 +20,76 @@ from .delivery_config import DeliveryConfig
 TRANSPORT_FIELDS = ("tracking_db", "state_root", "temporal_address", "temporal_namespace", "queue")
 
 _observation_mode = ContextVar("execution_configuration_observation", default=False)
+_observation_scope = ContextVar("execution_configuration_observation_scope", default=None)
+
+
+class _ObservationScope:
+    def __init__(self):
+        self.resources = {}
+        self.lock = threading.RLock()
+        self.closed = False
+
+    def resource(self, key, factory):
+        with self.lock:
+            if self.closed:
+                raise sqlite3.OperationalError("tracking observation scope is closed")
+            if key not in self.resources:
+                self.resources[key] = factory()
+            return self.resources[key]
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            resources = list(self.resources.values())
+        failure = None
+        for resource in reversed(resources):
+            try:
+                resource.close()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
 
 def is_observation_mode() -> bool:
     return _observation_mode.get()
 
 
+def observation_scope():
+    return _observation_scope.get()
+
+
 @contextmanager
 def observation_mode():
-    """Authenticate configuration without repairing or publishing any filesystem state."""
+    """Share read-only evidence and verify it before the outer observation returns."""
     token = _observation_mode.set(True)
+    scope = _observation_scope.get()
+    owner = scope is None
+    scope_token = None
+    if owner:
+        scope = _ObservationScope()
+        scope_token = _observation_scope.set(scope)
+    failed = False
     try:
         yield
+    except BaseException:
+        failed = True
+        raise
     finally:
-        _observation_mode.reset(token)
+        try:
+            if owner:
+                try:
+                    scope.close()
+                except Exception:
+                    if not failed:
+                        raise
+        finally:
+            if scope_token is not None:
+                _observation_scope.reset(scope_token)
+            _observation_mode.reset(token)
 
 
 def transport_binding(config: DeliveryConfig) -> tuple:

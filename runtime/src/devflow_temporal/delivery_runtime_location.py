@@ -87,15 +87,29 @@ def intent_command_id(receipt, run_id):
     return "runtime-location-intent-" + digest([receipt["command"]["command_id"], run_id])[:48]
 
 
+@contextmanager
+def _read_tracking(config):
+    from .delivery_execution_config import is_observation_mode
+
+    if is_observation_mode():
+        from .delivery_store import _observation_tracking_connection
+
+        with _observation_tracking_connection(config.tracking_db) as db:
+            yield db
+        return
+    db = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA query_only=ON")
+        yield db
+    finally:
+        db.close()
+
+
 def pending_acknowledged(config, receipt, reference, *, db=None):
     """An original preimage on disk alone is not an attributable interrupted apply."""
     if db is None:
-        connection = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
-        try:
-            connection.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as connection:
             return pending_acknowledged(config, receipt, reference, db=connection)
-        finally:
-            connection.close()
     for item in receipt["runs"]:
         key = intent_command_id(receipt, item["run_id"])
         response = {**reference, "run_id": item["run_id"], "command_id": key}
@@ -121,8 +135,7 @@ def pending_acknowledged(config, receipt, reference, *, db=None):
 def reversed_reference(config, reference, *, db=None):
     """A reversed intent is final even when its forward ACK never committed."""
     if db is None:
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as source:
-            source.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as source:
             return reversed_reference(config, reference, db=source)
     return bool(
         db.execute(
@@ -139,12 +152,8 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
         return None
     pointer = reference if reference is not None else json.loads(private_bytes(path))
     if db is None:
-        connection = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
-        try:
-            connection.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as connection:
             return _acknowledged(config, db=connection, historical=historical, reference=pointer)
-        finally:
-            connection.close()
     receipt_path = Path(pointer["receipt"])
     expected = config.state_root / "runtime-installations" / pointer["command_id"] / "receipt.json"
     if receipt_path != expected:
@@ -484,8 +493,7 @@ def require_not_pending(config):
             return
         if not folder.exists() or not config.tracking_db.exists():
             return
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
-            db.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as db:
             values = db.execute(
                 "SELECT payload_json FROM delivery_events WHERE type=? ORDER BY sequence DESC",
                 (PENDING,),

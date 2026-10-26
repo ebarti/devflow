@@ -10,7 +10,7 @@ import os
 import re
 import sqlite3
 import stat
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -500,7 +500,9 @@ def require_resource_idle(spec):
 
     parent = canonical_owner(spec)
     config = load_execution_config(parent or spec)
-    with closing(sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)) as db:
+    from .delivery_store import tracking_read_connection
+
+    with tracking_read_connection(config.tracking_db) as db:
         try:
             active = db.execute(
                 f"SELECT 1 FROM delivery_native_diagnostics WHERE run_id=? AND state IN {ACTIVE}",

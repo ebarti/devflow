@@ -2,8 +2,12 @@ import hashlib
 import json
 import sys
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
+from test_delivery_feature_revision_subject import (
+    findings_reconsideration as findings_reconsideration,
+)
 from test_delivery_feature_revisions import (
     _closed_revision_fixture,
     _stop_revision_fixture,
@@ -177,16 +181,28 @@ def test_public_revision_observes_owned_child_evidence(feature, monkeypatch):
     result = assess_transition(store, spec["run_id"], "revise_feature_plan", request)
     assert result["eligible"], result
     assert _contents(shared.path) == before
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET recovery_json=? WHERE run_id=?",
+                   (json.dumps({"kind": "unsupported"}), child["run_id"]))
+    unknown = assess_transition(store, spec["run_id"], "revise_feature_plan", request)
+    assert not unknown["eligible"]
+    assert "feature_revision_evidence_unknown" in {b["code"] for b in unknown["blockers"]}
+    assert _contents(shared.path) == before
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET recovery_json=NULL WHERE run_id=?", (child["run_id"],))
     assert revise_feature_plan(store, spec["run_id"], request)["revision_id"]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
-def test_public_reconsideration_without_workers_is_read_only(native_configuration, monkeypatch,
-                                                          tmp_path):
+@pytest.mark.parametrize("retain_kind", [None, "build"], ids=["no-workers", "retained-build"])
+def test_public_reconsideration_is_read_only(native_configuration, monkeypatch, tmp_path,
+                                             retain_kind):
     from test_delivery_feature_revisions import _genuine_fixture
 
+    # The retained-build variant uses the existing fixture's synthetic worker
+    # review_snapshot; it does not prove a real Temporal worker closure.
     fixture, command, *_ = _genuine_fixture(native_configuration, monkeypatch, tmp_path,
-                                            retain_kind=None)
+                                            retain_kind=retain_kind)
     store, spec, shared, _, _, _, prior, *_ = fixture
     record = prior["record"]
     closed = _closed_revision_fixture(store, spec["run_id"])
@@ -241,3 +257,42 @@ async def test_worker_history_observation_never_preserves_closure(monkeypatch):
         history, bound = await delivery_feature_closure._closed_history(object(), "worker", saved)
     assert history == "bound history" and bound == saved
     assert calls == [("worker", {"read_only": True})]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
+def test_recovered_child_evidence_uses_immutable_existing_custody(findings_reconsideration,
+                                                                   monkeypatch):
+    from devflow_temporal.delivery_execution_config import observation_mode
+    from devflow_temporal.delivery_feature_revisions import _readonly_revision_worker_spec
+    from devflow_temporal.delivery_stopped_resume import namespace
+
+    fixture, command, _runtime, child, _seal, _observe, files = findings_reconsideration
+    store, parent, shared, _, _, _, prior, *_ = fixture
+    closed = _closed_revision_fixture(store, parent["run_id"])
+    monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator",
+                        lambda *_a, **_kw: deepcopy(closed))
+    monkeypatch.setattr(GitHubDelivery, "load_record", lambda *_a: deepcopy(prior["record"]))
+    evidence = files[("implement", 4, "request.json")]
+    command = {**command, "evidence": [{"path": str(evidence), "sha256": _contents(evidence)}]}
+    before = _contents(shared.path)
+    with store._connect() as db:
+        tracking = list(db.iterdump())
+    with observation_mode():
+        assert _readonly_revision_worker_spec(store, parent, child["run_id"]) == child
+    with store._connect() as db:
+        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                                         (child["run_id"],)).fetchone()[0])
+    admission = Path(child["state_dir"]) / namespace(recovery) / "admission.json"
+    original = admission.read_bytes()
+    try:
+        admission.write_bytes(b"{}")
+        with observation_mode(), pytest.raises(ValueError):
+            _readonly_revision_worker_spec(store, parent, child["run_id"])
+    finally:
+        admission.write_bytes(original)
+    assessment = assess_transition(store, parent["run_id"], "revise_feature_plan", command)
+    assert assessment["eligible"], json.dumps(assessment, indent=2)
+    assert _contents(shared.path) == before
+    with store._connect() as db:
+        assert list(db.iterdump()) == tracking
+    assert revise_feature_plan(store, parent["run_id"], command)["revision_id"]

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 from copy import deepcopy
@@ -312,7 +313,8 @@ async def assess(store, run_id, request, client):
             *_, facts = await asyncio.to_thread(
                 _observe, store, run_id, closed, request, read_only=True)
             return evaluate_transition(facts, request)
-    except (ValueError, RuntimeError, OSError, KeyError, TypeError, subprocess.SubprocessError):
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError, sqlite3.Error,
+            subprocess.SubprocessError):
         return unknown_assessment(request)
     except RPCError:
         return unknown_assessment(request)

@@ -11,8 +11,8 @@ Ordinary status reads do not perform these proofs.
 The version 1 assessment has `operation`, `normalized_lifecycle`, `eligible`,
 `observed_revision`, candidate and publication bindings, `proof_digest`,
 `supported_next_actions`, and structured `blockers`. A blocker names its stable
-`code`, owner, missing or unknown fact, next action, and whether new authorization
-is required. An unavailable proof remains unknown. The lifecycle vocabulary is
+`code`, owner, missing or unknown fact, next action, whether the predicate is
+known false or unknown, and whether new authorization is required. An unavailable proof remains unknown. The lifecycle vocabulary is
 `pending`, `running`, `stopping`, `stopped`, `recovering`, `terminal`, and `unknown`;
 `paused` is reserved for the pause owner. These are owner observations, not inferred
 from a free-form error or a dashboard phase.
@@ -24,7 +24,7 @@ from a free-form error or a dashboard phase.
 | Merge follow-up | Delivered proof and merge command | Current proof and exclusive owner are reobserved under the existing admission fence |
 | CI inventory and native diagnostic | Owner-specific preflight evidence | Acknowledgement rechecks the selected owner facts; execution authorization remains separate |
 | Publication recovery, prelaunch retry and scope amendment | Where their owner can make a read-only proof, the existing admission guards are evaluated without issuing a command. Pending publication inspects the existing executor lease and exact remote head without changing its journal | The transaction rechecks owner, candidate, effects, cleanup and the original grant |
-| Feature continuation and plan revision | Read-only complete settlement proof is not yet available; assessment reports unknown | Existing execution guards continue to apply |
+| Feature continuation and plan revision | The owner authenticates a stopped coordinator, plan, registry, successor constraints and evidence without making reservations. Unsupported historical/scope paths and unavailable custody remain unknown | The original owner rechecks the current plan, budget, custody and claim at admission |
 | Offline filesystem custody and runtime location | The local owner reports the same assessment vocabulary alongside its existing explicit preflight; filesystem adoption still requires a separate operator decision | Existing offline locks and ownership remain in force; execution rechecks the evidence hash |
 | Other owners | Unsupported or unavailable proof reports unknown | Their existing recovery entry points and guards remain authoritative |
 

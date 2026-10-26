@@ -12,7 +12,6 @@ import fcntl
 import hashlib
 import json
 import os
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -206,9 +205,9 @@ def _reference(config):
             return json.loads(private_bytes(path))
     if config.tracking_db.exists():
         from .delivery_runtime_location import PENDING
+        from .delivery_store import tracking_read_connection
 
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
-            db.execute("PRAGMA query_only=ON")
+        with tracking_read_connection(config.tracking_db) as db:
             if not db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_events'"
             ).fetchone():
@@ -260,8 +259,9 @@ def _receipt(config, *, stop=False, reference=None):
             receipt["owner_after_sha256"],
         }:
             raise ValueError("pending installation original owner changed")
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
-            db.execute("PRAGMA query_only=ON")
+        from .delivery_store import tracking_read_connection
+
+        with tracking_read_connection(config.tracking_db) as db:
             for item in receipt["runs"]:
                 row = db.execute(
                     "SELECT request_digest,request_json FROM delivery_runs WHERE run_id=?",

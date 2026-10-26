@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import subprocess
 import threading
 import time
@@ -43,9 +44,17 @@ logger = logging.getLogger(__name__)
 
 
 def _recovery_conflict_detail(exc: Exception) -> Any:
-    from .delivery_lifecycle import RecoveryRefused
+    from .delivery_lifecycle import RecoveryRefused, evaluate_transition
 
-    return exc.assessment if isinstance(exc, RecoveryRefused) else str(exc)
+    if isinstance(exc, RecoveryRefused):
+        return exc.assessment
+    if isinstance(exc, sqlite3.Error):
+        return evaluate_transition({"operation": "unknown", "owner": "tracking_store",
+                                    "comparisons": [], "predicates": [{
+                                        "code": "tracking_store_unavailable", "satisfied": None,
+                                        "missing_or_unknown_fact": "existing tracking database",
+                                        "next_action": "restore the tracking store"}]}, {})
+    return str(exc)
 
 
 def _dispatch_failure_reason(exc: BaseException) -> str:
@@ -701,7 +710,7 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             with observation_mode():
                 return await asyncio.to_thread(preflight, service.store, run_id)
-        except ValueError as exc:
+        except (ValueError, sqlite3.Error) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/merge")
@@ -725,7 +734,8 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             with observation_mode():
                 return await asyncio.to_thread(service.store.gates_only_preflight, run_id)
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/admit-gates-only")
@@ -748,7 +758,8 @@ def create_app(config_path: Path) -> FastAPI:
             with observation_mode():
                 return await asyncio.to_thread(
                     preflight, service.store, run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post('/api/runs/{run_id}/ack-ci-inventory')
@@ -781,7 +792,8 @@ def create_app(config_path: Path) -> FastAPI:
             with observation_mode():
                 return await asyncio.to_thread(
                     preflight, service.store, run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post('/api/runs/{run_id}/ack-native-diagnostic')
@@ -835,7 +847,8 @@ def create_app(config_path: Path) -> FastAPI:
             with observation_mode():
                 return await asyncio.to_thread(service.store.repair_admission_preflight,
                                            run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
             raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/continue-repair")

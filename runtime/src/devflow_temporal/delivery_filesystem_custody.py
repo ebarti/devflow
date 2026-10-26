@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import stat
 import sys
 import tempfile
@@ -132,7 +131,9 @@ def _acknowledged(spec):
     if "config_path" not in spec:
         return None
     config = load_execution_config(spec)
-    with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
+    from .delivery_store import tracking_read_connection
+
+    with tracking_read_connection(config.tracking_db) as db:
         row = db.execute(
             "SELECT payload_json FROM delivery_events WHERE run_id=? AND type=? "
             "ORDER BY sequence DESC LIMIT 1",

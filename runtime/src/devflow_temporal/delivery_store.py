@@ -14,9 +14,11 @@ import re
 import sqlite3
 import stat
 import subprocess
+import tempfile
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import copy_context
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -82,6 +84,179 @@ def _private_directory(path: Path) -> None:
                 raise ValueError(message)
     finally:
         os.close(descriptor)
+
+
+_OBSERVATION_MAX_BYTES = 64 * 1024 * 1024
+_OBSERVATION_COPY_SECONDS = 5
+
+
+def _tracking_signature(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            info.st_mode, info.st_uid, info.st_nlink)
+
+
+def _copy_tracking_stream(source, target, deadline, size):
+    remaining = size
+    while remaining:
+        if time.monotonic() >= deadline:
+            raise sqlite3.OperationalError("tracking observation copy timed out")
+        chunk = source.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise sqlite3.OperationalError("tracking database changed during snapshot")
+        target.write(chunk)
+        remaining -= len(chunk)
+
+
+def _open_tracking_source(path):
+    """Anchor one owned regular source inode without following its final component."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        named = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o022
+                or _tracking_signature(info) != _tracking_signature(named)):
+            raise sqlite3.OperationalError("tracking source identity or ownership is unproven")
+        return os.fdopen(descriptor, "rb"), info
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+class _TrackingObservation:
+    """One bounded DB/WAL copy, shared and revalidated for a whole assessment."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.wal = Path(str(self.path) + "-wal")
+        self.shm = Path(str(self.path) + "-shm")
+        self.journal = Path(str(self.path) + "-journal")
+        self.stack = ExitStack()
+        try:
+            if os.path.lexists(self.journal):
+                raise sqlite3.OperationalError("tracking rollback journal is active or unconfirmed")
+            self.has_wal = os.path.lexists(self.wal)
+            if self.has_wal and not os.path.lexists(self.shm):
+                raise sqlite3.OperationalError("tracking WAL has no existing shared-memory sidecar")
+            deadline = time.monotonic() + _OBSERVATION_COPY_SECONDS
+            self.paths = (self.path, self.wal) if self.has_wal else (self.path,)
+            self.sources, self.before = [], []
+            for source_path in self.paths:
+                source, info = _open_tracking_source(source_path)
+                self.sources.append(self.stack.enter_context(source))
+                self.before.append(info)
+            self.shm_source = self.shm_info = None
+            if self.has_wal:
+                source, self.shm_info = _open_tracking_source(self.shm)
+                self.shm_source = self.stack.enter_context(source)
+            if sum(info.st_size for info in self.before) > _OBSERVATION_MAX_BYTES:
+                raise sqlite3.OperationalError(
+                    "tracking database snapshot is unavailable or oversized")
+            directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(
+                prefix="devflow-tracking-observation-")))
+            if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+                raise sqlite3.OperationalError("tracking observation directory is not private")
+            self.target = directory / "tracking.sqlite3"
+            destinations = ((self.target, Path(str(self.target) + "-wal"))
+                            if self.has_wal else (self.target,))
+            for source, destination, info in zip(
+                self.sources, destinations, self.before, strict=True
+            ):
+                descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as output:
+                    _copy_tracking_stream(source, output, deadline, info.st_size)
+            self.verify()
+        except BaseException:
+            self.stack.close()
+            raise
+
+    def verify(self):
+        try:
+            for source, source_path, initial in zip(
+                self.sources, self.paths, self.before, strict=True
+            ):
+                expected = _tracking_signature(initial)
+                if (_tracking_signature(os.fstat(source.fileno())) != expected
+                        or _tracking_signature(source_path.lstat()) != expected):
+                    raise sqlite3.OperationalError("tracking database changed during observation")
+            shm_changed = self.has_wal and (
+                _tracking_signature(os.fstat(self.shm_source.fileno()))
+                != _tracking_signature(self.shm_info)
+                or _tracking_signature(self.shm.lstat()) != _tracking_signature(self.shm_info))
+            if (os.path.lexists(self.journal) or os.path.lexists(self.wal) != self.has_wal
+                    or shm_changed):
+                raise sqlite3.OperationalError(
+                    "tracking journal custody changed during observation")
+        except (OSError, ValueError) as exc:
+            raise sqlite3.OperationalError("tracking database changed during observation") from exc
+
+    @contextmanager
+    def connect(self):
+        self.verify()
+        options = "?mode=ro" if self.has_wal else "?mode=ro&immutable=1"
+        db = sqlite3.connect(self.target.as_uri() + options, uri=True, timeout=5)
+        deadline = time.monotonic() + _OBSERVATION_COPY_SECONDS
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+            yield db
+        finally:
+            db.close()
+        self.verify()
+
+    def close(self):
+        try:
+            self.verify()
+        finally:
+            self.stack.close()
+
+
+@contextmanager
+def _observation_tracking_connection(path):
+    from .delivery_execution_config import observation_scope
+
+    scope = observation_scope()
+    if scope is None:
+        raise sqlite3.OperationalError("tracking observation scope is unavailable")
+    try:
+        resource = scope.resource(("tracking", str(path)), lambda: _TrackingObservation(path))
+        with resource.connect() as db:
+            yield db
+    except OSError as exc:
+        raise sqlite3.OperationalError("tracking database snapshot is unavailable") from exc
+
+
+@contextmanager
+def tracking_read_connection(path):
+    """Use the shared snapshot during observation and the normal read connection otherwise."""
+    from .delivery_execution_config import is_observation_mode
+
+    if is_observation_mode():
+        with _observation_tracking_connection(path) as db:
+            yield db
+        return
+    db = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA query_only=ON")
+        yield db
+    finally:
+        db.close()
+
+
+def _observational_preflight(method):
+    from functools import wraps
+
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        if kwargs.get("preflight"):
+            from .delivery_execution_config import observation_mode
+
+            with observation_mode():
+                return method(self, *args, **kwargs)
+        return method(self, *args, **kwargs)
+
+    return call
 
 
 class DeliveryStore:
@@ -508,6 +683,13 @@ class DeliveryStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        from .delivery_execution_config import is_observation_mode
+
+        if is_observation_mode():
+            with _observation_tracking_connection(self.config.tracking_db) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                yield db
+            return
         if getattr(self, "read_only", False):
             db = sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
@@ -1111,6 +1293,7 @@ class DeliveryStore:
                 logger.warning("Run %s: closure %s was not sealed (%s: %s)", run_id,
                                closed.get("workflow_id"), type(exc).__name__, exc)
 
+    @_observational_preflight
     def recover_publication(
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
@@ -1267,7 +1450,7 @@ class DeliveryStore:
             "existing": False,
         }
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("BEGIN" if preflight else "BEGIN IMMEDIATE")
             prior = db.execute(
                 "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
                 (command_id,),
@@ -1524,6 +1707,7 @@ class DeliveryStore:
         if DeliveryBroker(self, spec).candidate() != recovery["amended_candidate"]:
             raise ValueError("amended candidate changed before repair")
 
+    @_observational_preflight
     def continue_repair(
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
@@ -1949,6 +2133,7 @@ class DeliveryStore:
         return response
 
 
+    @_observational_preflight
     def retry_prelaunch(
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
@@ -2187,7 +2372,7 @@ class DeliveryStore:
             "existing": False,
         }
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("BEGIN" if preflight else "BEGIN IMMEDIATE")
             prior = db.execute(
                 "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
                 (command_id,),
@@ -2338,6 +2523,7 @@ class DeliveryStore:
         return response
 
 
+    @_observational_preflight
     def amend_scope(
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
@@ -2633,7 +2819,7 @@ class DeliveryStore:
             "existing": False,
         }
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("BEGIN" if preflight else "BEGIN IMMEDIATE")
             current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             current_attempts = db.execute(
                 "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
@@ -4353,9 +4539,8 @@ class DeliveryStore:
         from .delivery_phase_gates import evidence, state
         from .delivery_state_contract import gate_specs, recorded
 
-        with sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
+        with tracking_read_connection(self.config.tracking_db) as db:
             db.row_factory = sqlite3.Row
-            db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
             saved = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if saved is None:

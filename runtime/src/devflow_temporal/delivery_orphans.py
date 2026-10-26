@@ -9,7 +9,7 @@ import os
 import sqlite3
 import stat
 import time
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -219,7 +219,9 @@ def _observe_registered_process(spec, path, *, retained_memo=None):
             from .delivery_execution_config import load_execution_config
 
             config = load_execution_config(spec)
-            with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+            from .delivery_store import tracking_read_connection
+
+            with tracking_read_connection(config.tracking_db) as db:
                 db.row_factory = sqlite3.Row
                 row = db.execute('SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
                                  (path.parent.name, spec['run_id'])).fetchone()

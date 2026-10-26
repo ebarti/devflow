@@ -5,6 +5,7 @@ The evaluator is pure and can be called again when the owner holds its lock.
 """
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
 from functools import partial
 from typing import Any
@@ -137,8 +138,16 @@ def require_same_proof(operation: str, owner: str, observed_digest: str,
 def assess_transition(store, run_id: str, kind: str, request: dict[str, Any]) -> dict[str, Any]:
     from .delivery_execution_config import observation_mode
 
-    with observation_mode():
-        return _assess_transition(store, run_id, kind, request)
+    try:
+        with observation_mode():
+            return _assess_transition(store, run_id, kind, request)
+    except sqlite3.Error:
+        return evaluate_transition({"operation": kind if isinstance(kind, str) else "unknown",
+                                    "owner": "tracking_store", "comparisons": [],
+                                    "predicates": [{
+                                        "code": "tracking_store_unavailable", "satisfied": None,
+                                        "missing_or_unknown_fact": "stable tracking database",
+                                        "next_action": "inspect the tracking store"}]}, {})
 
 
 def _assess_transition(store, run_id: str, kind: str, request: dict[str, Any]) -> dict[str, Any]:
@@ -204,7 +213,7 @@ def _assess_transition(store, run_id: str, kind: str, request: dict[str, Any]) -
         result = preflight(run_id, request)
     except RecoveryRefused as exc:
         return exc.assessment
-    except (ValueError, RuntimeError, OSError):
+    except (ValueError, RuntimeError, OSError, sqlite3.Error):
         # Owner proof was not obtained. Do not classify failures by message text.
         return unknown(kind)
     if not isinstance(result, dict):
