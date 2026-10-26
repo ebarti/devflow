@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -171,14 +172,16 @@ def ci_case(service, monkeypatch):
     )
 
 
+@asynccontextmanager
 async def public(case):
     app = create_app(case.store.config.path)
     host = case.store.config.dashboard_url
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 10001)), base_url=host
     )
-    token = (await client.get("/api/session")).json()["csrf_token"]
-    return client, {"Origin": host, "X-Devflow-CSRF": token}
+    async with client:
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        yield client, {"Origin": host, "X-Devflow-CSRF": token}
 
 
 @pytest.mark.asyncio
@@ -196,8 +199,7 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
     with c.store._connect() as db:
         rows = [dict(r) for r in db.execute("SELECT * FROM delivery_runs")]
         events = [dict(r) for r in db.execute("SELECT * FROM delivery_events")]
-    client, headers = await public(c)
-    async with client:
+    async with public(c) as (client, headers):
         path = "/api/runs/run-1/"
         pre = await client.post(path + "ci-inventory-preflight", json=c.command)
         assert pre.status_code == 200, pre.text

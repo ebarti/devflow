@@ -216,3 +216,54 @@ def test_profile_mutation_is_inert_even_with_self_consistent_new_hashes(monkeypa
     case.profile = other
     with pytest.raises(ValueError, match="reviewed"):
         observed(case)
+
+
+def test_successful_ordinary_execution_inventory_cannot_satisfy_merge_context(
+    monkeypatch, tmp_path
+):
+    from devflow_temporal.delivery_merge import MergeBroker
+
+    case = fixture()
+    approve(monkeypatch, case)
+    result, _ = observed(case)
+    assert result["state"] == "passed" and result["merge_context_verified"] is False
+    repo, head = case.profile["subject"]["repository"], case.profile["subject"]["head"]
+    base, hosted = "6" * 40, "7" * 40
+    broker = object.__new__(MergeBroker)
+    broker.spec = {
+        "github_repo": repo,
+        "base_sha": base,
+        "policy": {"required_ci": case.profile["required_ci"]},
+    }
+    broker.root = tmp_path / "merge"
+
+    def api(endpoint):
+        if endpoint == f"repos/{repo}/git/commits/{hosted}":
+            return {
+                "sha": hosted,
+                "tree": {"sha": case.profile["subject"]["tree"]},
+                "parents": [{"sha": base}, {"sha": head}],
+            }
+        if endpoint.endswith("/check-runs?per_page=100"):
+            value = copy.deepcopy(case.data[f"repos/{repo}/commits/{head}/check-runs"])
+            value["total_count"] = len(value["check_runs"])
+            return value
+        if "/actions/jobs/" in endpoint:
+            identity = int(endpoint.rsplit("/", 1)[1])
+            return next(
+                j
+                for value in case.data.values()
+                if isinstance(value, dict)
+                for j in value.get("jobs", [])
+                if j["id"] == identity
+            )
+        return copy.deepcopy(case.data[endpoint])
+
+    broker.api = api
+    with pytest.raises(ValueError, match="different head, trigger or attempt"):
+        broker.live_ci(
+            {"head": head},
+            {"state": "open", "merged": False, "base": {"sha": base}, "merge_commit_sha": hosted},
+            case.profile["subject"]["tree"],
+        )
+    assert not broker.root.exists()
