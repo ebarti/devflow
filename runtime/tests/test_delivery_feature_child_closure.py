@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
-from test_delivery_feature_merge import setup_feature
+from test_delivery_feature_merge import previously_submitted, setup_feature
 from test_delivery_store import service as legacy_service
 
 from devflow_temporal import delivery_feature_merge as merger
@@ -19,17 +18,17 @@ service = legacy_service
 
 def test_child_closure_intents_name_only_its_required_confirmed_chunks(service, monkeypatch):
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
+    previously_submitted(store, spec, record, requested, command)
+    gh.merged = {20, 21, 22}
     commands = []
 
     def execute(argv, **_kwargs):
-        assert not gh.closed
         commands.append(argv)
-        gh.merged = {20, 21, 22}
-        return SimpleNamespace(returncode=0)
+        pytest.fail("must reconcile the retained stack submission")
 
     result = merger.merge(store, spec, requested, command, gh=gh, execute=execute)
     assert result["state"] == "confirmed" and result["stack_id"] == 42
-    assert commands == [["gh", "stack", "merge", "42", "--yes", "--squash"]]
+    assert commands == []
     shared = registry(spec)
     with shared.connect() as db:
         requests = [
@@ -45,15 +44,16 @@ def test_child_closure_intents_name_only_its_required_confirmed_chunks(service, 
     assert [item["number"] for item in by_issue["I_11"]["merges"]] == [21]
     assert by_issue["I_feature"]["required_chunks"] == ["model", "client", "endpoint"]
     assert merger.merge(store, spec, requested, command, gh=gh, execute=execute) == result
-    assert len(commands) == 1
+    assert commands == []
 
 
 def test_an_early_child_chunk_merge_cannot_close_that_child_or_the_parent(service, monkeypatch):
-    store, spec, _record, requested, command, gh = setup_feature(service, monkeypatch)
+    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
+    previously_submitted(store, spec, record, requested, command)
+    gh.merged = {20}
 
     def execute(_argv, **_kwargs):
-        gh.merged = {20}
-        return SimpleNamespace(returncode=0)
+        pytest.fail("must reconcile the retained stack submission")
 
     result = merger.merge(store, spec, requested, command, gh=gh, execute=execute)
     assert result["state"] == "pending"

@@ -202,9 +202,19 @@ an identical command always reads back its original acknowledgement.
 
 The merge boundary rereads the recorded stack and PR IDs, verifies the exact
 native evidence and required GitHub checks, and requires strict trunk protection
-without bypass actors. It uses `gh stack merge <number> --yes --squash` once for a
-stack, or a head-bound `gh pr merge` for one chunk. Unknown submission results are
-read back without blind replay. Unowned source changes cannot reuse previous
+without bypass actors. A non-stack single PR uses a head-bound `gh pr merge`.
+New native-stack merge submissions currently refuse with
+`stack_member_head_condition_unavailable` before creating a merge intent or
+changing a branch. GitHub's documented asynchronous API can condition the selected
+PR head, but it cannot condition every lower member and stack membership
+([documented request fields](https://github.com/github/gh-stack/blob/main/docs/src/content/docs/reference/merge-api.md)). A
+selected-head condition or another preflight read is insufficient to authenticate
+the complete irreversible mutation. Stack creation, publication and review remain
+available; existing submitted or merged stack effects retain their read-only
+reconciliation path. Enabling new stack merges requires a supported server-side
+condition for the whole qualified membership and head vector, without weakening
+the current rules or evidence requirements. Unknown submission results are read
+back without blind replay. Unowned source changes cannot reuse previous
 proof. Mechanical target reconciliation retains original source evidence and
 requires fresh current-target CI. Only confirmed merges whose trees match the verified
 chunks and are incorporated into the target close the issues. An incomplete

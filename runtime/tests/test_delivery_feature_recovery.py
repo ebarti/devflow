@@ -239,13 +239,13 @@ def test_integration_pass_retains_evidence_and_imports_without_force(service, mo
 
 @pytest.mark.parametrize("stale_pr_base", [False, True], ids=["current-pr-base", "stale-pr-base"])
 @pytest.mark.parametrize("plan_revision", [1, 2], ids=["original-plan", "revised-plan"])
-async def test_successor_reintegrates_completed_stack_after_target_moves(
+async def test_successor_reintegrates_published_single_pr_after_target_moves(
     service, monkeypatch, stale_pr_base, plan_revision,
 ):
     from types import SimpleNamespace
 
     monkeypatch.setattr(protocol.workflow, "patched", lambda _marker: False)
-    store, original, record, _, _, gh = setup_feature(service, monkeypatch)
+    store, original, record, _, _, gh = setup_feature(service, monkeypatch, single=True)
     shared, old_token = registry(original), original["feature_delivery"]["owner"]
     members = record["manifest"]["publication"]["members"]
     specifications = {}
@@ -377,9 +377,10 @@ async def test_successor_reintegrates_completed_stack_after_target_moves(
     monkeypatch.setattr(protocol.workflow, "wait_condition", explicit_merge)
     result = await protocol.coordinate(controller, spec)
     assert result["phase"] == "merged", result.get("error")
-    assert integrations == ["model", "client", "endpoint"]
-    assert len(commands) == 1 and commands[0][3] == "42"
-    assert [member["number"] for member in members] == [20, 21, 22]
+    assert integrations == ["model"]
+    assert commands == [["gh", "pr", "merge", "20", "--repo", "example/fixture",
+                         "--squash", "--match-head-commit", members[0]["head"]]]
+    assert [member["number"] for member in members] == [20]
     assert shared.checkpoints("I_feature")["verified:model"]["run_id"] == "original-model"
     assert checkpoints(spec)["verified:model"]["run_id"] == "integrated-model"
     assert shared.budget("I_feature")["used"] == 1
