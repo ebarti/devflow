@@ -224,6 +224,7 @@ def evidence(spec, state, attempts, previous, broker, *, resource_spec=None):
 
 
 def observe(store, spec, row, state, attempts, effects, closed, previous, broker):
+    from .delivery_amendment_capacity import live_owner
     from .delivery_policy_recovery import _rows, work_binding
     from .delivery_resources import observe_completed_resources
     from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
@@ -246,10 +247,23 @@ def observe(store, spec, row, state, attempts, effects, closed, previous, broker
             or store.state.claim_for(db, spec["work_id"]) is not None
         ):
             raise ValueError("published prerequisite current records or issue authority changed")
+        if (
+            db.execute(
+                "SELECT 1 FROM delivery_mutations WHERE run_id=? "
+                "AND (state!='complete' OR kind='cancel')",
+                (spec["run_id"],),
+            ).fetchone()
+            or db.execute(
+                "SELECT 1 FROM delivery_outbox WHERE run_id=? AND state!='sent'", (spec["run_id"],)
+            ).fetchone()
+        ):
+            raise ValueError("published prerequisite has unfinished delivery authority")
+        _, owner = live_owner(spec, db=db)
     return {
         **proof,
         "resources": resources,
         "work_binding": binding,
+        "operational_owner": owner,
         "closed_sha256": digest(closed),
     }
 
@@ -306,9 +320,11 @@ def authority(spec, recovery):
 
 
 def validate(store, spec, recovery, *, resource_spec=None):
+    from .delivery_amendment_capacity import live_owner
     from .delivery_feature_revision_subject import ObservationBroker
     from .delivery_gate_retry import _rows, gate_namespace
     from .delivery_listener_verification import historical_records
+    from .delivery_policy_recovery import work_binding
     from .delivery_stopped_resume import observed_preparation_cleanup
     from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
 
@@ -350,3 +366,9 @@ def validate(store, spec, recovery, *, resource_spec=None):
         or claim["owner"] != "external:devflow:" + spec["run_id"]
     ):
         raise ValueError("published prerequisite lost its current owned claim")
+    with store._connect() as db:
+        if (
+            work_binding(store, spec, db) != proof["work_binding"]
+            or live_owner(before, db=db)[1] != proof["operational_owner"]
+        ):
+            raise ValueError("published prerequisite current issue or operational owner changed")
