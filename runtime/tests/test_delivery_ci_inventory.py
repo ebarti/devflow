@@ -204,6 +204,8 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
         pre = await client.post(path + "ci-inventory-preflight", json=c.command)
         assert pre.status_code == 200, pre.text
         assert pre.json()["delivery_acceptance"] is False
+        assert pre.json()["ci_assessment"]["execution"]["state"] == "observed"
+        assert pre.json()["ci_assessment"]["delivery_policy"]["state"] == "not_evaluated"
         assert not (await client.get(path + "ci-inventory")).status_code == 200
         ack = {
             **c.command,
@@ -217,6 +219,8 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
         assert receipt["PR_ruleset_eligibility"] is False
         assert receipt["merge_context_verified"] is False
         assert receipt["additional_iterations"] == 0
+        assert receipt["ci_assessment"]["pr_eligibility"]["state"] == "not_established"
+        assert receipt["ci_assessment"]["merge_readiness"]["state"] == "unverified"
         replay = await client.post(path + "ack-ci-inventory", json=ack, headers=headers)
         assert replay.status_code == 200 and replay.json()["replayed"] is True, replay.text
         foreign = await client.post(

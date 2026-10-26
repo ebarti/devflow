@@ -360,8 +360,10 @@ def fixture(
 def approve(monkeypatch, case):
     from devflow_temporal import delivery_ci_inventory as owner
     from devflow_temporal import delivery_ci_inventory_contract as contract
+    from devflow_temporal import delivery_ci_teardown as teardown
 
     sha = digest(case.profile)
     monkeypatch.setattr(contract, "APPROVED_PROFILE_SHA256", sha)
     monkeypatch.setattr(owner, "APPROVED_PROFILE_SHA256", sha)
+    monkeypatch.setattr(teardown, "APPROVED_PROFILE_SHA256", sha)
     return sha

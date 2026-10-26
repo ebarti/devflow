@@ -14,6 +14,7 @@ from .contracts import canonical_json, digest
 from .delivery_ci_inventory_contract import APPROVED_PROFILE_SHA256, approved_profile
 from .delivery_ci_inventory_io import MAX_JSON, MAX_LOG, GitHubRead, owned_bytes, publish
 from .delivery_ci_inventory_observation import METHOD, collect
+from .delivery_ci_inventory_state import assessment
 
 KIND = "ordinary_ci_execution_inventory"
 ACK = "ordinary_execution_only_no_PR_ruleset_or_merge_eligibility"
@@ -118,6 +119,8 @@ def _compact(seal):
         "previous_digest": seal["previous_digest"],
         "stage": seal["stage"],
         "generation": seal["generation"],
+        **({'ci_inventory_historical_teardown': seal['ci_inventory_historical_teardown']}
+           if 'ci_inventory_historical_teardown' in seal else {}),
     }
 
 
@@ -166,7 +169,7 @@ def _authority(store, run_id, command, profile):
     require_not_pending(store.config)
 
     readonly = store if store.read_only else DeliveryStore(store.config, read_only=True)
-    seal = snapshot(readonly, run_id, CI_KIND)
+    seal = snapshot(readonly, run_id, CI_KIND, _inventory_profile=profile)
     spec, row, candidate = seal["original_spec"], seal["row"], seal["candidate"]
     _subject(spec, candidate, seal["publication"], profile)
     if (
@@ -255,6 +258,9 @@ def preflight(store, run_id, payload):
         "merge_context_verified": False,
         "delivery_acceptance": False,
         "additional_iterations": 0,
+        "ci_assessment": assessment(
+            "not_evaluated", profile["subject"]["head"], source=METHOD,
+            complete=True, required=profile["required_ci"], execution_only=True),
     }
 
 
@@ -346,6 +352,9 @@ def acknowledge(store, run_id, payload):
         "merge_context_verified": False,
         "delivery_acceptance": False,
         "additional_iterations": 0,
+        "ci_assessment": assessment(
+            "not_evaluated", profile["subject"]["head"], source=METHOD,
+            complete=True, required=profile["required_ci"], execution_only=True),
     }
     from .delivery_gate_retry import _sealed_row
     from .delivery_policy_recovery import work_binding
@@ -561,6 +570,9 @@ def authority(store, recovery):
         raise ValueError("ordinary CI execution changed its one finite original admission")
     _subject(before, recovery["seal"]["candidate"], recovery["seal"]["publication"], profile)
     _gate_acknowledgement(store, recovery)
+    from .delivery_ci_teardown import validate as validate_teardown
+
+    validate_teardown(store, recovery, profile)
     return response, receipt, profile
 
 
@@ -713,6 +725,9 @@ def result_for(broker, pr, *, timeout_seconds=None):
         "state": "passed",
         "head": profile["subject"]["head"],
         "checks": facts["checks"],
+        "ci_assessment": assessment(
+            "passed", profile["subject"]["head"], source=METHOD,
+            complete=True, required=profile["required_ci"], execution_only=True),
         "execution_inventory": {
             "method": METHOD,
             "receipt": reference,

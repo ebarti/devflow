@@ -923,6 +923,7 @@ class RunResources:
     def _closed_journals(self, manifest: dict, paths, *, unstarted=()):
         """Hold the original native leases while observing exact process closure."""
         from .delivery_native_process import (
+            interrupted_cleanup_proven,
             launch_binding,
             listeners,
             lost_monitor_without_provider,
@@ -933,6 +934,12 @@ class RunResources:
         role_leases = ExitStack()
         execution_specs, completed_intakes = {}, []
         _gate_roots(self.spec, execution_specs=execution_specs, completed_intakes=completed_intakes)
+        from .delivery_ci_teardown import for_resources
+
+        ci_teardown = for_resources(self.spec)
+        quarantine = (ci_teardown or {}).get('journal_sha256', {})
+        if not set(quarantine).issubset(manifest['processes']):
+            raise ValueError('CI historical journal is no longer registered')
         try:
             for folder in unstarted:
                 journal = folder / 'native-process.json'
@@ -966,7 +973,8 @@ class RunResources:
                 if (str(path) not in manifest['processes'] or path.resolve(strict=True) != path
                         or not path.is_relative_to(self.state)):
                     raise ValueError('disposable output lost its registered native journal')
-                value = read_private(path)
+                journal_bytes = read_private(path, raw=True)
+                value = json.loads(journal_bytes)
                 execution = execution_specs[max(
                     (root for root in execution_specs if path.is_relative_to(root)),
                     key=lambda root: len(root.parts))]
@@ -976,6 +984,13 @@ class RunResources:
                     else execution['policy_digest']) or execution['policy_digest']
                 role_attempt = (path.name == 'native-process.json'
                                 and path.parent.parent == self.state / 'attempts')
+                quarantined_role = (str(path) in quarantine and role_attempt
+                    and hashlib.sha256(journal_bytes).hexdigest() == quarantine[str(path)]
+                    and interrupted_cleanup_proven(value)
+                    and value.get('cleanup_reconciliation', {}).get('version') == 1
+                    and value.get('result', {}).get('provider_outcome') == 'unknown')
+                if str(path) in quarantine and not quarantined_role:
+                    raise ValueError('CI historical teardown binding changed')
                 request, row = None, None
                 if role_attempt:
                     from .delivery_execution_config import load_execution_config
@@ -1016,7 +1031,8 @@ class RunResources:
                         or value.get('phase') != 'finished'
                         or (value.get('monitoring_complete') is not True
                             and not lost_monitor_without_provider(
-                                value, role_attempt=role_attempt))):
+                                value, role_attempt=role_attempt)
+                            and not quarantined_role)):
                     raise ValueError('registered native process closure is unconfirmed')
                 # The completed-role validator already holds these exact leases.
                 for name in (() if historical_role else (
@@ -1050,10 +1066,12 @@ class RunResources:
                 if (any(table.get(pid, {}).get('identity') == actor['identity']
                         and not table[pid]['stat'].startswith('Z') for pid, actor in actors.items())
                         or any(listeners(port) for port in value.get('ports', []))
-                        or digest(read_private(path)) != digest(value)):
+                        or read_private(path, raw=True) != journal_bytes):
                     raise ValueError('registered native processes or ports remain active')
                 receipts.append({'journal': str(path),
-                                 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+                                 'sha256': hashlib.sha256(journal_bytes).hexdigest()})
+            if for_resources(self.spec) != ci_teardown:
+                raise ValueError('CI historical disposal authority changed under its leases')
             yield receipts
         finally:
             for descriptor in reversed(descriptors):

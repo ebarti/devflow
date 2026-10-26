@@ -16,6 +16,7 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_activities, delivery_broker
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_config import DeliveryConfig, scope_amended_spec
+from devflow_temporal.delivery_ci_inventory_io import GitHubRead, PRHeadChanged
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -47,15 +48,17 @@ async def observe(monkeypatch, *, limit=10800, mode="slow", legacy=False):
         conclusion = "SUCCESS" if clock.seconds >= 1800 else None
         if mode == "failure":
             conclusion = "FAILURE"
-        head = "replacement" if mode == "changed_head" else "candidate"
-        return json.dumps({"headRefOid": head, "statusCheckRollup": [
-            {"__typename": "CheckRun", "name": "Build", "conclusion": conclusion},
-        ]})
+        if mode == "changed_head":
+            raise PRHeadChanged("owned changed-head response")
+        return {"complete": True, "contexts": [
+            {"__typename": "CheckRun", "id": "owned-build", "name": "Build",
+             "status": "COMPLETED" if conclusion else "IN_PROGRESS", "conclusion": conclusion},
+        ]}
 
     async def off_loop(function, *args, **kwargs):
         return function(*args, **kwargs)
 
-    monkeypatch.setattr(delivery_broker, "_run", readback)
+    monkeypatch.setattr(GitHubRead, "rollup", readback)
     monkeypatch.setattr(delivery_broker.asyncio, "get_running_loop", lambda: clock)
     monkeypatch.setattr(delivery_broker.asyncio, "sleep", clock.sleep)
     monkeypatch.setattr(delivery_broker.asyncio, "to_thread", off_loop)
@@ -116,11 +119,12 @@ async def test_github_read_does_not_block_worker_event_loop(monkeypatch):
         started.set()
         # The watchdog prevents this regression from hanging the test suite.
         release.wait(1)
-        return json.dumps({"headRefOid": "candidate", "statusCheckRollup": [
-            {"__typename": "CheckRun", "name": "Build", "conclusion": "SUCCESS"},
-        ]})
+        return {"complete": True, "contexts": [
+            {"__typename": "CheckRun", "id": "owned-build", "name": "Build",
+             "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]}
 
-    monkeypatch.setattr(delivery_broker, "_run", readback)
+    monkeypatch.setattr(GitHubRead, "rollup", readback)
     pending = asyncio.create_task(broker.checks({"number": 1, "head": "candidate"}))
     try:
         while not started.is_set():

@@ -32,6 +32,10 @@ __typename ... on CheckRun{id name status conclusion detailsUrl}
 pageInfo{hasNextPage endCursor}}}}}}}}}"""
 
 
+class PRHeadChanged(ValueError):
+    """A complete read observed a different candidate, never pending CI."""
+
+
 def sha256(raw):
     return hashlib.sha256(raw).hexdigest()
 
@@ -467,6 +471,8 @@ class GitHubRead:
             if not isinstance(value, dict) or value.get("errors"):
                 raise ValueError("CI inventory canonical PR query is incomplete")
             pr = (value.get("data", {}).get("repository") or {}).get("pullRequest")
+            if isinstance(pr, dict) and pr.get("headRefOid") != head:
+                raise PRHeadChanged("CI inventory canonical PR head changed")
             if (
                 not isinstance(pr, dict)
                 or pr.get("number") != number
