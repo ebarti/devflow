@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import shutil
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -547,3 +548,34 @@ async def test_lifecycle_public_preflight_and_ack_agree_on_changed_checkpoint(ci
         for table, rows in before.items():
             assert [dict(row) for row in db.execute("SELECT * FROM " + table)] == rows
         assert not db.execute("SELECT 1 FROM delivery_ci_inventories").fetchone()
+
+
+@pytest.mark.asyncio
+async def test_public_preflight_absent_resource_root_is_read_only(ci_case, monkeypatch):
+    """Missing cleanup evidence must not be replaced by a new resource directory."""
+    from devflow_temporal import delivery_ci_teardown, delivery_gate_retry
+
+    c = ci_case
+    root = c.case.registry.root
+    shutil.rmtree(root)
+    assert not root.exists()
+    observations = []
+    profile_args = []
+    cleanup = delivery_gate_retry._stopped_cleanup
+
+    def no_historical_teardown(store, spec, previous, candidate, publication, profile=None):
+        profile_args.append(profile)
+        return None
+
+    def inspect_cleanup(spec, *, read_only=False):
+        observations.append(read_only)
+        return cleanup(spec, read_only=read_only)
+
+    monkeypatch.setattr(delivery_ci_teardown, "snapshot_cleanup", no_historical_teardown)
+    monkeypatch.setattr(delivery_gate_retry, "_stopped_cleanup", inspect_cleanup)
+    async with public(c) as (client, _headers):
+        response = await client.post("/api/runs/run-1/ci-inventory-preflight", json=c.command)
+    assert response.status_code == 409, response.text
+    assert len(profile_args) == 1 and profile_args[0] is not None
+    assert observations == [True]
+    assert not root.exists()

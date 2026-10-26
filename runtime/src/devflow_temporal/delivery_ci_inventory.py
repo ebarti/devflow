@@ -194,7 +194,7 @@ def _authority(store, run_id, command, profile):
     require_not_pending(store.config)
 
     readonly = store if store.read_only else DeliveryStore(store.config, read_only=True)
-    seal = snapshot(readonly, run_id, CI_KIND, _inventory_profile=profile)
+    seal = snapshot(readonly, run_id, CI_KIND, _inventory_profile=profile, _observation=True)
     spec, row, candidate = seal["original_spec"], seal["row"], seal["candidate"]
     _subject(spec, candidate, seal["publication"], profile)
     if (

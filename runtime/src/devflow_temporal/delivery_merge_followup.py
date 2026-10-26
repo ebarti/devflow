@@ -10,6 +10,8 @@ import asyncio
 import json
 from contextlib import ExitStack
 
+from temporalio.service import RPCError
+
 from .contracts import canonical_json, digest
 from .delivery_lifecycle import RecoveryRefused, evaluate_transition, require_transition
 from .delivery_merge import (
@@ -395,6 +397,16 @@ def _valid_request(request):
     )
 
 
+def _predecessor_closure(store, spec, saved):
+    """Treat unavailable SDK observation as an unknown predecessor, never as proof."""
+    from .delivery_merge_execution import predecessor_closure
+
+    try:
+        return predecessor_closure(store, spec, saved)
+    except RPCError as exc:
+        raise ValueError('predecessor merge closure is unavailable') from exc
+
+
 def assess(store, run_id, request):
     """Inspect current merge authority; assessment does not acquire a grant."""
     try:
@@ -406,28 +418,45 @@ def assess(store, run_id, request):
                                 'next_action': 'provide the explicit merge command',
                                 'new_authorization_required': True}],
             }, {})
-        with store._connect() as db:
-            previous = current(db, run_id)
-        spec, proof, _ = _observe_merge(store, run_id, request, previous)
-        if previous:
-            if not _continuable(previous):
-                raise ValueError('merge already owns a request')
-            original = json.loads(previous['grant_json'])
-            if (_immutable_row(original['row']) != _immutable_row(proof['row'])
-                    or (original.get('native_proof_sha256') is not None
-                        and original['native_proof_sha256'] != digest(_native_proof(proof)))):
-                raise ValueError('merge continuation changed delivered evidence')
-        prelaunch = []
-        if previous and previous['phase'] == 'unknown':
-            from .delivery_merge_resolution import prelaunch_receipts
-            prelaunch = prelaunch_receipts(store, spec, previous)
-        with store._connect() as db:
-            row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
-            if _snapshot(row) != proof['row'] or current(db, run_id) != previous:
-                raise ValueError('merge authority changed during assessment')
-            _exclusive(store, db, row,
-                       retained_owner='external:devflow:' + run_id if prelaunch else None)
-        return evaluate_transition(_lifecycle_facts(proof), request)
+        with ExitStack() as leases:
+            with store._connect() as db:
+                previous = current(db, run_id)
+                prior = db.execute(
+                    'SELECT run_id,request_digest FROM delivery_commands WHERE command_id=?',
+                    (request['command_id'],),
+                ).fetchone()
+            if prior and (prior['run_id'] != run_id or prior['request_digest'] != digest({
+                    'kind': 'merge_run', 'run_id': run_id, 'request': request})):
+                raise ValueError('merge command ID belongs to different inputs')
+            if previous:
+                if not _continuable(previous):
+                    raise ValueError('merge already owns a request')
+                from .delivery_merge_execution import existing_lease
+
+                leases.enter_context(existing_lease(store.config, exclusive=True))
+            spec, proof, _ = _observe_merge(store, run_id, request, previous)
+            if previous:
+                original = json.loads(previous['grant_json'])
+                if (original['spec_sha256'] != digest(spec)
+                        or _immutable_row(original['row']) != _immutable_row(proof['row'])
+                        or (original.get('native_proof_sha256') is not None
+                            and original['native_proof_sha256'] != digest(_native_proof(proof)))):
+                    raise ValueError('merge continuation changed delivered evidence')
+                _predecessor_closure(store, spec, previous)
+            prelaunch = None
+            if previous and previous['phase'] == 'unknown':
+                from .delivery_merge_resolution import prelaunch_receipts
+
+                prelaunch = leases.enter_context(prelaunch_receipts(store, spec, previous))
+            with store._connect() as db:
+                row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
+                if _snapshot(row) != proof['row'] or current(db, run_id) != previous:
+                    raise ValueError('merge authority changed during assessment')
+                _exclusive(store, db, row, prelaunch=prelaunch,
+                           retained_owner='external:devflow:' + run_id if prelaunch else None)
+            if prelaunch:
+                prelaunch.recheck()
+            return evaluate_transition(_lifecycle_facts(proof), request)
     except RecoveryRefused as exc:
         return exc.assessment
     except (ValueError, RuntimeError, OSError, KeyError, TypeError):
@@ -444,10 +473,10 @@ def preflight(store, run_id):
         if saved:
             if not _continuable(saved):
                 raise ValueError("merge already owns a request; read its current result")
-            from .delivery_merge_execution import existing_lease, predecessor_closure
+            from .delivery_merge_execution import existing_lease
 
             leases.enter_context(existing_lease(store.config, exclusive=True))
-            predecessor_closure(store, spec, saved)
+            _predecessor_closure(store, spec, saved)
         prelaunch = None
         if saved and _continuable(saved) and saved['phase'] == 'unknown':
             from .delivery_merge_resolution import prelaunch_receipts
@@ -559,9 +588,7 @@ def _admit(store, run_id, request):
             raise ValueError("merge continuation changed its original delivered evidence")
         grant = original
         response["grant_sha256"] = digest(original)
-        from .delivery_merge_execution import predecessor_closure
-
-        response["predecessor_merge"] = predecessor_closure(store, spec, previous_merge)
+        response["predecessor_merge"] = _predecessor_closure(store, spec, previous_merge)
     with ExitStack() as leases:
         prelaunch = []
         if previous_merge and previous_merge["phase"] == "unknown":
