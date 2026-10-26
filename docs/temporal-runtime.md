@@ -347,6 +347,11 @@ Use dedicated loopback ports that do not conflict with the target project. The r
 A failed process-identity observation is unknown custody, not a dead process.
 Lifecycle commands report that refusal and retain the process inventory and
 worker registration until observation proves exit or a different generation.
+`status` reports each known member normally and an unobservable member with
+`running: null` and `observation: "unknown"`, then exits unsuccessfully. A mixed
+`stop` still settles independently matched members and reports every member's
+result; any `observation_unknown` result makes the command unsuccessful and
+retains the inventory for reconciliation.
 They never signal a PID whose recorded identity could not be matched. An
 explicit `stop` records its intent before settlement, so periodic supervision
 cannot restart a partially stopped stack while visibility recovers. A retained

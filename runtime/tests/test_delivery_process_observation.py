@@ -124,8 +124,11 @@ def test_unknown_after_partial_stop_retains_inventory_and_supervisor_hold(
     monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
     monkeypatch.setattr(control.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(control.os, "killpg", terminate)
-    with pytest.raises(ProcessObservationUnknown, match="member observation unavailable"):
+    with pytest.raises(control.ServiceObservationUnknown, match="stop is pending") as pending:
         control.service_stop(config)
+    assert pending.value.results["worker"] == "observation_unknown"
+    assert pending.value.results["api"] == (
+        "observation_unknown" if failure_stage == "during_member_stop" else "stopped")
     assert signals == [(7001, signal.SIGTERM)]
     assert control._manifest(config).read_bytes() == before
     assert worker_marker.read_text() == "retained registration"
@@ -190,6 +193,8 @@ def test_public_stop_retains_unknown_live_member_then_recovers(tmp_path, recorde
         assert json.loads(control._stopped_marker(config).read_text())["command"] == "stop"
         status = _cli(config, "status", env=unavailable)
         assert status.returncode == 1 and "ownership remains unknown" in status.stderr
+        assert json.loads(status.stdout)["processes"]["api"]["running"] is None
+        assert json.loads(refused.stdout) == {"api": "observation_unknown"}
         restored = _cli(config, "status", env=env)
         assert restored.returncode == 0, restored.stderr
         assert json.loads(restored.stdout)["processes"]["api"]["pid"] == child.pid
@@ -210,3 +215,70 @@ def test_public_stop_retains_unknown_live_member_then_recovers(tmp_path, recorde
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
         child.wait(timeout=5)
+
+
+def test_public_mixed_stack_reports_unknown_member_and_stops_later_known_members(tmp_path):
+    config = _configuration(tmp_path)
+    children = {name: subprocess.Popen(
+        [sys.executable, "-B", "-c", "import time; time.sleep(60)"],
+        start_new_session=True, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ) for name in ("api", "worker", "temporal")}
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+           "PYTHONPATH": str(Path(control.__file__).resolve().parents[1])}
+    try:
+        processes = {name: {"pid": child.pid, "identity": control._process_identity(child.pid)}
+                     for name, child in children.items()}
+        control._write_manifest(config, processes)
+        original = control._manifest(config).read_bytes()
+        marker = config.state_root / "worker-ready.json"
+        marker.write_text("retained registration")
+        adapter = tmp_path / "bin"
+        adapter.mkdir()
+        ps = adapter / "ps"
+        real_ps = "/bin/ps" if Path("/bin/ps").is_file() else "/usr/bin/ps"
+        ps.write_text(
+            '#!/bin/sh\ncase "$*" in\n'
+            f'  "-p {children["api"].pid} -o lstart=") '
+            'echo "fixture: api identity observation unavailable" >&2; exit 1 ;;\n'
+            f'  *) exec {real_ps} "$@" ;;\nesac\n'
+        )
+        ps.chmod(0o700)
+        unavailable = {**env, "PATH": str(adapter) + os.pathsep + os.environ["PATH"]}
+        status = _cli(config, "status", env=unavailable)
+        assert status.returncode == 1, status.stderr
+        members = json.loads(status.stdout)["processes"]
+        assert members["api"]["running"] is None
+        assert members["api"]["observation"] == "unknown"
+        assert members["worker"]["running"] is True
+        assert members["temporal"]["running"] is True
+        stopped = _cli(config, "stop", env=unavailable)
+        assert stopped.returncode == 1, stopped.stderr
+        assert json.loads(stopped.stdout) == {
+            "api": "observation_unknown", "worker": "stopped", "temporal": "stopped",
+        }
+        assert children["api"].poll() is None
+        assert children["worker"].wait(timeout=5) == -signal.SIGTERM
+        assert children["temporal"].wait(timeout=5) == -signal.SIGTERM
+        assert control._manifest(config).read_bytes() == original
+        assert marker.read_text() == "retained registration"
+        assert control._stopped_marker(config).exists()
+        status = _cli(config, "status", env=unavailable)
+        assert status.returncode == 1
+        members = json.loads(status.stdout)["processes"]
+        assert members["api"]["running"] is None
+        assert members["worker"]["running"] is False
+        assert members["temporal"]["running"] is False
+        reconciled = _cli(config, "stop", env=env)
+        assert reconciled.returncode == 0, reconciled.stderr
+        assert json.loads(reconciled.stdout) == {
+            "api": "stopped", "worker": "already_stopped_or_changed",
+            "temporal": "already_stopped_or_changed",
+        }
+        assert children["api"].wait(timeout=5) == -signal.SIGTERM
+        assert not control._manifest(config).exists() and not marker.exists()
+    finally:
+        for child in children.values():
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=5)

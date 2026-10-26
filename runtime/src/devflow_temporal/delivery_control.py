@@ -41,7 +41,20 @@ from .delivery_store import DeliveryStore, _private_directory
 from .delivery_temporal_retention import ensure_namespace_retention
 from .delivery_workflow import DeliveryWorkflow
 from .payload import payload_digest
+from .supervisor import ProcessObservationUnknown
 from .supervisor import _process_identity as _local_identity
+
+
+class ServiceObservationUnknown(ProcessObservationUnknown):
+    """A mixed stop retained custody while reporting each observed member."""
+
+    def __init__(self, results: dict[str, str], errors: dict[str, str]):
+        self.results = results
+        self.errors = errors
+        super().__init__(
+            "service stop is pending; ownership remains unknown for "
+            + ", ".join(errors)
+        )
 
 
 def _config(path: str) -> DeliveryConfig:
@@ -344,17 +357,35 @@ def _stop(config: DeliveryConfig, manifest: dict) -> dict:
     if recorded is None:
         recorded = _recorded_deployment(_read_manifest(config) or {})
     results = {}
+    unknown = {}
     for name in ("api", "worker", "temporal"):
         process = manifest.get("processes", {}).get(name)
         if process is None:
             continue
-        results[name] = _terminate(name, process)
-    if all(not _owned(process) for process in manifest.get("processes", {}).values()):
+        try:
+            results[name] = _terminate(name, process)
+        except ProcessObservationUnknown as exc:
+            results[name] = "observation_unknown"
+            unknown[name] = str(exc)
+    settled = not unknown
+    for name, process in manifest.get("processes", {}).items():
+        if name in unknown:
+            continue
+        try:
+            if _owned(process):
+                settled = False
+        except ProcessObservationUnknown as exc:
+            results[name] = "observation_unknown"
+            unknown[name] = str(exc)
+            settled = False
+    if settled:
         if recorded is None:
             _manifest(config).unlink(missing_ok=True)
         else:
             _write_manifest(config, {}, deployment=recorded)
         (config.state_root / "worker-ready.json").unlink(missing_ok=True)
+    if unknown:
+        raise ServiceObservationUnknown(results, unknown)
     return results
 
 
@@ -1125,20 +1156,37 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     manifest = _read_manifest(config)
     if args.command == "status":
+        processes = {}
+        unknown = []
+        for name, process in (manifest or {}).get("processes", {}).items():
+            try:
+                processes[name] = {**process, "running": _owned(process)}
+            except ProcessObservationUnknown as exc:
+                processes[name] = {
+                    **process, "running": None, "observation": "unknown", "error": str(exc),
+                }
+                unknown.append(name)
         print(
             json.dumps(
                 {
                     "dashboard_url": config.dashboard_url,
-                    "processes": {
-                        name: {**process, "running": _owned(process)}
-                        for name, process in (manifest or {}).get("processes", {}).items()
-                    },
+                    "processes": processes,
                 },
                 sort_keys=True,
             )
         )
+        if unknown:
+            raise ProcessObservationUnknown(
+                "service observation is incomplete; ownership remains unknown for "
+                + ", ".join(unknown)
+            )
         return
-    print(json.dumps(service_stop(config), sort_keys=True))
+    try:
+        result = service_stop(config)
+    except ServiceObservationUnknown as exc:
+        print(json.dumps(exc.results, sort_keys=True))
+        raise
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
