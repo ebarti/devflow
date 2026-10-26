@@ -49,11 +49,20 @@ def _recovery_conflict_detail(exc: Exception) -> Any:
     if isinstance(exc, RecoveryRefused):
         return exc.assessment
     if isinstance(exc, sqlite3.Error):
-        return evaluate_transition({"operation": "unknown", "owner": "tracking_store",
+        from .delivery_feature_revision_subject import FeatureRegistryObservationError
+
+        feature = isinstance(exc, FeatureRegistryObservationError)
+        return evaluate_transition({"operation": "unknown",
+                                    "owner": "feature_registry" if feature else "tracking_store",
                                     "comparisons": [], "predicates": [{
-                                        "code": "tracking_store_unavailable", "satisfied": None,
-                                        "missing_or_unknown_fact": "existing tracking database",
-                                        "next_action": "restore the tracking store"}]}, {})
+                                        "code": ("feature_registry_proof_unknown" if feature else
+                                                 "tracking_store_unavailable"),
+                                        "satisfied": None,
+                                        "missing_or_unknown_fact": (
+                                            "stable feature registry" if feature else
+                                            "stable tracking database"),
+                                        "next_action": ("inspect the feature registry" if feature
+                                                        else "inspect the tracking store")}]}, {})
     return str(exc)
 
 

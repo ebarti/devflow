@@ -47,3 +47,13 @@ def test_cli_assessment_uses_existing_read_only_client(tmp_path, monkeypatch, ca
     delivery_control.main()
     assert json.loads(capsys.readouterr().out)['blockers'][0]['code'] == 'owner_proof_unknown'
     assert calls == [('run-1', 'stopped_delivery_resume', {'expected_revision': 5})]
+
+
+def test_direct_preflight_reports_the_registry_owner_when_snapshot_changes():
+    from devflow_temporal.delivery_api import _recovery_conflict_detail
+    from devflow_temporal.delivery_feature_revision_subject import FeatureRegistryObservationError
+
+    assessment = _recovery_conflict_detail(FeatureRegistryObservationError('unavailable'))
+    assert assessment['blockers'][0]['owner'] == 'feature_registry'
+    assert assessment['blockers'][1]['code'] == 'feature_registry_proof_unknown'
+    assert assessment['blockers'][1]['satisfied'] is None
