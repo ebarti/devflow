@@ -6,7 +6,9 @@ export function DurableOperations({ runId }: { runId: string }) {
   const [error, setError] = useState('')
   const refresh = useCallback(async () => {
     try {
-      setItems((await api.runOperations(runId)).operations)
+      const result = await api.runOperations(runId)
+      if (!Array.isArray(result?.operations)) throw new Error('Operation status is unavailable')
+      setItems(result.operations)
       setError('')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Operations unavailable')
@@ -20,7 +22,7 @@ export function DurableOperations({ runId }: { runId: string }) {
   if (!items.length && !error) return null
   return <section aria-label="Durable operations">
     <h2>Durable operations</h2>
-    {error ? <p role="alert">{error}</p> : null}
+    {error ? <p role="status">{error}</p> : null}
     {items.map(item => <div key={item.operation_id}>
       <strong>{item.kind}</strong> · {item.state} · {item.progress}
       <p>Operation {item.operation_id}. Next action: {item.next_action}.</p>

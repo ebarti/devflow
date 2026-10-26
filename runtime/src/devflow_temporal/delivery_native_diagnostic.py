@@ -714,10 +714,10 @@ def indexed_evidence(spec, row):
 
 async def dispatch_once(service):
     """Dispatch a durable queued identity once; a running identity is never relaunched."""
+    import time
+
     from .delivery_activities import _execute_check
     from .delivery_preparation import execution_retired
-
-    import time
 
     if not getattr(service, "_native_diagnostic_pending", True):
         return
@@ -752,9 +752,13 @@ async def dispatch_once(service):
             continue
         try:
             spec = await asyncio.to_thread(service.store.effective_spec, row["run_id"])
-            if execution_retired(spec) or not await asyncio.to_thread(
-                service.store.owns_execution, spec
-            ):
+            if execution_retired(spec):
+                continue
+            if not await asyncio.to_thread(service.store.owns_execution, spec):
+                # Ownership may become observable again after a transient loss.
+                # Keep a bounded wake hint, without authorizing execution here.
+                service._native_diagnostic_pending = True
+                service._native_diagnostic_retry_at = time.monotonic() + 5
                 continue
         except (ValueError, RuntimeError, OSError, KeyError):
             # Keep the wake hint for bounded retry after transient observation

@@ -76,7 +76,9 @@ def build_server(config_path: Path) -> FastMCP:
     @server.tool(annotations=write)
     async def reconcile_operation(operation_id: str) -> dict:
         """Inspect the original domain receipt without repeating the effect."""
-        return await asyncio.to_thread(read_only_client(config_path).reconcile_operation, operation_id)
+        return await asyncio.to_thread(
+            read_only_client(config_path).reconcile_operation, operation_id
+        )
 
     @server.tool(annotations=read)
     def get_service() -> dict:

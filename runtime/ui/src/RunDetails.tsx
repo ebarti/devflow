@@ -412,9 +412,19 @@ function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise
     }
     setBody(request); setBusy(true); setError('')
     try {
-      await api.merge(run.id, request)
-      setBody(null)
-      await onRefresh()
+      const operation = await api.createOperation({
+        operation_id: `merge:${request.command_id}`, run_id: run.id, kind: 'merge', request,
+      })
+      if (operation.state === 'succeeded') {
+        setBody(null)
+        await onRefresh()
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        setBody(null)
+        setError(operation.error || 'Merge admission was refused.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Merge admission could not be confirmed.')
       if (cause instanceof ApiError && cause.status === 409) setBody(null)

@@ -984,8 +984,11 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         else:
             if not args.id:
                 parser.error("--id is required")
-            result = {"operation": caller.operation, "operation-reconcile": caller.reconcile_operation,
-                      "run-operations": caller.run_operations}[args.command](args.id)
+            result = {
+                "operation": caller.operation,
+                "operation-reconcile": caller.reconcile_operation,
+                "run-operations": caller.run_operations,
+            }[args.command](args.id)
         print(json.dumps(result, sort_keys=True, indent=2))
         return
     if args.command == "capture-retained-closures":

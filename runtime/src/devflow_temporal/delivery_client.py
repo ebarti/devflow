@@ -74,7 +74,9 @@ class DeliveryClient:
         return self._request("GET", "/api/runs/" + quote(run_id, safe="") + "/operations")
 
     def reconcile_operation(self, operation_id: str) -> dict:
-        return self._request("POST", "/api/operations/" + quote(operation_id, safe="") + "/reconcile", {})
+        return self._request(
+            "POST", "/api/operations/" + quote(operation_id, safe="") + "/reconcile", {}
+        )
 
     def submit(self, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs", payload)
