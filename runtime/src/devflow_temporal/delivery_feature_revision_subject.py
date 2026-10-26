@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import stat
 from contextlib import contextmanager
 from datetime import datetime
@@ -35,34 +34,11 @@ class _ReadOnlyRegistry(ExecutionRegistry):
         _ancestors(self.path)
         if not self.path.is_absolute() or self.path.resolve(strict=True) != self.path:
             raise ValueError("retained observation requires the existing canonical registry")
-        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
-                raise ValueError("retained observation registry is not a private owned file")
-            header = os.read(fd, 100)
-            if (len(header) != 100 or header[:16] != b"SQLite format 3\x00"
-                    or header[18:20] != b"\x01\x01"
-                    or any(os.path.lexists(str(self.path) + suffix)
-                           for suffix in ("-wal", "-shm", "-journal"))):
-                # A read-only SQLite connection can create WAL sidecars. Do not
-                # use immutable=1: it can hide committed, uncheckpointed rows.
-                raise ValueError("retained observation requires a settled rollback registry")
-            db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30)
-            try:
-                observed = self.path.lstat()
-                keys = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink")
-                if any(getattr(observed, key) != getattr(info, key) for key in keys):
-                    raise ValueError("retained observation registry was replaced")
-                db.row_factory = sqlite3.Row
-                db.execute("PRAGMA query_only=ON")
-                db.execute("BEGIN")
-                yield db
-            finally:
-                db.close()
-        finally:
-            os.close(fd)
+        from .delivery_feature_handoff import readonly_registry_database
+
+        with readonly_registry_database(self.path, require_rollback=True) as db:
+            db.execute("BEGIN")
+            yield db
 
     def checkpoints(self, issue_id):
         with self.connect() as db:

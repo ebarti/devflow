@@ -109,6 +109,7 @@ def test_retired_adjudication_public_assessment_matches_execution(publication):
                "controller_path": "/controller", "controller_sha256": "d" * 64}
     observed = assess_transition(store, "run-1", adjudication.KIND, payload)
     assert observed["eligible"] is False
+    assert observed["normalized_lifecycle"] == "unknown"
     assert "adjudication_admission_retired" in {b["code"] for b in observed["blockers"]}
     with pytest.raises(RecoveryRefused) as refused:
         store.continue_repair("run-1", payload)

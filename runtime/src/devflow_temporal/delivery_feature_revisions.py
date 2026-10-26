@@ -291,8 +291,8 @@ def _assert_identity(record, identity):
     return observed
 
 
-def _worker_candidates(store, spec):
-    values = _values(spec)
+def _worker_candidates(store, spec, *, shared=None):
+    values = _values(spec, shared)
     result = {}
     for key, assignment in values.items():
         if "assignment:" not in key or not isinstance(assignment, dict):
@@ -310,7 +310,7 @@ def _worker_candidates(store, spec):
     return result
 
 
-def validate_diagnostic(store, spec, diagnostic, *, identity=None, candidate_id=None):
+def validate_diagnostic(store, spec, diagnostic, *, identity=None, candidate_id=None, shared=None):
     from .delivery_feature_execution import plan_for
     from .delivery_github_contract import ordered_chunks
 
@@ -336,14 +336,14 @@ def validate_diagnostic(store, spec, diagnostic, *, identity=None, candidate_id=
         raise OwnershipConflict("planning diagnostic refers to a stale plan revision")
     if diagnostic["chunk_id"] not in {item["id"] for item in ordered_chunks(plan_for(spec))}:
         raise ValueError("planning diagnostic names an unknown chunk")
-    candidates = _worker_candidates(store, spec).get(diagnostic["chunk_id"], set())
+    candidates = _worker_candidates(store, spec, shared=shared).get(diagnostic["chunk_id"], set())
     if candidate_id:
         candidates.add(candidate_id)
     if diagnostic["candidate_id"] not in candidates:
         raise OwnershipConflict("planning diagnostic candidate has no matching execution evidence")
     if not diagnostic["evidence"]:
         raise ValueError("planning defect requires durable evidence")
-    _evidence(store, spec, diagnostic["evidence"])
+    _evidence(store, spec, diagnostic["evidence"], shared=shared)
     return deepcopy(diagnostic)
 
 
@@ -543,16 +543,22 @@ def assess_feature_revision(store, run_id, request):
                 _validate_revision_submission_binding(prospective, admission, spec, admission)
                 facts["proof_digest"] = digest({"owner": facts["proof_digest"],
                                                 "revision_admission": admission})
-            successor = observe_handoff(store, run_id, inner, operation="continue_feature",
-                                         **({"revision_admission": admission} if saved else {}))
-            facts["predicates"].extend({"code": item["code"], "satisfied": item.get("satisfied"),
-                "owner": item["owner"], "missing_or_unknown_fact": item["missing_or_unknown_fact"],
-                "next_action": item["next_action"],
-                "new_authorization_required": item["new_authorization_required"]}
-                for item in successor["blockers"])
-            facts["proof_digest"] = digest({"revision": facts["proof_digest"],
-                                            "successor": successor["proof_digest"]})
-            return evaluate_transition(facts, request)
+                unknown["predicates"][0].update(
+                    code="feature_revision_registry_changed",
+                    missing_or_unknown_fact="stable feature registry through successor assessment",
+                    next_action="refresh the feature revision checkpoint")
+                successor = observe_handoff(store, run_id, inner, operation="continue_feature",
+                                             **({"revision_admission": admission} if saved else {}))
+                facts["predicates"].extend(
+                    {"code": item["code"], "satisfied": item.get("satisfied"),
+                     "owner": item["owner"],
+                     "missing_or_unknown_fact": item["missing_or_unknown_fact"],
+                     "next_action": item["next_action"],
+                     "new_authorization_required": item["new_authorization_required"]}
+                    for item in successor["blockers"])
+                facts["proof_digest"] = digest({"revision": facts["proof_digest"],
+                                                "successor": successor["proof_digest"]})
+                return evaluate_transition(facts, request)
         except (AttributeError, OSError, RuntimeError, ValueError, KeyError, TypeError):
             if facts is not None:
                 facts["predicates"].extend(unknown["predicates"])

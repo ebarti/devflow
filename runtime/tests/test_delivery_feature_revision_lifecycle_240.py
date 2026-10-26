@@ -296,3 +296,75 @@ def test_recovered_child_evidence_uses_immutable_existing_custody(findings_recon
     with store._connect() as db:
         assert list(db.iterdump()) == tracking
     assert revise_feature_plan(store, parent["run_id"], command)["revision_id"]
+
+
+@pytest.mark.asyncio
+async def test_public_revision_unreadable_closure_is_unknown(stopped, monkeypatch):
+    import httpx
+
+    from devflow_temporal.delivery_api import create_app
+
+    store, spec, shared, _, command = stopped
+
+    def unavailable(*_args, **_kwargs):
+        raise ValueError('closure unavailable')
+
+    monkeypatch.setattr('devflow_temporal.delivery_feature_closure.closed_coordinator', unavailable)
+    budget = shared.budget(spec['feature_delivery']['owner']['issue_id'])
+    before = _contents(shared.path)
+    with store._connect() as db:
+        tracking_before = list(db.iterdump())
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    origin = store.config.dashboard_url.rstrip('/')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+        session = (await client.get('/api/session')).json()
+        preview = await client.post(
+            f"/api/runs/{spec['run_id']}/assess-transition",
+            json={'kind': 'revise_feature_plan', 'request': command},
+        )
+        blocker = next(b for b in preview.json()['blockers']
+                       if b['code'] == 'feature_revision_closure_unknown')
+        assert blocker['satisfied'] is None
+        result = await client.post(
+            f"/api/runs/{spec['run_id']}/revise-feature-plan", json=command,
+            headers={'Origin': origin, 'X-Devflow-CSRF': session['csrf_token']},
+        )
+        assert result.status_code == 409
+    assert _contents(shared.path) == before
+    assert shared.budget(spec['feature_delivery']['owner']['issue_id']) == budget
+    with store._connect() as db:
+        assert list(db.iterdump()) == tracking_before
+
+
+@pytest.mark.asyncio
+async def test_public_revision_rejects_registry_change_during_successor(stopped, monkeypatch):
+    import httpx
+
+    from devflow_temporal import delivery_feature_handoff
+    from devflow_temporal.delivery_api import create_app
+
+    store, spec, shared, _, command = stopped
+    original = delivery_feature_handoff.observe_handoff
+    calls = []
+
+    def changed(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(True)
+        with shared.connect() as db:
+            db.execute('UPDATE execution_claims SET generation=generation+1 WHERE issue_id=?',
+                       (spec['feature_delivery']['owner']['issue_id'],))
+        return result
+
+    monkeypatch.setattr(delivery_feature_handoff, 'observe_handoff', changed)
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    origin = store.config.dashboard_url.rstrip('/')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+        result = await client.post(
+            f"/api/runs/{spec['run_id']}/assess-transition",
+            json={'kind': 'revise_feature_plan', 'request': command},
+        )
+    assert calls
+    assert not result.json()['eligible']
+    assert 'feature_revision_registry_changed' in {b['code'] for b in result.json()['blockers']}

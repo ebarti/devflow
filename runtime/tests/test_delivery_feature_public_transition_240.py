@@ -81,3 +81,67 @@ async def test_public_feature_preflight_and_execution_agree(feature, monkeypatch
                                 (spec["run_id"],)).fetchone()[0])
         assert after == before
     assert shared.budget(spec["feature_delivery"]["owner"]["issue_id"]) == budget
+
+
+@pytest.mark.asyncio
+async def test_public_continuation_unreadable_closure_is_unknown(feature, monkeypatch):
+    store, spec, shared, _record, _diagnostic = feature
+    row = _stopped_feature(store, spec, shared, monkeypatch)
+
+    def unavailable(*_args, **_kwargs):
+        raise ValueError('closure unavailable')
+
+    monkeypatch.setattr('devflow_temporal.delivery_feature_closure.closed_coordinator', unavailable)
+    request = {'command_id': 'unreadable-closure', 'expected_revision': row['revision']}
+    budget = shared.budget(spec['feature_delivery']['owner']['issue_id'])
+    with store._connect() as db:
+        before = list(db.iterdump())
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    origin = store.config.dashboard_url.rstrip('/')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+        session = (await client.get('/api/session')).json()
+        preview = await client.post(
+            f"/api/runs/{spec['run_id']}/assess-transition",
+            json={'kind': 'continue_feature', 'request': request},
+        )
+        blocker = next(b for b in preview.json()['blockers']
+                       if b['code'] == 'feature_coordinator_closure_unknown')
+        assert blocker['satisfied'] is None
+        result = await client.post(
+            f"/api/runs/{spec['run_id']}/continue-feature", json=request,
+            headers={'Origin': origin, 'X-Devflow-CSRF': session['csrf_token']},
+        )
+        assert result.status_code == 409
+    with store._connect() as db:
+        assert list(db.iterdump()) == before
+    assert shared.budget(spec['feature_delivery']['owner']['issue_id']) == budget
+
+
+@pytest.mark.asyncio
+async def test_public_preview_refuses_owner_takeover_during_closure(feature, monkeypatch):
+    store, spec, shared, _record, _diagnostic = feature
+    row = _stopped_feature(store, spec, shared, monkeypatch)
+    token = spec['feature_delivery']['owner']
+    calls = []
+
+    def takeover(*_args, **_kwargs):
+        if not calls:
+            calls.append(True)
+            shared.claim(spec['feature_delivery']['snapshot'], 'run-concurrent-owner',
+                         str(store.config.tracking_db), predecessor=token)
+        return {'result': {'cleanup': 'confirmed'}, 'workflow_id': 'closed'}
+
+    monkeypatch.setattr('devflow_temporal.delivery_feature_closure.closed_coordinator', takeover)
+    request = {'command_id': 'takeover-race', 'expected_revision': row['revision']}
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    origin = store.config.dashboard_url.rstrip('/')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+        preview = await client.post(
+            f"/api/runs/{spec['run_id']}/assess-transition",
+            json={'kind': 'continue_feature', 'request': request},
+        )
+    assert calls
+    assert not preview.json()['eligible']
+    assert 'feature_registry_proof_unknown' in {b['code'] for b in preview.json()['blockers']}

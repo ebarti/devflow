@@ -5,8 +5,8 @@ from __future__ import annotations
 from .delivery_feature_execution import registry
 
 
-def checkpoints(spec):
-    values = registry(spec).checkpoints(spec["feature_delivery"]["owner"]["issue_id"])
+def checkpoints(spec, *, shared=None):
+    values = (shared or registry(spec)).checkpoints(spec["feature_delivery"]["owner"]["issue_id"])
     passes = [value for key, value in values.items() if key.startswith("integration-pass:")]
     current = max(passes, key=lambda value: value["number"]) if passes else None
     if current:

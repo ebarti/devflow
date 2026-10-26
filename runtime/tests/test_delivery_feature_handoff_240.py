@@ -242,6 +242,8 @@ def test_unreadable_coordinator_closure_stays_unknown(feature, monkeypatch):
     monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator", unavailable)
     assessment = _observe(store)
     assert "feature_coordinator_closure_unknown" in _codes(assessment)
+    assert next(b for b in assessment["blockers"]
+                if b["code"] == "feature_coordinator_closure_unknown")["satisfied"] is None
     assert not assessment["eligible"]
 
 

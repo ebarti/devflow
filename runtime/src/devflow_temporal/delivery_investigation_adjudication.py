@@ -616,7 +616,7 @@ def _retired_facts():
     return {
         "operation": KIND, "owner": "investigation_adjudication", "owner_proof": True,
         "proof_digest": digest({"admission_policy": "retired", "operation": KIND}),
-        "normalized_lifecycle": "retired", "comparisons": [], "predicates": [{
+        "normalized_lifecycle": "unknown", "comparisons": [], "predicates": [{
             "code": "adjudication_admission_retired", "satisfied": False,
             "missing_or_unknown_fact": "authorization for a new adjudication admission",
             "next_action": "repair findings and obtain a passing QA assessment",
