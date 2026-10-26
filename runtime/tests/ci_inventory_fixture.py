@@ -241,6 +241,7 @@ def fixture(
                 "workflow_id": workflow_id,
                 "suite_id": suite,
                 "steps_sha256": digest(step_meta),
+                "canonical_job_sha256": digest(job),
                 "post_steps": ["Post Checkout"],
                 "log_sha256": hashlib.sha256(log).hexdigest(),
                 "log_bytes": len(log),

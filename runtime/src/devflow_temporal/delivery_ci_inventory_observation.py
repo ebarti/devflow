@@ -353,6 +353,7 @@ def collect(reader, profile, *, required, expected_tree):
             details = f"https://github.com/{repo}/actions/runs/{run['id']}/job/{job['id']}"
             if (
                 job.get("id") != pin["job_id"]
+                or digest(job) != pin["canonical_job_sha256"]
                 or check.get("id") != pin["check_id"]
                 or run["id"] != pin["run_id"]
                 or workflow["id"] != pin["workflow_id"]

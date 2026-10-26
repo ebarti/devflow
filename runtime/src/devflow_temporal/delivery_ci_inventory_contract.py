@@ -17,7 +17,7 @@ from .contracts import digest
 SCHEMA = "devflow.ordinary-ci-existing-dispatch-profile/v1"
 # No declaration can authorize observations until the reviewed complete source,
 # original selection and report profile is bound in this versioned owner.
-APPROVED_PROFILE_SHA256 = "aaae71efa5bd32ef7a8f10ce61955c202e8186bad27ca24be93b7c40fcd4de6a"
+APPROVED_PROFILE_SHA256 = "6803f314ec7e5418a0fee41c22368dfdef72462d91195761725cbc9b49289aa7"
 UNKNOWN = object()
 
 
