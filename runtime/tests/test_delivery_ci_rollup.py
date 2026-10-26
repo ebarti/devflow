@@ -274,4 +274,3 @@ async def test_legacy_lost_readback_preserves_prior_observation_without_promotin
     assert result["observations"] == [previous]
     assert result["ci_assessment"]["execution"]["state"] == "unknown"
     assert result["ci_assessment"]["execution"]["read_complete"] is False
-
