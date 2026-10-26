@@ -7,8 +7,9 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 import xml.etree.ElementTree as ET
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
 
@@ -498,8 +499,28 @@ def execution_lease(spec, row):
 
 def execute(broker, row):
     """Only a queued acknowledged identity can enter a fresh native generation."""
+    from .delivery_native_diagnostic import info
 
-    with execution_lease(broker.spec, row):
+    deadline = time.monotonic() + 5
+    with ExitStack() as leases:
+        while True:
+            try:
+                leases.enter_context(execution_lease(broker.spec, row))
+                break
+            except BlockingIOError:
+                # The ACK transaction becomes visible just before its held
+                # generation FD is released. Wait for that short publication
+                # window; another running body is observed, never superseded.
+                with broker.store._connect() as db:
+                    state = db.execute(
+                        "SELECT state FROM delivery_native_diagnostics WHERE identity=?",
+                        (row["identity"],),
+                    ).fetchone()
+                if state is None or state[0] != "queued":
+                    return info(broker.store, row["run_id"], row["command_id"])
+                if time.monotonic() >= deadline:
+                    raise ValueError("diagnostic queued generation lease remains owned") from None
+                time.sleep(0.03)
         return _execute(broker, row)
 
 

@@ -151,14 +151,15 @@ class DeliveryBroker:
     def run_resources(self, *, read_only=False):
         from .delivery_resources import RunResources
 
-        return (self.diagnostic_context.resources(read_only=read_only)
-                if self.diagnostic_context is not None else RunResources(
+        context = getattr(self, 'diagnostic_context', None)
+        return (context.resources(read_only=read_only)
+                if context is not None else RunResources(
                     self.spec, read_only=read_only))
 
     def _native_process(self, folder, **options):
         from .delivery_native_process import NativeProcess
 
-        if self.diagnostic_context is not None:
+        if getattr(self, 'diagnostic_context', None) is not None:
             options['register_resources'] = False
         return NativeProcess(self.spec, folder, **options)
 

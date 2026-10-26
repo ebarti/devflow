@@ -12,6 +12,9 @@ import hashlib
 import json
 import os
 import shutil
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -589,6 +592,41 @@ async def test_empty_dispatch_hint_never_rehydrates_authority_on_each_idle_pump(
     await diagnostic.dispatch_once(app.state.delivery)
 
 
+@pytest.mark.parametrize("state", ["queued", "running"])
+def test_visible_ack_waits_for_its_generation_fd_without_replacing_a_running_body(
+    stopped_diagnostic,
+    monkeypatch,
+    state,
+):
+    from devflow_temporal import delivery_native_diagnostic_execution as execution
+
+    case = stopped_diagnostic
+    _response, _command = ack(case)
+    with case.store._connect() as db:
+        row = dict(db.execute("SELECT * FROM delivery_native_diagnostics").fetchone())
+        if state == "running":
+            db.execute("UPDATE delivery_native_diagnostics SET state='running'")
+    root = diagnostic._root(case.spec, row["identity"])
+    generation = read_private(root / "intent.json")["generation"]
+    called = []
+
+    def body(*_args):
+        called.append(True)
+        return {"state": "unit-observed-lease", "no_native_payload": True}
+
+    monkeypatch.setattr(execution, "_execute", body)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with diagnostic.generation_lease(root, expected=generation):
+            task = pool.submit(execution.execute, DeliveryBroker(case.store, case.spec), row)
+            time.sleep(0.1)
+            assert not called
+            if state == "queued":
+                assert not task.done()
+        result = task.result(timeout=5)
+    assert len(called) == (1 if state == "queued" else 0)
+    assert result["state"] == ("unit-observed-lease" if state == "queued" else "running")
+
+
 @pytest.mark.asyncio
 async def test_public_http_preflight_ack_and_status_are_separate_from_delivery_acceptance(
     stopped_diagnostic,
@@ -621,3 +659,56 @@ async def test_public_http_preflight_ack_and_status_are_separate_from_delivery_a
         assert app.state.delivery._native_diagnostic_pending is True
         response = await client.get(path + "native-diagnostics/" + request["command_id"])
         assert response.status_code == 200 and response.json()["state"] == "queued"
+
+
+@pytest.mark.parametrize(
+    "command", ["native-diagnostic-preflight", "ack-native-diagnostic", "native-diagnostic"]
+)
+def test_public_cli_uses_existing_read_only_transport_without_service_start(
+    stopped_diagnostic,
+    monkeypatch,
+    capsys,
+    command,
+):
+    from types import SimpleNamespace
+
+    from devflow_temporal import delivery_control as cli
+
+    case = stopped_diagnostic
+    observed = []
+
+    def invoke(name, run_id, body):
+        observed.append((name, run_id, body))
+        return {"state": "unit-transport-only", "native_executed": False}
+
+    caller = SimpleNamespace(
+        **{
+            name: (lambda run_id, body, name=name: invoke(name, run_id, body))
+            for name in (
+                "native_diagnostic_preflight",
+                "ack_native_diagnostic",
+                "native_diagnostic",
+            )
+        }
+    )
+    monkeypatch.setattr(cli, "read_only_client", lambda _path: caller)
+    monkeypatch.setattr(cli, "api_client", lambda _path: pytest.fail("no implicit service start"))
+    monkeypatch.setattr(cli, "_config", lambda *_a: pytest.fail("no writable Store bootstrap"))
+    path = case.store.config.state_root / "operator-inputs/cli-diagnostic-request.json"
+    write_private(path, case.diagnostic_request)
+    argv = ["devflow-delivery", "--config", str(case.store.config.path), command, "--id", "run-1"]
+    argv += (
+        ["--diagnostic-command-id", "owned-finite-check"]
+        if command == "native-diagnostic"
+        else ["--request", str(path)]
+    )
+    monkeypatch.setattr(sys, "argv", argv)
+    cli.main()
+    assert json.loads(capsys.readouterr().out)["native_executed"] is False
+    assert observed == [
+        (
+            command.replace("-", "_"),
+            "run-1",
+            "owned-finite-check" if command == "native-diagnostic" else case.diagnostic_request,
+        )
+    ]
