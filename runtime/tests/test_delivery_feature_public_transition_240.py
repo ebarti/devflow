@@ -94,10 +94,10 @@ async def test_public_continuation_unreadable_closure_is_unknown(feature, monkey
     monkeypatch.setattr('devflow_temporal.delivery_feature_closure.closed_coordinator', unavailable)
     request = {'command_id': 'unreadable-closure', 'expected_revision': row['revision']}
     budget = shared.budget(spec['feature_delivery']['owner']['issue_id'])
-    with store._connect() as db:
-        before = list(db.iterdump())
     app = create_app(store.config.path)
     app.state.delivery.store = store
+    with store._connect() as db:
+        before = list(db.iterdump())
     origin = store.config.dashboard_url.rstrip('/')
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
         session = (await client.get('/api/session')).json()

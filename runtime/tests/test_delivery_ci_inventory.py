@@ -579,3 +579,44 @@ async def test_public_preflight_absent_resource_root_is_read_only(ci_case, monke
     assert len(profile_args) == 1 and profile_args[0] is not None
     assert observations == [True]
     assert not root.exists()
+
+
+@pytest.mark.asyncio
+async def test_public_preflight_ci_teardown_shares_tracking_snapshot(ci_case, monkeypatch):
+    """Teardown and nested resource reads must use one read-only tracking snapshot."""
+    from contextlib import contextmanager
+
+    from devflow_temporal import delivery_store
+    from devflow_temporal.delivery_execution_config import observation_scope
+
+    c = ci_case
+    tracking = c.store.config.tracking_db
+    paths = [Path(str(tracking) + suffix) for suffix in ("", "-wal", "-shm", "-journal")]
+    original = delivery_store.tracking_read_connection
+    identities = []
+    depth = 0
+    max_depth = 0
+
+    @contextmanager
+    def observed(path):
+        nonlocal depth, max_depth
+        with original(path) as db:
+            scope = observation_scope()
+            assert scope is not None
+            identity = scope.resources[("tracking", str(path))]
+            identities.append(id(identity))
+            depth += 1
+            max_depth = max(max_depth, depth)
+            try:
+                yield db
+            finally:
+                depth -= 1
+
+    monkeypatch.setattr(delivery_store, "tracking_read_connection", observed)
+    async with public(c) as (client, _headers):
+        before = {path: path.read_bytes() if path.exists() else None for path in paths}
+        response = await client.post("/api/runs/run-1/ci-inventory-preflight", json=c.command)
+        assert response.status_code == 200, response.text
+        assert len(identities) >= 2 and len(set(identities)) == 1
+        assert max_depth >= 2
+        assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
