@@ -201,6 +201,15 @@ class DeliveryStore:
                 )"""
             )
             db.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_native_renewal_anchors (
+                    run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
+                    namespace TEXT NOT NULL,
+                    binding_sha256 TEXT NOT NULL,
+                    parent_sha256 TEXT NOT NULL,
+                    PRIMARY KEY (run_id, namespace)
+                )"""
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_outbox (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
                     state TEXT NOT NULL,

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 from copy import deepcopy
 from pathlib import Path
@@ -19,7 +20,7 @@ from .delivery_native_preparation import (
     native_identity,
     verify_native_spec,
 )
-from .delivery_policy_recovery import _prepare
+from .delivery_policy_recovery import _preparation_parent, _prepare
 from .delivery_preparation import _private_bytes, run_binding
 from .delivery_resources import read_private, write_private
 
@@ -192,6 +193,34 @@ def readiness(spec, payload):
             'config_sha256': digest(config.raw)}
 
 
+def _seal_probe_anchor(config, spec, namespace, binding, parent):
+    """Bind a pre-admission probe to the controller's independently retained store."""
+    from .delivery_runtime_location import require_not_pending
+
+    require_not_pending(config)
+    with sqlite3.connect(config.tracking_db) as db:
+        db.execute('PRAGMA foreign_keys=ON')
+        db.execute('BEGIN IMMEDIATE')
+        original = db.execute(
+            'SELECT request_digest,work_id FROM delivery_runs WHERE run_id=?',
+            (spec['run_id'],),
+        ).fetchone()
+        if original != (spec['request_digest'], spec['work_id']):
+            raise ValueError('native renewal lost its original admitted run')
+        expected = (digest(binding), digest(parent))
+        db.execute(
+            'INSERT OR IGNORE INTO delivery_native_renewal_anchors '
+            '(run_id,namespace,binding_sha256,parent_sha256) VALUES (?,?,?,?)',
+            (spec['run_id'], namespace, *expected),
+        )
+        actual = db.execute(
+            'SELECT binding_sha256,parent_sha256 FROM delivery_native_renewal_anchors '
+            'WHERE run_id=? AND namespace=?', (spec['run_id'], namespace),
+        ).fetchone()
+        if actual != expected:
+            raise ValueError('native renewal conflicts with its durable probe authority')
+
+
 def renew(spec, payload, command_digest, *, technical=None, supplemental=None):
     """Effectful only after complete read-only readiness, never public inspection."""
     continuation = supplemental or technical
@@ -223,6 +252,8 @@ def renew(spec, payload, command_digest, *, technical=None, supplemental=None):
         if technical:
             binding['technical_predecessor'] = technical['predecessor']
         _immutable(root / 'authority.json', binding)
+        _seal_probe_anchor(config, spec, str(root.relative_to(spec['state_dir'])), binding,
+                           _preparation_parent(spec, config))
         path = root / 'preparation.json'
         if path.exists():
             intent = read_private(path)

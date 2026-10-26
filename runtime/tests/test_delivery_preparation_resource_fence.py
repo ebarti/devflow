@@ -16,6 +16,7 @@ from test_delivery_store import service as service
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_diagnostic import ERROR, require_resource_idle
+from devflow_temporal.delivery_native_renewal import _seal_probe_anchor
 from devflow_temporal.delivery_policy_recovery import _prepare
 from devflow_temporal.delivery_preparation import PreparationError, require_native_execution
 from devflow_temporal.delivery_preparation_resources import (
@@ -289,7 +290,8 @@ def test_probe_exclusive_parent_lease_serializes_the_diagnostic_ack_observation(
     "technical-successor/native-generation",
     "resource-closure/native-generation",
 ])
-@pytest.mark.parametrize("defect", [None, "wrong_namespace", "authority_changed", "intent_changed"])
+@pytest.mark.parametrize("defect", [None, "missing_anchor", "wrong_namespace",
+                                    "authority_changed", "intent_changed"])
 def test_renewal_probe_requires_exact_durable_namespace_and_authority(
     measurement_owner, namespace, defect,
 ):
@@ -302,24 +304,26 @@ def test_renewal_probe_requires_exact_durable_namespace_and_authority(
     write_private(root / "authority.json", authority)
     intent = {"binding_sha256": digest(authority), "preparation_attempts": []}
     owner = (store, original, registry, intent, path)
+    if defect != "missing_anchor":
+        _seal_probe_anchor(store.config, original, namespace, authority, original)
     probe = probe_for(owner)
     if defect == "authority_changed":
         write_private(root / "authority.json", {**authority, "command_digest": digest("changed")})
     elif defect == "intent_changed":
         intent["binding_sha256"] = digest("changed")
         write_private(path, intent)
-    with pytest.raises(ValueError):
-        require_resource_idle(probe)
     if defect:
+        with pytest.raises(ValueError):
+            require_resource_idle(probe)
         with pytest.raises(ValueError):
             with resource_scope(probe, original["state_dir"], intent, path, 0,
                                 renewal_binding=authority, renewal_parent=original):
                 pytest.fail("changed renewal authority was admitted")
     else:
+        assert canonical_owner(probe) == original
+        require_resource_idle(probe)
         with resource_scope(probe, original["state_dir"], intent, path, 0,
                             renewal_binding=authority, renewal_parent=original):
-            assert canonical_owner(probe) == original
-            require_resource_idle(probe)
             assert RunResources(probe).finalize("blocked")["state"] == "confirmed"
 
 
@@ -334,6 +338,7 @@ def test_renewal_probe_refuses_coherent_record_substitution(measurement_owner, n
     path = root / "preparation.json"
     authority = {"original_spec": original, "command_digest": digest("original")}
     write_private(root / "authority.json", authority)
+    _seal_probe_anchor(store.config, original, namespace, authority, original)
     intent = {"binding_sha256": digest(authority), "preparation_attempts": []}
     probe = probe_for((store, original, registry, intent, path))
     parent = copy.deepcopy(original)
@@ -353,3 +358,19 @@ def test_renewal_probe_refuses_coherent_record_substitution(measurement_owner, n
         with resource_scope(probe, original["state_dir"], intent, path, 0,
                             renewal_binding=authority, renewal_parent=original):
             pytest.fail("coherent substituted renewal was admitted")
+
+
+def test_renewal_probe_anchor_is_insert_once(measurement_owner):
+    store, original, _, _, _ = measurement_owner
+    namespace = "native-preparation-renewal"
+    authority = {"original_spec": original, "command_digest": digest("original")}
+    _seal_probe_anchor(store.config, original, namespace, authority, original)
+    _seal_probe_anchor(store.config, original, namespace, authority, original)
+    with pytest.raises(ValueError, match="conflicts with its durable probe authority"):
+        _seal_probe_anchor(store.config, original, namespace,
+                           {**authority, "command_digest": digest("foreign")}, original)
+    with store._connect() as db:
+        rows = db.execute("SELECT binding_sha256,parent_sha256 FROM "
+                          "delivery_native_renewal_anchors WHERE run_id=? AND namespace=?",
+                          (original["run_id"], namespace)).fetchall()
+    assert [tuple(row) for row in rows] == [(digest(authority), digest(original))]

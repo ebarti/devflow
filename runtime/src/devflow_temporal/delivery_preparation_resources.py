@@ -103,16 +103,7 @@ def canonical_owner(spec):
     if renewal:
         authority_raw = private_bytes(authority_path)
         authority = json.loads(authority_raw)
-        # The operation must supply its independently reconstructed complete
-        # authority, not merely two locally consistent mutable files.
-        expected_renewal = (legacy[2] if legacy is not None
-                            and legacy[0] == digest(spec) and len(legacy) == 3 else None)
-        if (
-            not isinstance(intent, dict)
-            or expected_renewal is None
-            or authority != expected_renewal
-            or digest(authority) != intent.get("binding_sha256")
-        ):
+        if not isinstance(intent, dict) or digest(authority) != intent.get("binding_sha256"):
             raise ValueError("native renewal lost its exact preparation authority")
     attempts = intent.get("preparation_attempts") if isinstance(intent, dict) else None
     if (
@@ -132,6 +123,17 @@ def canonical_owner(spec):
             "SELECT request_json,request_digest,work_id FROM delivery_runs WHERE run_id=?",
             (spec["run_id"],),
         ).fetchone()
+        if renewal:
+            try:
+                anchor = db.execute(
+                    "SELECT binding_sha256,parent_sha256 FROM delivery_native_renewal_anchors "
+                    "WHERE run_id=? AND namespace=?",
+                    (spec["run_id"], str(path.parent.relative_to(canonical))),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                raise ValueError("native renewal has no durable probe authority") from exc
+            if anchor != (digest(authority), digest(parent)):
+                raise ValueError("native renewal lost its durable probe authority")
     original = json.loads(row[0]) if row else None
     if (
         not isinstance(original, dict)

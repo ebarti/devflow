@@ -112,6 +112,22 @@ def amended_config(original, path, expected_hash):
     return config
 
 
+def _preparation_parent(original, config):
+    """Derive the exact run authority for a finite preparation probe."""
+    effective = deepcopy(original)
+    effective.pop('preparation', None)
+    for key in ('native_identity', 'codex_bin_sha256', 'environment_proof_sha256',
+                'security_binding_sha256'):
+        effective['policy'].pop(key, None)
+    effective['policy']['host_sandbox'] = 'trusted-local'
+    effective['policy_digest'] = digest(effective['policy'])
+    effective.update(config_path=str(config.path), config_digest=digest(config.raw),
+                     terminal_tracker_version=1)
+    if original['policy'].get('host_sandbox') != 'trusted-local':
+        effective['role_home_generation'] = 'policy-1'
+    return effective
+
+
 def _prepare(original, config, intent, intent_path, *, renewal_binding=None):
     from .delivery_native_diagnostic import require_resource_idle
     from .delivery_native_preparation import _measure, _validate, bind_native_spec, native_identity
@@ -130,17 +146,7 @@ def _prepare(original, config, intent, intent_path, *, renewal_binding=None):
                 or intent_path != Path(original['state_dir']) / relative):
             raise ValueError('native preparation lost its exact renewal parent')
 
-    effective = deepcopy(original)
-    effective.pop('preparation', None)
-    for key in ('native_identity', 'codex_bin_sha256', 'environment_proof_sha256',
-                'security_binding_sha256'):
-        effective['policy'].pop(key, None)
-    effective['policy']['host_sandbox'] = 'trusted-local'
-    effective['policy_digest'] = digest(effective['policy'])
-    effective.update(config_path=str(config.path), config_digest=digest(config.raw),
-                     terminal_tracker_version=1)
-    if original['policy'].get('host_sandbox') != 'trusted-local':
-        effective['role_home_generation'] = 'policy-1'
+    effective = _preparation_parent(original, config)
     root = Path(effective['state_dir']).parents[1]
     # Preparation has its own finite, journalled resource generations. It cannot
     # recreate or rewrite the predecessor's finalized transient roots/manifest.
