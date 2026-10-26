@@ -29,6 +29,7 @@ KINDS = {
     "revise-feature-plan": ("revise_feature_plan", "admission"),
     "continue-feature": ("continue_feature", "admission"),
     "recover-publication": ("recover_publication", "admission"),
+    "assess-transition": ("assess_transition", "observation"),
     "merge-preflight": ("merge_preflight", "observation"),
     "merge": ("merge_run", "admission"),
     "gates-only-preflight": ("gates_only_preflight", "observation"),
@@ -49,6 +50,7 @@ KINDS = {
 # These existing commands do not start the service and are observations or
 # explicit acknowledgements of already-owned work.
 NO_START = {
+    "assess-transition",
     "merge-preflight",
     "gates-only-preflight",
     "ci-inventory-preflight",

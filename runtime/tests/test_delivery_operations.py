@@ -79,6 +79,39 @@ async def test_public_operation_survives_caller_and_deduplicates(api_fixture, mo
 
 
 @pytest.mark.asyncio
+async def test_assessment_operation_routes_to_public_observation(api_fixture, monkeypatch):
+    path, _ = api_fixture
+    calls = []
+    result = {"version": 1, "eligible": False, "blockers": [{"code": "proof_unknown"}]}
+
+    def assess(store, run_id, kind, request):
+        calls.append((run_id, kind, request))
+        return result
+
+    monkeypatch.setattr("devflow_temporal.delivery_lifecycle.assess_transition", assess)
+    app = create_app(path)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+    request = {"kind": "recover_publication", "request": {"expected_revision": 3}}
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as client:
+        direct = await client.post("/api/runs/run-1/assess-transition", json=request)
+        accepted = await client.post("/api/operations", json={
+            "operation_id": "assessment-1", "run_id": "run-1",
+            "kind": "assess-transition", "request": request,
+        })
+        assert direct.status_code == 200
+        assert accepted.status_code == 202
+        for _ in range(100):
+            operation = (await client.get("/api/operations/assessment-1")).json()
+            if operation["state"] == "succeeded":
+                break
+            await asyncio.sleep(0.02)
+        assert operation["stage"] == "observation"
+        assert operation["result"] == direct.json() == result
+        assert operation["authority"] == "current_authority_unverified"
+        assert calls == [("run-1", "recover_publication", request["request"])] * 2
+
+
+@pytest.mark.asyncio
 async def test_restart_dispatches_only_pending_and_preserves_uncertain(api_fixture, monkeypatch):
     from devflow_temporal.contracts import digest
 
