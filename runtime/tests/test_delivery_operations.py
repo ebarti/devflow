@@ -389,3 +389,54 @@ def test_operation_lock_is_shared_by_database_not_service_root(tmp_path):
     lock = _lock(second, "operation-1")
     assert lock is not None
     os.close(lock)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_waiter_cannot_release_running_body(api_fixture):
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_operations import _execute, _recover_abandoned, read
+
+    path, _ = api_fixture
+    app = create_app(path)
+    service = app.state.delivery
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def slow():
+        calls.append("started")
+        started.set()
+        assert release.wait(10)
+        return {"run_id": "run-1"}
+
+    async def endpoint(_request, _run_id):
+        return await asyncio.to_thread(slow)
+
+    with service.store._connect() as db:
+        db.execute(
+            """INSERT INTO delivery_operations
+            (operation_id,run_id,kind,stage,request_digest,request_json,state,
+             created_at,updated_at,progress)
+            VALUES ('cancelled-waiter','run-1','merge-preflight','observation',?, '{}',
+                    'pending','2026','2026','queued')""",
+            (digest({"run_id": "run-1", "kind": "merge-preflight", "request": {}}),),
+        )
+    endpoints = {"merge_preflight": endpoint}
+    waiter = asyncio.create_task(
+        asyncio.to_thread(_execute, service, endpoints, "cancelled-waiter")
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.to_thread(_recover_abandoned, service.store, "cancelled-waiter")
+    assert read(service.store, "cancelled-waiter")["state"] == "running"
+    await asyncio.to_thread(_execute, service, endpoints, "cancelled-waiter")
+    assert calls == ["started"]
+    release.set()
+    for _ in range(200):
+        operation = read(service.store, "cancelled-waiter")
+        if operation["state"] == "succeeded":
+            break
+        await asyncio.sleep(0.02)
+    assert operation["state"] == "succeeded"
+    assert calls == ["started"]
