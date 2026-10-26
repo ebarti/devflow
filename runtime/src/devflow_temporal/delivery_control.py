@@ -905,6 +905,7 @@ _COMMANDS = (
     "submit",
     "runs",
     "run",
+    "run-detail",
     "evidence",
     "decision",
     "merge",
@@ -1020,7 +1021,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     read_commands = {"merge-preflight",
         'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
-        "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
+        "runs", "run", "run-detail", "evidence", "gates-only-preflight",
+        "repair-admission-preflight",
         'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "filesystem-custody-preflight",
     }
@@ -1081,6 +1083,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "submit",
         "runs",
         "run",
+        "run-detail",
         "evidence",
         "decision",
         "merge",
@@ -1126,6 +1129,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             args.command
             in {
                 "run",
+                "run-detail",
                 "evidence",
                 "decision",
                 "merge",
@@ -1168,6 +1172,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                                             cursor=getattr(args, "cursor", None),
                                             archived=getattr(args, "archived", False)),
                 "run": lambda: caller.status(args.id),
+                "run-detail": lambda: caller.detail(args.id),
                 "evidence": lambda: caller.evidence(args.id, args.evidence_id),
                 "decision": lambda: caller.decision(args.id, request),
                 "merge": lambda: caller.merge(args.id, request),

@@ -286,3 +286,8 @@ CLI `operation-create --request envelope.json`, `operation --id ID`,
 `operation-reconcile --id ID`, and `run-operations --id RUN` use an already
 running service. The corresponding MCP tools and dashboard operation panel
 expose the same state; none reissues an uncertain effect under a fresh ID.
+
+Routine CLI `run --id RUN` and MCP `get_run` read the versioned persisted
+status projection. They do not reconstruct current execution authority. Use
+CLI `run-detail --id RUN` or MCP `get_run_detail` for explicit full-detail
+and evidence reconstruction.

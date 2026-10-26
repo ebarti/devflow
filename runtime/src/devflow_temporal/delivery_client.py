@@ -96,6 +96,11 @@ class DeliveryClient:
         return self._request("GET", "/api/runs" + suffix)
 
     def status(self, run_id: str) -> dict:
+        """Read the bounded persisted projection, without reconstructing authority."""
+        return self._request("GET", "/api/runs/" + quote(run_id, safe="") + "/status")
+
+    def detail(self, run_id: str) -> dict:
+        """Explicitly reconstruct the complete run detail and indexed evidence."""
         return self._request("GET", "/api/runs/" + quote(run_id, safe=""))
 
     def evidence(self, run_id: str, evidence_id: str) -> dict:

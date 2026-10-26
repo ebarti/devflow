@@ -348,3 +348,21 @@ async def test_submit_receipt_recovers_and_is_listed_on_its_run(api_fixture):
         assert (await client.post("/api/operations", json=envelope, headers=headers)).json()[
             "result"
         ] == result
+
+
+def test_status_client_uses_bounded_projection_and_keeps_detail_explicit(monkeypatch):
+    from types import SimpleNamespace
+
+    from devflow_temporal.delivery_client import DeliveryClient
+
+    client = DeliveryClient(SimpleNamespace())
+    calls = []
+
+    def request(method, path):
+        calls.append((method, path))
+        return {"version": 1, "source": "persisted_projection", "run": {"run_id": "run-1"}}
+
+    monkeypatch.setattr(client, "_request", request)
+    assert client.status("run-1")["source"] == "persisted_projection"
+    client.detail("run-1")
+    assert calls == [("GET", "/api/runs/run-1/status"), ("GET", "/api/runs/run-1")]

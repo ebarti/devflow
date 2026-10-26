@@ -116,8 +116,13 @@ def build_server(config_path: Path) -> FastMCP:
 
     @server.tool(annotations=read)
     def get_run(run_id: str) -> dict:
-        """Read a run's current state, evidence index, and durable event timeline."""
+        """Read the bounded persisted run projection without fresh eligibility proof."""
         return read_only_client(config_path).status(run_id)
+
+    @server.tool(annotations=read)
+    def get_run_detail(run_id: str) -> dict:
+        """Explicitly reconstruct run detail, evidence index and timeline."""
+        return read_only_client(config_path).detail(run_id)
 
     @server.tool(annotations=read)
     def read_evidence(run_id: str, evidence_id: str) -> dict:
