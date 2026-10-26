@@ -60,13 +60,15 @@ def _reference(service, operation, workflow_id, workflow_run_id, update_name, co
     with service.store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute(
-            "SELECT state,effect_refs,request_digest FROM delivery_operations WHERE operation_id=?",
+            "SELECT state,effect_refs,request_digest,owner_generation FROM delivery_operations "
+            "WHERE operation_id=?",
             (operation["operation_id"],),
         ).fetchone()
         if (
             row is None
             or row["state"] != "running"
             or row["request_digest"] != operation["request_digest"]
+            or row["owner_generation"] != operation["owner_generation"]
         ):
             raise ValueError("operation no longer owns the Temporal update")
         refs = json.loads(row["effect_refs"]) if row["effect_refs"] else []

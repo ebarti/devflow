@@ -994,3 +994,91 @@ async def test_existing_operation_journal_backfills_domain_command_binding(api_f
             headers=headers,
         )
         assert conflict.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_definitive_pre_send_temporal_refusal_is_not_reported_unknown(
+    api_fixture, monkeypatch
+):
+    path, _ = api_fixture
+    app = create_app(path)
+
+    def reject(*_args):
+        raise ValueError("stale run revision")
+
+    monkeypatch.setattr(app.state.delivery.store, "begin_mutation", reject)
+    body = {
+        "command_id": "stale-decision",
+        "expected_revision": 1,
+        "decision_id": "decision-1",
+        "decision_revision": 1,
+        "candidate_revision": 1,
+        "answer": "continue",
+    }
+    envelope = {
+        "operation_id": "stale-operation",
+        "run_id": "run-1",
+        "kind": "decision",
+        "request": body,
+    }
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as client:
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+        await client.post("/api/operations", json=envelope, headers=headers)
+        for _ in range(200):
+            operation = (await client.get("/api/operations/stale-operation")).json()
+            if operation["state"] not in ("pending", "running"):
+                break
+            await asyncio.sleep(0.02)
+        assert operation["state"] == "refused"
+        assert operation["error"] == "stale run revision"
+        assert operation["effect_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_temporal_rejection_returns_refused(api_fixture, monkeypatch):
+    from temporalio.client import WorkflowUpdateFailedError
+
+    path, submit = api_fixture
+    app = create_app(path)
+    app.state.delivery.store.submit(submit)
+
+    class Handle:
+        async def execute_update(self, *_args, **_kwargs):
+            raise WorkflowUpdateFailedError(ValueError("stale decision revision"))
+
+    class Client:
+        def get_workflow_handle(self, _id):
+            return Handle()
+
+    async def client():
+        return Client()
+
+    monkeypatch.setattr(app.state.delivery, "client", client)
+    body = {
+        "command_id": "rejected-decision",
+        "expected_revision": 1,
+        "decision_id": "decision-1",
+        "decision_revision": 1,
+        "candidate_revision": 1,
+        "answer": "continue",
+    }
+    envelope = {
+        "operation_id": "rejected-operation",
+        "run_id": "run-1",
+        "kind": "decision",
+        "request": body,
+    }
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
+        token = (await browser.get("/api/session")).json()["csrf_token"]
+        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+        await browser.post("/api/operations", json=envelope, headers=headers)
+        for _ in range(200):
+            operation = (await browser.get("/api/operations/rejected-operation")).json()
+            if operation["state"] not in ("pending", "running"):
+                break
+            await asyncio.sleep(0.02)
+        assert operation["state"] == "refused"
+        assert operation["error"] == "stale decision revision"

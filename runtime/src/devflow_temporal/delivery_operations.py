@@ -170,24 +170,74 @@ def begin_temporal_mutation(service, run_id, command_id, name, payload):
         current = current_operation(service)
         with service.store._connect() as db:
             rows = db.execute(
-                "SELECT operation_id,state FROM delivery_operations WHERE domain_command_id=? "
-                "AND kind IN ('decision','cancel','disable-limits','reconcile-tracker')",
+                "SELECT operation_id,state,kind FROM delivery_operations WHERE domain_command_id=?",
                 (command_id,),
             ).fetchall()
             prior = db.execute(
                 "SELECT state FROM delivery_mutations WHERE command_id=?",
                 (command_id,),
             ).fetchone()
+        operation_kind = {
+            "disable_delivery_limits": "disable-limits",
+            "reconcile_tracker": "reconcile-tracker",
+        }.get(name, name)
         for row in rows:
-            if row["state"] in ("pending", "running", "unknown") and (
-                current is None or current["operation_id"] != row["operation_id"]
+            if (
+                _domain_namespaces(operation_kind) & _domain_namespaces(row["kind"])
+                and row["state"] in ("pending", "running", "unknown")
+                and (current is None or current["operation_id"] != row["operation_id"])
             ):
                 raise ValueError("command belongs to an unresolved durable operation; inspect it")
         if current is not None and prior is not None and prior["state"] in ("pending", "unknown"):
             raise ValueError("prior domain mutation is uncertain; reconcile it before another send")
-        return service.store.begin_mutation(run_id, command_id, name, payload)
+        try:
+            return service.store.begin_mutation(run_id, command_id, name, payload)
+        except ValueError as exc:
+            # begin_mutation performs no remote send and its database transaction
+            # rolls back on rejection. Record that specific pre-send refusal;
+            # uncertain prior mutations above deliberately do not take this path.
+            if current is not None:
+                with service.store._connect() as db:
+                    timestamp = now()
+                    db.execute(
+                        "UPDATE delivery_operations SET state='refused',updated_at=?,finished_at=?,"
+                        "progress='refused',error=? WHERE operation_id=? AND state='running' "
+                        "AND owner_generation=? AND request_digest=?",
+                        (
+                            timestamp,
+                            timestamp,
+                            str(exc),
+                            current["operation_id"],
+                            current["owner_generation"],
+                            current["request_digest"],
+                        ),
+                    )
+            raise
     finally:
         os.close(fd)
+
+
+def _temporal_refusal(store, operation):
+    names = {
+        "decision": "decision",
+        "cancel": "cancel",
+        "disable-limits": "disable_delivery_limits",
+        "reconcile-tracker": "reconcile_tracker",
+    }
+    kind = names.get(operation["kind"])
+    payload = operation["request"]
+    command_id = payload.get("command_id")
+    if kind is None or not isinstance(command_id, str):
+        return None
+    with store._connect() as db:
+        row = db.execute(
+            "SELECT request_digest,state,response_json FROM delivery_mutations "
+            "WHERE command_id=? AND run_id=? AND kind=?",
+            (command_id, operation["run_id"], kind),
+        ).fetchone()
+    if row is not None and row[0] == digest(payload) and row[1] == "rejected":
+        return json.loads(row[2])["error"]
+    return None
 
 
 def _set(store, operation_id, state, *, result=None, error=None):
@@ -273,6 +323,7 @@ def _execute(service, endpoints, operation_id):
                 (generation, now(), now(), operation_id),
             )
             operation = _row(row)
+            operation["owner_generation"] = generation
         endpoint = endpoints[KINDS[operation["kind"]][0]]
         request = _request(service, operation["request"])
 
@@ -290,6 +341,12 @@ def _execute(service, endpoints, operation_id):
         try:
             result = asyncio.run(invoke())
         except HTTPException as exc:
+            if read(service.store, operation_id)["state"] == "refused":
+                return
+            rejection = _temporal_refusal(service.store, operation)
+            if rejection is not None:
+                _set(service.store, operation_id, "refused", error=rejection)
+                return
             state = (
                 "refused"
                 if exc.status_code in (400, 403, 404, 422)
