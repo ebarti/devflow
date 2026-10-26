@@ -1053,8 +1053,8 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
     return candidate, next(iter(sessions), None)
 
 
-def snapshot(store, run_id, *, _revision=None):
-    return _snapshot(store, run_id, _revision=_revision)
+def snapshot(store, run_id, *, _revision=None, _observation=False):
+    return _snapshot(store, run_id, _revision=_revision, _observation=_observation)
 
 
 def review_snapshot(store, run_id):
@@ -1062,7 +1062,7 @@ def review_snapshot(store, run_id):
     return _snapshot(store, run_id, review_subject=True)
 
 
-def _snapshot(store, run_id, *, _revision=None, review_subject=False):
+def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observation=False):
     spec = store.effective_spec(run_id)
     if spec['provider'] != 'fake' and spec['policy'].get('host_sandbox') != 'trusted-local':
         raise ValueError('stopped resume preserves an already trusted execution policy')
@@ -1072,7 +1072,8 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     row, attempts, effects, claim = _rows(store, run_id)
     # Original admissions use the deterministic ID without a successor override.
     predecessor_id = row['workflow_id'] or 'delivery-' + run_id
-    closed = store._completed_temporal_result(run_id, workflow_id=predecessor_id)
+    closed = store._completed_temporal_result(
+        run_id, workflow_id=predecessor_id, **({'preserve': False} if _observation else {}))
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     stopped = ({'blocked', 'cancelled'} if spec.get('feature_worker') else {'blocked'})
@@ -1196,7 +1197,9 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
             **({'historical_quarantines': history} if history else {}),
             'cleanup_digest': (observed_preparation_cleanup(spec, quarantined=teardown)
                                if (pending or {}).get('implementation_preparation') else
-                               observed_native_cleanup(spec, read_only=True) if review_subject else
+                               observed_native_cleanup(spec, read_only=True, **(
+                                   {"quarantined": teardown} if teardown else {}))
+                               if review_subject or _observation else
                                observed_native_cleanup(spec, **(
                                    {"quarantined": teardown} if teardown else {}))),
             'work_binding': binding,
@@ -1238,7 +1241,7 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         if prior[0] != command_digest:
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior[1])
-    seal = snapshot(store, run_id, _revision=_revision)
+    seal = snapshot(store, run_id, _revision=_revision, _observation=preflight)
     gate_only = None
     if _revision is not None:
         from .delivery_feature_revision_recovery import gate_only_recovery
@@ -1247,11 +1250,15 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     with store._connect() as db:
         pending = None if gate_only else pending_repair(seal, db=db)
     ci_findings = None if gate_only else sealed_ci_findings(seal)
-    if (command['expected_revision'] != seal['state']['revision']
-            or command['expected_iteration'] != seal['state']['iteration']
-            or command['expected_candidate_id'] != seal['candidate']['id']
-            or command['expected_candidate_head'] != seal['candidate']['head']):
-        raise ValueError('stopped resume checkpoint is stale')
+    from .delivery_lifecycle import require_same_proof, require_transition
+
+    lifecycle_assessment = require_transition({
+        'operation': KIND, 'owner': 'delivery_stopped_resume', 'owner_proof': True,
+        'normalized_lifecycle': 'stopped', 'proof_digest': digest(seal),
+        'revision': seal['state']['revision'],
+        'iteration': seal['state']['iteration'], 'candidate_id': seal['candidate']['id'],
+        'candidate_head': seal['candidate']['head'],
+    }, command)
     # Interrupted work needs no repair cycle; only its exact plan is admitted this way.
     interrupted = None if _revision is not None or pending else interrupted_resume(seal)
     if interrupted and interrupted['additional_iterations'] != command['additional_iterations']:
@@ -1317,7 +1324,8 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             raise ValueError('revision recovery cannot add an unrelated scope amendment')
         amended = validate_revision_recovery(store, seal['predecessor_spec'], _revision)
     if preflight:
-        return {'run_id': run_id, 'preflight': True, 'candidate': seal['candidate'],
+        return {'run_id': run_id, 'preflight': True, 'lifecycle_assessment': lifecycle_assessment,
+                'candidate': seal['candidate'],
                 'authorized_through_iteration': maximum, 'implementation_authority': True,
                 **({'added_paths': command['added_paths']}
                    if SCOPE_FIELDS <= command.keys() else {}),
@@ -1341,12 +1349,12 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                 raise ValueError('command ID already belongs to different inputs')
             return json.loads(prior[1])
         # Recheck all stopped readbacks after lock acquisition, before any native work.
-        if digest(snapshot(store, run_id, _revision=_revision)) != digest(seal):
-            raise ValueError('stopped checkpoint changed before admission')
+        require_same_proof(KIND, 'delivery_stopped_resume',
+                           digest(snapshot(store, run_id, _revision=_revision)), digest(seal))
         private_directory(root)
         execution = prepare_runtime(amended, root, command_digest, digest(seal))
-        if digest(snapshot(store, run_id, _revision=_revision)) != digest(seal):
-            raise ValueError('stopped checkpoint changed during runtime preparation')
+        require_same_proof(KIND, 'delivery_stopped_resume',
+                           digest(snapshot(store, run_id, _revision=_revision)), digest(seal))
         if _revision is not None:
             if validate_revision_recovery(store, seal['predecessor_spec'], _revision) != amended:
                 raise ValueError('adopted worker derivation changed during runtime preparation')

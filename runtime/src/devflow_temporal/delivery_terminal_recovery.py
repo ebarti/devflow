@@ -12,6 +12,7 @@ from .contracts import canonical_json, digest
 from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
 from .delivery_closures import history_sha256
 from .delivery_codec import DELIVERY_DATA_CONVERTER
+from .delivery_lifecycle import require_transition
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_resources import RunResources, read_private
 
@@ -217,9 +218,7 @@ def _grant(store, run_id, payload, closed):
     # initial input. Bind authentic start input to its durable admission stage,
     # while the completed tail remains bound to the final effective authority.
     starts = [spec] if previous else [store.submitted_spec(run_id), store.spec(run_id), spec]
-    if row['protocol_revision'] != payload['expected_revision']:
-        raise ValueError('stale run revision')
-    if (spec.get('terminal_tracker_version') != 1 or tail.get('spec') != spec
+    invalid_projection = (spec.get('terminal_tracker_version') != 1 or tail.get('spec') != spec
             or closed['workflow_id'] != (row['workflow_id'] or f'delivery-{run_id}')
             or closed['input_spec'] not in starts
             or closed['input_recovery_sha256'] != (digest(previous) if previous else None)
@@ -238,8 +237,21 @@ def _grant(store, run_id, payload, closed):
             or checkpoint.get('status') != (
                 ('done' if spec.get('merge_version') == 1 else 'in-review')
                 if checkpoint['event'] == 'delivered' else 'blocked')
-            or not checkpoint.get('release')):
-        raise ValueError('closed terminal projection, cleanup or frozen transition changed')
+            or not checkpoint.get('release'))
+    candidate = json.loads(row['candidate_json'] or 'null') or {}
+    require_transition({
+        'operation': 'terminal_tracker_recovery', 'owner': 'terminal_tracker',
+        'owner_proof': True, 'normalized_lifecycle': 'stopped',
+        'revision': row['protocol_revision'], 'iteration': row['iteration'],
+        'candidate_id': candidate.get('id'), 'candidate_head': candidate.get('head'),
+        'proof_digest': digest({'row': row, 'snapshot': observed, 'closed': closed}),
+        'comparisons': [('revision', 'expected_revision', 'revision_changed')],
+        'predicates': [{
+            'code': 'terminal_projection_changed', 'satisfied': not invalid_projection,
+            'missing_or_unknown_fact': 'authenticated terminal projection and custody',
+            'next_action': 'inspect the terminal tracker recovery preflight',
+        }],
+    }, payload)
     while previous and previous.get('kind') == 'terminal_tracker_recovery':
         previous = previous['original_recovery']
     state = {key: deepcopy(value) for key, value in tail.items() if key not in (

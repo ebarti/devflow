@@ -299,6 +299,24 @@ def validate_diagnostic(store, spec, diagnostic, *, identity=None, candidate_id=
     return deepcopy(diagnostic)
 
 
+def assess_feature_revision(store, run_id, request):
+    """Observe only: revision reservation and successor admission remain unproved."""
+    from .delivery_lifecycle import evaluate_transition
+
+    with store._connect() as db:
+        row = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+    return evaluate_transition({
+        "operation": "revise_feature_plan", "owner": "feature_revision",
+        "owner_proof": None, "normalized_lifecycle": "unknown",
+        "revision": row["revision"] if row else None,
+        "comparisons": [("revision", "expected_revision", "revision_changed")],
+        "predicates": [{"code": "feature_revision_admission_proof_unknown", "satisfied": None,
+                        "missing_or_unknown_fact": (
+                            "revision custody, remaining budget and successor admission"),
+                        "next_action": "inspect revision custody and successor admission"}],
+    }, request)
+
+
 def revise_feature_plan(store, run_id, request):
     """Public stopped-feature admission; the runtime crafts and reviews the plan."""
     from .delivery_feature_closure import closed_coordinator

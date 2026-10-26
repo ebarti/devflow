@@ -511,3 +511,39 @@ def test_readonly_preflight_keeps_current_installation_guard_separate_from_histo
         monkeypatch.setattr(owner, "_observe", after)
     with pytest.raises(ValueError, match="current service guard"):
         owner.preflight(readonly, "run-1", c.command)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_public_preflight_and_ack_agree_on_changed_checkpoint(ci_case):
+    c = ci_case
+    with c.store._connect() as db:
+        before = {table: [dict(row) for row in db.execute("SELECT * FROM " + table)]
+                  for table in ("delivery_runs", "delivery_events", "delivery_commands")}
+    async with public(c) as (client, headers):
+        path = "/api/runs/run-1/"
+        good = await client.post(path + "ci-inventory-preflight", json=c.command)
+        assert good.status_code == 200, good.text
+        assert good.json()["lifecycle_assessment"]["eligible"] is True
+        for field, value, code in (
+            ("expected_revision", c.command["expected_revision"] + 1, "revision_changed"),
+            ("expected_projection_revision", c.command["expected_projection_revision"] + 1,
+             "projection_revision_changed"),
+            ("expected_candidate_id", "0" * 64, "candidate_changed"),
+            ("expected_candidate_head", "0" * 40, "candidate_head_changed"),
+            ("expected_content_sha256", "0" * 64, "candidate_content_changed"),
+            ("expected_pr_number", c.command["expected_pr_number"] + 1, "publication_changed"),
+        ):
+            body = {**c.command, field: value}
+            pre = await client.post(path + "ci-inventory-preflight", json=body)
+            ack = await client.post(path + "ack-ci-inventory", headers=headers, json={
+                **body, "preflight_key": good.json()["preflight_key"],
+                "acknowledgement": owner.ACK})
+            assert pre.status_code == ack.status_code == 409
+            for response in (pre, ack):
+                detail = response.json()["detail"]
+                assert not detail["eligible"]
+                assert code in {blocker["code"] for blocker in detail["blockers"]}
+    with c.store._connect() as db:
+        for table, rows in before.items():
+            assert [dict(row) for row in db.execute("SELECT * FROM " + table)] == rows
+        assert not db.execute("SELECT 1 FROM delivery_ci_inventories").fetchone()

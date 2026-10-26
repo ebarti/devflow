@@ -189,7 +189,7 @@ def _check(spec):
     return matches[0][0]
 
 
-def snapshot(store, run_id, command):
+def snapshot(store, run_id, command, *, return_assessment=False):
     """Observe original authority only. This function creates no path or database object."""
     from . import delivery_temporal_prerequisites as temporal
     from .delivery_amendment_capacity import live_owner
@@ -205,24 +205,41 @@ def snapshot(store, run_id, command):
     )
     latest = next((r for r in reversed(state.get("roles", [])) if r.get("role") == "implement"), {})
     publication = seal.get("publication") or {}
-    if (
-        spec.get("provider") != "codex"
-        or spec.get("feature_worker")
-        or spec.get("feature_delivery")
-        or spec["policy"].get("host_sandbox") != "trusted-local"
-        or latest.get("status") != "blocked"
-        or latest.get("finish_reason") != "done"
-        or latest.get("iteration") != row["iteration"]
-        or row["protocol_revision"] != command["expected_revision"]
-        or row["revision"] != command["expected_projection_revision"]
-        or row["iteration"] != command["expected_iteration"]
-        or candidate.get("id") != command["expected_candidate_id"]
-        or candidate.get("head") != command["expected_candidate_head"]
-        or candidate.get("content_sha256") != command["expected_content_sha256"]
-        or publication.get("number") != command["expected_pr_number"]
-        or publication.get("head") != command["expected_pr_head"]
-    ):
-        raise ValueError("native diagnostic lost its original closed blocked implementation")
+    from .delivery_lifecycle import require_transition
+
+    lifecycle_assessment = require_transition({
+        "operation": KIND, "owner": "delivery_native_diagnostic",
+        "owner_proof": True, "normalized_lifecycle": "stopped",
+        "proof_digest": digest(seal),
+        "revision": row["protocol_revision"], "projection_revision": row["revision"],
+        "iteration": row["iteration"], "candidate_id": candidate.get("id"),
+        "candidate_head": candidate.get("head"), "content_sha256": candidate.get("content_sha256"),
+        "publication_number": publication.get("number"),
+        "publication_head": publication.get("head"),
+        "publication_required": True,
+        "comparisons": [
+            ("revision", "expected_revision", "revision_changed"),
+            ("projection_revision", "expected_projection_revision", "projection_revision_changed"),
+            ("iteration", "expected_iteration", "iteration_changed"),
+            ("candidate_id", "expected_candidate_id", "candidate_changed"),
+            ("candidate_head", "expected_candidate_head", "candidate_head_changed"),
+            ("content_sha256", "expected_content_sha256", "candidate_content_changed"),
+            ("publication_number", "expected_pr_number", "publication_changed"),
+            ("publication_head", "expected_pr_head", "publication_head_changed"),
+        ],
+        "predicates": [{
+            "code": "diagnostic_scope_or_checkpoint_ineligible",
+            "satisfied": (spec.get("provider") == "codex" and not spec.get("feature_worker")
+                and not spec.get("feature_delivery")
+                and spec["policy"].get("host_sandbox") == "trusted-local"
+                and latest.get("status") == "blocked" and latest.get("finish_reason") == "done"
+                and latest.get("iteration") == row["iteration"]),
+            "missing_or_unknown_fact": (
+                "original closed blocked implementation and diagnostic scope"
+            ),
+            "next_action": "inspect the original diagnostic owner and retained execution",
+        }],
+    }, command)
     check = _check(spec)
     from .delivery_preparation import verify_prepared_spec
 
@@ -260,6 +277,20 @@ def snapshot(store, run_id, command):
             or any(item["state"] != "sent" for item in rows["delivery_outbox"])
         ):
             raise ValueError("native diagnostic has a superseded issue or unfinished command")
+    def refuse_tool_custody(fact):
+        # An authenticated closed seal is evidence, not a grant of tool authority.
+        require_transition({
+            "operation": KIND, "owner": "delivery_native_diagnostic",
+            "owner_proof": True, "proof_digest": digest(seal),
+            "normalized_lifecycle": "stopped", "comparisons": [],
+            "predicates": [{
+                "code": "diagnostic_tool_custody_unavailable",
+                "satisfied": False,
+                "missing_or_unknown_fact": fact,
+                "next_action": "inspect the original acknowledged official tool custody",
+            }],
+        }, command)
+
     marker = spec.get(temporal.MARKER)
     declaration = command.get(TEMPORAL)
     if declaration is not None:
@@ -267,18 +298,16 @@ def snapshot(store, run_id, command):
             not isinstance(declaration, dict)
             or declaration.get("provenance_sha256") != PROVENANCE_SHA256
         ):
-            raise ValueError(
-                "native diagnostic cannot change the authorized official tool authority"
-            )
+            refuse_tool_custody("authorized official tool provenance")
         if preparation is None:
             derived, preparation = temporal.proposal(seal, command, execution=spec)
             marker = derived[temporal.MARKER]
             if {k: v for k, v in derived.items() if k != temporal.MARKER} != spec:
                 raise ValueError("diagnostic tool bridge changed the original admitted execution")
         elif declaration != preparation["declaration"]:
-            raise ValueError("diagnostic declaration differs from its existing tool custody")
+            refuse_tool_custody("exact acknowledged tool declaration")
     if preparation is None or marker is None:
-        raise ValueError("native diagnostic requires explicit acknowledged official tool custody")
+        refuse_tool_custody("acknowledged official tool custody and marker")
     from .delivery_resources import observe_finalized_resources
 
     teardown = teardown_checkpoint(seal.get("historical_quarantines", []))
@@ -327,7 +356,7 @@ def snapshot(store, run_id, command):
             )
         }
     )
-    return result
+    return (result, lifecycle_assessment) if return_assessment else result
 
 
 def failed_gate(spec, candidate, check, failed, physical, local):
@@ -504,7 +533,7 @@ def active(store, run_id):
 
 def preflight(store, run_id, supplied):
     command = _request(supplied)
-    observed = snapshot(store, run_id, command)
+    observed, lifecycle_assessment = snapshot(store, run_id, command, return_assessment=True)
     with store._connect() as db:
         prior = _saved(db, run_id, identity=observed["identity"])
     if prior is not None:
@@ -512,6 +541,7 @@ def preflight(store, run_id, supplied):
     return {
         "kind": KIND,
         "run_id": run_id,
+        "lifecycle_assessment": lifecycle_assessment,
         "identity": observed["identity"],
         "preflight_key": digest(observed),
         "check_sha256": digest(observed["check"]),

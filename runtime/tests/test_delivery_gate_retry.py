@@ -51,7 +51,8 @@ def unpublished(service, monkeypatch):
               'request_digest': spec['request_digest'], 'recovery_digest': None, 'result': state}
     monkeypatch.setattr(store, '_completed_temporal_result', lambda *_args, **_kw: closed)
     monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_args, **_kw: None)
-    monkeypatch.setattr('devflow_temporal.delivery_gate_retry._stopped_cleanup', lambda _: {})
+    monkeypatch.setattr('devflow_temporal.delivery_gate_retry._stopped_cleanup',
+                        lambda _, **_kw: {})
     request = {'continuation_kind': PREPUBLICATION_KIND, 'command_id': 'retry-prechecks-1',
                'expected_revision': 9, 'expected_iteration': 0,
                'expected_candidate_id': candidate['id'],
@@ -263,7 +264,8 @@ def stopped(published, monkeypatch):
         db.execute("UPDATE delivery_runs SET cleanup='confirmed',workflow_id='delivery-run-1' "
                    "WHERE run_id='run-1'")
         store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
-    monkeypatch.setattr('devflow_temporal.delivery_gate_retry._stopped_cleanup', lambda _: {})
+    monkeypatch.setattr('devflow_temporal.delivery_gate_retry._stopped_cleanup',
+                        lambda _, **_kw: {})
     request = {'continuation_kind': KIND, 'command_id': 'retry-gates-1',
                'expected_revision': 13, 'expected_iteration': 1,
                'expected_candidate_id': state['candidate']['id'],

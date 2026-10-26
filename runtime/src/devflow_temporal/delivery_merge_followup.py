@@ -11,6 +11,7 @@ import json
 from contextlib import ExitStack
 
 from .contracts import canonical_json, digest
+from .delivery_lifecycle import RecoveryRefused, evaluate_transition, require_transition
 from .delivery_merge import (
     MergeBroker,
     native_implementation_output,
@@ -361,6 +362,79 @@ def _exclusive(store, db, row, *, retained_owner=None, prelaunch=None):
         raise ValueError("merge requires the current issue owner with settled effects")
 
 
+def _lifecycle_facts(proof):
+    return {
+        'operation': 'merge_run', 'owner': 'merge_followup', 'owner_proof': True,
+        'normalized_lifecycle': 'terminal', 'revision': proof['row']['protocol_revision'],
+        'iteration': proof['row']['iteration'], 'candidate_id': proof['candidate']['id'],
+        'candidate_head': proof['pull_request']['head'], 'publication_required': True,
+        'publication_number': proof['pull_request']['number'], 'proof_digest': digest(proof),
+        'comparisons': [('revision', 'expected_revision', 'revision_changed'),
+                        ('candidate_id', 'candidate_id', 'candidate_changed'),
+                        ('candidate_head', 'head', 'candidate_head_changed'),
+                        ('publication_number', 'pr_number', 'publication_changed')],
+    }
+
+
+def _valid_request(request):
+    required = {"command_id", "expected_revision", "candidate_id", "head", "pr_number", "answer"}
+    return not (
+        not isinstance(request, dict)
+        or set(request) != required
+        or not isinstance(request["command_id"], str)
+        or not request["command_id"].strip()
+        or len(request["command_id"]) > 200
+        or request["answer"] != "merge"
+        or type(request["expected_revision"]) is not int
+        or type(request["pr_number"]) is not int
+        or request["pr_number"] < 1
+        or not all(
+            isinstance(request[key], str) and 0 < len(request[key]) <= 200
+            for key in ("candidate_id", "head")
+        )
+    )
+
+
+def assess(store, run_id, request):
+    """Inspect current merge authority; assessment does not acquire a grant."""
+    try:
+        if not _valid_request(request):
+            return evaluate_transition({
+                'operation': 'merge_run', 'owner': 'merge_followup', 'comparisons': [],
+                'predicates': [{'code': 'merge_authorization_missing', 'satisfied': False,
+                                'missing_or_unknown_fact': 'explicit merge authorization',
+                                'next_action': 'provide the explicit merge command',
+                                'new_authorization_required': True}],
+            }, {})
+        with store._connect() as db:
+            previous = current(db, run_id)
+        spec, proof, _ = _observe_merge(store, run_id, request, previous)
+        if previous:
+            if not _continuable(previous):
+                raise ValueError('merge already owns a request')
+            original = json.loads(previous['grant_json'])
+            if (_immutable_row(original['row']) != _immutable_row(proof['row'])
+                    or (original.get('native_proof_sha256') is not None
+                        and original['native_proof_sha256'] != digest(_native_proof(proof)))):
+                raise ValueError('merge continuation changed delivered evidence')
+        prelaunch = []
+        if previous and previous['phase'] == 'unknown':
+            from .delivery_merge_resolution import prelaunch_receipts
+            prelaunch = prelaunch_receipts(store, spec, previous)
+        with store._connect() as db:
+            row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
+            if _snapshot(row) != proof['row'] or current(db, run_id) != previous:
+                raise ValueError('merge authority changed during assessment')
+            _exclusive(store, db, row,
+                       retained_owner='external:devflow:' + run_id if prelaunch else None)
+        return evaluate_transition(_lifecycle_facts(proof), request)
+    except RecoveryRefused as exc:
+        return exc.assessment
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+        return evaluate_transition({'operation': 'merge_run', 'owner': 'merge_followup',
+                                    'comparisons': []}, {})
+
+
 def preflight(store, run_id):
     spec = store.effective_spec(run_id)
     proof = evidence(store, spec)
@@ -393,59 +467,12 @@ def preflight(store, run_id):
     }
 
 
-def admit(store, run_id, request):
-    from .delivery_interrupted_recovery import installation_recovery_lease
-    from .delivery_merge_execution import existing_lease
-
-    # Closed-run maintenance holds the shared installation fence throughout its
-    # finalization. Admission must not overlap its last historical projection.
-    with store._connect() as db:
-        previous = current(db, run_id)
-    lease = existing_lease if previous else installation_recovery_lease
-    with lease(store.config, exclusive=True):
-        return _admit(store, run_id, request)
-
-
-def _admit(store, run_id, request):
-    required = {"command_id", "expected_revision", "candidate_id", "head", "pr_number", "answer"}
-    if (
-        not isinstance(request, dict)
-        or set(request) != required
-        or not isinstance(request["command_id"], str)
-        or not request["command_id"].strip()
-        or len(request["command_id"]) > 200
-        or request["answer"] != "merge"
-        or type(request["expected_revision"]) is not int
-        or type(request["pr_number"]) is not int
-        or request["pr_number"] < 1
-        or not all(
-            isinstance(request[key], str) and 0 < len(request[key]) <= 200
-            for key in ("candidate_id", "head")
-        )
-    ):
-        raise ValueError("merge requires an explicit exact-candidate merge command")
-    bound = digest({"kind": "merge_run", "run_id": run_id, "request": request})
-    with store._connect() as db:
-        prior = db.execute(
-            "SELECT * FROM delivery_commands WHERE command_id=?", (request["command_id"],)
-        ).fetchone()
-        if prior:
-            if prior["run_id"] != run_id or prior["request_digest"] != bound:
-                raise ValueError("merge command ID belongs to different inputs")
-            return json.loads(prior["response_json"])
-        previous_merge = current(db, run_id)
+def _observe_merge(store, run_id, request, previous_merge, *, preserve=False):
     spec = store.effective_spec(run_id)
     proof = evidence(store, spec)
-    if request["expected_revision"] != proof["row"]["protocol_revision"] or any(
-        request[key] != value
-        for key, value in (
-            ("candidate_id", proof["candidate"]["id"]),
-            ("head", proof["pull_request"]["head"]),
-            ("pr_number", proof["pull_request"]["number"]),
-        )
-    ):
-        raise ValueError("stale run revision or merge candidate; refresh the run")
-    closed = store._completed_temporal_result(run_id, workflow_id=store.active_workflow_id(run_id))
+    require_transition(_lifecycle_facts(proof), request)
+    closed = store._completed_temporal_result(
+        run_id, workflow_id=store.active_workflow_id(run_id), preserve=preserve)
     state = closed.get("result") or {}
     if (
         closed["request_digest"] != proof["row"]["request_digest"]
@@ -475,6 +502,36 @@ def _admit(store, run_id, request):
         remote = broker.publication(proof["pull_request"])
     if remote["merged"] or remote["state"] != "open":
         raise ValueError("merge requires the existing open unmerged PR")
+    return spec, proof, closed
+
+
+def admit(store, run_id, request):
+    from .delivery_interrupted_recovery import installation_recovery_lease
+    from .delivery_merge_execution import existing_lease
+
+    # Closed-run maintenance holds the shared installation fence throughout its
+    # finalization. Admission must not overlap its last historical projection.
+    with store._connect() as db:
+        previous = current(db, run_id)
+    lease = existing_lease if previous else installation_recovery_lease
+    with lease(store.config, exclusive=True):
+        return _admit(store, run_id, request)
+
+
+def _admit(store, run_id, request):
+    if not _valid_request(request):
+        raise ValueError("merge requires an explicit exact-candidate merge command")
+    bound = digest({"kind": "merge_run", "run_id": run_id, "request": request})
+    with store._connect() as db:
+        prior = db.execute(
+            "SELECT * FROM delivery_commands WHERE command_id=?", (request["command_id"],)
+        ).fetchone()
+        if prior:
+            if prior["run_id"] != run_id or prior["request_digest"] != bound:
+                raise ValueError("merge command ID belongs to different inputs")
+            return json.loads(prior["response_json"])
+        previous_merge = current(db, run_id)
+    spec, proof, closed = _observe_merge(store, run_id, request, previous_merge, preserve=True)
     workflow_id = "delivery-" + run_id + "-merge-" + bound[:20]
     grant = {
         "request": request,

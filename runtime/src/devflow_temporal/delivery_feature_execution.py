@@ -475,6 +475,24 @@ def register_worker(store, parent, spec):
     return spec
 
 
+def assess_feature_continuation(store, run_id, request):
+    """Observe only: settlement and successor admission have not yet been proved."""
+    from .delivery_lifecycle import evaluate_transition
+
+    with store._connect() as db:
+        row = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+    return evaluate_transition({
+        "operation": "continue_feature", "owner": "feature_continuation",
+        "owner_proof": None, "normalized_lifecycle": "unknown",
+        "revision": row["revision"] if row else None,
+        "comparisons": [("revision", "expected_revision", "revision_changed")],
+        "predicates": [{"code": "feature_settlement_proof_unknown", "satisfied": None,
+                        "missing_or_unknown_fact": (
+                            "settled feature effects, worker custody and successor admission"),
+                        "next_action": "inspect feature settlement and successor admission"}],
+    }, request)
+
+
 def continue_feature(store, run_id, request, *, _revision=None):
     from .delivery_config import COMMAND_RE
     from .delivery_feature_closure import closed_coordinator, closed_settlement, closed_worker
