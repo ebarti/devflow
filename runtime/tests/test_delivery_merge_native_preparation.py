@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -98,7 +100,19 @@ async def test_derived_execution_keeps_original_grant_and_replays_completed_role
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["reference", "receipt", "intent", "grant", "source", "policy"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "reference",
+        "receipt",
+        "intent",
+        "grant",
+        "source",
+        "policy",
+        "workspace_replacement",
+        "parent_evidence",
+    ],
+)
 async def test_derived_role_rejects_unbound_preparation_or_current_drift(
     relocated_conflict,
     change,
@@ -117,6 +131,13 @@ async def test_derived_role_rejects_unbound_preparation_or_current_drift(
         request["merge_context"]["effect_key"] = "foreign"
     elif change == "source":
         (Path(request["workspace"]) / "conflict.txt").write_text("unowned change")
+    elif change == "workspace_replacement":
+        path = Path(request["workspace"])
+        held = path.with_name(path.name + "-held")
+        path.rename(held)
+        shutil.copytree(held, path, symlinks=True)
+    elif change == "parent_evidence":
+        Path(request["merge_context"]["evidence_path"]).write_text("{}")
     else:
         request["spec"]["policy"]["max_repairs"] += 1
     with pytest.raises((ValueError, KeyError)):
@@ -124,7 +145,20 @@ async def test_derived_role_rejects_unbound_preparation_or_current_drift(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("defect", [None, "owner_missing", "launch", "unknown", "started"])
+@pytest.mark.parametrize(
+    "defect",
+    [
+        None,
+        "owner_missing",
+        "owner_busy",
+        "launch",
+        "unknown",
+        "started",
+        "session",
+        "foreign_grant",
+        "unexpected_file",
+    ],
+)
 async def test_actual_empty_prelaunch_continues_original_merge_without_fabricating_request(
     delivered,
     monkeypatch,
@@ -189,8 +223,29 @@ async def test_actual_empty_prelaunch_continues_original_merge_without_fabricati
         grant["grant_sha256"],
         "RuntimeError: merge resolution native cleanup remains unconfirmed",
     )
+    held_owner = None
     if defect == "owner_missing":
         DeliverySupervisor._owner_lock_path(d.spec, key).unlink()
+    elif defect == "owner_busy":
+        held_owner = DeliverySupervisor._owner_lock(d.spec, key)
+        assert held_owner is not None
+    elif defect == "session":
+        with d.store._connect() as db:
+            db.execute("UPDATE delivery_attempts SET session_id='foreign' WHERE job_key=?", (key,))
+    elif defect == "foreign_grant":
+        with d.store._connect() as db:
+            bound = json.loads(
+                db.execute(
+                    "SELECT request_json FROM delivery_effects WHERE effect_key=?", (effect,)
+                ).fetchone()[0]
+            )
+            bound["merge_authorization"] = "0" * 64
+            db.execute(
+                "UPDATE delivery_effects SET request_json=? WHERE effect_key=?",
+                (json.dumps(bound), effect),
+            )
+    elif defect == "unexpected_file":
+        (folder / "native-environment.json").write_text("{}")
     elif defect == "launch":
         from devflow_temporal.delivery_resources import write_private
 
@@ -208,17 +263,23 @@ async def test_actual_empty_prelaunch_continues_original_merge_without_fabricati
     names = {
         str(p.relative_to(Path(d.spec["state_dir"]))) for p in Path(d.spec["state_dir"]).rglob("*")
     }
+    assert not os.path.lexists(resolution.scratch_path(request))
     with d.store._connect() as db:
         before_commands = [dict(r) for r in db.execute("SELECT * FROM delivery_commands")]
         before_effects = [dict(r) for r in db.execute("SELECT * FROM delivery_effects")]
     if defect:
-        with pytest.raises(ValueError):
-            followup.preflight(d.store, "run-1")
+        try:
+            with pytest.raises(ValueError):
+                followup.preflight(d.store, "run-1")
+        finally:
+            if held_owner is not None:
+                os.close(held_owner)
     else:
         assert followup.preflight(d.store, "run-1")["phase"] == "available"
     assert {
         str(p.relative_to(Path(d.spec["state_dir"]))) for p in Path(d.spec["state_dir"]).rglob("*")
     } == names
+    assert not os.path.lexists(resolution.scratch_path(request))
     with d.store._connect() as db:
         assert [dict(r) for r in db.execute("SELECT * FROM delivery_commands")] == before_commands
         assert [dict(r) for r in db.execute("SELECT * FROM delivery_effects")] == before_effects
@@ -242,3 +303,47 @@ async def test_actual_empty_prelaunch_continues_original_merge_without_fabricati
         assert saved["state"] == "complete"
         assert json.loads(saved["observed_json"])["cleanup"] == "confirmed_prelaunch_absent"
     assert d.before == before
+
+
+@pytest.mark.parametrize("change", ["workflow", "source", "workspace"])
+def test_preparation_rechecks_current_generation_after_native_measurement(
+    relocated_conflict,
+    monkeypatch,
+    change,
+):
+    from devflow_temporal import delivery_gate_retry as gates
+
+    c = relocated_conflict
+    broker = MergeBroker(c.d.store, c.d.spec)
+    _, workspace, context = resolution._prepare(broker, c.pr, c.conflict, c.receipt["grant_sha256"])
+    key = f"merge-resolution:run-1:{context['resolution_id']}:implement"
+    request = {
+        "role": "implement",
+        "iteration": 0,
+        "spec": c.d.spec,
+        "candidate": candidate_for(workspace),
+        "workspace": str(workspace),
+        "merge_context": {**context, "effect_key": key},
+    }
+    measure = gates.prepare_runtime
+
+    def changed(*args, **kwargs):
+        execution = measure(*args, **kwargs)
+        if change == "workflow":
+            with c.d.store._connect() as db:
+                db.execute("UPDATE delivery_merge_requests SET workflow_id='foreign'")
+        elif change == "source":
+            (workspace / "conflict.txt").write_text("Changed during measurement")
+        else:
+            held = workspace.with_name(workspace.name + "-held")
+            workspace.rename(held)
+            shutil.copytree(held, workspace, symlinks=True)
+        return execution
+
+    monkeypatch.setattr(gates, "prepare_runtime", changed)
+    with pytest.raises(ValueError):
+        native.prepare(c.d.store, c.d.spec, request, c.receipt["grant_sha256"])
+    with c.d.store._connect() as db:
+        assert not db.execute(
+            "SELECT 1 FROM delivery_effects WHERE kind='merge_resolution'"
+        ).fetchone()

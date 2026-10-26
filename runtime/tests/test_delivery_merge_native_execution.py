@@ -209,6 +209,27 @@ Path(r['result_path']).chmod(0o600)
         with d.store._connect() as db:
             assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == original_row
             assert followup.current(db, "run-1")["phase"] == "merged"
+            original_merge_commands = db.execute(
+                "SELECT COUNT(*) FROM delivery_commands"
+            ).fetchone()[0]
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app(d.store.config.path)), base_url=host
+        ) as client:
+            response = await client.get("/api/runs/run-1")
+            assert response.status_code == 200, response.text
+            token = (await client.get("/api/session")).json()["csrf_token"]
+            replay = await client.post(
+                "/api/runs/run-1/merge",
+                json=d.command,
+                headers={"Origin": host, "X-Devflow-CSRF": token},
+            )
+            assert replay.status_code == 200 and replay.json() == admitted, replay.text
+        with d.store._connect() as db:
+            assert (
+                db.execute("SELECT COUNT(*) FROM delivery_commands").fetchone()[0]
+                == original_merge_commands
+            )
+        assert len(role_journals) == 2 and remote.merge_calls == 1
         if output := os.environ.get("DEVFLOW_TEST_MERGE_NATIVE_RESULT"):
             with open(output, "x") as stream:
                 json.dump(

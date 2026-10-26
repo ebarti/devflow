@@ -128,6 +128,15 @@ def prepare(store, original, request, authorization):
         _immutable(path, {"binding": binding, "execution_spec": execution})
     _same_authority(original, execution)
     verify_prepared_spec(execution)
+    authorize(store, original, authorization)
+    with store._connect() as db:
+        latest = current(db, original["run_id"])
+    if (
+        latest != saved
+        or _binding(original, request, authorization, saved["workflow_id"]) != binding
+        or candidate_for(Path(request["workspace"])) != request["candidate"]
+    ):
+        raise ValueError("merge preparation lost its current workflow or source generation")
     reference = {
         "path": str(path),
         "sha256": hashlib.sha256(read_private(path, raw=True)).hexdigest(),
