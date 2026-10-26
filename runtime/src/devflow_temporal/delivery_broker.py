@@ -27,9 +27,12 @@ from .delivery_store import DeliveryStore, _now
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str:
+    from .delivery_publication_execution import inherited_descriptors
+
     nul_output = argv[0] == 'git' and '-z' in argv
     result = subprocess.run(
-        argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False
+        argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False,
+        pass_fds=inherited_descriptors(),
     )
     stdout = result.stdout.decode('utf-8', 'surrogateescape') if nul_output else result.stdout
     stderr = result.stderr.decode('utf-8', 'surrogateescape') if nul_output else result.stderr
@@ -190,8 +193,12 @@ class DeliveryBroker:
         return None
 
     def _finish_effect(self, key: str, result: dict[str, Any]) -> None:
+        from .delivery_publication_execution import current
+
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if owner := current(key):
+                owner.check(db)
             db.execute(
                 """UPDATE delivery_effects SET state='complete',observed_json=?,updated_at=?
                    WHERE effect_key=?""",
@@ -1635,8 +1642,12 @@ class DeliveryBroker:
         self, key: str, head: str, number: int | None, *, remote_confirmed: bool = False,
     ) -> None:
         """Freeze observed identity in the existing effect before remote mutation."""
+        from .delivery_publication_execution import current
+
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if owner := current(key):
+                owner.check(db)
             saved = db.execute(
                 "SELECT state,observed_json FROM delivery_effects WHERE effect_key=?", (key,),
             ).fetchone()
@@ -1665,6 +1676,17 @@ class DeliveryBroker:
         return key + ":validate:" + head if head else key
 
     def publish(self, iteration: int, input_candidate: dict[str, Any]) -> dict[str, Any]:
+        from .delivery_publication_execution import PublicationUncertain, execution
+
+        with execution(self, iteration, input_candidate) as owner:
+            if owner is None:
+                return {"state": "pending", "reason": "publication_execution_active"}
+            try:
+                return self._publish_owned(iteration, input_candidate, owner)
+            except PublicationUncertain as exc:
+                return {"state": "pending", "reason": "original_" + exc.operation + "_readback"}
+
+    def _publish_owned(self, iteration, input_candidate, owner):
         # Only this invocation's confirmed pre-mutation failure can release uncertainty.
         # Any retained original effect may belong to an earlier lost completion.
         if self.spec.get("publication_readback_version") == 1:
@@ -1697,10 +1719,18 @@ class DeliveryBroker:
             return done
         if before["id"] != input_candidate["id"] and self._changed_paths(include_index=True):
             raise RuntimeError("candidate changed during publication recovery")
+        if before["id"] != input_candidate["id"]:
+            if (any(before.get(field) != input_candidate.get(field) for field in (
+                    "content_sha256", "base_sha", "policy_digest", "environment_digest"))
+                    or before["head"] != input_candidate["head"]
+                    and _git(self.checkout, "rev-parse", "HEAD^") != input_candidate["head"]):
+                raise ValueError("published candidate content or authority changed")
+            owner.observed("commit")
         changed = self._changed_paths(include_index=True)
         require_authorized(self.spec["policy"], changed, checkout=self.checkout)
         existing = self._existing_pr()
         if changed:
+            owner.require("commit")
             author = _git(self.checkout, "var", "GIT_AUTHOR_IDENT").rsplit(" ", 2)[0]
             committer = _git(self.checkout, "var", "GIT_COMMITTER_IDENT").rsplit(" ", 2)[0]
             if author != committer:
@@ -1719,7 +1749,7 @@ class DeliveryBroker:
             if stageable:
                 _git(self.checkout, '--literal-pathspecs', 'add', '--all', '--', *stageable)
             if _git(self.checkout, "diff", "--cached", "--name-only"):
-                _git(
+                owner.mutate("commit", lambda: _git(
                     self.checkout,
                     "-c",
                     "core.hooksPath=/dev/null",
@@ -1727,7 +1757,7 @@ class DeliveryBroker:
                     "--signoff",
                     "-m",
                     publication_subject(self.spec),
-                )
+                ))
         self._validate_publication_commits()
         head = _git(self.checkout, "rev-parse", "HEAD")
         if head == self.spec["base_sha"]:
@@ -1760,7 +1790,10 @@ class DeliveryBroker:
                 if ancestry.returncode != 0:
                     raise RuntimeError("remote feature branch diverged")
             self.publication_may_have_effect = True
-            _git(self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}")
+            owner.mutate("push", lambda: _git(
+                self.checkout, "push", "origin", f"HEAD:refs/heads/{self.spec['branch']}"))
+        else:
+            owner.observed("push")
         if self.spec.get("publication_readback_version") == 1:
             self._bind_pending_publication(
                 key, head, existing["number"] if existing else None, remote_confirmed=True,
@@ -1768,6 +1801,8 @@ class DeliveryBroker:
         if existing is None:
             self.publication_may_have_effect = True
             self._create_owned_pr(publication_branch)
+        else:
+            owner.observed("create")
         # A successful push can precede GitHub's PR-head projection. The
         # durable effect remains pending until a separate read-only
         # reconciliation proves all three heads equal.
@@ -1779,6 +1814,7 @@ class DeliveryBroker:
                 break
         else:
             return {"state": "pending", "reason": "pr_head_readback", "head": head}
+        owner.observed("create")
         result = {
             "number": found["number"],
             "url": found["url"],
@@ -1792,6 +1828,11 @@ class DeliveryBroker:
 
     def _create_owned_pr(self, publication_branch: str) -> None:
         """Open the regular PR for the pushed head; an existing one is read back."""
+        from .delivery_publication_execution import current
+
+        owner = current()
+        if owner is None:
+            raise ValueError("PR creation requires its publication executor")
         title = publication_title(publication_subject(self.spec))
         body = self.state_dir / "pull-request.md"
         body.write_text(
@@ -1805,25 +1846,17 @@ class DeliveryBroker:
         )
         os.chmod(body, 0o600)
         try:
-            _run(
-                [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--repo",
-                    self.spec["github_repo"],
-                    "--head",
-                    self.spec["branch"],
-                    "--base",
-                    publication_branch,
-                    "--title",
-                    title,
-                    "--body-file",
-                    str(body),
-                ],
-                cwd=self.checkout,
-                timeout=90,
-            )
+            def create():
+                return _run(
+                    [
+                        "gh", "pr", "create", "--repo", self.spec["github_repo"],
+                        "--head", self.spec["branch"], "--base", publication_branch,
+                        "--title", title, "--body-file", str(body),
+                    ],
+                    cwd=self.checkout,
+                    timeout=90,
+                )
+            owner.mutate("create", create)
         except RuntimeError as exc:
             # GitHub refuses a second open PR for one head and base: the
             # existing PR is this publication, and the caller reads it back.
@@ -1866,13 +1899,47 @@ class DeliveryBroker:
         complete: bool = True,
         create_missing: bool = False,
     ) -> dict[str, Any]:
+        from .delivery_publication_execution import PublicationUncertain, execution
+
+        with execution(self, iteration, input_candidate) as owner:
+            if owner is None:
+                return {"state": "pending", "reason": "publication_execution_active"}
+            try:
+                # The lost body may have ended in a confirmed pre-mutation
+                # query failure and discarded its unused row. Its durable
+                # journal, rather than absence of a remote projection, permits
+                # continuation of the same checked request. Admission readback
+                # (complete=False) cannot originate any publication operation.
+                if (create_missing and complete and owner.replacing
+                        and owner.permitted("push") and owner.permitted("create")):
+                    with self.store._connect() as db:
+                        saved = db.execute(
+                            "SELECT state FROM delivery_effects WHERE effect_key=?",
+                            (owner.key,),
+                        ).fetchone()
+                    if saved is None or saved["state"] == "pending":
+                        return self._publish_owned(iteration, input_candidate, owner)
+                return self._reconcile_publish_owned(
+                    iteration, input_candidate, expected_head=expected_head,
+                    expected_pr_number=expected_pr_number, complete=complete,
+                    create_missing=create_missing, owner=owner,
+                )
+            except PublicationUncertain as exc:
+                return {"state": "pending", "reason": "original_" + exc.operation + "_readback"}
+
+    def _reconcile_publish_owned(
+        self, iteration, input_candidate, *, expected_head=None, expected_pr_number=None,
+        complete=True, create_missing=False, owner,
+    ):
         """Complete an existing publish effect after external readback.
 
         This path cannot commit or push. It is safe after a successful push
         followed by a stale GitHub PR projection. With ``create_missing`` it
-        opens the PR for a pushed head that has none, so a publication whose
-        PR creation failed converges instead of waiting for nothing.
+        may finish a creation that was never launched; an uncertain earlier
+        creation must first be observed, even after its local process exits.
         """
+        from .delivery_publication_execution import PublicationUncertain
+
         key = self.publication_effect_key(iteration)
         self._validate_publication_commits()
         request = {"iteration": iteration, "input_candidate_id": input_candidate["id"]}
@@ -1945,9 +2012,12 @@ class DeliveryBroker:
             return {"state": "pending", "reason": "original_push_readback", "head": head}
         if not remote or remote.split()[0] != head:
             raise ValueError("remote feature branch differs from the published checkout")
+        owner.observed("push")
         if saved["state"] == "pending" and self.spec.get("publication_readback_version") == 1:
             self._bind_pending_publication(key, head, expected_pr_number, remote_confirmed=True)
         found = self._existing_pr()
+        if found is not None:
+            owner.observed("create")
         if (found is None and create_missing and saved["state"] == "pending"
                 and self.spec.get("publication_readback_version") == 1
                 and expected_pr_number is None):
@@ -1955,6 +2025,8 @@ class DeliveryBroker:
             # branch; finish the original mutation instead of waiting for it.
             try:
                 self._create_owned_pr(self._publication_base_ref())
+            except PublicationUncertain:
+                raise
             except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
                 raise BrokerReadbackUnavailable(
                     "owned PR creation is unconfirmed; remote readback required") from exc

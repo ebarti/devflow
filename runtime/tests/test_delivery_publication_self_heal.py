@@ -17,6 +17,7 @@ from devflow_temporal import delivery_activities, delivery_broker
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_publication import stopped_at_publication
+from devflow_temporal.delivery_publication_execution import execution
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -52,6 +53,8 @@ class FakeGitHub:
         if argv[:3] == ['gh', 'pr', 'create']:
             if self.create_failures:
                 self.create_failures -= 1
+                if isinstance(self.create_error, BaseException):
+                    raise self.create_error
                 if 'already exists' in self.create_error:
                     # A lost earlier attempt created it; GitHub refuses a second one.
                     self.created = True
@@ -160,32 +163,39 @@ async def test_deterministic_pre_push_refusal_stays_rejected(service, monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['create_failed', 'already_exists'])
-async def test_reconcile_creates_the_missing_pr_for_the_pushed_head(
+@pytest.mark.parametrize('failure', ['never_launched', 'unknown_create'])
+async def test_reconcile_distinguishes_never_launched_from_unknown_creation(
     service, monkeypatch, failure,
 ):
-    store, spec, broker, checked, gh = prepared(service, monkeypatch, create_failures=1)
+    store, spec, broker, checked, gh = prepared(
+        service, monkeypatch, create_failures=1,
+        create_error=FileNotFoundError('gh executable absent')
+        if failure == 'never_launched' else 'HTTP 502 Bad Gateway')
     request = {'spec': spec, 'iteration': 0, 'candidate': checked}
-    with pytest.raises(RuntimeError, match='HTTP 502'):
+    with pytest.raises(FileNotFoundError if failure == 'never_launched' else RuntimeError):
         await delivery_activities.delivery_publish(request)
     head = _git(broker.checkout, 'rev-parse', 'HEAD')
     assert remote_head(broker) == head
     state, observed = effect_row(store)
     assert state == 'pending'
     assert observed == {'head': head, 'number': None, 'remote_confirmed': True}
-    if failure == 'already_exists':
-        gh.create_failures, gh.create_error = 1, 'a pull request for this branch already exists'
     pushes = len(gh.mutations())
     published = await delivery_activities.delivery_reconcile_publish(
         {**request, 'expected_head': None, 'expected_pr_number': None})
+    if failure == 'unknown_create':
+        assert published == {'state': 'pending', 'reason': 'original_create_readback'}
+        assert len(gh.creations()) == 1
+        assert len(gh.mutations()) == pushes
+        # A 502 did not establish no effect. A later exact PR readback settles it.
+        gh.created = True
+        published = await delivery_activities.delivery_reconcile_publish(request)
     assert published['number'] == 1 and published['head'] == head
     assert effect_row(store)[0] == 'complete'
     creation = gh.creations()[-1]
     assert creation[creation.index('--head') + 1] == spec['branch']
     assert creation[creation.index('--base') + 1] == broker._publication_base_ref()
-    assert len(gh.creations()) == 2
-    # The reconciliation created the PR and nothing else.
-    assert len(gh.mutations()) == pushes + 1
+    assert len(gh.creations()) == (2 if failure == 'never_launched' else 1)
+    assert len(gh.mutations()) == pushes + (failure == 'never_launched')
     assert _git(broker.checkout, 'rev-parse', 'HEAD') == head
 
 
@@ -367,7 +377,8 @@ def test_discard_leaves_a_row_adopted_by_a_later_attempt(service, monkeypatch):
     store, spec, _broker, checked, gh = prepared(service, monkeypatch)
     key = 'publish:run-1:0'
     timed_out = DeliveryBroker(store, spec)
-    timed_out._effect(key, 'publish', {'iteration': 0, 'input_candidate_id': checked['id']})
+    with execution(timed_out, 0, checked):
+        timed_out._effect(key, 'publish', {'iteration': 0, 'input_candidate_id': checked['id']})
     timed_out.publication_may_have_effect = False
     adopted = DeliveryBroker(store, spec)
     gh.ls_remote_failure = RuntimeError('command failed (128): git -c: fatal: unable to access')
@@ -385,13 +396,15 @@ def test_discard_leaves_a_row_adopted_by_a_later_attempt(service, monkeypatch):
 def test_reconcile_adopts_the_pending_effect_it_depends_on(service, monkeypatch):
     store, spec, _broker, checked, _gh = prepared(service, monkeypatch)
     inserter = DeliveryBroker(store, spec)
-    inserter._effect('publish:run-1:0', 'publish', {'iteration': 0,
-                                                    'input_candidate_id': checked['id']})
-    _git(inserter.checkout, 'add', 'README.md')
-    _git(inserter.checkout, 'commit', '--signoff', '-m', 'chore: Checked edit')
-    head = _git(inserter.checkout, 'rev-parse', 'HEAD')
-    inserter._bind_pending_publication('publish:run-1:0', head, None)
-    # Its push never happened and the attempt timed out; the thread lives on.
+    with execution(inserter, 0, checked) as owner:
+        inserter._effect('publish:run-1:0', 'publish', {'iteration': 0,
+                                                        'input_candidate_id': checked['id']})
+        _git(inserter.checkout, 'add', 'README.md')
+        owner.mutate('commit', lambda: _git(
+            inserter.checkout, 'commit', '--signoff', '-m', 'chore: Checked edit'))
+        head = _git(inserter.checkout, 'rev-parse', 'HEAD')
+        inserter._bind_pending_publication('publish:run-1:0', head, None)
+    # This body ended before push admission; its journal authenticates that fact.
     inserter.publication_may_have_effect = False
     reader = DeliveryBroker(store, spec)
     assert reader.reconcile_publish(0, checked) == {
@@ -434,7 +447,7 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
     service, monkeypatch,
 ):
     """A current admission, the real publish/reconcile/project activities and the
-    default readback window: GitHub refuses PR creation until the run stops."""
+    default readback window: a PR-create response is lost until the run stops."""
     from temporalio import activity
     from temporalio.testing import WorkflowEnvironment
     from temporalio.worker import Worker
@@ -474,11 +487,6 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
     monkeypatch.setattr(delivery_broker.time, 'sleep', lambda _seconds: None)
     monkeypatch.setattr(delivery_activities, '_context',
                         lambda given, **_kw: (store, DeliveryBroker(store, given)))
-    monkeypatch.setattr('devflow_temporal.delivery_pending_publication._stopped_cleanup',
-                        lambda _: {})
-    # The fake provider has no native resource manifest to archive at admission.
-    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.preserve_resources',
-                        lambda *_args, **_kwargs: None)
     store.mark_start('run-1', accepted=True)
     seen = {'roles': [], 'uncertain': [], 'release': []}
 
@@ -521,11 +529,9 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
     @activity.defn(name='delivery_finalize_resources')
     async def finalize_resources(payload):
         seen['uncertain'].append(payload['uncertain'])
-        if payload['uncertain']:
-            return {'state': 'unknown', 'process_cleanup': 'unknown',
-                    'resource_cleanup': 'unknown'}
-        return {'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
-                'resource_cleanup': 'confirmed'}
+        return await asyncio.to_thread(
+            DeliveryBroker(store, payload['spec']).run_resources().finalize,
+            payload['outcome'], uncertain=payload['uncertain'])
 
     @activity.defn(name='delivery_terminal_tracker')
     async def terminal_tracker(payload):
@@ -547,8 +553,8 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
             assert stopped['error'] == 'publication unresolved: readback deadline exhausted'
             assert stopped['checks']['failure']['classification'] == 'transient'
             assert stopped['checks']['failure']['cause_type'] == 'publication_deadline'
-            assert stopped['cleanup'] == 'confirmed'
-            assert seen['uncertain'] == [False] and seen['release'] == [True]
+            assert stopped['cleanup'] == 'unknown'
+            assert seen['uncertain'] == [True] and seen['release'] == [False]
             assert stopped['pull_request'] is None
             assert remote_head(broker) == pushed and gh.created is False
             assert effect_row(store) == ('pending', {'head': pushed, 'number': None,
@@ -556,27 +562,49 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
             with store._connect() as db:
                 row = dict(db.execute(
                     "SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
-                # The terminal tracker releases the claim for codex providers.
-                store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
             assert (row['phase'], row['cleanup'], row['error']) == (
-                'blocked', 'confirmed', stopped['error'])
+                'blocked', 'unknown', stopped['error'])
             closed = {'workflow_id': 'delivery-run-1', 'execution_run_id': handle.result_run_id,
                       'closed_at': '2026-10-12T00:00:00Z',
                       'request_digest': spec['request_digest'], 'recovery_digest': None,
                       'result': stopped}
             monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_k: closed)
-            admitted = store.recover_publication('run-1', {
+            recover = {
                 'command_id': 'after-the-real-stop', 'expected_revision': stopped['revision'],
                 'expected_candidate_id': stopped['candidate']['id'], 'expected_head': pushed,
-                'expected_pr_number': 0})
+                'expected_pr_number': 0}
+            mutations = len(gh.mutations())
+            with pytest.raises(ValueError, match='exact completed PR readback'):
+                await asyncio.to_thread(store.recover_publication, 'run-1', recover)
+            assert len(gh.mutations()) == mutations
+            # Later transport readback discovers the original request's PR. It
+            # is evidence, not permission to issue another create request.
+            gh.created = True
+            with execution(broker, stopped['iteration'], stopped['candidate']):
+                with pytest.raises(ValueError, match='executor or remote outcome remains unknown'):
+                    await asyncio.to_thread(store.recover_publication, 'run-1', recover)
+            # A real live root user is independently refused even after exact
+            # PR readback; the publication lease alone is not native cleanup.
+            actor = subprocess.Popen(['/bin/sleep', '30'], cwd=broker.checkout)
+            try:
+                with pytest.raises(ValueError, match='live root user|unreadable lease'):
+                    await asyncio.to_thread(store.recover_publication, 'run-1', recover)
+            finally:
+                actor.terminate()
+                actor.wait(timeout=5)
+            admitted = await asyncio.to_thread(store.recover_publication, 'run-1', recover)
             assert admitted['phase'] == 'publication_recovery_queued'
             assert admitted['implementation_authority'] is False
-            gh.create_failures = 0
             store.mark_start('run-1', accepted=True)
             with store._connect() as db:
                 recovery = json.loads(db.execute(
                     "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
                 ).fetchone()[0])
+            assert digest(recovery['state']) == digest(stopped)
+            assert recovery['state']['cleanup'] == 'unknown'
+            retained_cleanup = (broker.state_dir / recovery['namespace'] /
+                                'predecessor-resources' / 'finalization.json')
+            assert json.loads(retained_cleanup.read_text())['state'] == 'unknown'
             effective = store.effective_spec('run-1')
             resumed = await environment.client.execute_workflow(
                 DeliveryWorkflow.run, args=[effective, recovery], id=admitted['workflow_id'],
@@ -586,5 +614,9 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
     assert resumed['pull_request']['head'] == pushed
     assert seen['roles'] == ['implement', 'review', 'verify']
     assert gh.created is True
+    assert len(gh.creations()) == 1
     assert effect_row(store)[0] == 'complete'
-    assert _git(broker.checkout, 'rev-list', '--count', spec['base_sha'] + '..HEAD') == '1'
+    # Successful terminal cleanup may remove the worktree. Its published Git
+    # object remains in the owned source repository for exact mutation evidence.
+    assert _git(broker.source, 'rev-list', '--count', spec['base_sha'] + '..' + pushed) == '1'
+    assert resumed['cleanup'] == 'confirmed'

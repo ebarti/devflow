@@ -47,15 +47,17 @@ def snapshot(store, run_id):
     # failure discarded it, pending once a push or PR creation was attempted.
     effect = pending[0] if len(pending) == 1 else None
     bound = json.loads(effect['observed_json'] or 'null') if effect else None
+    settling_unknown = row['cleanup'] == state.get('cleanup') == 'unknown'
     if sum(1 for r in _chain(previous) if r.get('kind') == KIND) >= PUBLICATION_RETRIES:
         raise ValueError('this run already received its bounded publication retries')
     if (row['phase'] != 'blocked' or row['outcome'] != 'blocked'
-            or row['execution_state'] != 'blocked' or row['cleanup'] != 'confirmed'
+            or row['execution_state'] != 'blocked'
+            or row['cleanup'] not in {'confirmed', 'unknown'}
             or state.get('phase') != 'blocked'
             or row['error'] != state.get('error')
             or state.get('checks') != json.loads(row['checks_json'] or '{}')
             or not stopped_at_publication(state)
-            or state.get('cleanup') != 'confirmed' or state.get('outcome') != 'blocked'
+            or state.get('cleanup') != row['cleanup'] or state.get('outcome') != 'blocked'
             or state.get('revision') != row['protocol_revision']
             or state.get('iteration') != row['iteration']
             or closed['request_digest'] != row['request_digest']
@@ -75,7 +77,9 @@ def snapshot(store, run_id):
             or any(implementation.get('candidate', {}).get(k) != candidate.get(k)
                    for k in ('id', 'head', 'base_sha', 'content_sha256', 'environment_digest'))
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
-            or claim is not None or len(pending) > 1
+            or (claim is not None and not (settling_unknown and claim['owner'] ==
+                                          'external:devflow:' + run_id))
+            or len(pending) > 1
             or (effect is not None and (
                 effect['effect_key'] != f"publish:{run_id}:{row['iteration']}"
                 or effect['kind'] != 'publish' or effect['state'] != 'pending'
@@ -118,13 +122,32 @@ def snapshot(store, run_id):
                 or pr['headRefOid'] not in {previous_head, observed['head']}))):
         raise ValueError('pending publication source, remote head or scope changed')
     load_execution_config(spec)
+    settlement = None
+    if settling_unknown:
+        # A later exact observation may settle an unknown publication stop. It
+        # grants no new mutation and never rewrites its historical provider or
+        # cleanup result. The executor lease and all native actors must be idle.
+        if (spec.get('resource_cleanup_version') != 1 or effect is None or pr is None
+                or not pushed or pr['headRefOid'] != observed['head']):
+            raise ValueError('unknown publication requires its exact completed PR readback')
+        publication = broker.reconcile_publish(
+            row['iteration'], candidate, expected_head=observed['head'],
+            expected_pr_number=pr['number'], complete=False,
+        )
+        if publication.get('state') == 'pending':
+            raise ValueError('original publication executor or remote outcome remains unknown')
+        from .delivery_resources import observe_completed_resources
+
+        settlement = {'publication': publication,
+                      'native_cleanup': observe_completed_resources(spec, attempts)}
     with store._connect() as db:
         binding = work_binding(store, spec, db)
     return {'row': _sealed_row(row), 'closed': closed, 'spec': spec,
             'previous_digest': digest(previous) if previous else None,
             'candidate': observed, 'pr': pr, 'published': published, 'pushed': pushed,
             'remote_head': remote_head, 'work_binding': binding,
-            'cleanup': _stopped_cleanup(spec)}
+            'cleanup': (settlement['native_cleanup'] if settlement else _stopped_cleanup(spec)),
+            **({'publication_settlement': settlement} if settlement else {})}
 
 def admit(store, run_id, payload):
     fields = {'command_id', 'expected_revision', 'expected_candidate_id',
@@ -236,4 +259,17 @@ def readback(store, spec, recovery):
     if spec['provider'] != 'fake':
         from .delivery_native_preparation import verify_native_spec
         verify_native_spec(spec)
+    settlement = seal.get('publication_settlement')
+    if settlement:
+        from .delivery_resources import observe_completed_resources
+
+        _row, attempts, _effects, _claim = _rows(store, spec['run_id'])
+        publication = broker.reconcile_publish(
+            recovery['state']['iteration'], recovery['state']['candidate'],
+            expected_head=seal['candidate']['head'],
+            expected_pr_number=settlement['publication']['number'], complete=False,
+        )
+        if (publication != settlement['publication']
+                or observe_completed_resources(spec, attempts) != settlement['native_cleanup']):
+            raise ValueError('settled publication or native actor custody changed after admission')
     return seal['candidate']

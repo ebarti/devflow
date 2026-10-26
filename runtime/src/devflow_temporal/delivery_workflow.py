@@ -1111,9 +1111,12 @@ class DeliveryWorkflow:
             remaining = (deadline - workflow.now()).total_seconds()
             if remaining <= 0:
                 if self.publication_v1:
-                    # A readback window longer than one publish attempt outlasts
-                    # any lost attempt; only the PR projection stays unknown.
-                    if spec["publication_readback_seconds"] >= _PUBLISH_ATTEMPT_SECONDS:
+                    # The activity timeout ends its waiter, not the publication
+                    # thread or its remote request. Only exact readback above
+                    # establishes completion; elapsed time releases no custody.
+                    if (not workflow.patched("publication-executor-custody-v1")
+                            and spec["publication_readback_seconds"] >= _PUBLISH_ATTEMPT_SECONDS):
+                        # Preserve already recorded finalization commands on replay.
                         self.state["cleanup"] = "none"
                     raise PublicationDeadline("readback deadline exhausted")
                 raise ApplicationError("original publication readback deadline exhausted")

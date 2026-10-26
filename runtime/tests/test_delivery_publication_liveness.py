@@ -53,10 +53,8 @@ async def run_publication_probe(*, versioned=True, failure='lost_initial', histo
     if versioned:
         spec.update(publication_readback_version=1,
                     publication_readback_seconds=readback_seconds)
-    # Cleanup is certain when the failure never mutated, or when the readback
-    # window outlasted every publish attempt (the production default does).
-    certain = failure in {'pre_mutation', 'pre_push_exhausted'} or (
-        failure == 'deadline' and readback_seconds >= 180)
+    # A readback deadline cannot establish that the original body/request ended.
+    certain = failure in {'pre_mutation', 'pre_push_exhausted'}
     if failure in {'deadline', 'cancel', 'semantic', 'pre_mutation', 'pre_push_exhausted'}:
         spec.update(resource_cleanup_version=1, terminal_tracker_version=1)
     if failure in {'deadline', 'pre_push_transient', 'pre_push_exhausted'}:
@@ -242,13 +240,13 @@ async def test_pre_marker_execution_stops_a_confirmed_transient_failure_as_rejec
 
 
 @pytest.mark.asyncio
-async def test_default_window_deadline_confirms_cleanup_and_releases_the_claim():
+async def test_default_window_deadline_preserves_unknown_cleanup_custody():
     result, calls, _events = await run_publication_probe(failure='deadline',
                                                          readback_seconds=900)
     assert result['outcome'] == 'blocked'
     assert result['error'] == 'publication unresolved: readback deadline exhausted'
-    assert result['cleanup'] == 'confirmed'
-    assert result['checks']['resource_cleanup']['state'] == 'confirmed'
+    assert result['cleanup'] == 'unknown'
+    assert result['checks']['resource_cleanup']['state'] == 'unknown'
     assert result['checks']['failure']['cause_type'] == 'publication_deadline'
     assert result['pull_request'] is None
     assert calls['publish'] == calls['implement'] == 1
