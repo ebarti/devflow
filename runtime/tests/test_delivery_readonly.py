@@ -22,6 +22,9 @@ from devflow_temporal.delivery_mcp import build_server
 
 READ_TOOLS = [
     ('get_service', {}), ('list_runs', {}), ('get_run', {'run_id': 'absent'}),
+    ('get_run_detail', {'run_id': 'absent'}),
+    ('get_operation', {'operation_id': 'absent'}),
+    ('get_run_operations', {'run_id': 'absent'}),
     ('read_evidence', {'run_id': 'absent', 'evidence_id': 'missing'}),
     ('gates_only_preflight', {'run_id': 'absent'}),
     ('repair_admission_preflight', {'run_id': 'absent', 'request_json': '{}'}),
@@ -153,10 +156,15 @@ def test_warm_read_client_uses_get_without_session_or_start(config, monkeypatch)
     assert caller.service() == {'fixture': '/api/service'}
     caller.runs()
     caller.status('run/one')
+    caller.detail('run/one')
+    caller.operation('operation/one')
+    caller.run_operations('run/one')
     caller.evidence('run/one', 'artifact/one')
     assert calls == [
         ('GET', '/api/service'), ('GET', '/api/runs'),
-        ('GET', '/api/runs/run%2Fone'), ('GET', '/api/runs/run%2Fone/evidence/artifact%2Fone'),
+        ('GET', '/api/runs/run%2Fone/status'), ('GET', '/api/runs/run%2Fone'),
+        ('GET', '/api/operations/operation%2Fone'), ('GET', '/api/runs/run%2Fone/operations'),
+        ('GET', '/api/runs/run%2Fone/evidence/artifact%2Fone'),
     ]
     assert caller.csrf == ''
     assert not config.state_root.exists()

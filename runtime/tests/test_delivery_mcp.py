@@ -71,6 +71,11 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             continue_repair=lambda run_id, request: {"run_id": run_id, **request},
             merge=lambda run_id, request: {"run_id": run_id, **request},
             merge_preflight=lambda run_id: {"run_id": run_id},
+            detail=lambda run_id: {"detail": run_id},
+            operation=lambda operation_id: {"operation": operation_id},
+            run_operations=lambda run_id: {"operations_for": run_id},
+            create_operation=lambda request: {"created": request},
+            reconcile_operation=lambda operation_id: {"reconciled": operation_id},
         )
 
     monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda path: client(path, "write"))
@@ -84,6 +89,11 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "submit_run",
             "list_runs",
             "get_run",
+            "get_run_detail",
+            "get_operation",
+            "get_run_operations",
+            "create_operation",
+            "reconcile_operation",
             "read_evidence",
             "answer_decision",
             "refresh_issue_context",
@@ -104,6 +114,9 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "get_service",
             "list_runs",
             "get_run",
+            "get_run_detail",
+            "get_operation",
+            "get_run_operations",
             "read_evidence",
             "gates_only_preflight",
             "merge_preflight",
@@ -114,6 +127,8 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             assert tools[name].annotations.openWorldHint is False
         for name in (
             "start_service",
+            "create_operation",
+            "reconcile_operation",
             "submit_run",
             "answer_decision",
             "refresh_issue_context",
@@ -131,6 +146,8 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             assert tools[name].annotations.openWorldHint is True
             assert tools[name].annotations.idempotentHint is True
         assert tools["cancel_run"].annotations.destructiveHint is True
+        assert tools["create_operation"].annotations.destructiveHint is False
+        assert tools["reconcile_operation"].annotations.destructiveHint is False
         assert tools["submit_run"].inputSchema["required"] == ["request_json"]
         assert tools["get_service"].inputSchema.get("required", []) == []
         assert tools["start_service"].inputSchema.get("required", []) == []
@@ -165,8 +182,19 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             }
         result = await session.call_tool("gates_only_preflight", {"run_id": "same-run"})
         assert not result.isError and json.loads(result.content[0].text) == {"run_id": "same-run"}
+        for name, arguments, expected in (
+            ("get_run_detail", {"run_id": "same-run"}, {"detail": "same-run"}),
+            ("get_operation", {"operation_id": "same-op"}, {"operation": "same-op"}),
+            ("get_run_operations", {"run_id": "same-run"}, {"operations_for": "same-run"}),
+            ("create_operation", {"request_json": '{"operation_id":"same-op"}'},
+             {"created": {"operation_id": "same-op"}}),
+            ("reconcile_operation", {"operation_id": "same-op"}, {"reconciled": "same-op"}),
+        ):
+            result = await session.call_tool(name, arguments)
+            assert not result.isError and json.loads(result.content[0].text) == expected
         assert seen == [(factory, config) for factory in (
             "read", "write", "write", "write", "read", "write", "read",
+            "read", "read", "read", "read", "read",
         )]
 
 
