@@ -476,21 +476,9 @@ def register_worker(store, parent, spec):
 
 
 def assess_feature_continuation(store, run_id, request):
-    """Observe only: settlement and successor admission have not yet been proved."""
-    from .delivery_lifecycle import evaluate_transition
+    from .delivery_feature_handoff import observe_handoff
 
-    with store._connect() as db:
-        row = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-    return evaluate_transition({
-        "operation": "continue_feature", "owner": "feature_continuation",
-        "owner_proof": None, "normalized_lifecycle": "unknown",
-        "revision": row["revision"] if row else None,
-        "comparisons": [("revision", "expected_revision", "revision_changed")],
-        "predicates": [{"code": "feature_settlement_proof_unknown", "satisfied": None,
-                        "missing_or_unknown_fact": (
-                            "settled feature effects, worker custody and successor admission"),
-                        "next_action": "inspect feature settlement and successor admission"}],
-    }, request)
+    return observe_handoff(store, run_id, request, operation="continue_feature")
 
 
 def continue_feature(store, run_id, request, *, _revision=None):

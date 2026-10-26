@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json, digest
+from .delivery_lifecycle import RecoveryRefused
 from .delivery_registry_epoch import initialize as initialize_authority_epochs
 
 PREPARATION_CONTINUATION_LIMIT = 3
@@ -94,6 +95,14 @@ class OwnershipConflict(ValueError):
 
 class UnresolvedEffect(OwnershipConflict):
     """An external operation needs readback before execution can continue."""
+
+
+class FeatureHandoffRefused(RecoveryRefused, OwnershipConflict):
+    """A typed refusal retaining the existing ownership-conflict contract."""
+
+
+class FeatureEffectRefused(RecoveryRefused, UnresolvedEffect):
+    """A typed refusal retaining the existing unresolved-effect contract."""
 
 
 def now() -> str:
@@ -281,8 +290,27 @@ class ExecutionRegistry:
                     or old["issue_url"] != issue["url"]
                 ):
                     raise OwnershipConflict("GitHub feature identity changed")
-                if predecessor != self.token(old) or old["state"] != "stopped":
-                    raise OwnershipConflict("feature already has an execution; continue its owner")
+                # The public observation and this owner-locked admission derive the
+                # same settlement facts. The prior observation grants no takeover.
+                from .delivery_feature_handoff import handoff_facts
+                from .delivery_lifecycle import evaluate_transition
+
+                assessment = evaluate_transition(handoff_facts(db, predecessor), {})
+                if not assessment["eligible"]:
+                    codes = {item["code"] for item in assessment["blockers"]}
+                    if "feature_owner_changed" in codes or "feature_owner_not_stopped" in codes:
+                        error = FeatureHandoffRefused(assessment)
+                        error.args = ("feature already has an execution; continue its owner",)
+                        raise error
+                    if "feature_workers_unsettled" in codes:
+                        error = FeatureHandoffRefused(assessment)
+                        error.args = ("feature still has unfinished or unknown workers",)
+                        raise error
+                    if "feature_effects_unsettled" in codes:
+                        error = FeatureEffectRefused(assessment)
+                        error.args = ("feature has an external operation awaiting readback",)
+                        raise error
+                    raise FeatureHandoffRefused(assessment)
                 self._settled(db, issue["id"])
                 pending = self._pending_revision(db, issue["id"])
                 if (pending and pending.get("successor_id") != run_id
@@ -479,7 +507,8 @@ class ExecutionRegistry:
         ).fetchone():
             raise OwnershipConflict("feature still has unfinished or unknown workers")
         if db.execute(
-            "SELECT 1 FROM execution_effects WHERE issue_id=? AND state='pending'", (issue_id,)
+            "SELECT 1 FROM execution_effects WHERE issue_id=? "
+            "AND (state NOT IN ('complete','absent') OR result_json IS NULL)", (issue_id,)
         ).fetchone():
             raise UnresolvedEffect("feature has an external operation awaiting readback")
 
