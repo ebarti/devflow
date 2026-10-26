@@ -91,18 +91,18 @@ def authenticate(request, store):
     with store._connect() as db:
         saved = current(db, spec["run_id"])
         effect = db.execute(
-            "SELECT request_json FROM delivery_effects WHERE effect_key=? AND run_id=? "
+            "SELECT * FROM delivery_effects WHERE effect_key=? AND run_id=? "
             "AND kind='merge_resolution'", (context["effect_key"], spec["run_id"]),
         ).fetchone()
         claim = store.state.claim_for(db, spec["work_id"])
     if not saved or not effect:
         raise ValueError("merge role has no admitted resolution")
-    expected = json.loads(effect[0])
+    expected = json.loads(effect['request_json'])
+    original = store.effective_spec(spec['run_id'])
     if (
         saved["phase"] not in ACTIVE
         or expected["merge_authorization"] != digest(json.loads(saved["grant_json"]))
-        or expected["spec_sha256"] != digest(store.effective_spec(spec["run_id"]))
-        or expected["spec_sha256"] != digest(spec)
+        or expected["spec_sha256"] != digest(original)
         or expected["merge_context"] != context
         or expected["job_key"] != DeliverySupervisor._job_key(request)
         or expected["candidate"] != request["candidate"]
@@ -113,6 +113,9 @@ def authenticate(request, store):
         or not claim or claim["owner"] != "external:devflow:" + spec["run_id"]
     ):
         raise ValueError("merge role changed its admitted scope, candidate or authority")
+    from .delivery_merge_native_preparation import authenticate as native_authenticate
+
+    native_authenticate(store, original, request, expected, effect)
 
 
 def scratch_path(request):
@@ -288,6 +291,7 @@ def _prepare(broker, pr, conflict, authorization):
 
 
 async def _role(broker, spec, workspace, context, authorization, role):
+    from .delivery_merge_native_preparation import FIELD, prepare, recorded
     from .supervisor import DeliverySupervisor, get_supervisor
 
     key = "merge-resolution:" + spec["run_id"] + ":" + context["resolution_id"] + ":" + role
@@ -304,20 +308,37 @@ async def _role(broker, spec, workspace, context, authorization, role):
                    "merge_context": bound["merge_context"]}
         if bound.get("review_diff"):
             request["review_diff"] = bound["review_diff"]
+        if bound.get(FIELD):
+            execution, _binding = recorded(spec, request, authorization, bound[FIELD])
+            request['spec'] = execution
+            request[FIELD] = bound[FIELD]
     else:
         request = {"spec": spec, "role": role, "iteration": 0,
                    "candidate": candidate_for(workspace), "workspace": str(workspace),
                    "merge_context": {**context, "effect_key": key}}
         if role == "review":
             request["review_diff"] = review_diff(request)
+        execution, prepared = await asyncio.to_thread(
+            prepare, broker.store, spec, request, authorization)
+        request['spec'] = execution
+        if prepared:
+            request[FIELD] = prepared
         bound = {"merge_authorization": authorization, "spec_sha256": digest(spec),
                  "candidate": request["candidate"], "workspace": request["workspace"],
                  "merge_context": request["merge_context"],
                  "job_key": DeliverySupervisor._job_key(request)}
+        if prepared:
+            bound.update({FIELD: prepared, 'execution_spec_sha256': digest(execution)})
         if request.get("review_diff"):
             bound["review_diff"] = request["review_diff"]
         broker.intent(key, "merge_resolution", bound)
     result = await get_supervisor(broker.store).run(request)
+    if (result.get('status') == 'blocked' and result.get('finish_reason') == 'prelaunch'
+            and result.get('cleanup') == 'confirmed' and result.get('session_id') is None
+            and not result.get('native_process') and not result.get('process_cleanup')):
+        # Preserve the pending intent for the typed absent-provider continuation;
+        # no monitored-process receipt or provider verdict exists in this branch.
+        raise RuntimeError('merge native role was blocked before provider launch')
     if result.get("cleanup") != "confirmed" or result.get("process_cleanup") != (
         "observed-native-confirmed"
     ):

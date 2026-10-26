@@ -67,8 +67,9 @@ def _continuable(saved):
         return False
     reason = result.get("reason")
     return ((saved["phase"] == "decision_required" and reason == "conflicting_upstream_changes")
-            or (saved["phase"] == "unknown" and reason
-                == "RuntimeError: merge resolution native cleanup remains unconfirmed")
+            or (saved["phase"] == "unknown" and reason in {
+                "RuntimeError: merge resolution native cleanup remains unconfirmed",
+                "RuntimeError: merge native role was blocked before provider launch"})
             or (saved["phase"] == "blocked" and reason
                 == "ValueError: predecessor process/root custody is unconfirmed"))
 
@@ -320,7 +321,7 @@ def evidence(store, spec):
     }
 
 
-def _exclusive(store, db, row, *, retained_owner=None):
+def _exclusive(store, db, row, *, retained_owner=None, prelaunch=None):
     spec = json.loads(row["request_json"])
     work_binding(store, spec, db)
     issue = store.state.issue_resource(row["issue_url"])
@@ -332,13 +333,20 @@ def _exclusive(store, db, row, *, retained_owner=None):
         ),
         None,
     )
+    unsettled = db.execute(
+        "SELECT 1 FROM delivery_effects WHERE run_id=? AND state!='complete'", (row['run_id'],)
+    ).fetchone()
+    if prelaunch is not None:
+        from .delivery_merge_native_preparation import _PrelaunchProofs
+
+        if not isinstance(prelaunch, _PrelaunchProofs):
+            raise ValueError('merge exclusivity requires its leased prelaunch observation')
+        unsettled = prelaunch.unsettled(db, row['run_id'])
     if (
         latest != row["run_id"]
         or (store.state.claim_for(db, row["work_id"]) is not None
             and store.state.claim_for(db, row["work_id"])["owner"] != retained_owner)
-        or db.execute(
-            "SELECT 1 FROM delivery_effects WHERE run_id=? AND state!='complete'", (row["run_id"],)
-        ).fetchone()
+        or unsettled
         or db.execute(
             "SELECT 1 FROM delivery_mutations WHERE run_id=? AND state IN ('pending','unknown')",
             (row["run_id"],),
@@ -353,9 +361,20 @@ def _exclusive(store, db, row, *, retained_owner=None):
 def preflight(store, run_id):
     spec = store.effective_spec(run_id)
     proof = evidence(store, spec)
-    with store._connect() as db:
-        row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-        _exclusive(store, db, row)
+    with ExitStack() as leases:
+        with store._connect() as db:
+            saved = current(db, run_id)
+        prelaunch = None
+        if saved and _continuable(saved) and saved['phase'] == 'unknown':
+            from .delivery_merge_resolution import prelaunch_receipts
+
+            prelaunch = leases.enter_context(prelaunch_receipts(store, spec, saved))
+        with store._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            _exclusive(store, db, row, prelaunch=prelaunch,
+                       retained_owner='external:devflow:' + run_id if prelaunch else None)
+        if prelaunch:
+            prelaunch.recheck()
     return {
         "candidate_id": proof["candidate"]["id"],
         "head": proof["pull_request"]["head"],

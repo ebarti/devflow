@@ -107,9 +107,24 @@ def conflicted(delivered, monkeypatch, tmp_path):
                 assert (workspace / "conflict.txt").read_text() == (
                     "feature requirement\nmain requirement\n")
             assessments[key] = result
+            if request.get('merge_native_preparation'):
+                # This entire assessment is an authored external seam. Retain
+                # its typed completed row so replay cannot invent another role.
+                folder = Path(d.spec['state_dir']) / 'attempts' / key
+                with d.store._connect() as db:
+                    db.execute('INSERT INTO delivery_attempts '
+                               '(job_key,run_id,role,iteration,candidate_id,state,cleanup,'
+                               'result_json,result_path,finished_at) VALUES '
+                               "(?,'run-1',?,0,?,'finished','confirmed',?,?,'now')",
+                               (key, request['role'], request['candidate']['id'],
+                                canonical_json(result), str(folder / 'result.json')))
             return result
 
     monkeypatch.setattr(supervisor, "get_supervisor", lambda _: Native())
+    # This fixture controls the entire native assessment boundary. The separate
+    # native-preparation module exercises the real preparation/supervisor path.
+    monkeypatch.setattr('devflow_temporal.delivery_merge_native_preparation.prepare',
+                        lambda _store, original, *_args: (original, None))
     conflict = {"state": "resolve_conflicts", "original_head": previous,
                 "previous_head": previous, "target": target}
     return SimpleNamespace(d=d, pr=pr, receipt=receipt, target=target, previous=previous,
@@ -236,6 +251,13 @@ def test_proven_prelaunch_continues_same_grant_without_replaying_the_failed_atte
                "candidate": candidate_for(Path(d.spec["source_path"])),
                "merge_context": {"effect_key": key}}
     job = supervisor.DeliverySupervisor._job_key(request)
+    # Actual supervisor prelaunch already owns this name. Observation cannot
+    # create a missing authoritative lease as a substitute for evidence.
+    import os
+
+    owner_lock = supervisor.DeliverySupervisor._owner_lock(d.spec, job)
+    assert owner_lock is not None
+    os.close(owner_lock)
     folder = Path(d.spec["state_dir"]) / "attempts" / job
     write_private(folder / "request.json", request)
     write_private(folder / "native-environment.json", {"version": 3})

@@ -2,16 +2,187 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
 import shutil
 import stat
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
+from importlib.metadata import distribution
 from pathlib import Path
 
 from .candidate import candidate_for
 from .contracts import digest
 from .delivery_resources import _ancestors, read_private
+
+SCHEMA = "devflow.merge-native-execution/v1"
+FIELD = "merge_native_preparation"
+
+
+def _path(original, request):
+    context = request["merge_context"]
+    root = Path(original["state_dir"]) / "merge-resolutions" / context["resolution_id"]
+    if (
+        Path(request["workspace"]) != root / "checkout"
+        or context["effect_key"].split(":")[0] != "merge-resolution"
+    ):
+        raise ValueError("merge native preparation left its exact conflict workspace")
+    return root / "native-executions" / digest(context["effect_key"]) / "execution.json"
+
+
+def _binding(original, request, authorization, workflow):
+    from .delivery_resources import _identity
+
+    return {
+        "schema": SCHEMA,
+        "grant_sha256": authorization,
+        "workflow_id": workflow,
+        "original_spec_sha256": digest(original),
+        "role": request["role"],
+        "iteration": request["iteration"],
+        "candidate": request["candidate"],
+        "workspace": request["workspace"],
+        "merge_context": request["merge_context"],
+        "workspace_identity": _identity(Path(request["workspace"])),
+    }
+
+
+def _same_authority(original, execution):
+    before, after = deepcopy(original), deepcopy(execution)
+    for value in (before, after):
+        value.pop("preparation", None)
+        value.pop("policy_digest", None)
+        for name in (
+            "codex_bin",
+            "native_identity",
+            "environment_proof_sha256",
+            "security_binding_sha256",
+        ):
+            value["policy"].pop(name, None)
+    if before != after or digest(execution["policy"]) != execution["policy_digest"]:
+        raise ValueError("merge native execution changed original non-preparation authority")
+
+
+def prepare(store, original, request, authorization):
+    """Only _role derives a fresh execution; standalone files grant nothing."""
+    from .delivery_gate_retry import _immutable, prepare_runtime
+    from .delivery_merge_followup import authorize, current
+    from .delivery_preparation import verify_prepared_spec
+    from .delivery_runtime_location import require_preparation_location
+
+    if original.get("provider") == "fake":
+        return original, None
+    binary = Path(distribution("openai-codex-cli-bin").locate_file("codex_cli_bin/bin/codex"))
+    if str(binary.resolve()) == original["policy"]["codex_bin"]:
+        verify_prepared_spec(original)
+        return original, None
+    # This is the existing acknowledged location change, not a generic failed
+    # proof renewal or an arbitrary equal-hash executable supplied by a caller.
+    require_preparation_location(original, binary.resolve())
+    authorize(store, original, authorization)
+    with store._connect() as db:
+        saved = current(db, original["run_id"])
+    binding = _binding(original, request, authorization, saved["workflow_id"])
+    if candidate_for(Path(request["workspace"])) != request["candidate"]:
+        raise ValueError("merge workspace changed before native preparation")
+    path = _path(original, request)
+    execution = prepare_runtime(original, path.parent, digest(binding), digest(binding))
+    if os.path.lexists(path):
+        record = read_private(path)
+        if record.get("binding") != binding or record.get("execution_spec") != execution:
+            raise ValueError("merge native generation already belongs to different authority")
+    else:
+        _same_authority(original, execution)
+        verify_prepared_spec(execution)
+        authorize(store, original, authorization)
+        if (
+            _binding(original, request, authorization, saved["workflow_id"]) != binding
+            or candidate_for(Path(request["workspace"])) != request["candidate"]
+        ):
+            raise ValueError("merge authority or workspace changed during native preparation")
+        _immutable(path, {"binding": binding, "execution_spec": execution})
+    _same_authority(original, execution)
+    verify_prepared_spec(execution)
+    reference = {
+        "path": str(path),
+        "sha256": hashlib.sha256(read_private(path, raw=True)).hexdigest(),
+    }
+    return execution, reference
+
+
+def recorded(original, request, authorization, reference):
+    """Immutable metadata only; never claim that this historical value may launch."""
+    path = _path(original, request)
+    if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
+        raise ValueError("merge native reference is malformed")
+    raw = read_private(path, raw=True)
+    if reference["path"] != str(path) or hashlib.sha256(raw).hexdigest() != reference["sha256"]:
+        raise ValueError("merge native preparation receipt changed")
+    record = json.loads(raw)
+    binding, execution = record["binding"], record["execution_spec"]
+    prepared = read_private(path.parent / "runtime-preparation/intent.json")
+    if (
+        binding.get("schema") != SCHEMA
+        or binding.get("grant_sha256") != authorization
+        or binding.get("original_spec_sha256") != digest(original)
+        or any(
+            binding.get(key) != request.get(key)
+            for key in ("role", "iteration", "candidate", "workspace", "merge_context")
+        )
+        or prepared.get("state") != "prepared"
+        or prepared.get("command_digest") != digest(binding)
+        or prepared.get("seal_digest") != digest(binding)
+        or prepared.get("effective_spec") != execution
+    ):
+        raise ValueError("merge native receipt lost its original grant or request")
+    _same_authority(original, execution)
+    return execution, binding
+
+
+def authenticate(store, original, request, bound, effect):
+    """Current launch/reattachment authority; original grant remains separate."""
+    from .delivery_merge_followup import authorize, current
+    from .delivery_preparation import verify_prepared_spec
+    from .delivery_resources import _identity
+
+    reference = bound.get(FIELD)
+    if request.get(FIELD) != reference:
+        raise ValueError("merge role changed its native preparation reference")
+    if reference is None:
+        if request["spec"] != original:
+            raise ValueError("merge role has no derived native execution authority")
+        return
+    execution, binding = recorded(original, request, bound["merge_authorization"], reference)
+    if execution != request["spec"] or bound.get("execution_spec_sha256") != digest(execution):
+        raise ValueError("merge role changed its exact prepared execution")
+    with store._connect() as db:
+        saved = current(db, original["run_id"])
+        attempt = db.execute(
+            "SELECT state FROM delivery_attempts WHERE job_key=? AND run_id=?",
+            (bound["job_key"], original["run_id"]),
+        ).fetchone()
+    if (
+        not saved
+        or (effect["state"] != "complete" and saved["workflow_id"] != binding["workflow_id"])
+        or _identity(Path(request["workspace"])) != binding["workspace_identity"]
+    ):
+        raise ValueError("merge native execution lost its current workspace or workflow")
+    if effect["state"] == "complete" and (not attempt or attempt["state"] != "finished"):
+        raise ValueError("completed merge effect has no finished original native attempt")
+    if effect["state"] == "complete":
+        observed = json.loads(effect["observed_json"] or "null")
+        if not isinstance(observed, dict) or candidate_for(
+            Path(request["workspace"])
+        ) != observed.get("candidate"):
+            raise ValueError("completed merge role lost its observed output candidate")
+    if not attempt or attempt["state"] in {"queued", "starting"}:
+        if candidate_for(Path(request["workspace"])) != request["candidate"]:
+            raise ValueError("merge workspace changed before provider launch")
+    authorize(store, original, bound["merge_authorization"])
+    if not attempt or attempt["state"] != "finished":
+        verify_prepared_spec(execution)
 
 
 def _directory_stamp(info):
@@ -21,10 +192,41 @@ def _directory_stamp(info):
 class _PrelaunchProofs(list):
     """Observation leases survive until the public admission transaction commits."""
 
-    def __init__(self):
+    def __init__(self, saved):
         super().__init__()
         self._checks = []
         self._scratch = []
+        self._saved = saved
+
+    def unsettled(self, db, run_id):
+        from .delivery_merge_followup import current
+
+        self.recheck()
+        if current(db, run_id) != self._saved:
+            raise ValueError("merge prelaunch owner changed during observation")
+        effects = [
+            dict(e)
+            for e in db.execute(
+                "SELECT * FROM delivery_effects WHERE run_id=? AND state!='complete'", (run_id,)
+            )
+        ]
+        expected = {r["effect_key"]: r for r in self}
+        for effect in effects:
+            proof = expected.get(effect["effect_key"])
+            attempt = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                (run_id, proof["job_key"] if proof else ""),
+            ).fetchone()
+            if (
+                not proof
+                or effect["request_json"] != proof["request_json"]
+                or not attempt
+                or digest(dict(attempt)) != proof["attempt_sha256"]
+            ):
+                raise ValueError("merge prelaunch SQL custody changed during observation")
+        if {e["effect_key"] for e in effects} != set(expected):
+            raise ValueError("merge prelaunch effect inventory changed during observation")
+        return []
 
     def recheck(self):
         for check in self._checks:
@@ -66,7 +268,7 @@ def prelaunch_receipts(store, spec, saved):
         ]
     if not effects:
         raise ValueError("merge continuation has no confirmed prelaunch failure")
-    proofs = _PrelaunchProofs()
+    proofs = _PrelaunchProofs(saved)
     with ExitStack() as leases:
         for effect in effects:
             bound = json.loads(effect["request_json"])
@@ -78,10 +280,27 @@ def prelaunch_receipts(store, spec, saved):
             ):
                 raise ValueError("merge continuation retains an unresolved external effect")
             key = bound["job_key"]
-            lock = DeliverySupervisor._owner_lock(spec, key)
-            if lock is None:
-                raise ValueError("merge prelaunch owner is still active")
+            owner = DeliverySupervisor._owner_lock_path(spec, key)
+            try:
+                _ancestors(owner)
+                lock = os.open(owner, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError as exc:
+                raise ValueError("merge prelaunch original owner lease is unavailable") from exc
             leases.callback(os.close, lock)
+            info = os.fstat(lock)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != (owner.lstat().st_dev, owner.lstat().st_ino)
+            ):
+                raise ValueError("merge prelaunch original owner lock changed")
+            owner_stamp = _directory_stamp(info)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("merge prelaunch owner is still active") from exc
             with store._connect() as db:
                 attempt = db.execute(
                     "SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?",
@@ -168,9 +387,15 @@ def prelaunch_receipts(store, spec, saved):
                 bound=bound,
                 missing_request=missing_request,
                 scratch=scratch,
+                owner=owner,
+                owner_descriptor=lock,
+                owner_stamp=owner_stamp,
             ):
                 if (
-                    _directory_stamp(os.fstat(descriptor)) != stamp
+                    _directory_stamp(os.fstat(owner_descriptor)) != owner_stamp
+                    or _directory_stamp(owner.lstat()) != owner_stamp
+                    or os.fstat(owner_descriptor).st_nlink != 1
+                    or _directory_stamp(os.fstat(descriptor)) != stamp
                     or _directory_stamp(folder.lstat()) != stamp
                     or {p.name for p in folder.iterdir()} != names
                     or (

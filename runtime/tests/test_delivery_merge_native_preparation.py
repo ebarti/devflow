@@ -13,20 +13,122 @@ from pathlib import Path
 
 import pytest
 from test_delivery_merge_followup import delivered as delivered
+from test_delivery_merge_resolution import conflicted as conflicted
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_merge_followup as followup
+from devflow_temporal import delivery_merge_native_preparation as native
+from devflow_temporal import delivery_merge_resolution as resolution
 from devflow_temporal import delivery_native_process, delivery_preparation
 from devflow_temporal.candidate import candidate_for
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_merge import MergeBroker
 from devflow_temporal.supervisor import DeliverySupervisor
 
+REAL_PREPARE = native.prepare
+
+
+@pytest.fixture
+def relocated_conflict(conflicted, monkeypatch):
+    """Unit boundary only: location ACK and native measurement are controlled."""
+    from devflow_temporal import delivery_gate_retry as gates
+    from devflow_temporal import delivery_runtime_location as location
+    from devflow_temporal.contracts import canonical_json
+    from devflow_temporal.delivery_resources import write_private
+
+    c = conflicted
+    c.preparations = []
+    monkeypatch.setattr(native, "prepare", REAL_PREPARE)
+    monkeypatch.setattr(location, "require_preparation_location", lambda _old, _binary: None)
+
+    def prepare(old, root, command, seal):
+        c.preparations.append((copy.deepcopy(old), root, command, seal))
+        execution = copy.deepcopy(old)
+        execution["policy"]["codex_bin"] = "/owned/prepared/bundled-codex"
+        execution["policy"]["native_identity"] = {"controlled_measurement": True}
+        execution["policy_digest"] = digest(execution["policy"])
+        write_private(
+            root / "runtime-preparation/intent.json",
+            {
+                "command_digest": command,
+                "seal_digest": seal,
+                "state": "prepared",
+                "preparation_attempts": [],
+                "effective_spec": execution,
+            },
+        )
+        return execution
+
+    def verify(execution):
+        assert execution["policy"]["codex_bin"] == "/owned/prepared/bundled-codex"
+
+    monkeypatch.setattr(gates, "prepare_runtime", prepare)
+    monkeypatch.setattr(delivery_preparation, "verify_prepared_spec", verify)
+    c.original_bytes = canonical_json(c.d.spec)
+    return c
+
 
 @pytest.mark.asyncio
+async def test_derived_execution_keeps_original_grant_and_replays_completed_roles(
+    relocated_conflict,
+):
+    c = relocated_conflict
+    from test_delivery_store import _git
+
+    result = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    assert result["state"] == "pending"
+    assert [r["role"] for r in c.calls] == ["implement", "review"]
+    assert len(c.preparations) == 2
+    assert all(r["spec"] != c.d.spec and r.get(native.FIELD) for r in c.calls)
+    assert _git(c.remote, "show", "-s", "--format=%P", result["head"]).split() == [
+        c.previous,
+        c.target,
+    ]
+    assert _git(c.remote, "show", result["head"] + ":conflict.txt") == (
+        "feature requirement\nmain requirement"
+    )
+    replay = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    assert replay == result and len(c.preparations) == 2 and len(c.calls) == 2
+    with c.d.store._connect() as db:
+        assert followup.current(db, "run-1")["grant_json"]
+        assert digest(c.d.store.effective_spec("run-1")) == digest(c.d.spec)
+    from devflow_temporal.contracts import canonical_json
+
+    assert canonical_json(c.d.spec) == c.original_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["reference", "receipt", "intent", "grant", "source", "policy"])
+async def test_derived_role_rejects_unbound_preparation_or_current_drift(
+    relocated_conflict,
+    change,
+):
+    c = relocated_conflict
+    await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    request = copy.deepcopy(c.calls[0])
+    if change == "reference":
+        request[native.FIELD]["sha256"] = "0" * 64
+    elif change == "receipt":
+        Path(request[native.FIELD]["path"]).write_text("{}")
+    elif change == "intent":
+        path = Path(request[native.FIELD]["path"]).parent / "runtime-preparation/intent.json"
+        path.write_text("{}")
+    elif change == "grant":
+        request["merge_context"]["effect_key"] = "foreign"
+    elif change == "source":
+        (Path(request["workspace"]) / "conflict.txt").write_text("unowned change")
+    else:
+        request["spec"]["policy"]["max_repairs"] += 1
+    with pytest.raises((ValueError, KeyError)):
+        resolution.authenticate(request, c.d.store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", [None, "owner_missing", "launch", "unknown", "started"])
 async def test_actual_empty_prelaunch_continues_original_merge_without_fabricating_request(
     delivered,
     monkeypatch,
+    defect,
 ):
     d = delivered
     grant = followup.admit(d.store, "run-1", d.command)
@@ -87,8 +189,41 @@ async def test_actual_empty_prelaunch_continues_original_merge_without_fabricati
         grant["grant_sha256"],
         "RuntimeError: merge resolution native cleanup remains unconfirmed",
     )
-    with pytest.raises(ValueError, match="settled effects"):
-        followup.preflight(d.store, "run-1")
+    if defect == "owner_missing":
+        DeliverySupervisor._owner_lock_path(d.spec, key).unlink()
+    elif defect == "launch":
+        from devflow_temporal.delivery_resources import write_private
+
+        write_private(folder / "launch.json", {"never": "authority"})
+    elif defect in {"unknown", "started"}:
+        with d.store._connect() as db:
+            if defect == "unknown":
+                db.execute("UPDATE delivery_attempts SET state='unknown' WHERE job_key=?", (key,))
+            else:
+                db.execute(
+                    "UPDATE delivery_attempts SET started_at='2026-10-26T00:00:00Z' "
+                    "WHERE job_key=?",
+                    (key,),
+                )
+    names = {
+        str(p.relative_to(Path(d.spec["state_dir"]))) for p in Path(d.spec["state_dir"]).rglob("*")
+    }
+    with d.store._connect() as db:
+        before_commands = [dict(r) for r in db.execute("SELECT * FROM delivery_commands")]
+        before_effects = [dict(r) for r in db.execute("SELECT * FROM delivery_effects")]
+    if defect:
+        with pytest.raises(ValueError):
+            followup.preflight(d.store, "run-1")
+    else:
+        assert followup.preflight(d.store, "run-1")["phase"] == "available"
+    assert {
+        str(p.relative_to(Path(d.spec["state_dir"]))) for p in Path(d.spec["state_dir"]).rglob("*")
+    } == names
+    with d.store._connect() as db:
+        assert [dict(r) for r in db.execute("SELECT * FROM delivery_commands")] == before_commands
+        assert [dict(r) for r in db.execute("SELECT * FROM delivery_effects")] == before_effects
+    if defect:
+        return
     before = copy.deepcopy(d.before)
     command = {**d.command, "command_id": "continue-real-empty-prelaunch"}
     continued = followup.admit(d.store, "run-1", command)
