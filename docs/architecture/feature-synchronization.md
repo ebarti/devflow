@@ -34,7 +34,8 @@ merge does not rewrite a historical delivery outcome or authorize closing an iss
   Historical run data is not rewritten to adopt new execution policies.
 - Project Status options reuse case-insensitive matching names, so an existing
   `In Progress` option also matches `In progress`. Configure the Project's Status
-  field with the canonical statuses below before starting synchronization. If an
+  field with `Backlog`, `Queued`, `Planning`, `In Progress`, `Validating`,
+  `Awaiting merge`, `Done`, `Blocked` and `Cancelled` before starting synchronization. If an
   option is missing, its mirror stays pending with the Project URL, missing name
   and configuration action; the normal durable retry discovers the option after
   the owner configures it. Routine item mirroring never creates or replaces
