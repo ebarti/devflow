@@ -429,9 +429,10 @@ def _assessment_ancestry(recovery):
     from .delivery_check_prelaunch import preparation_authority
     from .delivery_gate_preflight_continuation import _authority
     from .delivery_listener_verification import authority as verification_authority
+    from .delivery_prerequisite_gate_recovery import authority as prerequisite_authority
 
     chain, previous = [], recovery
-    for kind in ('browser-ordering', 'verification', 'report', 'preparation',
+    for kind in ('prerequisite', 'browser-ordering', 'verification', 'report', 'preparation',
                  'preflight', 'preflight'):
         if not previous:
             break
@@ -451,7 +452,8 @@ def _assessment_ancestry(recovery):
             raise ValueError('gate retry finite predecessor admission changed')
         from .delivery_browser_qa import browser_ordering_authority
 
-        authority = (browser_ordering_authority if kind == 'browser-ordering'
+        authority = (prerequisite_authority if kind == 'prerequisite'
+                     else browser_ordering_authority if kind == 'browser-ordering'
                      else verification_authority if kind == 'verification'
                      else _report_layout_authority if kind == 'report' else preparation_authority
                      if kind == 'preparation' else _authority)
@@ -461,7 +463,7 @@ def _assessment_ancestry(recovery):
                          'cause') == 'browser_artifact_assessment_order'
                      or previous.get('seal', {}).get('verification_observation')
                      or previous['execution_spec'].get('gate_retry_stage')
-                     in {'report', 'preparation'}
+                     in {'report', 'preparation', 'prerequisite'}
                      or previous['execution_spec'].get('gate_retry_preflight_generation')):
         raise ValueError('gate retry exceeds its finite retained assessment ancestry')
     return [*chain, previous]
@@ -540,6 +542,9 @@ def snapshot(store, run_id, kind=KIND):
     failure = state.get('checks', {}).get('failure') or {}
     reconciled = reconciled_cleanup(store, row, state, closed=closed)
     state_checks, row_checks = closed_checks(row, state, reconciled)
+    from .delivery_prerequisite_gate_recovery import possible as prerequisite_possible
+
+    prerequisite_retry = kind == KIND and prerequisite_possible(spec, state)
     # A recorded gate verdict stands: a transport or controller stop after it is
     # never a fresh assessment of the same head.
     verdict = gate_failed(state.get('checks') or {})
@@ -588,6 +593,8 @@ def snapshot(store, run_id, kind=KIND):
             'finalized_checkpoint'):
         published_after_recovery = False
     while history:
+        if prerequisite_retry and history.get('seal', {}).get('ordinary_prerequisite_observation'):
+            raise ValueError('ordinary prerequisite already received its one gate recovery')
         if browser_prelaunch and history.get('kind') == PRELAUNCH_KIND:
             raise ValueError('this run already received its bounded prelaunch retry')
         if report_retry and history.get('execution_spec', {}).get('gate_retry_stage') == 'report':
@@ -662,6 +669,15 @@ def snapshot(store, run_id, kind=KIND):
     attribution_observation = None
     browser_artifact_observation = None
     verification_observation = None
+    prerequisite_observation = None
+    if prerequisite_retry:
+        from .delivery_prerequisite_gate_recovery import observe
+
+        if state_checks != row_checks:
+            raise ValueError('published prerequisite lost its exact original checks')
+        prerequisite_observation = observe(
+            store, spec, row, state, attempts, effects, closed, previous, broker)
+        failed_gate = True
     if attribution_retry:
         from .delivery_gate_attribution_recovery import observe
         from .delivery_native_preparation import native_identity
@@ -752,7 +768,7 @@ def snapshot(store, run_id, kind=KIND):
             or (previous is not None and not (
                 renewed or published_after_recovery or prelaunch
                 or report_retry or ci_only or transient_retry or attribution_retry
-                or verification_retry or browser_artifact_retry))
+                or verification_retry or browser_artifact_retry or prerequisite_retry))
             or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
@@ -772,7 +788,7 @@ def snapshot(store, run_id, kind=KIND):
                                       else unpublished_error
                                       if unpublished else state.get('error')
                                       if (controller_only or attribution_retry
-                                          or browser_artifact_retry)
+                                          or browser_artifact_retry or prerequisite_retry)
                                       else 'repair limit exhausted'}))
             or row['protocol_revision'] != state.get('revision')
             or row['iteration'] != state.get('iteration')
@@ -824,20 +840,23 @@ def snapshot(store, run_id, kind=KIND):
             ancestor = ancestor.get('original_recovery')
         if admitted and (not (renewed or published_after_recovery or prelaunch
                              or report_retry or ci_only or transient_retry or attribution_retry
-                             or verification_retry or browser_artifact_retry)
+                             or verification_retry or browser_artifact_retry or prerequisite_retry)
                          or (digest(prior_gate) != attribution_observation['prior_gate_digest']
                              if attribution_retry else prior_gate != ancestor)):
             raise ValueError('this run already received its bounded gate assessment retry')
     return {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
             'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
-            'cleanup': (verification_observation['resources'] if verification_retry
+            'cleanup': (prerequisite_observation['resources'] if prerequisite_retry
+                        else verification_observation['resources'] if verification_retry
                         else report_observation['resources'] if layout_report
                         else prelaunch_observation or _stopped_cleanup(spec)),
             'work_binding': binding,
             'previous_digest': digest(previous) if previous else None,
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,
             **({'local_download_retry': True} if local_download_retry else {}),
+            **({'ordinary_prerequisite_observation': prerequisite_observation}
+               if prerequisite_observation else {}),
             **({'report_observation': report_observation} if report_observation else {}),
             **({'verification_observation': verification_observation}
                if verification_observation else {}),
@@ -850,7 +869,8 @@ def snapshot(store, run_id, kind=KIND):
                if attribution_retry or layout_report or verification_retry else {}),
             **({'browser_prelaunch_observation': browser_observation}
                if browser_observation else {}),
-            'stage': 'transient' if transient_retry or verification_retry
+            'stage': 'prerequisite' if prerequisite_retry
+                     else 'transient' if transient_retry or verification_retry
                      else 'report' if report_retry
                      else 'ci' if ci_only else 'published'
                      if published_after_recovery or prelaunch or controller_only
@@ -1046,7 +1066,7 @@ def admit(store, run_id, payload, *, preflight=False):
             row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
             if canonical_json(_sealed_row(row)) != canonical_json(seal['row']):
                 raise ValueError('gate retry admission lost its stopped projection')
-            if verification or ordering:
+            if verification or ordering or seal.get('ordinary_prerequisite_observation'):
                 if store.state.claim_for(db, spec['work_id']) is not None:
                     raise ValueError('listener verification admission lost its released claim')
                 for table, key, expected in [('delivery_attempts', 'job_key', seal['attempts']),
@@ -1120,6 +1140,8 @@ def gate_namespace(generation, stage=None, *, preflight_generation=0, prepared_h
         suffix = f'-{preflight_generation}' if preflight_generation > 1 else ''
         return gate_namespace(generation, stage) + '/preflight-continuation' + suffix
     if stage is not None:
+        if stage == 'prerequisite' and type(generation) is int and generation == 1:
+            return 'ordinary-prerequisite-gates-admission'
         if stage == 'preparation' and type(generation) is int and generation in (1, 2):
             return f'published-preparation-admission-{generation}'
         if stage == 'report' and generation == 1:
@@ -1154,6 +1176,10 @@ def effective_spec(store, original, recovery):
             or recovery['original_spec'] != original
             or recovery['command']['additional_iterations'] != 0):
         raise ValueError('published gate retry lost its durable admission')
+    if recovery.get('seal', {}).get('ordinary_prerequisite_observation'):
+        from .delivery_prerequisite_gate_recovery import authority
+
+        authority(recovery['execution_spec'], recovery)
     return recovery['execution_spec']
 
 
@@ -1165,7 +1191,11 @@ def readback(store, spec, recovery, *, resource_spec=None):
               if resource_spec is not None else DeliveryBroker(store, spec))
     if effective != spec or broker.candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
-    if recovery['seal'].get('verification_observation'):
+    if recovery['seal'].get('ordinary_prerequisite_observation'):
+        from .delivery_prerequisite_gate_recovery import validate
+
+        validate(store, spec, recovery, resource_spec=resource_spec or spec)
+    elif recovery['seal'].get('verification_observation'):
         from .delivery_listener_verification import validate
 
         validate(store, spec, recovery, resource_spec=resource_spec or spec)

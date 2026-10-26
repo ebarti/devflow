@@ -595,6 +595,29 @@ fresh integration evidence. Concurrent administrative changes to branch rules ar
 outside that server-enforcement guarantee. Unknown merge effects retain the claim;
 read-only terminal reconciliation never schedules another merge.
 
+### Ordinary published prerequisite recovery
+
+The existing `published_gate_retry` zero-iteration request can admit one ordinary
+published candidate whose planned locked Python prerequisite genuinely launched
+and failed before any current independent or browser assessment. This requires
+the original completed passing implementation and its raw final assessment,
+session, separate input/output candidates, exact published source, closed
+execution, complete published cleanup and released claim. The observer derives
+the dependency command and project/lock/test-selection hashes from the frozen
+plan and checks the exact native launch, journal, environment, runtime, log and
+finished nonzero result. A name, failure summary, null session, missing test
+report or cleanup flag grants no exception. Unknown monitoring, a test assertion,
+browser failure or failed implementation remains outside this cause.
+
+Admission preserves that launched failure and creates one fresh gate namespace.
+It grants no implementation turn, changes no recipe or allowance, and cannot
+repeat under another command ID. Worker readback reauthenticates the historical
+receipts and current physical resource/source/claim authority. The same native
+prerequisite must then complete and every normal required gate must run with its
+original selection, deadline, JUnit and minimum counts. No diagnostic receipt is
+an acceptance result, and no new browser, cache, environment or tool permission
+is added by this recovery.
+
 ### Evidence-only frozen worker diagnostic
 
 A stopped ordinary trusted-local delivery can expose a failed native worker

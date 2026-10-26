@@ -59,6 +59,15 @@ def completed_blocked_finding(seal):
     The SDK's final assessment, raw role receipt and enriched supervisor result
     must agree. Input and partial output are separate recorded checkpoints.
     """
+    return _completed_implementation_assessment(seal, status='blocked')
+
+
+def completed_passing_implementation(seal):
+    """A completed passing provider assessment, separate from later publication."""
+    return _completed_implementation_assessment(seal, status='pass')
+
+
+def _completed_implementation_assessment(seal, *, status):
     from .delivery_gates_admission import _native_attempt_bytes
     from .delivery_sandbox import _native_role_home
     from .supervisor import DeliverySupervisor
@@ -70,7 +79,7 @@ def completed_blocked_finding(seal):
                 and a['iteration'] == role.get('iteration')]
     custody = seal.get('session_custody') or {}
     if (spec.get('provider') != 'codex' or spec.get('feature_worker')
-            or role.get('status') != 'blocked' or role.get('finish_reason') != 'done'
+            or role.get('status') != status or role.get('finish_reason') != 'done'
             or role.get('iteration') != state['iteration'] or len(attempts) != 1
             or not isinstance(session, str) or not session
             or role.get('session_id') != session or 'generation' not in custody):
@@ -122,9 +131,10 @@ def completed_blocked_finding(seal):
         raise ValueError('blocked scope finding has no final structured assessment') from exc
     if (not isinstance(assessment, dict)
             or assessment != {key: raw.get(key) for key in ('status', 'summary', 'findings')}
-            or raw.get('status') != 'blocked' or raw.get('finish_reason') != 'done'
+            or raw.get('status') != status or raw.get('finish_reason') != 'done'
             or not isinstance(raw.get('summary'), str) or not raw['summary'].strip()
-            or not isinstance(raw.get('findings'), list) or not raw['findings']
+            or not isinstance(raw.get('findings'), list)
+            or (not raw['findings'] if status == 'blocked' else raw['findings'] != [])
             or any(not isinstance(item, str) or not item.strip() for item in raw['findings'])
             or not _same_assessment(raw, result)
             or role.get('candidate') != seal['candidate']
@@ -135,7 +145,7 @@ def completed_blocked_finding(seal):
             or request.get('result_path') != str(folder / 'result.json')
             or request.get('start_path') != str(folder / 'start.json')
             or not isinstance(request.get('candidate'), dict)
-            or request['candidate'] != state.get('candidate')
+            or (status == 'blocked' and request['candidate'] != state.get('candidate'))
             or request['candidate'].get('id') != attempt['candidate_id']
             or role.get('input_candidate_id') != attempt['candidate_id']
             or DeliverySupervisor._job_key(request) != attempt['job_key']
