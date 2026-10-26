@@ -241,3 +241,65 @@ def test_non_json_numbers_or_excessive_nested_metadata_never_grants_observation(
     )
     with pytest.raises(ValueError):
         reader.get("repos/example/fixture")
+
+
+def test_remote_graphql_cursor_is_an_opaque_string_never_gh_local_file_input(tmp_path):
+    secret = tmp_path / "owned-canary"
+    secret.write_text("must never enter a GraphQL parameter")
+    cursor = "@" + str(secret)
+    commands = []
+
+    def transport(command, *_):
+        commands.append(command)
+        more = len(commands) == 1
+        if not more:
+            index = command.index("cursor=" + cursor)
+            assert command[index - 1] == "-f"  # -F would read the local file.
+        for field in ("owner=example", "name=fixture"):
+            assert command[command.index(field) - 1] == "-f"
+        value = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "number": 10,
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "headRefOid": "a" * 40,
+                        "headRefName": "owned",
+                        "commits": {
+                            "nodes": [
+                                {
+                                    "commit": {
+                                        "oid": "a" * 40,
+                                        "statusCheckRollup": {
+                                            "contexts": {
+                                                "nodes": [
+                                                    {
+                                                        "__typename": "CheckRun",
+                                                        "id": "owned-" + str(len(commands)),
+                                                        "name": "neutral",
+                                                        "status": "COMPLETED",
+                                                        "conclusion": "SUCCESS",
+                                                    }
+                                                ],
+                                                "pageInfo": {
+                                                    "hasNextPage": more,
+                                                    "endCursor": cursor if more else None,
+                                                },
+                                            }
+                                        },
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        }
+        raw = json.dumps(value).encode()
+        return b"HTTP/2.0 200 OK\r\n\r\n" + raw
+
+    reader = io.GitHubRead(repositories={"example/fixture"}, runner=transport)
+    result = reader.rollup("example/fixture", 10, "a" * 40)
+    assert result["complete"] is True and len(result["contexts"]) == 2
+    assert secret.read_text() == "must never enter a GraphQL parameter"

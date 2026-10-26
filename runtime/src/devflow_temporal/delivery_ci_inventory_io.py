@@ -442,15 +442,16 @@ class GitHubRead:
                 "graphql",
                 "-f",
                 "query=" + ROLLUP,
-                "-F",
+                "-f",
                 "owner=" + owner,
-                "-F",
+                "-f",
                 "name=" + name,
                 "-F",
                 "number=" + str(number),
             ]
             if cursor is not None:
-                command += ["-F", "cursor=" + cursor]
+                # This is an opaque remote string, never gh's typed @file input.
+                command += ["-f", "cursor=" + cursor]
             raw, response = self._response(command, MAX_JSON)
             self._record(
                 {

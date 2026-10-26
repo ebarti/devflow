@@ -219,6 +219,30 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
                 real_closed, c.store, "run-1", workflow_id=admitted["workflow_id"]
             )
             assert closed["result"]["checks"]["ci"] == ci
+            # Normal public readers authenticate the separate ACK/result again;
+            # they expose JSON receipts, never terminal-control log bodies.
+            async with public(c) as (client, _headers):
+                detail = await client.get("/api/runs/run-1")
+                assert detail.status_code == 200, detail.text
+                evidence_ids = {item["id"] for item in detail.json()["evidence"]}
+                assert {
+                    "ordinary-ci-inventory-acknowledgement",
+                    "ordinary-ci-execution-observation",
+                } <= evidence_ids
+                listed = await client.get("/api/runs?limit=50")
+                assert listed.status_code == 200, listed.text
+                assert len(listed.json()["runs"]) == 1
+                for evidence_id in sorted(
+                    evidence_ids
+                    & {
+                        "ordinary-ci-inventory-acknowledgement",
+                        "ordinary-ci-execution-observation",
+                    }
+                ):
+                    response = await client.get(f"/api/runs/run-1/evidence/{evidence_id}")
+                    assert response.status_code == 200, response.text
+                    assert "\x1b" not in response.json()["text"]
+                assert (await client.get("/api/runs/run-1/ci-inventory")).json() == acknowledgement
             if output := os.environ.get("DEVFLOW_TEST_CI_INVENTORY_NATIVE_RESULT"):
                 with open(output, "x") as stream:
                     json.dump(
