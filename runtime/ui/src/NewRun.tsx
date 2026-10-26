@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, ApiError, type DurableOperation } from './api'
+import { api, type DurableOperation } from './api'
 import type { NewRunRequest, ServiceInfo } from './model'
 
 type Fields = Omit<NewRunRequest, 'command_id' | 'authorized_endpoint'>
@@ -109,9 +109,6 @@ export function NewRun({ service, onCreated, onBack }: { service: ServiceInfo | 
         setError(`Operation ${operation.operation_id} is ${operation.state}. Retry this request or inspect its status.`)
       }
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 409) {
-        setIntent(null); clearStored(); setCommandId(crypto.randomUUID())
-      }
       setError(cause instanceof Error ? cause.message : 'The run could not be submitted.')
     } finally { setBusy(false) }
   }

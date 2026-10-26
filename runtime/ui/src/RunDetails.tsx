@@ -233,11 +233,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
         setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
       }
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 409) {
-        saveIntent(intentKey, null); setIntent(null); setStale(true)
-        setError('The decision changed. The latest run is loading; review it before responding.')
-        await onRefresh()
-      } else setError(cause instanceof Error ? cause.message : 'Could not submit the decision.')
+      setError(cause instanceof Error ? cause.message : 'Could not submit the decision.')
     } finally { setBusy(false) }
   }
 
@@ -350,9 +346,10 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
 }
 
 function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
-  const [body, setBody] = useState<{ command_id: string; expected_revision: number } | null>(null)
+  const intentKey = `devflow.reconcile-tracker:${run.id}`
+  const [body, setBody] = useState<{ command_id: string; expected_revision: number } | null>(() => loadIntent(intentKey))
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState(body ? 'A previous tracker request is retained. Check its operation.' : '')
   const checkpoint = run.checks?.terminal_tracker_checkpoint
   if (!checkpoint || run.execution_retired || run.outcome != null) return null
   const available = run.phase === 'waiting_tracker' && (checkpoint.waiting || checkpoint.closed)
@@ -360,17 +357,17 @@ function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => 
   async function reconcile() {
     if (busy || (!body && (run.protocol_revision == null || !available))) return
     const request = body ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision! }
-    setBody(request); setBusy(true); setError('')
+    saveIntent(intentKey, request); setBody(request); setBusy(true); setError('')
     try {
       const operation = await api.createOperation({
         operation_id: `tracker:${request.command_id}`, run_id: run.id,
         kind: 'reconcile-tracker', request,
       })
       if (operation.state === 'succeeded') {
-        setBody(null)
+        saveIntent(intentKey, null); setBody(null)
         await onRefresh()
       } else if (operation.state === 'refused' || operation.state === 'failed') {
-        setBody(null)
+        saveIntent(intentKey, null); setBody(null)
         setError(operation.error || 'Tracker reconciliation was refused.')
         await onRefresh()
       } else {
@@ -379,7 +376,6 @@ function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => 
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Tracker readback could not be confirmed.')
       await onRefresh()
-      if (cause instanceof ApiError && cause.status === 409 && cause.message.includes('stale run revision')) setBody(null)
     } finally { setBusy(false) }
   }
 
@@ -424,8 +420,9 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
 
 function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [body, setBody] = useState<Parameters<typeof api.merge>[1] | null>(null)
+  const intentKey = `devflow.merge:${run.id}`
+  const [body, setBody] = useState<Parameters<typeof api.merge>[1] | null>(() => loadIntent(intentKey))
+  const [error, setError] = useState(body ? 'A previous merge request is retained. Check its operation.' : '')
   const merge = run.merge
   if (!merge || merge.phase === 'unavailable' || run.feature_delivery || run.execution_retired) return null
   const ready = merge.available && run.protocol_revision != null && !!merge.candidate_id && !!merge.head && !!merge.pr_number
@@ -437,16 +434,16 @@ function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise
       candidate_id: merge!.candidate_id!, head: merge!.head!,
       pr_number: merge!.pr_number!, answer: 'merge' as const,
     }
-    setBody(request); setBusy(true); setError('')
+    saveIntent(intentKey, request); setBody(request); setBusy(true); setError('')
     try {
       const operation = await api.createOperation({
         operation_id: `merge:${request.command_id}`, run_id: run.id, kind: 'merge', request,
       })
       if (operation.state === 'succeeded') {
-        setBody(null)
+        saveIntent(intentKey, null); setBody(null)
         await onRefresh()
       } else if (operation.state === 'refused' || operation.state === 'failed') {
-        setBody(null)
+        saveIntent(intentKey, null); setBody(null)
         setError(operation.error || 'Merge admission was refused.')
         await onRefresh()
       } else {
@@ -454,7 +451,6 @@ function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Merge admission could not be confirmed.')
-      if (cause instanceof ApiError && cause.status === 409) setBody(null)
       await onRefresh()
     } finally { setBusy(false) }
   }

@@ -81,7 +81,7 @@ it('preserves the full command after an uncertain response even if local eligibi
 
 it('refreshes a rejected stale request before binding a new command', async () => {
   const request = vi.spyOn(api, 'createOperation')
-    .mockRejectedValueOnce(new ApiError('Stale projection revision', 409))
+    .mockResolvedValueOnce({ ...completedOperation(), state: 'refused', result: null, error: 'Stale projection revision', next_action: 'inspect_error', authority: null })
     .mockResolvedValueOnce(completedOperation({ run_id: 'next-feature', phase: 'queued', revision_phase: 'requested' }))
   const refresh = vi.fn().mockResolvedValue(undefined)
   const user = userEvent.setup()
@@ -106,4 +106,19 @@ it('describes fresh intake as unplanned until a GitHub revision is published', (
   expect(screen.getByText('Plan state: Unplanned.')).toBeTruthy()
   expect(screen.queryByText(/GitHub plan revision/)).toBeNull()
   expect(screen.queryByRole('button', { name: 'Request plan revision' })).toBeNull()
+})
+
+it('retains a feature revision command after an operation submission conflict', async () => {
+  const request = vi.spyOn(api, 'createOperation')
+    .mockRejectedValueOnce(new ApiError('Operation ID conflicts', 409))
+    .mockImplementationOnce(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'unknown', result: null, progress: 'unknown', next_action: 'reconcile', authority: null }))
+  const refresh = vi.fn().mockResolvedValue(undefined)
+  const user = userEvent.setup()
+  render(<FeatureDelivery run={feature} onRefresh={refresh} />)
+  await user.type(screen.getByLabelText('Planning defect'), 'The selector belongs to web1.')
+  await user.click(screen.getByRole('button', { name: 'Request plan revision' }))
+  expect(await screen.findByText('Operation ID conflicts')).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: 'Retry plan revision request' }))
+  expect(request.mock.calls[1]).toEqual(request.mock.calls[0])
+  expect(refresh).not.toHaveBeenCalled()
 })

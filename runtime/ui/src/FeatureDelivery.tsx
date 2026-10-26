@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { api, ApiError, safeWebUrl } from './api'
+import { api, safeWebUrl } from './api'
 import { loadIntent, saveIntent } from './operationIntent'
 import { titleCase } from './format'
 import type { RunDetail } from './model'
@@ -49,10 +49,6 @@ export function FeatureDelivery({ run, onRefresh }: { run: RunDetail; onRefresh:
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not continue this feature.')
-      if (cause instanceof ApiError && cause.status === 409) {
-        saveIntent(continueKey, null); intent.current = null
-        await onRefresh()
-      }
     } finally { setBusy(false) }
   }
 
@@ -84,10 +80,6 @@ export function FeatureDelivery({ run, onRefresh }: { run: RunDetail; onRefresh:
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not request a plan revision.')
-      if (cause instanceof ApiError && cause.status === 409) {
-        saveIntent(revisionKey, null); revisionIntent.current = null
-        await onRefresh()
-      }
     } finally { setBusy(false) }
   }
 

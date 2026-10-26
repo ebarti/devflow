@@ -7,7 +7,7 @@ import { runStatus } from '../src/runStatus'
 import { mockRun } from './fixtures'
 import type { RunDetail } from '../src/model'
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => { vi.restoreAllMocks(); sessionStorage.clear() })
 
 const completed = { operation_id: 'merge:done', run_id: 'run-1', kind: 'merge', stage: 'admission', state: 'succeeded' as const, progress: 'succeeded', next_action: 'inspect_result', result: { phase: 'queued' }, error: null, authority: 'current_authority_unverified' }
 
@@ -85,5 +85,32 @@ it('retains the original merge intent while the durable operation is pending', a
   await screen.findByText(/operation .* is running/i)
   expect(refresh).not.toHaveBeenCalled()
   await userEvent.click(screen.getByRole('button', { name: 'Retry same merge request' }))
+  expect(merge.mock.calls[1]).toEqual(merge.mock.calls[0])
+})
+
+it('retains a merge command after an operation submission conflict', async () => {
+  const merge = vi.spyOn(api, 'createOperation')
+    .mockRejectedValueOnce(new ApiError('Operation ID conflicts', 409))
+    .mockResolvedValue({ ...completed, state: 'unknown', result: null, progress: 'unknown', next_action: 'reconcile', authority: null })
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const refresh = vi.fn().mockResolvedValue(undefined)
+  render(<RunDetails run={delivered} onRefresh={refresh} />)
+  await userEvent.click(screen.getByRole('button', { name: 'Merge PR #1109' }))
+  expect(await screen.findByText(/Operation ID conflicts/)).toBeTruthy()
+  await userEvent.click(screen.getByRole('button', { name: 'Retry same merge request' }))
+  expect(merge.mock.calls[1]).toEqual(merge.mock.calls[0])
+})
+
+it('restores the exact merge request after reopening', async () => {
+  const merge = vi.spyOn(api, 'createOperation').mockImplementation(async envelope => ({ ...completed, operation_id: envelope.operation_id, state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null }))
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const user = userEvent.setup()
+  const view = render(<RunDetails run={delivered} onRefresh={vi.fn()} />)
+  await user.click(screen.getByRole('button', { name: 'Merge PR #1109' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  view.unmount()
+  render(<RunDetails run={{ ...delivered, protocol_revision: 99 }} onRefresh={vi.fn()} />)
+  expect(screen.getByText(/previous merge request is retained/i)).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: 'Retry same merge request' }))
   expect(merge.mock.calls[1]).toEqual(merge.mock.calls[0])
 })

@@ -162,7 +162,7 @@ describe('dashboard commands', () => {
 
   it('does not resubmit a stale decision after a 409 and refreshes the run', async () => {
     const user = userEvent.setup()
-    const answer = vi.spyOn(api, 'createOperation').mockRejectedValue(new ApiError('revision conflict', 409))
+    const answer = vi.spyOn(api, 'createOperation').mockResolvedValue({ ...completedOperation(), state: 'refused', result: null, error: 'The decision changed. The latest run is loading; review it before responding.', next_action: 'inspect_error', authority: null })
     const refresh = vi.fn().mockResolvedValue(undefined)
     render(<RunDetails run={mockRun} onRefresh={refresh} />)
     await user.click(screen.getByRole('radio', { name: 'Yes' }))
@@ -509,5 +509,35 @@ it('restores the exact decision after reopening while its operation is pending',
   render(<RunDetails run={{ ...run, protocol_revision: 99 }} onRefresh={vi.fn()} />)
   expect(screen.getByText(/previous decision request is retained/i)).toBeTruthy()
   await user.click(screen.getByRole('button', { name: 'Check submitted decision' }))
+  expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
+})
+
+it('keeps the original decision when operation submission reports a conflict', async () => {
+  const operation = vi.spyOn(api, 'createOperation')
+    .mockRejectedValueOnce(new ApiError('Operation ID conflicts', 409))
+    .mockImplementationOnce(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'unknown', result: null, progress: 'unknown', next_action: 'reconcile', authority: null }))
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const run: RunDetail = { ...mockRun, decisions: [{ id: 'conflict-decision', revision: 1, kind: 'question', candidate_revision: 1, prompt: 'Choose a scope', options: ['Proceed'], state: 'pending' }] }
+  const user = userEvent.setup()
+  render(<RunDetails run={run} onRefresh={vi.fn()} />)
+  await user.click(screen.getByRole('radio', { name: 'Proceed' }))
+  await user.click(screen.getByRole('button', { name: 'Submit answer' }))
+  expect(await screen.findByText('Operation ID conflicts')).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: 'Check submitted decision' }))
+  expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
+})
+
+it('restores the exact tracker request after reopening', async () => {
+  const operation = vi.spyOn(api, 'createOperation').mockImplementation(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'running', result: null, progress: 'running', next_action: 'wait', authority: null }))
+  vi.spyOn(api, 'runOperations').mockResolvedValue({ operations: [] })
+  const run: RunDetail = { ...mockRun, decisions: [], outcome: null, phase: 'waiting_tracker', checks: { terminal_tracker_checkpoint: { waiting: true } } }
+  const user = userEvent.setup()
+  const view = render(<RunDetails run={run} onRefresh={vi.fn()} />)
+  await user.click(screen.getByRole('button', { name: 'Reconcile tracker' }))
+  expect(await screen.findByText(/operation .* is running/i)).toBeTruthy()
+  view.unmount()
+  render(<RunDetails run={{ ...run, protocol_revision: 99 }} onRefresh={vi.fn()} />)
+  expect(screen.getByText(/previous tracker request is retained/i)).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: 'Retry same reconciliation' }))
   expect(operation.mock.calls[1]).toEqual(operation.mock.calls[0])
 })
