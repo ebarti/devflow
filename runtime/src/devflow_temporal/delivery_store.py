@@ -957,7 +957,22 @@ class DeliveryStore:
         was never sealed must be imported from its authentic exported history.
         """
         preserve = preserve and not self.read_only
-        if not preserve and self.submitted_spec(run_id).get("feature_delivery"):
+        submitted = self.submitted_spec(run_id) if not preserve else None
+        if submitted and submitted.get("feature_worker"):
+            from .delivery_execution_config import observation_mode
+            from .delivery_feature_revision_recovery import retained_recovery
+
+            with self._connect() as db:
+                row = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                                 (run_id,)).fetchone()
+            recovery = json.loads(row[0]) if row and row[0] else None
+            # Only the ordinary stopped-worker recovery has the pure custody path.
+            if recovery and (recovery.get("kind") != "stopped_delivery_resume"
+                             or (retained_recovery(recovery) or {}).get("feature_plan_revision")):
+                raise ValueError("worker recovery lineage is unavailable for read-only closure")
+            with observation_mode():
+                observation_spec = self.effective_spec(run_id)
+        elif submitted and submitted.get("feature_delivery"):
             from .delivery_feature_handoff import readonly_feature_spec
 
             observation_spec = readonly_feature_spec(self, run_id)

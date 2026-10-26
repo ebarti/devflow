@@ -441,7 +441,7 @@ def _progress(store, spec, row, attempts, recovery, seal):
             "native_progress_sha256": digest(proofs)}
 
 
-def retained_worker_subject(store, original, row, attempts, recovery):
+def retained_worker_subject(store, original, row, attempts, recovery, *, shared=None):
     """Establish full ordinary continuation prerequisites before review reservation."""
     from .delivery_stopped_resume import review_snapshot
 
@@ -473,7 +473,8 @@ def retained_worker_subject(store, original, row, attempts, recovery):
             from .delivery_feature_execution import registry
             from .delivery_stopped_resume import remaining_worker_repairs
 
-            budget = registry(original).budget(original["feature_delivery"]["owner"]["issue_id"])
+            budget = (shared or registry(original)).budget(
+                original["feature_delivery"]["owner"]["issue_id"])
             remaining = remaining_worker_repairs(budget, original, seal["state"]["iteration"])
         if remaining <= 0:
             raise ValueError("unpassed retained worker has no ordinary implementation turn left")

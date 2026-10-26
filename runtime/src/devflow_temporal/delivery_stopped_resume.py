@@ -104,12 +104,22 @@ def remaining_worker_repairs(budget, spec, iteration, *, credit=0):
             min(remaining, spec['policy']['max_repairs'] - iteration))
 
 
-def paid_alias_credit(spec, owner, iteration, revision_id):
-    """A sealed existing alias spends its bound debit, including across owners."""
+def _observation_registry(spec):
+    from .delivery_execution_config import is_observation_mode
+
+    if is_observation_mode():
+        from .delivery_feature_revision_subject import _ReadOnlyRegistry
+
+        return _ReadOnlyRegistry(spec["feature_delivery"]["registry"])
     from .delivery_feature_execution import registry
 
+    return registry(spec)
+
+
+def paid_alias_credit(spec, owner, iteration, revision_id):
+    """A sealed existing alias spends its bound debit, including across owners."""
     key = 'plan-revision:repair-alias:' + spec['run_id'] + ':' + str(iteration)
-    with registry(spec).connect() as db:
+    with _observation_registry(spec).connect() as db:
         row = db.execute('SELECT content_digest,content_json FROM execution_checkpoints '
                          'WHERE issue_id=? AND checkpoint_key=?',
                          (owner['issue_id'], key)).fetchone()
@@ -130,8 +140,6 @@ def paid_alias_credit(spec, owner, iteration, revision_id):
 
 def validate_worker_allowance(spec, *, current=False):
     """Authenticate the receipt even when reading an old immutable recovery."""
-    from .delivery_feature_execution import registry
-
     authority = spec['repair_allowance']
     if (not isinstance(authority, dict)
             or set(authority) not in ({'run_id', 'owner', 'receipt', 'start_iteration',
@@ -144,7 +152,7 @@ def validate_worker_allowance(spec, *, current=False):
             or authority['owner'].get('store_path')
                 != spec['feature_delivery']['owner']['store_path']):
         raise ValueError('worker changed its finite runtime repair allowance')
-    receipt = registry(spec).repair_allowance(authority['owner'], authority['receipt'],
+    receipt = _observation_registry(spec).repair_allowance(authority['owner'], authority['receipt'],
                                              current=current)
     credit = authority.get('credit')
     if credit:
@@ -304,8 +312,6 @@ def pending_repair(seal, *, db=None):
 
 def _unstarted_repair(seal, previous, db, *, closing=False):
     """An exact admitted and charged repair has not reached a provider turn."""
-    from .delivery_feature_execution import registry
-
     spec, state = seal['predecessor_spec'], seal['state']
     prior = previous['state']
     iteration = state['iteration']
@@ -417,7 +423,7 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
         # admission plus unchanged inventory and absent provider turn above prove
         # that this exact fixed-budget iteration has not executed yet.
         return native_preparation or True
-    shared = registry(spec)
+    shared = _observation_registry(spec)
     owner = origin['execution_spec']['repair_allowance']['owner']
     current_owner = spec['repair_allowance']['owner']
     if any(current_owner.get(key) != owner.get(key) for key in ('issue_id', 'store_path')):
@@ -1059,7 +1065,9 @@ def snapshot(store, run_id, *, _revision=None, _observation=False):
 
 def review_snapshot(store, run_id):
     """Observe complete stopped-worker custody without admitting or creating resources."""
-    return _snapshot(store, run_id, review_subject=True)
+    from .delivery_execution_config import is_observation_mode
+
+    return _snapshot(store, run_id, review_subject=True, _observation=is_observation_mode())
 
 
 def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observation=False):

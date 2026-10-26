@@ -325,7 +325,12 @@ async def completed_settlement(history, store, spec, row, closed):
 
 
 async def _closed_history(store, workflow_id, closed):
-    sealed = await sealed_closure(store, workflow_id)
+    from .delivery_execution_config import is_observation_mode
+
+    if is_observation_mode():
+        sealed = await sealed_closure(store, workflow_id, read_only=True)
+    else:
+        sealed = await sealed_closure(store, workflow_id)
     if sealed is not None:
         bound = {key: sealed[key] for key in ('workflow_id', 'execution_run_id', 'closed_at',
                                             'request_digest', 'recovery_digest', 'result')}
@@ -403,8 +408,10 @@ def closed_worker(store, run_id, workflow_id, *, sealed_only=False):
         raise ValueError('closed worker workflow or service custody changed')
     with store._connect() as db:
         row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone())
-    closed = (None if sealed_only else
-              store._completed_temporal_result(run_id, workflow_id=workflow_id))
+    from .delivery_execution_config import is_observation_mode
+
+    closed = (None if sealed_only else store._completed_temporal_result(
+        run_id, workflow_id=workflow_id, **({"preserve": False} if is_observation_mode() else {})))
 
     async def read():
         history, bound = await _closed_history(store, workflow_id, closed)
