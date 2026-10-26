@@ -440,3 +440,92 @@ async def test_cancelled_dispatch_waiter_cannot_release_running_body(api_fixture
         await asyncio.sleep(0.02)
     assert operation["state"] == "succeeded"
     assert calls == ["started"]
+
+
+@pytest.mark.asyncio
+async def test_network_response_loss_before_and_after_completion(api_fixture, monkeypatch):
+    import json
+    import socket
+
+    import uvicorn
+
+    path, _ = api_fixture
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    host = f"http://127.0.0.1:{port}"
+    config = json.loads(path.read_text())
+    config["dashboard_url"] = host
+    path.write_text(json.dumps(config))
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def slow(_store, run_id):
+        calls.append(run_id)
+        started.set()
+        assert release.wait(15)
+        return {"run_id": run_id, "observation": "complete"}
+
+    monkeypatch.setattr("devflow_temporal.delivery_merge_followup.preflight", slow)
+    app = create_app(path)
+
+    async def dormant_dispatch():
+        await asyncio.Event().wait()
+
+    app.state.delivery.dispatch_loop = dormant_dispatch
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    serving = asyncio.create_task(server.serve(sockets=[listener]))
+    envelope = {
+        "operation_id": "socket-loss",
+        "run_id": "run-1",
+        "kind": "merge-preflight",
+        "request": {},
+    }
+    body = json.dumps(envelope).encode()
+
+    async def send_without_reading():
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            (
+                f"POST /api/operations HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode()
+            + body
+        )
+        await writer.drain()
+        return writer
+
+    try:
+        for _ in range(200):
+            if server.started:
+                break
+            await asyncio.sleep(0.02)
+        assert server.started
+        first = await send_without_reading()
+        assert await asyncio.to_thread(started.wait, 5)
+        first.close()
+        await first.wait_closed()
+        async with httpx.AsyncClient(base_url=host) as client:
+            assert (await client.get("/api/operations/socket-loss")).json()["state"] == "running"
+            release.set()
+            for _ in range(200):
+                operation = (await client.get("/api/operations/socket-loss")).json()
+                if operation["state"] == "succeeded":
+                    break
+                await asyncio.sleep(0.02)
+            assert operation["result"] == {"run_id": "run-1", "observation": "complete"}
+            duplicate = await send_without_reading()
+            duplicate.close()
+            await duplicate.wait_closed()
+            assert (await client.post("/api/operations", json=envelope)).json()[
+                "result"
+            ] == operation["result"]
+            assert calls == ["run-1"]
+    finally:
+        release.set()
+        server.should_exit = True
+        await asyncio.wait_for(serving, 10)
+        listener.close()
