@@ -59,6 +59,7 @@ def ci_case(service, monkeypatch):
     prepublish = case.broker.run_prechecks(3, candidate)
     assert local["state"] == prepublish["state"] == "passed"
     final = RunResources(case.spec).finalize("blocked")
+    case.registry = RunResources(case.spec)
     assert final["state"] == "confirmed"
     roles = case.state["roles"]
     roles[0]["status"] = "pass"

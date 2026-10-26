@@ -181,3 +181,63 @@ def test_foreign_repository_is_refused_before_transport():
     with pytest.raises(ValueError, match="endpoint is invalid"):
         reader.get("repos/foreign/fixture/actions/runs/1")
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "status",
+        "length",
+        "encoding",
+        "duplicate_length",
+        "header_missing",
+        "header_control",
+        "body_bound",
+        "duplicate_json",
+    ],
+)
+def test_complete_http_custody_is_required_before_json_or_raw_decode(change):
+    body = b'{"id":1}'
+    header = b"HTTP/2.0 200 OK\r\nContent-Length: 8"
+    if change == "status":
+        header = b"HTTP/2.0 302 Found"
+    elif change == "length":
+        header = b"HTTP/2.0 200 OK\r\nContent-Length: 9"
+    elif change == "encoding":
+        header += b"\r\nContent-Encoding: gzip"
+    elif change == "duplicate_length":
+        header += b"\r\nContent-Length: 8"
+    elif change == "header_control":
+        header += b"\r\nX-Untrusted: \x1b[31m"
+    elif change == "duplicate_json":
+        body = b'{"id":1,"id":2}'
+        header = b"HTTP/2.0 200 OK\r\nContent-Length: " + str(len(body)).encode()
+    content = header + b"\r\n\r\n" + body if change != "header_missing" else body
+    reader = io.GitHubRead(repositories={"example/fixture"}, runner=lambda *_a: content)
+    with pytest.raises(ValueError):
+        reader.get("repos/example/fixture", limit=2 if change == "body_bound" else 1024)
+
+
+def test_escape_sequence_flag_is_private_raw_transport_only_and_display_is_escaped():
+    raw = b"\x1b[31mowned raw evidence\x1b[0m\n"
+    calls = []
+
+    def transport(command, *_):
+        calls.append(command)
+        return b"HTTP/2.0 200 OK\r\n\r\n" + raw
+
+    reader = io.GitHubRead(repositories={"example/fixture"}, runner=transport)
+    assert reader.get("repos/example/fixture/actions/jobs/1/logs", raw=True) == raw
+    assert "--allow-escape-sequences" in calls[0]
+    assert "\x1b" not in io.escaped_text(raw)
+    assert "\\u001b" in io.escaped_text(raw)
+    assert reader.observations[0]["raw"] == raw
+
+
+@pytest.mark.parametrize("raw", [b'{"id":NaN}', b'{"id":Infinity}', b"[" * 1001 + b"]" * 1001])
+def test_non_json_numbers_or_excessive_nested_metadata_never_grants_observation(raw):
+    reader = io.GitHubRead(
+        repositories={"example/fixture"}, runner=lambda *_a: b"HTTP/2.0 200 OK\r\n\r\n" + raw
+    )
+    with pytest.raises(ValueError):
+        reader.get("repos/example/fixture")

@@ -65,6 +65,7 @@ def fixture(
         "workflows": [],
         "jobs": {},
         "artifacts": [],
+        "excluded_jobs": [],
         "PR_ruleset_eligibility": False,
         "merge_context_verified": False,
     }

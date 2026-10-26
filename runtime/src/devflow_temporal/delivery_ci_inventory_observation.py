@@ -320,7 +320,20 @@ def collect(reader, profile, *, required, expected_tree):
         for job in jobs:
             source = by_name[job["name"]]
             if not source["enabled"]:
-                if job.get("conclusion") != "skipped" or job.get("status") != "completed":
+                excluded = [
+                    x
+                    for x in profile["excluded_jobs"]
+                    if x["workflow_id"] == workflow["id"] and x["name"] == job["name"]
+                ]
+                if (
+                    len(excluded) != 1
+                    or job.get("id") != excluded[0]["job_id"]
+                    or job.get("run_id") != run["id"]
+                    or job.get("head_sha") != head
+                    or job.get("steps") != []
+                    or job.get("conclusion") != "skipped"
+                    or job.get("status") != "completed"
+                ):
                     raise ValueError("ordinary CI excluded publication job unexpectedly ran")
                 observed.append(
                     {
@@ -389,6 +402,11 @@ def collect(reader, profile, *, required, expected_tree):
             }
         if any(j["enabled"] and not any(x["name"] == j["name"] for x in jobs) for j in plan):
             raise ValueError("ordinary CI workflow did not execute every required matrix job")
+        if any(
+            x["run_id"] == run["id"] and not any(j.get("id") == x["job_id"] for j in jobs)
+            for x in profile["excluded_jobs"]
+        ):
+            raise ValueError("ordinary CI excluded publication job inventory changed")
         artifacts = reader.pages(f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
         selected_authority.append(
             (

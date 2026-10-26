@@ -705,3 +705,66 @@ existing exclusive lease in read-only mode; the diagnostic ACK's shared lease
 therefore cannot overlap a separate preparation registry. Both owner checks
 and FD/name authentication run after acquisition. The original configuration
 loader, run rows, claims and canonical resource bytes remain unchanged.
+
+### Acknowledged ordinary CI execution inventory
+
+GitHub can omit genuine `workflow_dispatch` jobs from a PR's canonical status
+rollup. A successful Actions run alone does not establish PR/ruleset or merge
+eligibility. The ordinary published-unmerged endpoint supports one separately
+reviewed, compiled-hash provenance profile for its exact original subject,
+five existing attempt-1 runs and eleven frozen required names. Other subjects,
+profiles, event formats or run selections refuse. It neither dispatches nor
+reruns workflows and never changes the original policy or failed CI history.
+
+Use `ci-inventory-preflight --id RUN --request FILE`, then explicitly acknowledge
+its returned `preflight_key` with `ack-ci-inventory`. The HTTP equivalents are
+`POST /api/runs/{id}/ci-inventory-preflight` and same-origin/CSRF-protected
+`POST /api/runs/{id}/ack-ci-inventory`. The request contains `command_id`,
+`expected_revision`, `expected_projection_revision`, `expected_iteration`,
+`expected_candidate_id`, `expected_candidate_head`, `expected_content_sha256`,
+`expected_pr_number`, `profile_path` and `expected_profile_sha256`. The private
+profile is canonical JSON, mode 0600, single-link and bounded to 128 KiB; its
+hash must equal the compiled reviewed fingerprint. ACK adds `preflight_key`
+and the literal acknowledgement
+`ordinary_execution_only_no_PR_ruleset_or_merge_eligibility`. No public input,
+configuration, header or environment variable can override formats, matrix,
+source pins, reports, minima, actor, selection or the profile fingerprint.
+
+Preflight and ACK independently read the complete bounded current public
+account/repository/PR/head, canonical rollup, selected run/suite/check/job
+inventories and exact frozen source/action/main/post/dependency/selector graph.
+They join actual checkout and source-framed commands, inputs, interpreters,
+terminal reports and required uploaded artifact bytes. Required-job skips,
+zero/partial/unknown reports, missing pages, duplicates, later attempts,
+changed source/log bytes and current local authority drift refuse. Cases that
+the original source permitted to skip or retry stay explicitly recorded as
+skipped or flaky; build exits remain distinct from positive test reports.
+Unuploaded runner-local reports are not invented.
+
+Raw ANSI-bearing GitHub responses use the supported `gh api
+--allow-escape-sequences` output option only inside bounded private capture.
+Raw bytes are hashed before literal runner/report framing is parsed, and never
+rendered to a terminal or evidence UI. The profile records complete retained
+connector UTF-8 text with historical wire SHA unknown; a new successful exact
+raw read is separately required, never inferred from an old connector result.
+Transport failure or different bytes refuse without stripping or normalization
+to make a match pass.
+
+ACK appends only its own metadata/command/audit records. Every delivery-run
+column, claim, ordinary event, source, role verdict/session, allowance, gate and
+finalization remains unchanged. File-only profiles/receipts are inert. A new
+command ID cannot mint another inventory. Read the acknowledgement with
+`ci-inventory --id RUN` or `GET /api/runs/{id}/ci-inventory`; historical hydration
+checks immutable bytes and commands without requiring an ended checkout or a
+new GitHub read.
+
+The existing separately admitted `published_ci_retry` with zero additional
+iterations is the only normal execution consumer. Its admission seals the exact
+ACK and original checkpoint; worker and CI readback recheck current native
+source/resources, owner, full original ledger and exact claim generation before
+and after remote observation. The existing workflow alone records CI, tracker,
+finalization and any delivered outcome. All independent local/browser/review/
+verification gates remain required. The result always states
+`PR_ruleset_eligibility: false` and `merge_context_verified: false`. Merge
+readback keeps its independent pull-request event, current-base, hosted-tree,
+ruleset and all other stronger predicates; this receipt never satisfies them.

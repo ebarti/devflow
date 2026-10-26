@@ -40,6 +40,10 @@ def initialize(db):
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_ci_inventory_audit (
         run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
         command_id TEXT UNIQUE NOT NULL, response_json TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_ci_inventory_results (
+        run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
+        gate_command_id TEXT UNIQUE NOT NULL, generation INTEGER NOT NULL,
+        recovery_sha256 TEXT NOT NULL, response_json TEXT NOT NULL)""")
 
 
 def _request(value, acknowledged=False):
@@ -226,6 +230,11 @@ def preflight(store, run_id, payload):
     profile, _ = _profile(command["profile_path"])
     if _saved(store, run_id):
         raise ValueError("ordinary CI selection already has its one acknowledged inventory")
+    with store._connect() as db:
+        if db.execute(
+            "SELECT 1 FROM delivery_commands WHERE command_id=?", (command["command_id"],)
+        ).fetchone():
+            raise ValueError("ordinary CI command ID already belongs to another operation")
     _, before = _authority(store, run_id, command, profile)
     facts, _ = _observe(profile)
     _, after = _authority(store, run_id, command, profile)
@@ -256,6 +265,11 @@ def acknowledge(store, run_id, payload):
         archive(store, run_id)
         return {**json.loads(prior["response_json"]), "replayed": True}
     profile, raw = _profile(command["profile_path"])
+    with store._connect() as db:
+        if db.execute(
+            "SELECT 1 FROM delivery_commands WHERE command_id=?", (command["command_id"],)
+        ).fetchone():
+            raise ValueError("ordinary CI command ID already belongs to another operation")
     seal, before = _authority(store, run_id, command, profile)
     facts, observations = _observe(profile)
     key = digest({"command": command, "authority": before, "facts": facts})
@@ -381,10 +395,28 @@ def archive(store, run_id):
     if profile_ref["path"] != str(root / "raw" / APPROVED_PROFILE_SHA256):
         raise ValueError("ordinary CI profile archive left its sealed namespace")
     profile, _ = _profile(profile_ref["path"])
+    expected_key = digest(
+        {
+            "command": receipt["command"],
+            "authority": receipt["authority"],
+            "facts": receipt["observation"]["facts"],
+        }
+    )
+    expected_request = digest(
+        {
+            "run_id": run_id,
+            **receipt["command"],
+            "preflight_key": expected_key,
+            "acknowledgement": ACK,
+        }
+    )
     if (
         receipt.get("schema") != KIND + "/v1"
         or receipt.get("run_id") != run_id
         or receipt.get("request_digest") != saved["request_digest"]
+        or expected_request != saved["request_digest"]
+        or profile_ref["sha256"] != APPROVED_PROFILE_SHA256
+        or profile_ref["bytes"] != len(canonical_json(profile).encode())
         or receipt["command"]["command_id"] != saved["command_id"]
         or response.get("command_id") != saved["command_id"]
         or response.get("profile_sha256") != APPROVED_PROFILE_SHA256
@@ -478,7 +510,43 @@ def authority(store, recovery):
     ):
         raise ValueError("ordinary CI execution changed its one finite original admission")
     _subject(before, recovery["seal"]["candidate"], recovery["seal"]["publication"], profile)
+    _gate_acknowledgement(store, recovery)
     return response, receipt, profile
+
+
+def _gate_acknowledgement(store, recovery):
+    spec = recovery["execution_spec"]
+    with store._connect() as db:
+        command = db.execute(
+            "SELECT * FROM delivery_commands WHERE command_id=?",
+            (recovery["command"]["command_id"],),
+        ).fetchone()
+        response = json.loads(command["response_json"]) if command else {}
+        expected = {
+            "run_id": spec["run_id"],
+            "phase": "gates_retry_queued",
+            "workflow_id": f"delivery-{spec['run_id']}-ci-retry-{spec['gate_retry_generation']}",
+            "candidate_id": recovery["candidate"]["id"],
+            "implementation_authority": False,
+            "additional_iterations": 0,
+            "claim_identity": response.get("claim_identity"),
+        }
+        events = db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? AND "
+            "type='gates_retry_queued' AND run_revision=? LIMIT 2",
+            (spec["run_id"], recovery["seal"]["row"]["revision"] + 1),
+        ).fetchall()
+    if (
+        not command
+        or command["run_id"] != spec["run_id"]
+        or command["request_digest"] != digest({"run_id": spec["run_id"], **recovery["command"]})
+        or response != expected
+        or not isinstance(response.get("claim_identity"), dict)
+        or len(events) != 1
+        or json.loads(events[0][0]) != response
+    ):
+        raise ValueError("ordinary CI execution lost its exact normal admission ACK")
+    return response
 
 
 def validate(store, spec, recovery, *, resource_spec=None):
@@ -498,19 +566,48 @@ def validate(store, spec, recovery, *, resource_spec=None):
     historical_records(store, recovery, resource_spec or spec)
     _physical(store, before, recovery["original_recovery"], resource_spec=resource_spec or spec)
     row, _, _, claim = _rows(store, spec["run_id"])
+    expected_candidate = (
+        recovery["seal"]["candidate"]
+        if row["phase"] == "gates_retry_queued"
+        and row["protocol_revision"] == recovery["seal"]["row"]["protocol_revision"]
+        else recovery["candidate"]
+    )
     with store._connect() as db:
         command = db.execute(
             "SELECT * FROM delivery_commands WHERE command_id=?",
             (recovery["command"]["command_id"],),
         ).fetchone()
         response = json.loads(command["response_json"]) if command else {}
+        expected = {
+            "run_id": spec["run_id"],
+            "phase": "gates_retry_queued",
+            "workflow_id": f"delivery-{spec['run_id']}-ci-retry-{spec['gate_retry_generation']}",
+            "candidate_id": recovery["candidate"]["id"],
+            "implementation_authority": False,
+            "additional_iterations": 0,
+            "claim_identity": response.get("claim_identity"),
+        }
+        events = db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? AND "
+            "type='gates_retry_queued' AND run_revision=? LIMIT 2",
+            (spec["run_id"], recovery["seal"]["row"]["revision"] + 1),
+        ).fetchall()
         if (
             row["work_id"] != spec["work_id"]
+            or row["iteration"] != recovery["state"]["iteration"]
+            or json.loads(row["candidate_json"]) != expected_candidate
             or not claim
             or claim["owner"] != "external:devflow:" + spec["run_id"]
             or response.get("claim_identity") != claim_identity(claim)
             or work_binding(store, spec, db) != receipt["authority"]["work_binding"]
             or live_owner(before, db=db)[1] != receipt["authority"]["operational_owner"]
+            or not command
+            or command["run_id"] != spec["run_id"]
+            or command["request_digest"]
+            != digest({"run_id": spec["run_id"], **recovery["command"]})
+            or response != expected
+            or len(events) != 1
+            or json.loads(events[0][0]) != response
         ):
             raise ValueError("ordinary CI execution lost its current exact claim/owner generation")
 
@@ -528,6 +625,10 @@ def result_for(broker, pr, *, timeout_seconds=None):
         # A file/ACK alone cannot replace normal CI. Only its separately
         # admitted original CI retry is eligible to consume this inventory.
         return None
+    from .delivery_gate_retry import effective_spec
+
+    if effective_spec(store, recovery["original_spec"], recovery) != spec:
+        raise ValueError("ordinary CI reader differs from its admitted execution")
     response, _, profile = authority(store, recovery)
     if pr.get("head") != profile["subject"]["head"] or pr.get("number") != profile["subject"]["pr"]:
         raise ValueError("ordinary CI current publication changed")
@@ -553,7 +654,7 @@ def result_for(broker, pr, *, timeout_seconds=None):
     }
     reference = publish(root / "observations", canonical_json(document).encode(), limit=MAX_JSON)
     validate(store, spec, recovery)
-    return {
+    result = {
         "state": "passed",
         "head": profile["subject"]["head"],
         "checks": facts["checks"],
@@ -566,12 +667,83 @@ def result_for(broker, pr, *, timeout_seconds=None):
             "merge_context_verified": False,
         },
     }
+    from .delivery_prerequisite_gate_recovery import claim_identity
+
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute(
+            "SELECT recovery_json FROM delivery_runs WHERE run_id=?", (spec["run_id"],)
+        ).fetchone()
+        claim = store.state.claim_for(db, spec["work_id"])
+        admitted = db.execute(
+            "SELECT response_json FROM delivery_commands WHERE command_id=?",
+            (recovery["command"]["command_id"],),
+        ).fetchone()
+        if (
+            not current
+            or json.loads(current[0]) != recovery
+            or not claim
+            or not admitted
+            or json.loads(admitted[0]).get("claim_identity") != claim_identity(claim)
+        ):
+            raise ValueError("ordinary CI result lost its current finite admission/claim")
+        saved = db.execute(
+            "SELECT * FROM delivery_ci_inventory_results WHERE run_id=?", (spec["run_id"],)
+        ).fetchone()
+        if saved:
+            prior = json.loads(saved["response_json"])
+            prior_record = _document(
+                store, prior["execution_inventory"]["receipt"], spec["run_id"], "observations"
+            )
+            if (
+                saved["gate_command_id"] != recovery["command"]["command_id"]
+                or saved["recovery_sha256"] != digest(recovery)
+                or prior_record["facts"] != facts
+            ):
+                raise ValueError("ordinary CI execution cannot replace its one observed receipt")
+            result = prior
+        else:
+            db.execute(
+                "INSERT INTO delivery_ci_inventory_results VALUES (?,?,?,?,?)",
+                (
+                    spec["run_id"],
+                    recovery["command"]["command_id"],
+                    spec["gate_retry_generation"],
+                    digest(recovery),
+                    canonical_json(result),
+                ),
+            )
+    validate_result(store, spec["run_id"], result)
+    validate(store, spec, recovery)
+    return result
 
 
 def validate_result(store, run_id, result):
     proof = result.get("execution_inventory")
     if not proof:
         return
+    with store._connect() as db:
+        saved = db.execute(
+            "SELECT * FROM delivery_ci_inventory_results WHERE run_id=?", (run_id,)
+        ).fetchone()
+    if not saved or json.loads(saved["response_json"]) != result:
+        raise ValueError("file-only CI observations grant no normal result authority")
+    from .delivery_gate_retry import gate_namespace
+    from .delivery_resources import read_private
+
+    generation = saved["generation"]
+    if type(generation) is not int or not 1 <= generation <= 8:
+        raise ValueError("ordinary CI result has an invalid finite generation")
+    admitted = read_private(
+        Path(store.spec(run_id)["state_dir"]) / gate_namespace(generation, "ci") / "admission.json"
+    )
+    if (
+        digest(admitted) != saved["recovery_sha256"]
+        or admitted["command"]["command_id"] != saved["gate_command_id"]
+        or admitted["execution_spec"]["gate_retry_generation"] != generation
+    ):
+        raise ValueError("ordinary CI result lost its immutable normal admission")
+    authority(store, admitted)
     response, _, profile = archive(store, run_id)
     record = _document(store, proof["receipt"], run_id, "observations")
     _proof(store, run_id, record)
@@ -582,6 +754,7 @@ def validate_result(store, run_id, result):
         or record.get("acknowledgement") != response["receipt"]
         or record.get("schema") != METHOD
         or record.get("run_id") != run_id
+        or record.get("gate_command_id") != saved["gate_command_id"]
         or result.get("state") != "passed"
         or result.get("head") != profile["subject"]["head"]
         or result.get("checks") != record["facts"]["checks"]
@@ -602,7 +775,7 @@ def indexed_evidence(store, run_id):
     response, _, _ = archive(store, run_id)
     # Raw logs may contain terminal controls. Only JSON-escaped summaries and
     # hashes are exposed by the generic evidence UI; raw bodies stay private.
-    return [
+    indexed = [
         {
             "id": "ordinary-ci-inventory-acknowledgement",
             "label": "Ordinary execution inventory; PR/ruleset and merge eligibility false",
@@ -610,3 +783,19 @@ def indexed_evidence(store, run_id):
             "limit": MAX_JSON,
         }
     ]
+    with store._connect() as db:
+        result = db.execute(
+            "SELECT response_json FROM delivery_ci_inventory_results WHERE run_id=?", (run_id,)
+        ).fetchone()
+    if result:
+        value = json.loads(result[0])
+        validate_result(store, run_id, value)
+        indexed.append(
+            {
+                "id": "ordinary-ci-execution-observation",
+                "label": "Ordinary executed checks; not PR/ruleset or merge eligibility",
+                "path": Path(value["execution_inventory"]["receipt"]["path"]),
+                "limit": MAX_JSON,
+            }
+        )
+    return indexed
