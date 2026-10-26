@@ -4,6 +4,7 @@ import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, IntakePlan, PhaseGate, RoleState, RunDetail } from './model'
 import { RunControls } from './RunControls'
+import { DurableOperations } from './DurableOperations'
 import { FeatureDelivery } from './FeatureDelivery'
 import { runStatus } from './runStatus'
 
@@ -387,6 +388,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     <p className="stream-note">Updates stream from the local service. Waiting uses no model calls. Last observation: {time(run.observed_at || run.updated_at)}.</p>
     {!run.feature_delivery ? <><EvidenceAndQuality run={run} /><GateDetails gates={run.phase_gates} /></> : null}
     <Operations run={run} />
+    <DurableOperations runId={run.id} />
     <UsageSection run={run} />
     <TrackerRecovery key={run.id} run={run} onRefresh={onRefresh} />
     <CancelRun run={run} onRefresh={onRefresh} />

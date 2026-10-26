@@ -717,7 +717,11 @@ async def dispatch_once(service):
     from .delivery_activities import _execute_check
     from .delivery_preparation import execution_retired
 
+    import time
+
     if not getattr(service, "_native_diagnostic_pending", True):
+        return
+    if time.monotonic() < getattr(service, "_native_diagnostic_retry_at", 0):
         return
     # This is only a wake hint, cleared before the read so a concurrent ACK
     # sets it again. Idle pumps do not hydrate the full installation receipt
@@ -753,8 +757,10 @@ async def dispatch_once(service):
             ):
                 continue
         except (ValueError, RuntimeError, OSError, KeyError):
-            # Unknown/foreign ownership grants neither a native body nor a
-            # write to that owner's diagnostic acknowledgement.
+            # Keep the wake hint for bounded retry after transient observation
+            # failures, without relaunching running or unknown diagnostics.
+            service._native_diagnostic_pending = True
+            service._native_diagnostic_retry_at = time.monotonic() + 5
             continue
 
         async def once(spec=spec, row=row):

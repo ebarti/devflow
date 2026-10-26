@@ -87,7 +87,24 @@ async function command<T>(path: string, body: object): Promise<T> {
   })
 }
 
+export interface DurableOperation {
+  operation_id: string
+  run_id: string | null
+  kind: string
+  stage: string
+  state: 'pending' | 'running' | 'succeeded' | 'refused' | 'failed' | 'unknown'
+  progress: string
+  next_action: string
+  result: unknown
+  error: string | null
+  authority: string | null
+}
+
 export const api = {
+  createOperation: (body: { operation_id: string; run_id: string | null; kind: string; request: object }): Promise<DurableOperation> => command('/api/operations', body),
+  getOperation: (id: string): Promise<DurableOperation> => request(`/api/operations/${encodeURIComponent(id)}`),
+  runOperations: (runId: string): Promise<{ operations: DurableOperation[] }> => request(`/api/runs/${encodeURIComponent(runId)}/operations`),
+  reconcileOperation: (id: string): Promise<DurableOperation> => command(`/api/operations/${encodeURIComponent(id)}/reconcile`, {}),
   session,
   getProjectBoard: (): Promise<ProjectBoard> => request('/api/project-board'),
   listRuns: async (archived = false): Promise<RunSummary[]> => (await api.listRunsPage(archived)).runs,

@@ -890,6 +890,10 @@ async def worker(
 
 
 _COMMANDS = (
+    "operation-create",
+    "operation",
+    "operation-reconcile",
+    "run-operations",
     "start",
     "status",
     "stop",
@@ -971,6 +975,19 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
     if deployment is not None and args.command not in {"start", "worker"}:
         parser.error("worker deployment options apply only to start or worker")
+    if args.command in {"operation-create", "operation", "operation-reconcile", "run-operations"}:
+        caller = read_only_client(Path(args.config).expanduser().resolve(strict=True))
+        if args.command == "operation-create":
+            if args.request is None:
+                parser.error("operation-create requires --request")
+            result = caller.create_operation(json.loads(args.request.read_text(encoding="utf-8")))
+        else:
+            if not args.id:
+                parser.error("--id is required")
+            result = {"operation": caller.operation, "operation-reconcile": caller.reconcile_operation,
+                      "run-operations": caller.run_operations}[args.command](args.id)
+        print(json.dumps(result, sort_keys=True, indent=2))
+        return
     if args.command == "capture-retained-closures":
         if args.request is None:
             parser.error("--request is required for explicit retained-history capture")

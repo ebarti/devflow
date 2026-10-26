@@ -412,6 +412,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await service.resume_pending_operations()
         service.dispatch_task = asyncio.create_task(service.dispatch_loop())
         try:
             yield
@@ -1008,4 +1009,7 @@ def create_app(config_path: Path) -> FastAPI:
             return FileResponse(dist / "index.html")
         return HTMLResponse("<h1>Devflow delivery</h1><p>Dashboard assets are not built.</p>")
 
+    from .delivery_operations import register_operations
+
+    register_operations(app, service, _host, _mutation)
     return app

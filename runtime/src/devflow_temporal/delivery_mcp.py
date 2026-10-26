@@ -54,6 +54,30 @@ def build_server(config_path: Path) -> FastMCP:
 
         return await asyncio.to_thread(invoke)
 
+    @server.tool(annotations=write)
+    async def create_operation(request_json: str) -> dict:
+        """Submit an exact operation envelope; retain its ID and inspect pending results.
+
+        Requires the service already running. A timeout does not cancel the operation.
+        """
+        request = json.loads(request_json)
+        return await asyncio.to_thread(read_only_client(config_path).create_operation, request)
+
+    @server.tool(annotations=read)
+    def get_operation(operation_id: str) -> dict:
+        """Read a durable operation without starting the service."""
+        return read_only_client(config_path).operation(operation_id)
+
+    @server.tool(annotations=read)
+    def get_run_operations(run_id: str) -> dict:
+        """Read the most recent durable operations for a run."""
+        return read_only_client(config_path).run_operations(run_id)
+
+    @server.tool(annotations=write)
+    async def reconcile_operation(operation_id: str) -> dict:
+        """Inspect the original domain receipt without repeating the effect."""
+        return await asyncio.to_thread(read_only_client(config_path).reconcile_operation, operation_id)
+
     @server.tool(annotations=read)
     def get_service() -> dict:
         """Read local health and public policy; report unavailable if stopped."""

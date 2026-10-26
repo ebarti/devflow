@@ -63,6 +63,19 @@ class DeliveryClient:
         result = self._request("GET", "/api/session", timeout=timeout)
         self.csrf = result["csrf_token"]
 
+    def create_operation(self, request: dict[str, Any]) -> dict:
+        """Return the durable operation, including pending/unknown states."""
+        return self._request("POST", "/api/operations", request)
+
+    def operation(self, operation_id: str) -> dict:
+        return self._request("GET", "/api/operations/" + quote(operation_id, safe=""))
+
+    def run_operations(self, run_id: str) -> dict:
+        return self._request("GET", "/api/runs/" + quote(run_id, safe="") + "/operations")
+
+    def reconcile_operation(self, operation_id: str) -> dict:
+        return self._request("POST", "/api/operations/" + quote(operation_id, safe="") + "/reconcile", {})
+
     def submit(self, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs", payload)
 
