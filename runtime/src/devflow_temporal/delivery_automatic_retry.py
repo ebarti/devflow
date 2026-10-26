@@ -19,6 +19,7 @@ from pathlib import Path
 from .contracts import digest
 from .delivery_activities import _tracker_sync
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_control_lineage import inherit_delivery_control
 from .delivery_metadata_recovery import _immutable
 from .delivery_policy_recovery import gate_failed
 from .delivery_resources import (
@@ -460,6 +461,7 @@ def validate_transaction(store, db, spec, expected):
         raise ValueError('fresh base changed after readback')
     spec['accepted_plan'] = previous['accepted_plan_text'] or old['accepted_plan']
     spec['intake_required'] = False
+    inherit_delivery_control(store, db, spec, previous, closed=expected.get("closed"))
 
 
 def retry_once(store, *, stopped=lambda: False):
@@ -542,7 +544,7 @@ def retry_once(store, *, stopped=lambda: False):
                             supersedes_run_id=spec['run_id'], branch='fix/automatic-' + identity,
                             accepted_plan=row['accepted_plan_text'] or spec['accepted_plan'])
             admitted.append(store.submit(supplied, _automatic={
-                'row': row, 'base_sha': base, 'stopped': stopped}))
+                'row': row, 'base_sha': base, 'stopped': stopped, 'closed': closed}))
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
                 subprocess.SubprocessError, sqlite3.Error) as exc:
             # Wait for conclusive fresh observations; no absence inferred from errors.

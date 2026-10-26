@@ -8,6 +8,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 from .contracts import digest
+from .delivery_control_lineage import control_from_spec
 
 KEYS = ("delivery_timeout_seconds", "no_progress_timeout_seconds")
 SETTLEMENT = frozenset({
@@ -173,10 +174,19 @@ async def _watch(controller, spec):
 async def run(controller, spec, recovery, operation):
     control = (((recovery or {}).get("state") or {}).get("checks", {})
                .get("delivery_limits_control", {}))
-    controller.delivery_limits_control = dict(control) if control.get("disabled") is True else None
+    inherited = control_from_spec(spec)
+    controller.delivery_limits_control = (dict(control) if control.get("disabled") is True
+                                          else inherited)
     controller.delivery_limits_disabled = controller.delivery_limits_control is not None
     if spec.get("delivery_limits_version") != 1:
         return await operation(spec, recovery)
+    # A sealed terminal tail permits only settlement. Restore its clock mode
+    # before either the watcher or the first preflight can evaluate product time.
+    # The patch leaves already recorded terminal-recovery histories replayable.
+    if ((recovery or {}).get("kind") == "terminal_tracker_recovery"
+            and (not workflow.in_workflow()
+                 or workflow.patched("delivery-terminal-settlement-clock-v1"))):
+        controller.delivery_limits_closing = True
     controller.delivery_limit_policy = policy(spec["policy"])
     if not controller.delivery_limit_policy and not controller.delivery_limits_disabled:
         raise ValueError("bounded delivery requires its frozen time policy")

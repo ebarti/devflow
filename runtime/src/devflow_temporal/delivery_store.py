@@ -252,6 +252,14 @@ class DeliveryStore:
                    ON delivery_events(run_id, sequence)"""
             )
             db.execute(
+                "CREATE INDEX IF NOT EXISTS delivery_events_gate_iteration ON delivery_events("
+                "run_id,type,json_extract(payload_json,'$.iteration'),sequence DESC)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS delivery_events_gate_run ON delivery_events("
+                "run_id,type,sequence DESC)"
+            )
+            db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_attempts (
                     job_key TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
@@ -788,6 +796,18 @@ class DeliveryStore:
                 db.execute(
                     "UPDATE runtime_sessions SET closed_at=? WHERE id=? AND closed_at IS NULL",
                     (self.state.now(), old_owner),
+                )
+            if _automatic is None and (superseded or retained is not None):
+                from .delivery_control_lineage import inherit_delivery_control
+
+                predecessor_id = superseded or retained["run_id"]
+                predecessor_row = db.execute(
+                    "SELECT * FROM delivery_runs WHERE run_id=?", (predecessor_id,),
+                ).fetchone()
+                if predecessor_row is None:
+                    raise ValueError("delivery-limit predecessor is absent")
+                inherit_delivery_control(
+                    self, db, spec, predecessor_row, closed=temporal_result,
                 )
             self.state.claim_work(db, spec["work_id"], f"external:devflow:{run_id}", dashboard_url)
             if self.config.raw.get("feature_delivery_version") == 1:
@@ -3439,6 +3459,11 @@ class DeliveryStore:
                 raise ValueError("projection row revision changed")
             if expected_row is not None and dict(row) != expected_row:
                 raise ValueError("projection row changed")
+            if (protocol_revision is not None
+                    and protocol_revision < (row["protocol_revision"] or 0)):
+                # A completed activity can arrive after a newer accepted control
+                # or owner transition. Its history is not the current projection.
+                return dict(row)
             feature_readback_wait = False
             if (event_type == "feature_readback_pending" and phase == "waiting_feature_readback"
                     and execution_state == "waiting" and outcome is None
@@ -3975,6 +4000,8 @@ class DeliveryStore:
                 "terminal", "blocked", "cancelled", "waiting_tracker",
             }),
         )
+        from .delivery_state_contract import recorded
+
         return {
             **dashboard_state,
             "id": row["run_id"],
@@ -4001,8 +4028,56 @@ class DeliveryStore:
             "outcome": row["outcome"],
             "cleanup": cleanup,
             "cleanup_recorded": row["cleanup"],
+            "state_contract": recorded(row, spec),
             **({"execution_readback": execution_readback} if execution_readback else {}),
         }
+
+    def persisted_status(self, run_id: str) -> dict[str, Any]:
+        """Read recorded status without reconstructing launch/recovery proofs.
+
+        Runtime installation readiness fences writes and execution, not visibility
+        of accepted work. This connection is read-only and cannot acknowledge an
+        effect, repair a projection, or turn recorded custody into a launch grant.
+        """
+        from .delivery_phase_gates import evidence, state
+        from .delivery_state_contract import gate_specs, recorded
+
+        with sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            saved = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            if saved is None:
+                raise ValueError("run ID not found")
+            row = dict(saved)
+            spec = json.loads(row["request_json"])
+            checks = json.loads(row["checks_json"] or "{}")
+            tracker = json.loads(row["tracker_json"] or "{}")
+            gates = gate_specs(spec)
+            latest = evidence(db, run_id, row["iteration"], gates)
+            observations = {"prepublish": checks.get("prepublish", {}).get("state"),
+                            "local_checks": checks.get("local", {}).get("state"),
+                            "browser_qa": checks.get("browser_qa", {}).get("state"),
+                            "required_ci": checks.get("ci", {}).get("state"),
+                            "tracker": tracker.get("state")}
+            effects = {item["state"]: item["count"] for item in db.execute(
+                "SELECT state,COUNT(*) AS count FROM delivery_effects WHERE run_id=? GROUP BY state",
+                (run_id,),
+            )}
+            return {
+                "run_id": run_id, "phase": row["phase"],
+                "execution_state": row["execution_state"], "outcome": row["outcome"],
+                "revision": row["protocol_revision"], "projection_revision": row["revision"],
+                "iteration": row["iteration"], "cleanup_recorded": row["cleanup"],
+                "state_contract": recorded(row, spec), "effects": effects,
+                "phase_gates": [{"id": name, "label": label,
+                                 "state": state(name, completion, row=row,
+                                                observed=observations.get(name), latest=latest)}
+                                for name, label, completion in gates],
+                "candidate": json.loads(row["candidate_json"]) if row["candidate_json"] else None,
+                "pull_request": json.loads(row["pr_json"]) if row["pr_json"] else None,
+                "error": row["error"], "updated_at": row["updated_at"],
+            }
 
     @staticmethod
     def _display_title(spec):
@@ -4113,25 +4188,10 @@ class DeliveryStore:
                     "cleanup": attempt["cleanup"],
                 }
             )
-        gate_specs = [
-            ("prepare", "Prepare", "tracker_start"),
-            ("prepublish", "Before PR checks", "candidate_ready"),
-            ("publish", "Publish", "published"),
-            (
-                "local_checks",
-                "Local checks",
-                "browser_qa_started" if spec["policy"].get("browser_qa") else "ci_wait",
-            ),
-        ]
-        if spec["policy"].get("browser_qa"):
-            gate_specs.append(("browser_qa", "Browser / API QA", "browser_qa_passed"))
-        gate_specs.extend(
-            (
-                ("required_ci", "Required CI", "tracker_started"),
-                ("tracker", "Tracker", "delivered"),
-            )
-        )
-        completion_types = tuple(sorted({completion for _, _, completion in gate_specs}))
+        from .delivery_state_contract import gate_specs as recorded_gate_specs
+
+        gate_specs = recorded_gate_specs(spec)
+        from .delivery_phase_gates import evidence as gate_evidence, state as gate_state
         with self._connect() as db:
             active = db.execute(
                 """SELECT COUNT(*) FROM delivery_attempts
@@ -4148,22 +4208,11 @@ class DeliveryStore:
                    ORDER BY sequence DESC LIMIT 200""",
                 (run_id,),
             ).fetchall()
-            # Gate evidence must include relevant events outside the display window.
-            gate_event_rows = db.execute(
-                f"""SELECT type,payload_json FROM delivery_events
-                    WHERE run_id=? AND type IN ({','.join('?' for _ in completion_types)})""",
-                (run_id, *completion_types),
-            ).fetchall()
+            latest_gate_evidence = gate_evidence(db, run_id, row["iteration"], gate_specs)
         events = [
             {**dict(event), "payload": json.loads(event["payload_json"]), "evidence_refs": []}
             for event in reversed(recent_event_rows)
         ]
-        event_types = {event["type"] for event in gate_event_rows}
-        current_event_types = {
-            event["type"]
-            for event in gate_event_rows
-            if json.loads(event["payload_json"]).get("iteration") == row["iteration"]
-        }
         checks = json.loads(row["checks_json"]) if row["checks_json"] else {}
         tracker = json.loads(row["tracker_json"]) if row["tracker_json"] else {}
         observed_gate_states = {
@@ -4174,35 +4223,13 @@ class DeliveryStore:
             "tracker": tracker.get("state"),
         }
 
-        def gate_state(name: str, completion: str) -> str:
-            relevant_events = event_types if name == "prepare" else current_event_types
-            if name == "tracker":
-                tracker_state = observed_gate_states[name]
-                if tracker_state in {"failed", "blocked", "conflict"}:
-                    return "failed"
-                if tracker_state == "unknown":
-                    return "unknown"
-                return (
-                    "completed"
-                    if row["outcome"] == "delivered" and tracker_state == "consistent"
-                    else "pending"
-                )
-            if completion in relevant_events or observed_gate_states.get(name) in {
-                "passed",
-                "consistent",
-            }:
-                return "completed"
-            if observed_gate_states.get(name) in {"failed", "blocked", "conflict"}:
-                return "failed"
-            if observed_gate_states.get(name) == "unknown":
-                return "unknown"
-            return "pending"
-
         gates = [
             {
                 "id": name,
                 "label": label,
-                "state": gate_state(name, completion),
+                "state": gate_state(name, completion, row=row,
+                                    observed=observed_gate_states.get(name),
+                                    latest=latest_gate_evidence),
             }
             for name, label, completion in gate_specs
         ]
