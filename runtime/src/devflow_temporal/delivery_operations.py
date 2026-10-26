@@ -106,7 +106,11 @@ def read(store, operation_id):
 
 
 def _lock(store, operation_id):
-    root = Path(store.config.state_root) / "operation-locks"
+    # Database aliases and services with different state roots must fence the
+    # same journal row with one OS lock.
+    database = Path(store.config.tracking_db).resolve()
+    database_key = hashlib.sha256(str(database).encode()).hexdigest()
+    root = database.parent / ".delivery-operation-locks" / database_key
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = root / (hashlib.sha256(operation_id.encode()).hexdigest() + ".lock")
     fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)

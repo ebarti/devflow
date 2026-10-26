@@ -366,3 +366,26 @@ def test_status_client_uses_bounded_projection_and_keeps_detail_explicit(monkeyp
     assert client.status("run-1")["source"] == "persisted_projection"
     client.detail("run-1")
     assert calls == [("GET", "/api/runs/run-1/status"), ("GET", "/api/runs/run-1")]
+
+
+def test_operation_lock_is_shared_by_database_not_service_root(tmp_path):
+    import os
+    from types import SimpleNamespace
+
+    from devflow_temporal.delivery_operations import _lock
+
+    database = tmp_path / "delivery.sqlite3"
+    database.touch()
+    first = SimpleNamespace(config=SimpleNamespace(tracking_db=database, state_root=tmp_path / "a"))
+    second = SimpleNamespace(
+        config=SimpleNamespace(tracking_db=database, state_root=tmp_path / "b")
+    )
+    lock = _lock(first, "operation-1")
+    assert lock is not None
+    try:
+        assert _lock(second, "operation-1") is None
+    finally:
+        os.close(lock)
+    lock = _lock(second, "operation-1")
+    assert lock is not None
+    os.close(lock)
