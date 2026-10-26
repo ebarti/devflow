@@ -40,6 +40,9 @@ def measurement_owner(service):
     raw["repositories"]["fixture"].update(
         prepublish_checks=[{"id": "prepublish", "argv": ["/usr/bin/true"]}],
         checks=[{"id": "local", "argv": ["/usr/bin/true"]}],
+        required_ci=["owned-ci"],
+        project_url="https://github.com/users/example/projects/1",
+        assignee="example",
     )
     old.config.path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(old.config.path))
