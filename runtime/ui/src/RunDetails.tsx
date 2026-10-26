@@ -285,19 +285,33 @@ function IntakeHistory({ run }: { run: RunDetail }) {
 }
 
 function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
-  const [reason, setReason] = useState('')
-  const intent = useRef<Parameters<typeof api.cancel>[1] | null>(null)
-  const [open, setOpen] = useState(false)
+  const intentKey = `devflow.cancel:${run.id}`
+  const [saved] = useState(() => {
+    try {
+      const raw = sessionStorage.getItem(intentKey)
+      if (raw === null) return { request: null, blocked: false }
+      const value: unknown = JSON.parse(raw)
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return { request: null, blocked: true }
+      const request = value as Record<string, unknown>
+      if (Object.keys(request).length !== 3 || typeof request.command_id !== 'string' || !request.command_id ||
+          typeof request.expected_revision !== 'number' || !Number.isInteger(request.expected_revision) ||
+          typeof request.reason !== 'string' || !request.reason.trim()) return { request: null, blocked: true }
+      return { request: request as Parameters<typeof api.cancel>[1], blocked: false }
+    } catch { return { request: null, blocked: true } }
+  })
+  const [reason, setReason] = useState(saved.request?.reason ?? '')
+  const intent = useRef<Parameters<typeof api.cancel>[1] | null>(saved.request)
+  const [open, setOpen] = useState(Boolean(saved.request))
   const [busy, setBusy] = useState(false)
-  const [uncertain, setUncertain] = useState(false)
+  const [uncertain, setUncertain] = useState(Boolean(saved.request))
   const [settled, setSettled] = useState<{ acknowledged: boolean; revision: number } | null>(null)
   const [observed, setObserved] = useState<RunDetail | null>(null)
-  const [error, setError] = useState('')
+  const [error, setError] = useState(saved.blocked ? 'The retained cancellation request is unavailable. Resolve it before starting another cancellation.' : saved.request ? 'A previous cancellation request is retained. Retry to confirm the same request.' : '')
   const canRequest = !run.execution_retired && run.outcome == null && !run.checks?.terminal_tracker_checkpoint && !['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')
   const observedCurrent = observed?.id === run.id && observed.protocol_revision === run.protocol_revision && observed.outcome === run.outcome && observed.execution_state === run.execution_state && Boolean(observed.execution_retired) === Boolean(run.execution_retired) && Boolean(observed.checks?.terminal_tracker_checkpoint) === Boolean(run.checks?.terminal_tracker_checkpoint)
   const canStart = canRequest && (!settled || observedCurrent && (!settled.acknowledged || run.protocol_revision !== settled.revision))
   const awaitingObservation = Boolean(settled) && !canStart
-  if (!canRequest && !intent.current) return null
+  if (!canRequest && !intent.current && !saved.blocked) return null
 
   async function refresh(observeResponse: boolean) {
     if (observeResponse) {
@@ -310,15 +324,20 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   }
 
   async function cancel() {
-    if (busy || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))) return
-    intent.current ??= { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision!, reason: reason.trim() }
-    const request = intent.current
+    if (busy || saved.blocked || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))) return
+    const request = intent.current ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision!, reason: reason.trim() }
+    if (!intent.current) {
+      try { sessionStorage.setItem(intentKey, JSON.stringify(request)) }
+      catch { setError('The cancellation request could not be retained. It was not submitted.'); return }
+      intent.current = request
+    }
     let knownResponse = false
     setSettled(null); setObserved(null)
     setBusy(true); setError('')
     try {
       await api.cancel(run.id, request)
       knownResponse = true
+      try { sessionStorage.removeItem(intentKey) } catch { /* A retained receipt is safe to replay. */ }
       intent.current = null
       setSettled({ acknowledged: true, revision: request.expected_revision })
       setUncertain(false); setOpen(false)
@@ -327,6 +346,7 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
       setUncertain(unknown)
       if (!unknown) {
         knownResponse = true
+        try { sessionStorage.removeItem(intentKey) } catch { /* A retained refusal is safe to recheck. */ }
         intent.current = null
         setSettled({ acknowledged: false, revision: request.expected_revision })
       }
@@ -339,7 +359,7 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
   return <div className="cancel-control">
     {settled?.acknowledged && awaitingObservation ? <p role="status">Cancellation requested. Waiting for the latest run state.</p> : open ? <div className="cancel-form"><label htmlFor="cancel-reason">Reason for cancellation</label><input id="cancel-reason" value={reason} disabled={busy || uncertain} onChange={event => setReason(event.target.value)} required />
       <div className="button-row"><button type="button" className="danger-button" onClick={() => void cancel()} disabled={busy || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))}>{busy ? 'Requesting…' : uncertain ? 'Retry cancellation request' : 'Request cancellation'}</button><button type="button" className="text-button" disabled={busy || uncertain} onClick={() => setOpen(false)}>Keep run</button></div>
-    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={!canStart || run.protocol_revision == null}>Cancel run</button>}
+    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={saved.blocked || !canStart || run.protocol_revision == null}>Cancel run</button>}
     {awaitingObservation ? <button type="button" className="text-button" disabled={busy} onClick={async () => { if (busy) return; setBusy(true); await refresh(true); setBusy(false) }}>Refresh run state</button> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
   </div>
@@ -414,7 +434,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     <DurableOperations runId={run.id} />
     <UsageSection run={run} />
     <TrackerRecovery key={run.id} run={run} onRefresh={onRefresh} />
-    <CancelRun run={run} onRefresh={onRefresh} />
+    <CancelRun key={`cancel-${run.id}`} run={run} onRefresh={onRefresh} />
   </div>
 }
 

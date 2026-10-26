@@ -249,7 +249,7 @@ describe('dashboard commands', () => {
     await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
     await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
-    expect(screen.getByRole('status').textContent).toContain('Cancellation requested')
+    expect(screen.getByText(/Cancellation requested. Waiting for the latest run state/)).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
     rerender(<RunDetails run={{ ...run, protocol_revision: 6 }} onRefresh={refresh} />)
     expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
