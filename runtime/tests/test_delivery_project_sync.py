@@ -342,7 +342,7 @@ def test_project_drift_is_rechecked_at_twenty_four_hours(service):
 
 @pytest.mark.parametrize("assignee", ["owner", "@me"])
 @pytest.mark.parametrize("already_assigned", [True, False])
-@pytest.mark.parametrize("existing_status", [None, "dOnE"])
+@pytest.mark.parametrize("existing_status", ["Done", "dOnE"])
 def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
     assignee, already_assigned, existing_status,
 ):
@@ -384,10 +384,7 @@ def test_github_preserves_option_ids_paginates_and_reads_back_exact_status(
                 return {"user": {"projectV2": {"id": "project", "closed": False,
                         "field": {"id": "field", "options": self.options}}}}
             if "updateProjectV2Field(" in query:
-                supplied = variables["input"]["singleSelectOptions"]
-                assert supplied[0] == self.options[0]  # Stable identity and existing values.
-                self.options = [supplied[0], {**supplied[1], "id": "merged"}]
-                return {"updateProjectV2Field": {"projectV2Field": {"options": self.options}}}
+                pytest.fail("item mirroring must not change Project schema")
             if "projectItems(first:" in query:
                 self.cursors.append(variables["cursor"])
                 first = variables["cursor"] is None

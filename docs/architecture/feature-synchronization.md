@@ -33,8 +33,14 @@ merge does not rewrite a historical delivery outcome or authorize closing an iss
   Terminal publication still requires its PR custody readback before local acknowledgement.
   Historical run data is not rewritten to adopt new execution policies.
 - Project Status options reuse case-insensitive matching names, so an existing
-  `In Progress` option does not create a second `In progress` column. Creating missing
-  options preserves existing IDs and values.
+  `In Progress` option also matches `In progress`. Configure the Project's Status
+  field with the canonical statuses below before starting synchronization. If an
+  option is missing, its mirror stays pending with the Project URL, missing name
+  and configuration action; the normal durable retry discovers the option after
+  the owner configures it. Routine item mirroring never creates or replaces
+  Project field options: that would replace the entire remote list and could
+  erase another actor's concurrent configuration or unrelated item values.
+  Existing IDs, names, colors and descriptions remain owned by the Project.
 - Required bound PRs observed merged produce `Done`. Closing an issue alone does not
   prove delivery. A closed unmerged PR returns unfinished work to `Backlog`; explicit
   owner deferral is retained in the backlog, and an explicit decision not to do the
