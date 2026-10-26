@@ -17,7 +17,7 @@ from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_diagnostic import ERROR, require_resource_idle
 from devflow_temporal.delivery_policy_recovery import _prepare
-from devflow_temporal.delivery_preparation import require_native_execution
+from devflow_temporal.delivery_preparation import PreparationError, require_native_execution
 from devflow_temporal.delivery_preparation_resources import (
     FIELD,
     binding,
@@ -119,7 +119,7 @@ def test_uncached_real_native_measurement_keeps_canonical_rows_and_resources(mea
     with store._connect() as db:
         assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == original_row
         assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 0
-    with pytest.raises(ValueError, match="measurement resource metadata"):
+    with pytest.raises(PreparationError, match="measurement resource metadata"):
         require_native_execution(probe)
 
 
