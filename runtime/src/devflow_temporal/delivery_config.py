@@ -40,6 +40,28 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _scope_git(repo: Path, *args: str) -> str:
+    """Read physical objects for this frozen-base context, never graft/replace views."""
+    result = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(repo), *args],
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull},
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    return result.stdout.strip()
+
+
+def _ordinary_scope_git_view(source: Path) -> None:
+    # --git-path info/grafts honors our deliberately disabled GIT_GRAFT_FILE.
+    # The repository's actual legacy namespace lives in the common Git owner.
+    common = Path(_scope_git(source, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    graft = common / "info/grafts"
+    if (os.path.lexists(graft)
+            or _scope_git(source, "for-each-ref", "--format=%(refname)", "refs/replace/")
+            or os.environ.get("GIT_GRAFT_FILE") not in (None, os.devnull)
+            or os.environ.get("GIT_REPLACE_REF_BASE") not in (None, "refs/replace/")):
+        raise ValueError("ordinary scope continuation has an altered Git object view")
+
+
 def publication_base_ref(source: Path, base_ref: str, base_sha: str) -> str:
     """Bind GitHub's branch primitive independently of the pinned Git object."""
     try:
@@ -57,6 +79,45 @@ def publication_base_ref(source: Path, base_ref: str, base_sha: str) -> str:
     except subprocess.CalledProcessError as exc:
         raise ValueError("publication base requires a resolvable branch") from exc
     raise ValueError("publication base requires a branch, not a tag or ambiguous commit")
+
+
+def ordinary_scope_base(config: DeliveryConfig, original: dict[str, Any]) -> dict[str, str]:
+    """Observe a current named branch without replacing an ordinary accepted base.
+
+    The stopped-scope owner authenticates the complete original spec/config first.
+    This observer grants no admission and is deliberately outside historical
+    custody hydration: only current preparation/readback needs the physical refs.
+    """
+    repository = config.raw["repositories"].get(original.get("repository_key"), {})
+    if (original.get("provider") != "codex" or config.raw.get("provider", "codex") != "codex"
+            or original.get("feature_worker") or original.get("feature_delivery")
+            or not re.fullmatch(r"[0-9a-f]{40}", original.get("base_sha", ""))
+            or repository.get("base_ref") != original.get("base_ref")
+            or repository.get("origin_url") != original.get("origin_url")
+            or repository.get("github_repo") != original.get("github_repo")
+            or repository.get("expected_base_sha") not in (None, original["base_sha"])):
+        raise ValueError("ordinary scope continuation changed its frozen base authority")
+    source = Path(repository["source_path"]).resolve(strict=True)
+    if (str(source) != original.get("source_path")
+            or _git(source, "rev-parse", "--show-toplevel") != str(source)
+            or _git(source, "remote", "get-url", "origin") != original["origin_url"]):
+        raise ValueError("ordinary scope continuation changed its frozen source identity")
+    try:
+        _ordinary_scope_git_view(source)
+        if _scope_git(source, "cat-file", "-t", original["base_sha"]) != "commit":
+            raise ValueError("ordinary scope continuation lost its frozen base commit")
+        current = _scope_git(source, "rev-parse", original["base_ref"])
+        branch = publication_base_ref(source, original["base_ref"], current)
+        if branch != original.get("publication_base_ref"):
+            raise ValueError("ordinary scope continuation changed its named publication branch")
+        _scope_git(source, "merge-base", "--is-ancestor", original["base_sha"], current)
+        _ordinary_scope_git_view(source)
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            "ordinary scope continuation lost its original commit or descendant branch"
+        ) from exc
+    return {"base_sha": original["base_sha"], "current_base": current,
+            "publication_base_ref": branch}
 
 
 @dataclass(frozen=True)
@@ -183,6 +244,7 @@ class DeliveryConfig:
     def admit(
         self, supplied: dict[str, Any], *, _base_ref: str | None = None,
         _feature_base: dict[str, Any] | None = None, legacy_publication: bool = False,
+        _scope_base: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         required = {
             "command_id",
@@ -286,8 +348,20 @@ class DeliveryConfig:
             if resolved_ref not in {branch, "refs/heads/" + branch, "origin/" + branch, _base_ref}:
                 raise ValueError("fresh base changed the configured named branch")
             resolved_ref = _base_ref
-        current_base = _git(source, "rev-parse", resolved_ref)
-        base_sha = current_base
+        if _scope_base is not None:
+            if (_base_ref is not None or _feature_base is not None
+                    or any(supplied.get(key) != _scope_base.get(key) for key in (
+                        "command_id", "run_id", "work_id", "issue_url", "repository_key",
+                        "goal", "base_ref", "branch", "authorized_endpoint", "origin_thread_id"))
+                    or summary.get("publication_summary")
+                    != _scope_base.get("publication_summary")):
+                raise ValueError("ordinary scope continuation changed its original request")
+            observed = ordinary_scope_base(self, _scope_base)
+            current_base = observed["current_base"]
+            base_sha = observed["base_sha"]
+        else:
+            current_base = _git(source, "rev-parse", resolved_ref)
+            base_sha = current_base
         if _feature_base is not None:
             # Store admission has authenticated this exact stopped predecessor.
             # Its accepted baseline survives integration of the retained workers.
@@ -308,7 +382,8 @@ class DeliveryConfig:
             base_sha = _git(source, "rev-parse", _feature_base["base_sha"])
             if base_sha != _feature_base["base_sha"]:
                 raise ValueError("feature continuation lost its frozen base commit")
-        base_paths = _git(source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
+        base_paths = (_scope_git if _scope_base is not None else _git)(
+            source, "ls-tree", "-r", "--name-only", base_sha).splitlines()
         if any(path == ".codex" or path.startswith(".codex/") for path in base_paths):
             raise ValueError("project Codex configuration is not admitted")
         expected = repository.get("expected_base_sha")
@@ -647,6 +722,12 @@ def scope_amendment_config(
     amended = DeliveryConfig.load(path)
     repository_key = original["repository_key"]
     old_raw, new_raw = deepcopy(original_config.raw), deepcopy(amended.raw)
+    from .delivery_amendment_capacity import acknowledge
+
+    if old_raw.get("capacity", 2) != new_raw.get("capacity", 2):
+        acknowledge(original, amended)
+    old_raw.pop("capacity", None)
+    new_raw.pop("capacity", None)
     old_repository = old_raw["repositories"][repository_key]
     new_repository = new_raw["repositories"][repository_key]
     from .delivery_source_scope import amended_scope, authority
@@ -670,6 +751,37 @@ def scope_amendment_config(
     if new_raw != old_raw:
         raise ValueError("scope amendment changed unrelated execution authority")
     return amended
+
+
+def scope_receipt_spec(
+    original: dict[str, Any], config_path: Path, config_sha256: str,
+    added_paths: list[str],
+) -> dict[str, Any]:
+    """Reconstruct only a sealed ordinary scope receipt, granting no current access.
+
+    The caller must first authenticate its immutable command/admission. Current
+    proposal and worker readback retain their independent physical source/base
+    observers; historical composition never re-admits against a mutable ref.
+    """
+    if (original.get("provider") != "codex" or original.get("feature_worker")
+            or original.get("feature_delivery")):
+        raise ValueError("scope receipt requires its original ordinary native authority")
+    amended = scope_amendment_config(original, config_path, config_sha256, added_paths)
+    repository = amended.raw["repositories"][original["repository_key"]]
+    effective = deepcopy(original)
+    effective["policy"]["allowed_paths"] = deepcopy(repository.get("allowed_paths", []))
+    if repository.get("source_scope") is not None:
+        effective["policy"]["source_scope"] = deepcopy(repository["source_scope"])
+    else:
+        effective["policy"].pop("source_scope", None)
+    effective["config_path"] = str(amended.path)
+    effective["config_digest"] = digest(amended.raw)
+    effective["policy_digest"] = digest(effective["policy"])
+    if original.get("preparation_version") == 1:
+        from .delivery_runtime_location import bind_provenance
+
+        effective = bind_provenance(effective, original)
+    return effective
 
 
 def scope_amended_spec(
@@ -696,11 +808,15 @@ def scope_amended_spec(
         supplied.pop("accepted_plan", None)
         supplied["plan_approval"] = original.get("plan_approval", "required")
     # Re-admission of a historical frozen spec must not acquire new metadata.
-    effective = amended.admit(supplied, legacy_publication="publication_summary" not in original)
+    effective = amended.admit(
+        supplied, legacy_publication="publication_summary" not in original,
+        **({"_scope_base": original} if original["provider"] == "codex" else {}),
+    )
     if "provider_max_attempts" in original["policy"]:
         effective["policy"]["provider_max_attempts"] = original["policy"]["provider_max_attempts"]
     else:
         effective["policy"].pop("provider_max_attempts", None)
+    effective["policy"]["capacity"] = original["policy"]["capacity"]
     effective["policy_digest"] = digest(effective["policy"])
     if "projection_retry_version" in original:
         effective["projection_retry_version"] = original["projection_retry_version"]
@@ -717,7 +833,8 @@ def scope_amended_spec(
                    "merge_version", "workflow_failure_boundary_version",
                    "assessment_batch_version", "validation_schedule_version",
                    "merge_reconciliation_version",
-                   "delivery_limits_version", "delivery_admitted_at"):
+                   "delivery_limits_version", "delivery_admitted_at",
+                   "temporal_test_preparation"):
         if marker in original:
             effective[marker] = original[marker]
         else:
@@ -762,6 +879,8 @@ def scope_amended_spec(
     ):
         if effective[key] != original[key]:
             raise ValueError("scope amendment changed the admitted run identity")
+    if effective.get("publication_base_ref") != original.get("publication_base_ref"):
+        raise ValueError("scope amendment changed the named publication branch")
     if effective.get("origin_thread_id") != original.get("origin_thread_id"):
         raise ValueError("scope amendment changed the originating thread")
     if effective.get("publication_summary") != original.get("publication_summary"):
@@ -770,14 +889,9 @@ def scope_amended_spec(
     if "continuation" in original:
         effective["continuation"] = original["continuation"]
     if original.get("preparation_version") == 1:
-        from .delivery_native_preparation import bind_native_spec
-        from .delivery_preparation import verify_prepared_spec
+        from .delivery_runtime_location import bind_provenance
 
-        verify_prepared_spec(original)
-        proof_path = Path(original["preparation"]["environment"]["path"])
-        effective = bind_native_spec(
-            effective, original["policy"]["native_identity"], proof_path, reused=True,
-            measured=original["preparation"].get("measured_policy_digest"),
-        )
-        verify_prepared_spec(effective)
+        effective = bind_provenance(effective, original)
+    if original["provider"] == "codex":
+        ordinary_scope_base(amended, original)
     return effective

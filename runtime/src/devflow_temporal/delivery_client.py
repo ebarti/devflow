@@ -152,6 +152,29 @@ class DeliveryClient:
         return self._request("POST", "/api/runs/" + quote(run_id, safe="")
                              + "/repair-admission-preflight", request, timeout=120)
 
+    def ci_inventory_preflight(self, run_id, request):
+        return self._request('POST', '/api/runs/' + quote(run_id, safe='')
+                             + '/ci-inventory-preflight', request, timeout=180)
+
+    def ack_ci_inventory(self, run_id, request):
+        return self._request('POST', '/api/runs/' + quote(run_id, safe='')
+                             + '/ack-ci-inventory', request, timeout=180)
+
+    def ci_inventory(self, run_id):
+        return self._request('GET', '/api/runs/' + quote(run_id, safe='') + '/ci-inventory')
+
+    def native_diagnostic_preflight(self, run_id, request):
+        return self._request('POST', '/api/runs/' + quote(run_id, safe='')
+                             + '/native-diagnostic-preflight', request, timeout=120)
+
+    def ack_native_diagnostic(self, run_id, request):
+        return self._request('POST', '/api/runs/' + quote(run_id, safe='')
+                             + '/ack-native-diagnostic', request, timeout=120)
+
+    def native_diagnostic(self, run_id, command_id):
+        return self._request('GET', '/api/runs/' + quote(run_id, safe='')
+                             + '/native-diagnostics/' + quote(command_id, safe=''))
+
     def continue_repair(self, run_id: str, payload: dict[str, Any]) -> dict:
         return self._request(
             "POST",

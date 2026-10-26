@@ -279,8 +279,9 @@ async def _replay_feature_stop(store, run_id, spec, description, state, record, 
     return {"state": "reconciled", "feature_stop_key": key}
 
 
-async def _reconcile_terminal(store, row, spec, description, state, history, failure,
-                              expected_extra):
+async def observe_terminal_projection(store, row, spec, description, state, history, failure,
+                                      expected_extra):
+    """Authenticate a failed terminal projection without projecting or replaying it."""
     run_id = row["run_id"]
     scheduled, failed, last_projection = {}, set(), None
     for event in history.events:
@@ -322,7 +323,7 @@ async def _reconcile_terminal(store, row, spec, description, state, history, fai
                     and json.loads(event["payload_json"]).get("key") == key]
     if observations:
         # An already reconciled execution cannot overwrite any subsequent row.
-        return {"state": "observed", "key": key}
+        return {"state": "observed", "key": key}, None
     current = row
     maintained = _cleanup_row(row, spec, description, scheduled, events)
     if maintained:
@@ -359,13 +360,28 @@ async def _reconcile_terminal(store, row, spec, description, state, history, fai
     if (projection.get("candidate") is None and row["candidate_json"] is not None
             or projection.get("pull_request") is None and row["pr_json"] is not None):
         raise ValueError("completed projection cannot discard a retained candidate or publication")
-    await asyncio.to_thread(
-        store.project, run_id,
-        **{name: desired.get(name) for name in (*FIELDS, *JSON_FIELDS, "protocol_revision")},
-        event_type=EVENT, message="Observed the authentic completed controller terminal result",
-        key=key, expected_revision=current["revision"], expected_row=current,
-    )
-    return {"state": "reconciled", "key": key}
+    return {"state": "reconciled", "key": key}, {
+        "run_id": run_id,
+        "fields": {name: desired.get(name)
+                   for name in (*FIELDS, *JSON_FIELDS, "protocol_revision")},
+        "key": key,
+        "expected_revision": current["revision"],
+        "expected_row": current,
+    }
+
+
+async def _reconcile_terminal(store, row, spec, description, state, history, failure,
+                              expected_extra):
+    observed, request = await observe_terminal_projection(
+        store, row, spec, description, state, history, failure, expected_extra)
+    if request is not None:
+        await asyncio.to_thread(
+            store.project, request["run_id"], **request["fields"], event_type=EVENT,
+            message="Observed the authentic completed controller terminal result",
+            key=request["key"], expected_revision=request["expected_revision"],
+            expected_row=request["expected_row"],
+        )
+    return observed
 
 
 async def reconcile_projection(store, client, row):

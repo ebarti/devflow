@@ -32,7 +32,8 @@ async def test_default_api_page_bounds_compaction_and_exposes_all_history(api_fi
     store = app.state.delivery.store
     compact = store._compact
     seen = []
-    monkeypatch.setattr(store, '_compact', lambda row: seen.append(row['run_id']) or compact(row))
+    monkeypatch.setattr(store, '_compact',
+                        lambda row, **kw: seen.append(row['run_id']) or compact(row, **kw))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app,
                                 client=('127.0.0.1', 1)),
                                 base_url='http://127.0.0.1:18770') as browser:

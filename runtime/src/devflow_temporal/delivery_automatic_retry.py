@@ -118,8 +118,25 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
     root = Path(execution['state_dir']) / 'resources'
     original = closed['result']['checks']
     binding = digest(closed['result'])
+    producer = original.get('resource_cleanup')
+    if not isinstance(producer, dict):
+        raise ValueError('original cleanup producer is malformed')
+    unrecorded = 'receipt_sha256' not in producer
+    if unrecorded:
+        # The workflow's finalizer-exception placeholder deliberately has no
+        # receipt. It cannot supply original file bytes or a historical hash.
+        if ('receipt' in producer or any(producer.get(key) != 'unknown' for key in (
+                'state', 'process_cleanup', 'resource_cleanup'))):
+            raise ValueError('original cleanup receipt binding is incomplete')
+    elif (not isinstance(producer['receipt_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', producer['receipt_sha256'])
+            or ('receipt' in producer and producer['receipt'] != str(root / 'finalization.json'))):
+        raise ValueError('original cleanup receipt binding is malformed')
+    inventory_key = 'observed_resources' if unrecorded else 'predecessor_resources'
     archive = root / 'predecessor-resources'
-    if row['recovery_json'] is not None:
+    if unrecorded:
+        archive = root / 'cleanup-observations' / binding
+    elif row['recovery_json'] is not None:
         archive = archive / binding
     with store._connect() as db:
         records = [json.loads(item[0]) for item in db.execute(
@@ -128,15 +145,22 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
     prior = next((item for item in records
                   if item.get('original_result_digest') == binding
                   and item.get('original_checks') == original
-                  and 'predecessor_resources' in item), None)
-    saved = prior['predecessor_resources'] if prior else None
+                  and inventory_key in item), None)
+    if unrecorded and prior is not None and prior.get('producer_receipt_source') != 'not_recorded':
+        raise ValueError('unrecorded original cleanup observation lost its provenance')
+    saved = prior[inventory_key] if prior else None
     superseding = prior.get('superseding_finalization') if prior else None
-    expected = {'manifest.json': before['manifest_sha256'],
-                'finalization.json': original['resource_cleanup']['receipt_sha256']}
+    expected = {'manifest.json': before['manifest_sha256']}
+    if unrecorded:
+        # Replay authenticates the first saved observation, even if ordinary
+        # finalization subsequently replaced the canonical latest files.
+        expected['observed-finalization.json'] = (saved.get('observed-finalization.json')
+            if saved is not None else before['finalization_sha256'])
+    else:
+        expected['finalization.json'] = producer['receipt_sha256']
     if saved is None:
         historical = None
-        if before['finalization_sha256'] != expected['finalization.json']:
-            producer = original['resource_cleanup']
+        if not unrecorded and before['finalization_sha256'] != expected['finalization.json']:
             current = json.loads(row['checks_json']).get('resource_cleanup') or {}
             body = {k: v for k, v in producer.items() if k not in {'receipt', 'receipt_sha256'}}
             historical = (json.dumps(body, sort_keys=True, indent=2) + '\n').encode()
@@ -149,7 +173,8 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         with RunResources(execution, read_only=True).locked():
             current_bytes = {}
             for name, sha in expected.items():
-                raw = read_private(root / name, raw=True)
+                source = 'finalization.json' if name == 'observed-finalization.json' else name
+                raw = read_private(root / source, raw=True)
                 expected_hash = superseding if name == 'finalization.json' and historical else sha
                 if hashlib.sha256(raw).hexdigest() != expected_hash:
                     raise ValueError('original resource bytes changed before archive')
@@ -173,13 +198,13 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
         read_private(path)
         if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
             raise ValueError('archived original resource bytes changed')
-    if saved.get('finalization.json') != expected['finalization.json']:
+    if not unrecorded and saved.get('finalization.json') != expected['finalization.json']:
         raise ValueError('archived finalization differs from the original closed result')
     if superseding is not None:
         raw = read_private(archive / 'observed-finalization.json', raw=True)
         if hashlib.sha256(raw).hexdigest() != superseding:
             raise ValueError('archived later finalization changed')
-    if any('predecessor_resources' in item and item.get('original_result_digest') == binding
+    if any(inventory_key in item and item.get('original_result_digest') == binding
            and item.get('original_checks') == original for item in records):
         return
     with store._connect() as db:
@@ -197,13 +222,16 @@ def _preserve_cleanup(store, row, spec, execution, closed, before, attempts, sto
             "AND type='resource_cleanup_reconciled'", (spec['run_id'],))]
         if any(item.get('original_result_digest') == binding
                and item.get('original_checks') == original
-               and item.get('predecessor_resources') == saved for item in existing):
+               and item.get(inventory_key) == saved for item in existing):
             return
         # This observes preservation, not completed cleanup or permission to retry.
         store._event(db, spec['run_id'], row['revision'], 'resource_cleanup_reconciled',
-            'Original cleanup bytes retained before refreshing the latest observation',
+            ('Original cleanup receipt was not recorded; later observed bytes retained'
+             if unrecorded else
+             'Original cleanup bytes retained before refreshing the latest observation'),
             {'original_checks': original, 'original_result_digest': binding,
-             'predecessor_resources': saved,
+             inventory_key: saved,
+             **({'producer_receipt_source': 'not_recorded'} if unrecorded else {}),
              **({'superseding_finalization': superseding,
                  'producer_receipt_source': 'closed_workflow'} if superseding else {})})
 
@@ -217,16 +245,35 @@ def _tracker_closed(spec, tracker):
     return tracker.get('state') == 'consistent' and tracker.get('pending') is False
 
 
-def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
+def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
+                   closure=None, quarantined=None, closure_checkpoint=None):
     """Keep historical failure immutable; record separately authenticated later cleanup.
 
     A published run keeps its branch and PR; only its native cleanup and claim
     are closed here, so its same-run continuations can be admitted.
     """
+    from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
+
+    previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
+    history = quarantine_history(previous)
+    if history:
+        quarantined = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
+
+    def checkpoint():
+        if quarantine_history(previous) != history:
+            raise ValueError('historical provider teardown custody changed')
+        if closure_checkpoint is not None:
+            from .delivery_unpublished_recovery import cleanup_checkpoint
+
+            if cleanup_checkpoint(store, row, spec, closed) != closure_checkpoint:
+                raise ValueError('unpublished closure checkpoint changed')
+
+    checkpoint()
     attempts = _current(store, row, spec, stopped, published=published)
     execution = (store.effective_spec(spec['run_id']) if row['recovery_json']
                  else store.intake_execution_spec(spec['run_id']))
-    before = observe_completed_resources(execution, attempts)
+    observation_args = {"quarantined": quarantined} if quarantined else {}
+    before = observe_completed_resources(execution, attempts, **observation_args)
     if not published:
         unpublished(store, spec)
     if _current(store, row, spec, stopped, published=published) != attempts:
@@ -234,22 +281,34 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
     _preserve_cleanup(store, row, spec, execution, closed, before, attempts, stopped,
                       published=published)
     receipt = RunResources(execution, read_only=True).finalize('blocked')
-    observed = observe_finalized_resources(execution)
+    observed = observe_finalized_resources(execution, **observation_args)
     if (not (receipt.get('state') == receipt.get('resource_cleanup') == 'confirmed')
             or receipt.get('process_cleanup') != 'observed-native-confirmed'
             or observed['finalization_sha256'] != receipt.get('receipt_sha256')
             or before['journal_sha256'] != observed['journal_sha256']):
         raise ValueError('fresh original cleanup remains unconfirmed')
+    def prelaunch_checkpoint():
+        if before.get('prelaunch_attempts'):
+            fresh = observe_completed_resources(execution, attempts, **observation_args)
+            if fresh.get('prelaunch_attempts') != before['prelaunch_attempts']:
+                raise ValueError('completed prelaunch custody changed before acknowledgement')
+
+    prelaunch_checkpoint()
+    if before.get('prelaunch_attempts'):
+        observed['prelaunch_attempts'] = before['prelaunch_attempts']
     if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original completed attempts changed before tracker closure')
     if not published:
         unpublished(store, spec)
     if _current(store, row, spec, stopped, published=published) != attempts:
         raise ValueError('original attempts changed during publication readback')
+    checkpoint()
     tracker = _tracker_sync(execution, 'blocked', release=True, terminal=True,
                             reason=closed['result'].get('error') or 'Retained transient failure')
     if not _tracker_closed(execution, tracker):
         raise ValueError('terminal tracker closure remains unacknowledged')
+    checkpoint()
+    prelaunch_checkpoint()
     checks = json.loads(row['checks_json'])
     with store._connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -261,15 +320,29 @@ def _close_cleanup(store, row, spec, closed, stopped, *, published=False):
                     'SELECT * FROM delivery_attempts WHERE run_id=?',
                     (spec['run_id'],))] != attempts):
             raise ValueError('predecessor changed after terminal tracker acknowledgement')
+        if closure_checkpoint is not None:
+            from .delivery_policy_recovery import work_binding
+
+            if work_binding(store, spec, db) != closure_checkpoint['work_binding']:
+                raise ValueError('unpublished frozen work authority changed')
         # The old checks remain in the existing append-only event transaction.
-        store._event(db, spec['run_id'], row['revision'] + 1, 'resource_cleanup_reconciled',
-            'Owner retry maintenance independently confirmed later cleanup and claim closure',
-            {'original_checks': checks, 'closed_workflow': {
-                key: value for key, value in closed.items()
-                if key != 'result'}, 'original_result_digest': digest(closed['result']),
+        payload = {'original_checks': checks, 'closed_workflow': {
+                key: value for key, value in closed.items() if key != 'result'},
+             'original_result_digest': digest(closed['result']),
              'resource_cleanup': receipt, 'tracker': tracker,
              'original_attempts': attempts, 'native_observation': observed,
-             **({'closure': 'published'} if published else {})})
+             **({'closure': 'published'} if published else
+                {'closure': closure} if closure else {}),
+             **({'unpublished_checkpoint': closure_checkpoint} if closure_checkpoint else {}),
+             **({'historical_quarantines': history} if history else {}),
+             **({('quarantined_cleanup' if history or (closure_checkpoint
+                  and closure_checkpoint.get('quarantined_cleanup')) else
+                  'quarantined_implementation'): quarantined} if quarantined else {})}
+        if closure_checkpoint is not None:
+            payload['key'] = digest(payload)
+        store._event(db, spec['run_id'], row['revision'] + 1, 'resource_cleanup_reconciled',
+            'Owner retry maintenance independently confirmed later cleanup and claim closure',
+            payload)
         db.execute('UPDATE delivery_runs SET checks_json=?,cleanup=?,tracker_json=?,revision=? '
                    'WHERE run_id=?', (json.dumps({**checks, 'resource_cleanup': receipt}),
                     'confirmed', json.dumps(tracker), row['revision'] + 1, spec['run_id']))
@@ -297,10 +370,20 @@ def _reuse_cleanup(store, row, spec, closed, stopped):
         return False
     attempts = _current(store, row, spec, stopped)
     execution = store.intake_execution_spec(spec['run_id'])
-    fresh = observe_completed_resources(execution, attempts)
-    observed = observe_finalized_resources(execution)
+    from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
+
+    history = quarantine_history(json.loads(row['recovery_json']) if row['recovery_json'] else None)
+    teardown = teardown_checkpoint(history)
+    if history and (prior.get('historical_quarantines') != history
+                    or prior.get('quarantined_cleanup') != teardown):
+        raise ValueError('later cleanup lost its historical provider teardown custody')
+    arguments = {'quarantined': teardown} if teardown else {}
+    fresh = observe_completed_resources(execution, attempts, **arguments)
+    observed = observe_finalized_resources(execution, **arguments)
     if (attempts != prior['original_attempts']
             or fresh['journal_sha256'] != prior['native_observation']['journal_sha256']
+            or fresh.get('prelaunch_attempts', {})
+                != prior['native_observation'].get('prelaunch_attempts', {})
             or observed['finalization_sha256'] != checks['resource_cleanup']['receipt_sha256']):
         raise ValueError('later cleanup changed after its acknowledged closure')
     _preserve_cleanup(store, row, spec, execution, closed, fresh, attempts, stopped)

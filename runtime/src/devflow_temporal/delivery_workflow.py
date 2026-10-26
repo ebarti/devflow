@@ -20,7 +20,7 @@ from . import delivery_limits
 from .contracts import digest
 from .delivery_baseline_contract import preparation_failure as _preparation_failure
 from .delivery_baseline_contract import repairable_baseline
-from .delivery_budget_contract import fixed_budget_allows
+from .delivery_budget_contract import continuation_maximum, fixed_budget_allows
 from .delivery_metadata_contract import evidence_applicability
 from .delivery_publication import stopped_at_publication
 from .delivery_questions import valid_blocking_questions
@@ -35,13 +35,15 @@ class PublicationDeadline(RuntimeError):
     """A bounded publication wait ended without the owned PR reading back."""
 
 
-def _cleanup_evidence_unknown(state: dict, launch_window_v1: bool) -> bool:
+def _cleanup_evidence_unknown(state: dict, launch_window_v1: bool,
+                              confirmed_roles=()) -> bool:
     """Whether recorded roles or gates leave the run's cleanup unknown.
 
     Module-level on purpose: duck-typed controllers in tests run `_stop` unbound.
     """
     return any(
-        role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown"
+        (role.get("cleanup") == "unknown" or role.get("finish_reason") == "recovery_unknown")
+        and digest(role) not in confirmed_roles
         for role in state["roles"]
     ) or any(
         isinstance(check, dict)
@@ -972,7 +974,8 @@ class DeliveryWorkflow:
         controller_cause: str | None = None,
     ) -> dict[str, Any]:
         # Duck-typed controllers in tests call this unbound; keep it attribute-light.
-        if _cleanup_evidence_unknown(self.state, getattr(self, "launch_window_v1", False)):
+        if _cleanup_evidence_unknown(self.state, getattr(self, "launch_window_v1", False),
+                                     getattr(self, "quarantined_cleanup_roles", ())):
             self.state["cleanup"] = "unknown"
         if self.cancel_requested:
             self.state["cleanup"] = "unknown"
@@ -1002,7 +1005,8 @@ class DeliveryWorkflow:
 
     async def _cancelled(self, spec: dict[str, Any]) -> dict[str, Any]:
         uncertain = self.state.get("cleanup") == "unknown" or _cleanup_evidence_unknown(
-            self.state, getattr(self, "launch_window_v1", False))
+            self.state, getattr(self, "launch_window_v1", False),
+            getattr(self, "quarantined_cleanup_roles", ()))
         self.state["phase"] = "cancelled"
         self.state["execution_state"] = "terminal"
         self.state["outcome"] = "cancelled"
@@ -2133,8 +2137,9 @@ class DeliveryWorkflow:
 
     async def _resume_stopped(self, spec, recovery):
         if (recovery['execution_spec'] != spec
-                or recovery['maximum_iteration'] != (recovery['state']['iteration']
-                    + recovery['command']['additional_iterations'])):
+                or recovery['maximum_iteration'] != continuation_maximum(
+                    recovery['state']['iteration'], recovery['command']['additional_iterations'],
+                    recovery.get('pending_repair'))):
             raise ValueError('stopped resume changed its finite command authority')
         self.state = deepcopy(recovery['state'])
         self.state.update(phase='repair_preflight', execution_state='running', outcome=None,
@@ -2150,6 +2155,12 @@ class DeliveryWorkflow:
             self.state['checks'].pop('failure', None)
         if not await self._confirm_repair_preflight(spec, recovery):
             return self.state
+        proofs = list(recovery.get('historical_quarantines', []))
+        if recovery.get('quarantined_implementation'):
+            proofs.append(recovery['quarantined_implementation'])
+        # The successful owning readback above authenticated these exact old
+        # teardowns. Their old provider verdicts and role bytes remain unknown.
+        self.quarantined_cleanup_roles = {proof['closed_role_sha256'] for proof in proofs}
         tracker_pending_projected = False
         delay = 5
         while True:
@@ -2235,6 +2246,10 @@ class DeliveryWorkflow:
                     return await self._stop(spec, 'recorded gate failure has no repair findings')
             else:
                 findings = _recorded_findings(stopped, stopped['iteration'] - 1)
+        elif recovery.get('quarantined_implementation'):
+            # The prior turn has no verdict. Its retained partial output is the
+            # new turn's input, not an invented model finding or resumed session.
+            findings = []
         else:
             findings = [stopped['error'], *role_findings]
         return await self._run_iterations(

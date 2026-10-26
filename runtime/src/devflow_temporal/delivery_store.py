@@ -84,10 +84,15 @@ def _private_directory(path: Path) -> None:
 
 
 class DeliveryStore:
-    def __init__(self, config: DeliveryConfig) -> None:
+    def __init__(self, config: DeliveryConfig, *, read_only: bool = False) -> None:
+        from .delivery_runtime_location import helper_path, require_ready
+
         self.config = config
-        _private_directory(config.state_root)
-        helper = config.helpers_dir / "state.py"
+        self.read_only = read_only
+        if not read_only:
+            require_ready(config)
+            _private_directory(config.state_root)
+        helper = helper_path(config, read_only=read_only)
         if not helper.is_file():
             raise ValueError("configured Devflow state helper is missing")
         module_spec = importlib.util.spec_from_file_location("devflow_delivery_state", helper)
@@ -96,6 +101,8 @@ class DeliveryStore:
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         self.state = module
+        if read_only:
+            return  # Public custody preflight never migrates or republishes evidence.
         try:
             preserve_execution_config(config)
         except (OSError, ValueError) as exc:
@@ -467,10 +474,24 @@ class DeliveryStore:
             from .delivery_merge_followup import initialize as initialize_merges
 
             initialize_merges(db)
+            from .delivery_native_diagnostic import initialize as initialize_native_diagnostics
+
+            initialize_native_diagnostics(db)
+            from .delivery_ci_inventory import initialize as initialize_ci_inventory
+
+            initialize_ci_inventory(db)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = self.state.connect(self.config.tracking_db)
+        if getattr(self, "read_only", False):
+            db = sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+        else:
+            from .delivery_runtime_location import require_not_pending
+
+            require_not_pending(self.config)
+            db = self.state.connect(self.config.tracking_db)
         db.execute("PRAGMA foreign_keys=ON")
         feature_event = False
 
@@ -486,6 +507,12 @@ class DeliveryStore:
         try:
             with db:
                 yield db
+        except sqlite3.IntegrityError as exc:
+            from .delivery_native_diagnostic import ERROR
+
+            if str(exc) == ERROR:
+                raise ValueError(ERROR) from exc
+            raise
         finally:
             db.close()
         if feature_event:
@@ -997,6 +1024,13 @@ class DeliveryStore:
             logger.debug("Run %s: Temporal closure unproven (%s: %s)",
                          run_id, type(exc).__name__, exc)
             raise ValueError("continuation predecessor Temporal closure is unproven") from exc
+        result = closed.get('result')
+        checks = result.get('checks') if isinstance(result, dict) else None
+        ci = checks.get('ci') if isinstance(checks, dict) else None
+        if isinstance(ci, dict) and ci.get('execution_inventory'):
+            from .delivery_ci_inventory import validate_result
+
+            validate_result(self, run_id, ci)
         if not sealed:
             self._preserve_closure(run_id, closed)
         return closed
@@ -2840,12 +2874,15 @@ class DeliveryStore:
 
     def spec(self, run_id: str) -> dict[str, Any]:
         with self._connect() as db:
-            row = db.execute(
-                "SELECT request_json FROM delivery_runs WHERE run_id=?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise ValueError("run ID not found")
-            return self._prepared_original(db, json.loads(row[0]))
+            return self._spec(db, run_id)
+
+    def _spec(self, db: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+        row = db.execute(
+            "SELECT request_json FROM delivery_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("run ID not found")
+        return self._prepared_original(db, json.loads(row[0]))
 
     def submitted_spec(self, run_id: str) -> dict[str, Any]:
         """Read immutable admission input, including after preparation freezes."""
@@ -3831,13 +3868,23 @@ class DeliveryStore:
                 " ORDER BY r.updated_at DESC,r.run_id DESC LIMIT ?",
                 (*parameters, limit + 1),
             ).fetchall()
+            # One page reads one owner. Opening a guarded connection per row
+            # repeatedly hydrates the entire installation authority, including
+            # its historical native actor inventory. Keep only this page's SQL
+            # connection; no proof or observation survives the operation.
+            runs = [self._compact(dict(row), db=db) for row in rows[:limit]]
+        if not self.read_only:
+            from .delivery_runtime_location import require_not_pending
+
+            # Row presentation may observe files. Recheck the complete mutable
+            # pointer/cohort/owner/guard authority after that work, before return.
+            require_not_pending(self.config)
         next_cursor = None
         if len(rows) > limit:
             last = rows[limit - 1]
             encoded = json.dumps([archived, last["updated_at"], last["run_id"]]).encode()
             next_cursor = base64.urlsafe_b64encode(encoded).decode().rstrip("=")
-        return {"runs": [self._compact(dict(row)) for row in rows[:limit]],
-                "next_cursor": next_cursor}
+        return {"runs": runs, "next_cursor": next_cursor}
 
     def feature(self, run_id: str) -> dict | None:
         from .delivery_features import current
@@ -3869,7 +3916,12 @@ class DeliveryStore:
                     "checkout": spec["checkout"]}
         return None
 
-    def _compact(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _compact(
+        self, row: dict[str, Any], *, db: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        if db is None:
+            with self._connect() as connection:
+                return self._compact(row, db=connection)
         spec = json.loads(row["request_json"])
         recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
         technical = False
@@ -3889,25 +3941,23 @@ class DeliveryStore:
         )
         if not isinstance(effective, dict):
             effective = spec
+        from .delivery_dashboard import presentation
         from .delivery_resources import projected_cleanup
 
-        with self._connect() as db:
-            from .delivery_dashboard import presentation
+        dashboard_state = presentation(db, row["run_id"])
+        from .delivery_features import current as current_feature
 
-            dashboard_state = presentation(db, row["run_id"])
-            from .delivery_features import current as current_feature
+        feature = current_feature(db, row["issue_url"])
+        active, unfinished = db.execute(
+            "SELECT COUNT(*),COALESCE(SUM(state!='finished'),0) FROM delivery_attempts "
+            "WHERE run_id=? AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
+        ).fetchone()
+        from .delivery_merge_followup import action as merge_action
 
-            feature = current_feature(db, row["issue_url"])
-            active, unfinished = db.execute(
-                "SELECT COUNT(*),COALESCE(SUM(state!='finished'),0) FROM delivery_attempts "
-                "WHERE run_id=? AND (state!='finished' OR cleanup='unknown')", (row["run_id"],),
-            ).fetchone()
-            from .delivery_merge_followup import action as merge_action
-
-            merge = merge_action(db, row, spec)
+        merge = merge_action(db, row, spec)
         execution_readback = self._historical_execution_readback(row, spec, unfinished=unfinished)
         if execution_readback:
-            effective = self.spec(row["run_id"])
+            effective = self._spec(db, row["run_id"])
         elif technical:
             effective = self.effective_spec(row["run_id"])
         cleanup = projected_cleanup(
@@ -4260,10 +4310,29 @@ class DeliveryStore:
 
         return detail(self, spec)
 
-    def _evidence_items(self, run_id: str) -> list[dict[str, Any]]:
+    def _evidence_items(
+        self, run_id: str, *, details: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if details is not None and details.get("run_id") != run_id:
+            raise ValueError("evidence detail observation belongs to another run")
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        inventory_root = root / 'ci-execution-inventory'
+        if inventory_root.is_dir() and not inventory_root.is_symlink():
+            from .delivery_ci_inventory import indexed_evidence
+
+            indexed.extend(indexed_evidence(self, run_id))
+        diagnostic_root = root / 'native-diagnostics'
+        if diagnostic_root.is_dir() and not diagnostic_root.is_symlink():
+            with self._connect() as db:
+                diagnostics = db.execute(
+                    'SELECT * FROM delivery_native_diagnostics WHERE run_id=?',
+                    (run_id,)).fetchall()
+            from .delivery_native_diagnostic import indexed_evidence
+
+            for diagnostic in diagnostics:
+                indexed.extend(indexed_evidence(spec, diagnostic))
         context_root = root / "issue-context"
         if context_root.is_dir() and not context_root.is_symlink():
             for path in sorted(context_root.glob("*.json")):
@@ -4405,7 +4474,7 @@ class DeliveryStore:
                                     "label": item["relative_path"], "path": Path(item["path"]),
                                     "expected_sha256": item["sha256"],
                                     "limit": 50 * 1024 * 1024})
-        details = self.detail(run_id)
+        details = self.detail(run_id) if details is None else details
         for result in details.get("checks", {}).get("local", {}).get("results", []):
             if "log" not in result:
                 continue  # Preparation can fail before a process log exists.
@@ -4537,9 +4606,11 @@ class DeliveryStore:
             safe.append(item)
         return safe
 
-    def evidence_index(self, run_id: str) -> list[dict[str, Any]]:
+    def evidence_index(
+        self, run_id: str, *, details: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         safe = []
-        for item in self._evidence_items(run_id):
+        for item in self._evidence_items(run_id, details=details):
             path = item["path"]
             safe.append(
                 {

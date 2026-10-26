@@ -557,6 +557,10 @@ def test_retained_custody_is_complete_but_new_or_changed_resources_remain_pendin
 
     class PrivateRows:
         def execute(self, sql, _parameters=()):
+            if sql == ("SELECT run_id FROM delivery_native_diagnostics "
+                       "WHERE state IN ('queued','running','unknown')"):
+                assert _parameters == ()
+                return []
             if 'WHERE EXISTS' in sql:
                 return []
             assert 'cleanup_rowid' in sql

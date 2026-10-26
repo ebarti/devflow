@@ -269,7 +269,7 @@ def test_historical_original_leases_are_held_until_reconciliation_finishes(
     _store, current, path, _request, _journal, _result, _table, _ports = historical_role
     reconcile = orphans.reconcile_process
 
-    def observed_under_leases(original):
+    def observed_under_leases(original, *, spec=None):
         for name in ('native-monitor.lock', 'native-process.lock'):
             descriptor = os.open(original.with_name(name), os.O_RDONLY)
             try:
@@ -277,7 +277,7 @@ def test_historical_original_leases_are_held_until_reconciliation_finishes(
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             finally:
                 os.close(descriptor)
-        return reconcile(original)
+        return reconcile(original, spec=spec)
 
     monkeypatch.setattr(orphans, 'reconcile_process', observed_under_leases)
     assert orphans._observe_registered_process(current, path)['cleanup'] \

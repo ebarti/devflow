@@ -315,9 +315,9 @@ def test_concurrent_independent_roots_and_restart_after_removal(tmp_path, monkey
     real = module.remove_directory
     first = True
 
-    def interrupted(path, identity):
+    def interrupted(path, identity, *, spec=None):
         nonlocal first
-        real(path, identity)
+        real(path, identity, spec=spec)
         if first:
             first = False
             raise KeyboardInterrupt("worker lost after removal, before final receipt")

@@ -102,7 +102,7 @@ def listeners(port: int) -> set[int]:
     return {int(line) for line in result.stdout.splitlines() if line.isdecimal()}
 
 
-def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) -> dict:
+def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict, spec=None) -> dict:
     """Confirm teardown independently; never reconstruct the provider's verdict."""
     receipt = {"journal": str(path), "cleanup": "unknown",
                "reason": "interrupted monitoring has no independently confirmed teardown"}
@@ -137,6 +137,8 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
                    or not entry["identity"] for pid, entry in owned.items())
             or not path.is_absolute() or path.resolve() != path):
         return receipt
+    from .delivery_filesystem_custody import matches
+
     descriptors = []
     try:
         # These original lock inodes exclude a surviving monitor or another
@@ -157,8 +159,9 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
             if recorded is not None and (
                     not isinstance(recorded, dict)
                     or set(recorded) != {"native-monitor.lock", "native-process.lock"}
-                    or recorded.get(name) != {"device": info.st_dev, "inode": info.st_ino,
-                                             "uid": info.st_uid}):
+                    or not matches(spec, lock_path, recorded.get(name), current={
+                        "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid},
+                        directory=False)):
                 raise ValueError("recorded native lifecycle lock changed")
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if digest(read_private(path)) != digest(journal):
@@ -222,7 +225,7 @@ def _reconcile_interrupted(path: Path, journal: dict, owned: dict, locks: dict) 
             os.close(descriptor)
 
 
-def reconcile_process(path: Path, *, _locks: dict | None = None) -> dict:
+def reconcile_process(path: Path, *, _locks: dict | None = None, spec: dict | None = None) -> dict:
     if not path.exists():
         return {
             "journal": str(path),
@@ -237,7 +240,7 @@ def reconcile_process(path: Path, *, _locks: dict | None = None) -> dict:
         all_owned[monitor["pid"]] = monitor
         owned.pop(monitor["pid"], None)
     if journal.get("phase") != "finished" or journal.get("monitoring_complete") is not True:
-        return _reconcile_interrupted(path, journal, owned, _locks or {})
+        return _reconcile_interrupted(path, journal, owned, _locks or {}, spec)
     # An interrupted monitor must be allowed to collect its child's exit and
     # flush output. A finished monitor has no remaining command work to lose.
     stopped = stop_observed(all_owned if journal.get("phase") == "finished" else owned)
@@ -404,6 +407,9 @@ class NativeProcess:
             if self.journal.exists() or self.journal.is_symlink():
                 reattaching = True
                 return self._run(monitor_lock=lock)
+            from .delivery_runtime_location import require_execution_location
+
+            require_execution_location(self.spec)
             descriptor = os.open(
                 self.folder / "monitor.log", os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
                 0o600,
@@ -503,7 +509,7 @@ class NativeProcess:
                 locks = {"native-process.lock": lock}
                 if monitor_lock is not None:
                     locks["native-monitor.lock"] = monitor_lock
-                receipt = reconcile_process(self.journal, _locks=locks)
+                receipt = reconcile_process(self.journal, _locks=locks, spec=self.spec)
                 if receipt["cleanup"] == "observed-native-confirmed":
                     return read_private(self.journal)["result"]
                 return {
@@ -513,6 +519,9 @@ class NativeProcess:
                     "reason": receipt["reason"],
                     "journal": str(self.journal),
                 }
+            from .delivery_runtime_location import require_execution_location
+
+            require_execution_location(self.spec)
             for port in self.ports:
                 if listeners(port):
                     raise ValueError("native fixture port belongs to another process")

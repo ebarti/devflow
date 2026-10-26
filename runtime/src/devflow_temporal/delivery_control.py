@@ -159,7 +159,13 @@ def _ensure_namespace_retention(config: DeliveryConfig, deadline: float) -> None
 
 
 @contextmanager
-def _lifecycle_lock(config: DeliveryConfig, deadline: float):
+def _lifecycle_lock(config: DeliveryConfig, deadline: float, *, pending_stop: bool = False):
+    from .delivery_runtime_service_guard import recognized_lifecycle
+
+    with recognized_lifecycle(config, deadline, stop=pending_stop) as guarded:
+        if guarded:
+            yield
+            return
     _private_directory(config.state_root)
     path = config.state_root / "service.lock"
     message = f"service lock must be an owned private file (0600): {path}"
@@ -188,6 +194,12 @@ def _lifecycle_lock(config: DeliveryConfig, deadline: float):
                 break
             except BlockingIOError:
                 time.sleep(min(0.05, _remaining(deadline)))
+        if not pending_stop:
+            from .delivery_runtime_location import require_ready
+
+            # A current caller may have opened this FD before PENDING and then
+            # waited behind installation. Recheck before touching the marker.
+            require_ready(config)
         yield
     finally:
         os.close(descriptor)
@@ -350,7 +362,7 @@ def _stopped_marker(config: DeliveryConfig) -> Path:
 
 
 def service_stop(config: DeliveryConfig) -> dict:
-    with _lifecycle_lock(config, _deadline(config)):
+    with _lifecycle_lock(config, _deadline(config), pending_stop=True):
         results = _stop(config, _read_manifest(config) or {"processes": {}})
         # A supervisor's periodic start must not undo this; the next explicit
         # start, restart or write-triggered start lifts it.
@@ -525,6 +537,9 @@ def ensure_service_running(
     unless_stopped: bool = False,
 ) -> dict:
     """Have the stack running; ``unless_stopped`` (supervised) honours an owner's stop."""
+    from .delivery_runtime_location import require_ready
+
+    require_ready(config)
     deadline = _deadline(config)
     try:
         _ports(config)
@@ -828,6 +843,12 @@ _COMMANDS = (
     "reconcile-tracker",
     "recover-publication",
     "repair-admission-preflight",
+    "native-diagnostic-preflight",
+    "ack-native-diagnostic",
+    "native-diagnostic",
+    "ci-inventory-preflight",
+    "ack-ci-inventory",
+    "ci-inventory",
     "gates-only-preflight",
     "admit-gates-only",
     "continue-repair",
@@ -837,6 +858,12 @@ _COMMANDS = (
     "amend-scope",
     "import-closure",
     "reconcile-attempt",
+    "filesystem-custody-preflight",
+    "adopt-filesystem-custody",
+    "capture-retained-closures",
+    "runtime-location-preflight",
+    "adopt-runtime-location",
+    "rollback-runtime-location",
 )
 
 
@@ -850,6 +877,8 @@ def main() -> None:
     parser.add_argument("--request", type=Path, help="JSON request file for a mutation")
     parser.add_argument("--id", help="run ID")
     parser.add_argument("--evidence-id", help="indexed evidence ID")
+    parser.add_argument('--diagnostic-command-id',
+                        help='original acknowledged diagnostic command ID')
     parser.add_argument("--deployment-name", help="explicit Temporal worker deployment")
     parser.add_argument("--deployment-build-id", help="immutable retained source artifact version")
     parser.add_argument("--limit", type=int, default=50, help="run page size (1-100)")
@@ -874,10 +903,40 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
     if deployment is not None and args.command not in {"start", "worker"}:
         parser.error("worker deployment options apply only to start or worker")
+    if args.command == "capture-retained-closures":
+        if args.request is None:
+            parser.error("--request is required for explicit retained-history capture")
+        from .delivery_retained_closures import capture
+        from .delivery_runtime_location import private_bytes
+
+        config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
+        supplied = json.loads(private_bytes(args.request))
+        print(json.dumps(capture(config, supplied), sort_keys=True, indent=2))
+        return
+    if args.command in {
+        "runtime-location-preflight", "adopt-runtime-location", "rollback-runtime-location"
+    }:
+        if args.request is None:
+            parser.error("--request is required for explicit installation location recovery")
+        from . import delivery_runtime_installation as installation
+        from .delivery_runtime_location import private_bytes
+
+        config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
+        supplied = json.loads(private_bytes(args.request))
+        operation = {
+            "runtime-location-preflight": installation.preflight,
+            "adopt-runtime-location": installation.apply,
+            "rollback-runtime-location": installation.rollback,
+        }[args.command]
+        print(json.dumps(operation(config, supplied), sort_keys=True, indent=2))
+        return
     read_commands = {"merge-preflight",
+        'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
         "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
+        'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
+        "filesystem-custody-preflight",
     }
-    if args.command in read_commands | {"status", "token", "disable-limits"}:
+    if args.command in read_commands | {"status", "token", "disable-limits", "stop"}:
         config = DeliveryConfig.load(Path(args.config).expanduser().resolve(strict=True))
     else:
         config = _config(args.config)
@@ -897,6 +956,22 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("import-closure requires --id, --workflow-id and --history")
         print(json.dumps(_import_closure(config, args.id, args.workflow_id, args.history),
                          indent=2, sort_keys=True))
+        return
+    if args.command in {"filesystem-custody-preflight", "adopt-filesystem-custody"}:
+        from .delivery_filesystem_custody import adopt, preflight
+
+        if not args.id:
+            parser.error("--id is required for filesystem custody commands")
+        if args.command == "adopt-filesystem-custody" and not args.request:
+            parser.error("--request is required for explicit filesystem adoption")
+        try:
+            store = DeliveryStore(
+                config, read_only=args.command == "filesystem-custody-preflight")
+            result = (preflight(store, args.id) if args.command == "filesystem-custody-preflight"
+                      else adopt(store, args.id, json.loads(args.request.read_text())))
+        except (ValueError, OSError, RuntimeError) as exc:
+            parser.exit(1, f"devflow-delivery: {exc}\n")
+        print(json.dumps(result, sort_keys=True, indent=2))
         return
     if args.command == "reconcile-attempt":
         from .delivery_orphans import reconcile_attempt
@@ -928,6 +1003,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "reconcile-tracker",
         "recover-publication",
         "repair-admission-preflight",
+        'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "gates-only-preflight",
         "admit-gates-only",
         "continue-repair",
@@ -935,6 +1011,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "revise-feature-plan",
         "retry-prelaunch",
         "amend-scope",
+        'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
     }:
         request = json.loads(args.request.read_text(encoding="utf-8")) if args.request else None
         if args.command in {
@@ -947,6 +1024,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "reconcile-tracker",
             "recover-publication",
             "repair-admission-preflight",
+            'native-diagnostic-preflight', 'ack-native-diagnostic',
+            'ci-inventory-preflight', 'ack-ci-inventory',
             "admit-gates-only",
             "continue-repair",
             "continue-feature",
@@ -969,6 +1048,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "reconcile-tracker",
                 "recover-publication",
                 "repair-admission-preflight",
+                'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
+                'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
                 "gates-only-preflight",
                 "admit-gates-only",
                 "continue-repair",
@@ -982,6 +1063,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("--id is required for this command")
         if args.command == "evidence" and not args.evidence_id:
             parser.error("--evidence-id is required")
+        if args.command == 'native-diagnostic' and not args.diagnostic_command_id:
+            parser.error('--diagnostic-command-id is required')
         try:
             if args.command == "submit":
                 from .delivery_origin import bind_origin
@@ -1008,6 +1091,14 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "recover-publication": lambda: caller.recover_publication(args.id, request),
                 "repair-admission-preflight": lambda: caller.repair_admission_preflight(
                     args.id, request),
+                'native-diagnostic-preflight': lambda: caller.native_diagnostic_preflight(
+                    args.id, request),
+                'ci-inventory-preflight': lambda: caller.ci_inventory_preflight(args.id, request),
+                'ack-ci-inventory': lambda: caller.ack_ci_inventory(args.id, request),
+                'ci-inventory': lambda: caller.ci_inventory(args.id),
+                'ack-native-diagnostic': lambda: caller.ack_native_diagnostic(args.id, request),
+                'native-diagnostic': lambda: caller.native_diagnostic(
+                    args.id, args.diagnostic_command_id),
                 "gates-only-preflight": lambda: caller.gates_only_preflight(args.id),
                 "admit-gates-only": lambda: caller.admit_gates_only(args.id, request),
                 "continue-repair": lambda: caller.continue_repair(args.id, request),

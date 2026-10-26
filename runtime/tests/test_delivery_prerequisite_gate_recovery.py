@@ -1,0 +1,522 @@
+from __future__ import annotations
+
+import base64
+import copy
+import csv
+import hashlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import zipfile
+from datetime import UTC, datetime
+from importlib.metadata import distribution
+from pathlib import Path
+
+import pytest
+from test_delivery_blocked_scope import rewrite_assessment, rewrite_observation, scope_case
+from test_delivery_browser_mode_recovery import restore_native_observers
+from test_delivery_store import _git
+from test_delivery_store import service as service
+
+from devflow_temporal.contracts import canonical_json
+from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_resources import RunResources, read_private, write_private
+from devflow_temporal.delivery_store import DeliveryStore
+
+
+def wheelhouse(root):
+    root.mkdir(mode=0o700)
+    out = []
+    for name in ("pytest", "iniconfig", "packaging", "pluggy", "pygments"):
+        d = distribution(name)
+        files = {}
+        for f in d.files:
+            path = Path(d.locate_file(f))
+            raw = str(f)
+            if ".." in Path(raw).parts or raw.endswith(".pyc") or raw.endswith("/RECORD"):
+                continue
+            if path.is_file():
+                files[raw] = path.read_bytes()
+        info = next(x.split("/")[0] for x in files if x.endswith(".dist-info/WHEEL"))
+        tag = next(
+            x.split(": ", 1)[1]
+            for x in files[info + "/WHEEL"].decode().splitlines()
+            if x.startswith("Tag: ")
+        )
+        normalized = d.metadata["Name"].replace("-", "_").lower()
+        p = root / f"{normalized}-{d.version}-{tag}.whl"
+        rows = []
+        for f, b in files.items():
+            rows.append(
+                [
+                    f,
+                    "sha256="
+                    + base64.urlsafe_b64encode(hashlib.sha256(b).digest()).decode().rstrip("="),
+                    str(len(b)),
+                ]
+            )
+        rows.append([info + "/RECORD", "", ""])
+        s = io.StringIO()
+        csv.writer(s).writerows(rows)
+        files[info + "/RECORD"] = s.getvalue().encode()
+        with zipfile.ZipFile(p, "x", zipfile.ZIP_DEFLATED) as z:
+            for f, b in files.items():
+                z.writestr(f, b)
+        out.append(p)
+    return out
+
+
+@pytest.fixture
+def stopped_prerequisite(service, monkeypatch, tmp_path, request):
+    owner, submission = service
+    mode = getattr(request, "param", "prerequisite")
+    wheels = wheelhouse(tmp_path / "wheelhouse")
+    project = tmp_path / "initial-project"
+    project.mkdir()
+    pyproject = (
+        '[project]\nname="owned-frozen-gate"\nversion="0.1.0"\nrequires-python=">=3.12"\n'
+        '[project.optional-dependencies]\ndev=["pytest=={version}"]\n'
+        "[tool.uv]\nno-index=true\nenvironments=['sys_platform == \"darwin\"']\n"
+        "find-links=[{wheelhouse}]\n"
+    ).format(
+        version=distribution("pytest").version, wheelhouse=json.dumps(str(tmp_path / "wheelhouse"))
+    )
+    (project / "pyproject.toml").write_text(pyproject)
+    subprocess.run(
+        [
+            shutil.which("uv"),
+            "lock",
+            "--offline",
+            "--python",
+            str(Path(sys.executable).resolve()),
+            "--project",
+            str(project),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={k: v for k, v in os.environ.items() if k != "UV_EXCLUDE_NEWER"},
+    )
+    extra = {
+        ".gitignore": "project/.venv/\n__pycache__/\n.pytest_cache/\n",
+        "project/pyproject.toml": pyproject,
+        "project/uv.lock": (project / "uv.lock").read_text(),
+        "project/tests/test_owned_prerequisite.py": (
+            "def test_real_owned_structural_invariant():\n"
+            '    assert {"truth": 2+2} == {"truth":' + ("5" if mode == "assertion" else "4") + "}\n"
+        ),
+    }
+    plan = canonical_json({"verification": ["Run project/tests/test_owned_prerequisite.py"]})
+    case = scope_case(
+        (owner, {**submission, "accepted_plan": plan}), monkeypatch, extra_sources=extra
+    )
+    # A neutral genuine completed typed native PASS, with separate input/output.
+    raw = {
+        **case.raw,
+        "status": "pass",
+        "summary": "Owned source change completed.",
+        "findings": [],
+    }
+    rewrite_assessment(case, raw)
+    obs = read_private(case.folder / "native-thread-observation.json")
+    assessment = {k: raw[k] for k in ("status", "summary", "findings")}
+    obs["turns"][-1]["items"][-1]["text"] = json.dumps(assessment)
+    obs["turns"][-1]["turn"]["items"][-1]["text"] = json.dumps(assessment)
+    rewrite_observation(case, obs)
+    _git(case.broker.checkout, "add", case.api)
+    _git(case.broker.checkout, "commit", "-qm", "Publish owned completed candidate")
+    _git(case.broker.checkout, "push", "origin", "HEAD:refs/heads/" + case.spec["branch"])
+    candidate = case.broker.candidate()
+    case.publication.update(head=candidate["head"], candidate=candidate)
+    case.state.update(candidate=candidate, pull_request=case.publication)
+    monkeypatch.setattr(
+        DeliveryBroker,
+        "_existing_pr",
+        lambda *_a, **_k: {
+            "number": 12,
+            "headRefOid": candidate["head"],
+            "state": "OPEN",
+            "isDraft": False,
+            "url": case.publication["url"],
+        },
+    )
+    restore_native_observers(monkeypatch)
+    precheck = case.broker.run_prechecks(3, candidate)
+    assert precheck["state"] == "passed"
+    missing = next(p for p in wheels if p.name.startswith("pytest-"))
+    data = missing.read_bytes()
+    if mode == "prerequisite":
+        missing.unlink()
+    local = case.broker.run_checks(3, candidate)
+    assert local["state"] == "failed" and local["source_unchanged"] is True
+    failed = [x for x in local["results"] if x.get("passed") is False]
+    assert len(failed) == 1 and failed[0]["exit_code"] == (2 if mode == "prerequisite" else 1)
+    if mode == "prerequisite":
+        assert failed[0]["argv"][1:4] == ["sync", "--locked", "--extra"]
+    native = failed[0]["native_process"]
+    assert (
+        native["state"] == "finished"
+        and native["monitoring_complete"] is True
+        and native["exit_code"] == (2 if mode == "prerequisite" else 1)
+    )
+    missing.write_bytes(data)
+    final = RunResources(case.spec).finalize("blocked")
+    assert final["state"] == "confirmed"
+    error = (
+        "environment preparation failed: "
+        + failed[0]["id"]
+        + "; candidate retained without requesting code repair"
+    )
+    if mode == "assertion":
+        error = "repair limit exhausted"
+    case.state.update(error=error, findings=[])
+    case.state["checks"] = {
+        "prepublish": precheck,
+        "local": local,
+        "resource_cleanup": final,
+        "failure": {"classification": "terminal", "stage": "checks", "reason": error},
+    }
+    case.store.project(
+        "run-1",
+        phase="blocked",
+        execution_state="blocked",
+        outcome="blocked",
+        event_type="blocked",
+        message=error,
+        candidate=candidate,
+        pull_request=case.publication,
+        checks=case.state["checks"],
+        iteration=3,
+        protocol_revision=40,
+        error=error,
+        cleanup="confirmed",
+    )
+    closed = {
+        "workflow_id": "delivery-run-1",
+        "execution_run_id": "owned-closed-launched-prerequisite",
+        "request_digest": case.spec["request_digest"],
+        "recovery_digest": None,
+        "closed_at": datetime.now(UTC).isoformat(),
+        "result": case.state,
+    }
+    monkeypatch.setattr(case.store, "_completed_temporal_result", lambda *_a, **_k: closed)
+    monkeypatch.setattr(DeliveryStore, "_completed_temporal_result", lambda *_a, **_k: closed)
+    command = {
+        "continuation_kind": "published_gate_retry",
+        "command_id": "one-prerequisite-gate-recovery",
+        "expected_revision": 40,
+        "expected_iteration": 3,
+        "expected_candidate_id": candidate["id"],
+        "expected_pr_number": 12,
+        "expected_pr_head": candidate["head"],
+        "additional_iterations": 0,
+    }
+    return case, local, command, closed
+
+
+def test_public_published_prerequisite_recovery_keeps_failed_native_result(stopped_prerequisite):
+    from devflow_temporal import delivery_gate_retry as gates
+
+    case, local, command, closed = stopped_prerequisite
+    original = copy.deepcopy(closed)
+    raw = {
+        Path(item["native_process"]["journal"]): Path(
+            item["native_process"]["journal"]
+        ).read_bytes()
+        for item in local["results"]
+    }
+    preflight = case.store.repair_admission_preflight("run-1", command)
+    assert (
+        preflight["additional_iterations"] == 0 and preflight["implementation_authority"] is False
+    )
+    response = case.store.continue_repair("run-1", command)
+    assert response["additional_iterations"] == 0 and response["implementation_authority"] is False
+    assert case.store.continue_repair("run-1", command) == response
+    current = case.store.effective_spec("run-1")
+    with case.store._connect() as db:
+        recovery = json.loads(
+            db.execute("SELECT recovery_json FROM delivery_gate_admissions").fetchone()[0]
+        )
+        assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
+    assert current["gate_retry_stage"] == "prerequisite"
+    assert current["policy"]["max_repairs"] == case.spec["policy"]["max_repairs"] == 10
+    assert recovery["state"] == original["result"] and closed == original
+    assert all(p.read_bytes() == b for p, b in raw.items())
+    assert gates.readback(case.store, current, recovery)["number"] == 12
+    assert case.broker.candidate()["content_sha256"] == recovery["candidate"]["content_sha256"]
+    with pytest.raises(ValueError):
+        case.store.repair_admission_preflight(
+            "run-1", {**command, "command_id": "another-setup-retry"}
+        )
+
+
+def _project(case):
+    case.store.project(
+        "run-1",
+        phase="blocked",
+        execution_state="blocked",
+        outcome="blocked",
+        iteration=3,
+        protocol_revision=40,
+        candidate=case.state["candidate"],
+        pull_request=case.publication,
+        checks=case.state["checks"],
+        error=case.state["error"],
+        cleanup=case.state["cleanup"],
+        event_type="blocked",
+        message="Owned strict prerequisite control",
+    )
+
+
+@pytest.mark.parametrize("stopped_prerequisite", ["assertion"], indirect=True)
+def test_real_worker_assertion_is_not_prerequisite_recovery(stopped_prerequisite):
+    from devflow_temporal.delivery_check_evidence import junit_counts
+
+    case, local, command, _ = stopped_prerequisite
+    failed = local["results"][-1]
+    assert (
+        junit_counts(failed["artifacts"], local["candidate_id"], Path(case.spec["state_dir"]))[
+            "failures"
+        ]
+        == 1
+    )
+    with pytest.raises(ValueError):
+        case.store.repair_admission_preflight("run-1", command)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "unknown",
+        "prelaunch",
+        "timeout",
+        "interrupted",
+        "argv",
+        "cwd",
+        "provenance",
+        "log_hash",
+        "journal",
+        "launch",
+        "raw_implementation",
+        "terminal_assessment",
+        "role_status",
+        "role_findings",
+        "input",
+        "output",
+        "local_candidate",
+        "source_unchanged",
+        "browser",
+        "later_role",
+        "claim",
+        "effect",
+        "closure",
+        "config",
+        "live_actor",
+    ],
+)
+def test_public_prerequisite_refuses_incomplete_or_foreign_authority(
+    stopped_prerequisite,
+    defect,
+    monkeypatch,
+):
+    case, local, command, closed = stopped_prerequisite
+    failure = local["results"][-1]
+    if defect == "unknown":
+        failure["native_process"]["state"] = "unknown"
+    elif defect == "prelaunch":
+        failure.update(launched=False, failure_kind="preparation")
+    elif defect in {"timeout", "interrupted"}:
+        failure["native_process"]["timed_out" if defect == "timeout" else "interrupted_monitor"] = (
+            True
+        )
+    elif defect == "argv":
+        failure["argv"] = [*failure["argv"], "--no-dev"]
+    elif defect == "cwd":
+        failure["cwd"] += "-foreign"
+    elif defect == "provenance":
+        failure["plan_provenance"]["metadata"]["uv.lock"] = "0" * 64
+    elif defect == "log_hash":
+        failure["log_sha256"] = "0" * 64
+    elif defect in {"journal", "launch"}:
+        path = Path(failure["native_process"]["journal"])
+        if defect == "launch":
+            path = path.with_name("launch.json")
+        value = read_private(path)
+        value["unacknowledged"] = True
+        if defect == "journal":
+            value["intent"]["timeout"] += 1
+        else:
+            value["argv"] = [*value["argv"], "--no-dev"]
+        write_private(path, value)
+    elif defect == "raw_implementation":
+        raw = read_private(case.folder / "result.json")
+        raw["summary"] += " changed"
+        write_private(case.folder / "result.json", raw)
+    elif defect == "terminal_assessment":
+        observation = read_private(case.folder / "native-thread-observation.json")
+        final = observation["turns"][-1]["items"][-1]
+        observation["turns"][-1]["items"].append({**final, "id": "later", "text": "not JSON"})
+        rewrite_observation(case, observation)
+    elif defect in {"role_status", "role_findings"}:
+        raw = {**case.raw, "status": "blocked", "findings": ["Owned unresolved source problem"]}
+        if defect == "role_findings":
+            raw["status"] = "pass"
+        rewrite_assessment(case, raw)
+    elif defect == "input":
+        case.state["roles"][-1]["input_candidate_id"] = "0" * 64
+    elif defect == "output":
+        case.state["roles"][-1]["candidate"]["content_sha256"] = "0" * 64
+    elif defect == "local_candidate":
+        local["candidate_id"] = "0" * 64
+    elif defect == "source_unchanged":
+        local["source_unchanged"] = False
+    elif defect == "browser":
+        case.state["checks"]["browser_qa"] = {"state": "failed"}
+    elif defect == "later_role":
+        case.state["roles"].append({"role": "review", "iteration": 3, "status": "blocked"})
+    elif defect == "claim":
+        with case.store._connect() as db:
+            case.store.state.claim_work(db, case.spec["work_id"], "foreign", "Owned contradiction")
+    elif defect == "effect":
+        case.broker._effect("owned-unresolved", "publish", {"owned": True})
+    elif defect == "closure":
+        closed["request_digest"] = "0" * 64
+    elif defect == "config":
+        config = json.loads(case.store.config.path.read_text())
+        config["roles"]["verify"]["model"] = "different"
+        case.store.config.path.write_text(json.dumps(config))
+    elif defect == "live_actor":
+        journal = read_private(Path(failure["native_process"]["journal"]))
+        pid, item = next(iter(journal["owned"].items()))
+        monkeypatch.setattr(
+            "devflow_temporal.delivery_native_process.process_table",
+            lambda: {int(pid): {"identity": item["identity"], "stat": "R"}},
+        )
+    _project(case)
+    with pytest.raises((ValueError, OSError)):
+        case.store.repair_admission_preflight("run-1", command)
+    with case.store._connect() as db:
+        assert not db.execute("SELECT 1 FROM delivery_gate_admissions").fetchone()
+        assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
+
+
+@pytest.mark.parametrize("phase", ["preflight", "readback"])
+@pytest.mark.parametrize("defect", ["missing", "symlink", "replacement"])
+def test_current_physical_checkout_is_required_at_both_authority_boundaries(
+    stopped_prerequisite,
+    phase,
+    defect,
+):
+    from devflow_temporal import delivery_gate_retry as gates
+
+    case, _, command, _ = stopped_prerequisite
+    recovery = current = None
+    if phase == "readback":
+        case.store.continue_repair("run-1", command)
+        current = case.store.effective_spec("run-1")
+        with case.store._connect() as db:
+            recovery = json.loads(
+                db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0]
+            )
+    checkout = case.broker.checkout
+    retained = checkout.with_name(checkout.name + "-held")
+    checkout.rename(retained)
+    try:
+        if defect == "symlink":
+            checkout.symlink_to(retained, target_is_directory=True)
+        elif defect == "replacement":
+            shutil.copytree(retained, checkout, symlinks=True)
+        with pytest.raises((ValueError, OSError, subprocess.CalledProcessError)) as caught:
+            if phase == "readback":
+                gates.readback(case.store, current, recovery)
+            else:
+                case.store.repair_admission_preflight("run-1", command)
+        if isinstance(caught.value, subprocess.CalledProcessError):
+            assert caught.value.returncode == 128
+            assert caught.value.cmd == ["git", "-C", str(checkout), "rev-parse", "HEAD"]
+    finally:
+        if checkout.is_symlink():
+            checkout.unlink()
+        elif checkout.exists():
+            shutil.rmtree(checkout)
+        retained.rename(checkout)
+
+
+def test_prerequisite_does_not_grant_an_implementation_or_changed_request(stopped_prerequisite):
+    case, _, command, _ = stopped_prerequisite
+    for fields in (
+        {"additional_iterations": 1},
+        {"expected_revision": 41},
+        {"expected_pr_head": "0" * 40},
+        {"recipe": {"argv": ["/usr/bin/true"]}},
+    ):
+        with pytest.raises(ValueError):
+            case.store.continue_repair("run-1", {**command, **fields})
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_claim",
+        "foreign_owner",
+        "same_owner_reclaim",
+        "owner_drift",
+        "native_raw",
+        "ack",
+    ],
+)
+def test_worker_rechecks_original_receipts_and_exact_current_claim(stopped_prerequisite, defect):
+    from devflow_temporal import delivery_gate_retry as gates
+
+    case, local, command, _ = stopped_prerequisite
+    response = case.store.continue_repair("run-1", command)
+    current = case.store.effective_spec("run-1")
+    with case.store._connect() as db:
+        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
+    if defect in {"missing_claim", "foreign_owner", "same_owner_reclaim"}:
+        with case.store._connect() as db:
+            case.store.state.release_work(db, current["work_id"], "external:devflow:run-1")
+            if defect != "missing_claim":
+                case.store.state.claim_work(
+                    db,
+                    current["work_id"],
+                    "foreign" if defect == "foreign_owner" else "external:devflow:run-1",
+                )
+    elif defect == "owner_drift":
+        owner = json.loads(case.store.config.path.read_text())
+        owner["capacity"] = 3
+        case.store.config.path.write_text(json.dumps(owner))
+    elif defect == "native_raw":
+        path = Path(local["results"][-1]["native_process"]["journal"])
+        value = read_private(path)
+        value["intent"]["argv"].append("--no-dev")
+        write_private(path, value)
+    elif defect == "ack":
+        response["claim_identity"]["claimed_at"] += "-changed"
+        with case.store._connect() as db:
+            db.execute(
+                "UPDATE delivery_commands SET response_json=? WHERE command_id=?",
+                (canonical_json(response), command["command_id"]),
+            )
+    with pytest.raises((ValueError, OSError)):
+        gates.readback(case.store, current, recovery)
+
+
+def test_claim_metadata_refresh_keeps_the_same_acquired_generation(stopped_prerequisite):
+    from devflow_temporal import delivery_gate_retry as gates
+
+    case, _, command, _ = stopped_prerequisite
+    response = case.store.continue_repair("run-1", command)
+    current = case.store.effective_spec("run-1")
+    with case.store._connect() as db:
+        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
+        refreshed = case.store.state.claim_work(
+            db, current["work_id"], "external:devflow:run-1", "Owned tracking metadata refresh"
+        )
+    assert refreshed["replayed"] is True
+    assert refreshed["claim"]["claimed_at"] == response["claim_identity"]["claimed_at"]
+    assert gates.readback(case.store, current, recovery)["number"] == 12

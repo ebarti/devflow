@@ -1,0 +1,814 @@
+"""Owned native public capture/migration fixture; no external provider or GitHub.
+
+The workflow protocol is primed with already-recorded role results at the
+terminal boundary. The REAL DeliveryWorkflow terminal/finalization/tracker
+commands run on Temporal; activities model unavailable projection and tracker.
+No history event is fabricated or inserted into the Temporal database.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import sqlite3
+import sys
+import time
+from contextlib import ExitStack, redirect_stdout
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+import devflow_temporal
+
+SOURCE = Path(devflow_temporal.__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).parent))
+import runtime_location_scenario as fixture  # noqa: E402
+
+from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER  # noqa: E402
+from devflow_temporal.delivery_config import DeliveryConfig  # noqa: E402
+from devflow_temporal.delivery_resources import read_private, write_private  # noqa: E402
+from devflow_temporal.delivery_store import DeliveryStore  # noqa: E402
+
+
+async def original_histories(root):
+    from temporalio import activity
+    from temporalio.client import Client
+    from temporalio.exceptions import ApplicationError
+    from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+    from devflow_temporal.delivery_activities import delivery_project
+    from devflow_temporal.delivery_orphans import reconcile_closed_native
+    from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+    case = fixture.restored(root)
+    store = DeliveryStore(DeliveryConfig.load(Path(case.owner)))
+    states, specs = {}, {}
+    for run, protocol in (("run-1", 48), ("run-2", 39)):
+        specs[run] = store.effective_spec(run)
+        if run == "run-1":
+            state = copy.deepcopy(case.state)
+        else:
+            state = {
+                "run_id": run,
+                "phase": "blocked",
+                "execution_state": "blocked",
+                "outcome": "blocked",
+                "iteration": 3,
+                "candidate": None,
+                "pull_request": None,
+                "roles": [],
+                "checks": {},
+                "tracker": None,
+                "usage": {},
+                "decision": None,
+                "intake": None,
+            }
+        state.update(
+            revision=protocol,
+            iteration=3,
+            cleanup="unknown",
+            error="terminal tracker synchronization conflicted",
+        )
+        for key in ("terminal_projection_failure", "terminal_tracker_checkpoint"):
+            state["checks"].pop(key, None)
+        states[run] = state
+        with store._connect() as db:
+            db.execute("DELETE FROM delivery_closures WHERE workflow_id=?", ("delivery-" + run,))
+            db.execute(
+                "UPDATE delivery_runs SET phase=?,execution_state='running',outcome=NULL,"
+                "protocol_revision=?,iteration=3,cleanup='unknown',error=NULL,updated_at=? "
+                "WHERE run_id=?",
+                (
+                    "checks" if run == "run-1" else "repair",
+                    protocol - 2,
+                    datetime.now(UTC).isoformat(),
+                    run,
+                ),
+            )
+
+    @activity.defn(name="delivery_project")
+    async def unavailable(request):
+        if request["event_type"] == "tracker_deadline":
+            raise ApplicationError("Owned terminal projection unavailable", non_retryable=True)
+        return await delivery_project(request)
+
+    @activity.defn(name="delivery_finalize_resources")
+    async def finalizer(_request):
+        raise ApplicationError("Owned aggregate receipt unavailable", non_retryable=True)
+
+    @activity.defn(name="delivery_terminal_tracker")
+    async def tracker(_request):
+        return {"state": "conflicted", "retryable": False}
+
+    async def terminal(self, spec, recovery=None):
+        assert recovery is None
+        self.state = copy.deepcopy(states[spec["run_id"]])
+        terminal_revision = self.state["revision"]
+        self.state.update(
+            revision=terminal_revision - 2,
+            outcome=None,
+            execution_state="running",
+            phase="checks" if spec["run_id"] == "run-1" else "repair",
+            error=None,
+        )
+        await self._project(
+            spec,
+            "checks_started" if spec["run_id"] == "run-1" else "role_started",
+            "Owned immutable in-flight checkpoint",
+        )
+        self.state.update(
+            revision=terminal_revision,
+            phase="blocked",
+            execution_state="blocked",
+            outcome="blocked",
+            error="terminal tracker synchronization conflicted",
+        )
+        await self._project(spec, "blocked", self.state["error"])
+        return self.state
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(DeliveryWorkflow, "_run_protocol", terminal)
+    client = await Client.connect(
+        store.config.temporal_address, data_converter=DELIVERY_DATA_CONVERTER
+    )
+    selected = []
+    try:
+        async with Worker(
+            client,
+            task_queue=store.config.queue,
+            workflows=[DeliveryWorkflow],
+            activities=[unavailable, finalizer, tracker],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            for run in states:
+                handle = await client.start_workflow(
+                    DeliveryWorkflow.run,
+                    args=[specs[run], None],
+                    id="delivery-" + run,
+                    task_queue=store.config.queue,
+                    memo={"request_digest": specs[run]["request_digest"]},
+                )
+                state = await asyncio.wait_for(handle.result(), 30)
+                description = await handle.describe()
+                assert state["revision"] == (48 if run == "run-1" else 39)
+                assert (
+                    state["checks"]["terminal_projection_failure"]["event_type"]
+                    == "tracker_deadline"
+                )
+                assert state["checks"]["terminal_tracker_checkpoint"]["state"] == "conflicted"
+                with store._connect() as db:
+                    row = dict(
+                        db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run,)).fetchone()
+                    )
+                selected.append(
+                    {
+                        key: row[key]
+                        for key in ("run_id", "revision", "protocol_revision", "request_digest")
+                    }
+                )
+                selected[-1].update(
+                    workflow_id=description.id,
+                    execution_run_id=description.run_id,
+                    recovery_digest=None,
+                )
+                if run == "run-1":
+                    case.state = state
+                    case.command["expected_revision"] = 48
+        await reconcile_closed_native(store, client)
+        with store._connect() as db:
+            for item in selected:
+                row = dict(
+                    db.execute(
+                        "SELECT * FROM delivery_runs WHERE run_id=?", (item["run_id"],)
+                    ).fetchone()
+                )
+                closed = await client.get_workflow_handle(item["workflow_id"]).describe()
+                assert datetime.fromisoformat(row["updated_at"]) > closed.close_time
+                assert db.execute(
+                    "SELECT 1 FROM delivery_events WHERE run_id=? "
+                    "AND type='resource_cleanup_reconciled'",
+                    (item["run_id"],),
+                ).fetchone()
+                item["revision"] = row["revision"]
+                # Setup simulates the genuinely missing cache, never alters Temporal.
+                db.execute(
+                    "DELETE FROM delivery_closures WHERE workflow_id=?", (item["workflow_id"],)
+                )
+    finally:
+        patch.undo()
+    saved = read_private(root / "case.json")
+    saved.update(state=case.state, command=case.command, captures=selected)
+    write_private(root / "case.json", saved)
+
+
+def seed(root):
+    original = fixture.fixture_service
+
+    def service(path):
+        store, request = original(path)
+        raw = copy.deepcopy(store.config.raw)
+        raw["temporal_bin"] = "/opt/homebrew/bin/temporal"
+        dashboard, ui = fixture.ports()
+        raw["dashboard_url"] = "http://127.0.0.1:" + str(dashboard)
+        raw["temporal_ui_port"] = ui
+        store.config.path.write_text(json.dumps(raw))
+        return DeliveryStore(DeliveryConfig.load(store.config.path)), request
+
+    fixture.fixture_service = service
+    fixture.seed(root, "stale1169")
+    asyncio.run(original_histories(root))
+
+
+def volume(root):
+    """Complete historical actors, not an ignored padding field in authority.
+
+    Reused synthetic PIDs have distinct authentic-format historical start times.
+    None is a current actor. Every pair and journal hash is read by the actual
+    global observation/current owner in capture AND subsequent installation.
+    """
+    from devflow_temporal.contracts import canonical_json
+    from devflow_temporal.delivery_runtime_installation import _global_native
+
+    case = fixture.restored(root)
+    config = DeliveryConfig.load(Path(case.owner))
+    actors = 0
+    for index in range(2527):
+        owned = {}
+        for item in range(360):
+            key = index * 360 + item
+            identity = (datetime(2001, 1, 1) + timedelta(days=key // 90000)).strftime(
+                "%a %b %e %H:%M:%S %Y"
+            )
+            owned[str(10000 + key % 90000)] = {"identity": identity}
+        journal = (
+            config.state_root / "owned-history-volume" / f"{index:04d}" / "native-process.json"
+        )
+        journal.parent.mkdir(parents=True, mode=0o700)
+        raw = canonical_json(
+            {
+                "version": 1,
+                "phase": "finished",
+                "owned": owned,
+                "ports": [],
+                "result": {"cleanup": "confirmed"},
+            }
+        ).encode()
+        descriptor = os.open(journal, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+        actors += len(owned)
+    # Calibrate BEFORE capture/copy/export/crash phases. The actual global owner
+    # reads every owned journal and checks all actors; its complete canonical
+    # observation alone is a strict lower bound on both owners' full authority.
+    with ExitStack() as leases:
+        observed = _global_native(config, {"runs": [], "owner_path": str(config.path)}, leases)
+    lower_bound = len(canonical_json({"global_native": observed}).encode())
+    assert lower_bound >= 30571522, "Increase meaningful evidence before expensive public phases"
+    result = {
+        "journals": 2527,
+        "actors": actors,
+        "last_journal": str(journal),
+        "canonical_global_authority_bytes": lower_bound,
+    }
+    write_private(root / "volume.json", result)
+    print(json.dumps(result))
+
+
+def migration(case, config):
+    from importlib.metadata import distribution
+
+    from devflow_temporal import delivery_runtime_location as location
+    from devflow_temporal.payload import payload_digest
+
+    after = copy.deepcopy(config.raw)
+    after["codex_bin"] = str(
+        distribution("openai-codex-cli-bin").locate_file("codex_cli_bin/bin/codex")
+    )
+    proposal = config.state_root / "operator-inputs/permanent-owner.json"
+    write_private(proposal, after)
+    value = {
+        "command_id": "capture-six-permanent",
+        "owner_before_sha256": hashlib.sha256(config.path.read_bytes()).hexdigest(),
+        "owner_after_path": str(proposal),
+        "owner_after_sha256": hashlib.sha256(proposal.read_bytes()).hexdigest(),
+        "destination": {
+            "root": str(SOURCE),
+            "revision": fixture.git(SOURCE, "rev-parse", "HEAD"),
+            "tree": fixture.git(SOURCE, "rev-parse", "HEAD^{tree}"),
+            "payload_sha256": payload_digest(SOURCE / "runtime/src/devflow_temporal"),
+        },
+        "runs": ["run-" + str(i) for i in range(1, 7)],
+        "host_home": str(Path.home()),
+        "host_cli": case.cli,
+        "host_cli_sha256": hashlib.sha256(Path(case.cli).read_bytes()).hexdigest(),
+        "baseline_revision": "1ebfc71ea5522ee74dbf6cd820f01649e3197bca",
+        "answer": location.ANSWER,
+    }
+    request = config.state_root / "operator-inputs/permanent-request.json"
+    write_private(request, value)
+    return request
+
+
+def public(config, name, *, request=None, run=None, role=None, iteration=None):
+    from devflow_temporal import delivery_control
+
+    argv = ["devflow-delivery", "--config", str(config.path), name]
+    for flag, value in (
+        ("--request", request),
+        ("--id", run),
+        ("--role", role),
+        ("--iteration", iteration),
+    ):
+        if value is not None:
+            argv += [flag, str(value)]
+    patch = pytest.MonkeyPatch()
+    patch.setattr(sys, "argv", argv)
+    output = io.StringIO()
+    try:
+        with redirect_stdout(output):
+            delivery_control.main()
+        return json.loads(output.getvalue())
+    finally:
+        patch.undo()
+
+
+def capture(root, mode):
+    from devflow_temporal import delivery_retained_closures as owner
+
+    case = fixture.restored(root)
+    config = DeliveryConfig.load(Path(case.owner))
+    assert not Path(case.old_root).exists()
+    with pytest.raises(ValueError, match="helper is missing"):
+        DeliveryStore(config)
+    if not (config.state_root / "service.lock").exists():
+        fixture.control(config, "stop")
+    request = migration(case, config)
+    value = {
+        "command_id": "owned-two-history-capture",
+        "migration_path": str(request),
+        "migration_sha256": hashlib.sha256(request.read_bytes()).hexdigest(),
+        "captures": case.captures,
+        "answer": owner.ANSWER,
+        "reader": {
+            "configured_path": "/opt/homebrew/bin/temporal",
+            "resolved_path": "/opt/homebrew/Cellar/temporal/1.9.1/bin/temporal",
+            "sha256": owner.READER_SHA,
+            "version": "1.9.1",
+            "server_version": "1.32.0",
+            "historical_start_binary_sha256": None,
+        },
+    }
+    path = config.state_root / "operator-inputs/capture.json"
+    write_private(path, value)
+    before = fixture.original_rows(config)
+    original_capture = owner.capture
+
+    def guarded_capture(config, supplied):
+        connect = sqlite3.connect
+
+        def observed(database, *args, **kwargs):
+            raw = str(database)
+            if raw.startswith("file:"):
+                from urllib.parse import unquote, urlsplit
+
+                target = Path(unquote(urlsplit(raw).path))
+            else:
+                target = Path(raw)
+            if target == config.state_root / "temporal.sqlite3":
+                raise AssertionError("Capture MUST NOT SQLite-open original Temporal data")
+            db = connect(database, *args, **kwargs)
+            if target == config.tracking_db:
+
+                def readonly_rows(action, table, _column, _database, _trigger):
+                    if action in {
+                        sqlite3.SQLITE_INSERT,
+                        sqlite3.SQLITE_UPDATE,
+                        sqlite3.SQLITE_DELETE,
+                    }:
+                        if action != sqlite3.SQLITE_INSERT or table not in {
+                            "delivery_commands",
+                            "delivery_events",
+                            "delivery_closures",
+                        }:
+                            return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                db.set_authorizer(readonly_rows)
+            return db
+
+        sqlite3.connect = observed
+        try:
+            return original_capture(config, supplied)
+        finally:
+            sqlite3.connect = connect
+
+    owner.capture = guarded_capture
+    if mode == "live-tail":
+        from devflow_temporal.delivery_native_process import process_table
+
+        last = Path(read_private(root / "volume.json")["last_journal"])
+        original = last.read_bytes()
+        changed = json.loads(original)
+        changed["owned"][str(os.getpid())] = {"identity": process_table()[os.getpid()]["identity"]}
+        try:
+            write_private(last, changed)
+            with pytest.raises(SystemExit) as rejected:
+                public(config, "capture-retained-closures", request=path)
+            assert rejected.value.code == 1
+        finally:
+            last.write_bytes(original)
+        assert not (config.state_root / "closure-captures").exists()
+        assert fixture.original_rows(config) == before
+        print(json.dumps({"far_end_live_actor_refused": True, "rows_unchanged": True}))
+        return
+    if mode == "pre-go":
+        original = owner._serve
+
+        def replaced_after_original_launch_guard(*args):
+            guard = args[-1]
+
+            def drift():
+                guard()
+                reader = config.state_root / "closure-captures" / value["command_id"] / "readers/0"
+                database = reader / "snapshot/working/server.sqlite3"
+                database.rename(database.with_suffix(".before-go"))
+                database.symlink_to(config.state_root / "temporal.sqlite3")
+
+            return original(*args[:-1], drift)
+
+        owner._serve = replaced_after_original_launch_guard
+        with pytest.raises(SystemExit) as rejected:
+            public(config, "capture-retained-closures", request=path)
+        assert rejected.value.code == 1
+        reader = config.state_root / "closure-captures" / value["command_id"] / "readers/0"
+        assert (reader / "ready.json").exists()  # The real child reached its GO gate.
+        assert not (reader / "authorized.json").exists()
+        assert (reader / "server.log").read_bytes() == b""  # Server never received GO.
+        assert fixture.original_rows(config) == before
+        print(json.dumps({"pre_go_refused": True, "rows_unchanged": True}))
+        return
+    if mode == "inputs":
+        invalid = []
+        for defect in ("partial", "duplicate", "revision", "workflow", "digest", "reader"):
+            changed = copy.deepcopy(value)
+            if defect == "partial":
+                changed["captures"].pop()
+            elif defect == "duplicate":
+                changed["captures"][1] = copy.deepcopy(changed["captures"][0])
+            elif defect == "revision":
+                changed["captures"][0]["revision"] += 1
+            elif defect == "workflow":
+                changed["captures"][0]["workflow_id"] += "-foreign"
+            elif defect == "digest":
+                changed["migration_sha256"] = "0" * 64
+            else:
+                changed["reader"]["sha256"] = "0" * 64
+            write_private(path, changed)
+            with pytest.raises(SystemExit) as rejected:
+                public(config, "capture-retained-closures", request=path)
+            assert rejected.value.code == 1
+            assert fixture.original_rows(config) == before
+            invalid.append(defect)
+        write_private(path, value)
+        assert not (config.state_root / "closure-captures").exists()
+        print(json.dumps({"refused": invalid, "rows_unchanged": True}))
+        return
+    if mode != "normal":
+        # Faults are scoped to this owned public CLI process; production has no fault flag.
+        if mode == "popen":
+            original = owner.subprocess.Popen
+
+            def crash(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if "devflow_temporal.native_child" in args[0]:
+                    os._exit(73)
+                return result
+
+            owner.subprocess.Popen = crash
+        elif mode == "transaction":
+            from devflow_temporal import delivery_closures
+
+            original = delivery_closures.insert_seal
+
+            def crash(*args, **kwargs):
+                result = original(*args, **kwargs)
+                os._exit(74)
+                return result
+
+            delivery_closures.insert_seal = crash
+        elif mode == "ack":
+            original = owner.capture
+
+            def crash(*args, **kwargs):
+                original(*args, **kwargs)
+                os._exit(75)
+
+            owner.capture = crash
+        public(config, "capture-retained-closures", request=path)
+        raise AssertionError("The intended owned crash did not happen")
+    response = public(config, "capture-retained-closures", request=path)
+    assert fixture.original_rows(config) == before
+    assert response["kind"] == owner.SCHEMA and len(response["histories"]) == 2
+    replay = public(config, "capture-retained-closures", request=path)
+    assert replay["replayed"] is True
+    assert fixture.original_rows(config) == before
+    if (root / "volume.json").exists():
+        from devflow_temporal import delivery_runtime_authority as representation
+
+        receipt_path = Path(response["receipt"])
+        manifest = json.loads(receipt_path.read_bytes())
+        intent = json.loads((receipt_path.parent / "intent.json").read_bytes())
+        assert manifest["schema"] == intent["schema"] == representation.SCHEMA
+        assert min(manifest["canonical_bytes"], intent["canonical_bytes"]) > 30571522
+        part = (
+            receipt_path.parent
+            / (receipt_path.name + ".authority-parts")
+            / (representation._name(manifest["parts"][-1]))
+        )
+        original = part.read_bytes()
+        try:
+            part.write_bytes(b"!" + original[1:])
+            with pytest.raises(SystemExit) as rejected:
+                public(config, "capture-retained-closures", request=path)
+            assert rejected.value.code == 1
+            assert fixture.original_rows(config) == before
+        finally:
+            part.write_bytes(original)
+    # The separate old projector does not know the new command/audit types.
+    # Its actual unchanged helper still reads/refreshes unrelated owned work.
+    sys.path.insert(0, str(root / "loaded-old-projector"))
+    loader = importlib.util.spec_from_file_location(
+        "retained_old_projector", root / "loaded-old-projector/state.py"
+    )
+    old = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(old)
+    with old.connect(config.tracking_db) as db:
+        assert old.metrics(db)
+        old.record(db, "work", {"id": "copy-history-old-projector", "title": "Owned observation"})
+        old.update(
+            db, "work", {"id": "copy-history-old-projector", "title": "Owned refresh"}, "owned"
+        )
+    assert fixture.original_rows(config) == before
+    assert (config.state_root / "service.lock").stat().st_nlink == 1
+    assert not (config.state_root / "runtime-installations/current.json").exists()
+    write_private(
+        root / "capture-result.json",
+        {
+            "response": response,
+            "migration": str(request),
+            "owner": str(config.path),
+            "rows": before,
+        },
+    )
+    print(json.dumps({"state": "captured", "rows_unchanged": True, "histories": 2}))
+
+
+def install(root):
+    case = fixture.restored(root)
+    config = DeliveryConfig.load(Path(case.owner))
+    captured = read_private(root / "capture-result.json")
+    rows = fixture.original_rows(config)
+    assert rows == captured["rows"]
+    request = Path(captured["migration"])
+    original_capture_input = (request, request.read_bytes())
+    archived = Path(captured["response"]["receipt"]).parent / "owner-before.json"
+    original_archive = archived.read_bytes()
+    try:
+        archived.write_bytes(original_archive + b" ")
+        with pytest.raises(SystemExit) as rejected:
+            public(config, "runtime-location-preflight", request=request)
+        assert rejected.value.code == 1
+    finally:
+        archived.write_bytes(original_archive)
+    assert fixture.original_rows(config) == rows
+    # Preserve the original capture input/proposal/ACK. A later compatible
+    # migration names current source and the original package witness separately.
+    supplied = read_private(request)
+    supplied.update(
+        command_id=supplied["command_id"] + "-package-v1",
+        baseline_revision=fixture.PLUGIN_BASELINE,
+        plugin_origin=case.plugin_origin,
+    )
+    from devflow_temporal.payload import payload_digest
+
+    supplied["destination"] = {
+        "root": str(SOURCE),
+        "revision": fixture.git(SOURCE, "rev-parse", "HEAD"),
+        "tree": fixture.git(SOURCE, "rev-parse", "HEAD^{tree}"),
+        "payload_sha256": payload_digest(SOURCE / "runtime/src/devflow_temporal"),
+    }
+    request = config.state_root / "operator-inputs/after-capture-package-v1.json"
+    write_private(request, supplied)
+    preflight = fixture.control(config, "runtime-location-preflight", request)
+    assert len(preflight["authority"]["runs"]) == 6
+    supplied = read_private(request)
+    supplied["expected_evidence_sha256"] = preflight["expected_evidence_sha256"]
+    write_private(request, supplied)
+    if (root / "volume.json").exists():
+        last = Path(read_private(root / "volume.json")["last_journal"])
+        original = last.read_bytes()
+        try:
+            changed = json.loads(original)
+            changed["result"]["cleanup"] = "unknown"
+            write_private(last, changed)
+            refused = fixture.control(config, "adopt-runtime-location", request, success=False)
+            assert "preflight authority changed" in refused
+            assert fixture.original_rows(config) == rows
+            assert not (config.state_root / "runtime-installations/current.json").exists()
+        finally:
+            last.write_bytes(original)
+    result = fixture.control(config, "adopt-runtime-location", request)
+    assert result["state"] == "acknowledged"
+    scopes = fixture.assert_cohort_native_authority(DeliveryConfig.load(config.path))
+    assert scopes.count([]) == 2 and sum(bool(value) for value in scopes) == 4
+    assert fixture.original_rows(config) == rows
+    if (root / "volume.json").exists():
+        from devflow_temporal import delivery_runtime_authority as representation
+        from devflow_temporal import delivery_runtime_location as location
+        from devflow_temporal.delivery_control import _lifecycle_lock
+
+        current_config = DeliveryConfig.load(config.path)
+        existing_store = DeliveryStore(current_config)
+        receipt_path = Path(result["receipt"])
+        manifest = json.loads(receipt_path.read_bytes())
+        assert manifest["schema"] == representation.SCHEMA
+        assert manifest["canonical_bytes"] > 30571522
+        part = (
+            receipt_path.parent
+            / (receipt_path.name + ".authority-parts")
+            / (representation._name(manifest["parts"][-1]))
+        )
+        original = part.read_bytes()
+        try:
+            part.write_bytes(b"!" + original[1:])
+            with pytest.raises(ValueError, match="part bytes changed"):
+                location.require_ready(current_config)
+            with pytest.raises(ValueError, match="part bytes changed"):
+                with existing_store._connect():
+                    raise AssertionError("Untrusted authority reached a writable connection")
+            with pytest.raises(ValueError, match="part bytes changed"):
+                with _lifecycle_lock(current_config, time.monotonic() + 5):
+                    raise AssertionError("Untrusted authority reached lifecycle control")
+            with pytest.raises(ValueError, match="part bytes changed"):
+                location.require_preparation_location(case.spec, current_config.raw["codex_bin"])
+        finally:
+            part.write_bytes(original)
+        replay = fixture.control(current_config, "adopt-runtime-location", request)
+        assert replay["replayed"] is True
+        assert fixture.original_rows(current_config) == rows
+    assert original_capture_input[0].read_bytes() == original_capture_input[1]
+    print(
+        json.dumps(
+            {
+                "state": "installed",
+                "all_six": True,
+                "rows_unchanged": True,
+                "historical_capture_input_preserved": True,
+            }
+        )
+    )
+
+
+def receive_bound(root):
+    from temporalio.client import Client
+    from temporalio.service import RetryConfig, RPCError, RPCStatusCode
+
+    from devflow_temporal import delivery_retained_closures as owner
+
+    case = fixture.restored(root)
+    owner.MAX_HISTORY = 1024  # Test only: prove Core refuses BEFORE page allocation.
+    config = DeliveryConfig.load(Path(case.owner))
+
+    async def observe():
+        client = await Client.connect(
+            config.temporal_address, retry_config=RetryConfig(max_retries=1)
+        )
+        iterator = client.get_workflow_handle("delivery-run-1").fetch_history_events()
+        with pytest.raises(RPCError) as rejected:
+            await iterator.fetch_next_page()
+        assert rejected.value.status == RPCStatusCode.OUT_OF_RANGE
+        return str(rejected.value)
+
+    with owner._sdk_receive_limit():
+        detail = asyncio.run(observe())
+    assert "TEMPORAL_MAX_INCOMING_GRPC_BYTES" not in os.environ
+    print(json.dumps({"receive_bound": 1024, "sdk_refused": True, "detail": detail}))
+
+
+def continue_original(root):
+    import httpx
+
+    from devflow_temporal.delivery_activities import delivery_repair_preflight
+    from devflow_temporal.delivery_api import create_app
+    from devflow_temporal.delivery_closed_projection import reconcile_completed_projections
+    from devflow_temporal.delivery_closures import sealed_closure
+    from devflow_temporal.delivery_native_preparation import verify_native_spec
+    from devflow_temporal.delivery_resources import _gate_roots
+
+    case = fixture.restored(root)
+    case.store = DeliveryStore(DeliveryConfig.load(Path(case.owner)))
+    patch = pytest.MonkeyPatch()
+    fixture.scoped_external_boundaries(case, patch)
+
+    async def maintenance():
+        from temporalio.client import Client
+
+        client = await Client.connect(
+            case.store.config.temporal_address, data_converter=DELIVERY_DATA_CONVERTER
+        )
+        return await reconcile_completed_projections(case.store, client)
+
+    observed = asyncio.run(maintenance())
+    assert {v["run_id"] for v in observed if v["state"] == "reconciled"} == {"run-1", "run-2"}, (
+        observed
+    )
+    assert case.store.detail("run-1")["protocol_revision"] == 48
+    assert case.store.detail("run-2")["protocol_revision"] == 39
+    cleanup = public(
+        case.store.config, "reconcile-attempt", run="run-1", role="cleanup", iteration=3
+    )
+    assert cleanup["cleanup"] == "confirmed"
+    case.command["expected_revision"] = 48
+    request = case.store.config.state_root / "operator-inputs/finite-continuation.json"
+    write_private(request, case.command)
+    # Real public API handlers and CSRF, without a lifespan/dispatcher/API worker
+    # or a provider. Only the HTTP transport is in-process in this owned case.
+    app = create_app(case.store.config.path)
+
+    def api(operation):
+        async def send():
+            transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 40000))
+            async with httpx.AsyncClient(
+                transport=transport, base_url=case.store.config.dashboard_url
+            ) as caller:
+                session = await caller.get("/api/session")
+                assert session.status_code == 200
+                response = await caller.post(
+                    "/api/runs/run-1/" + operation,
+                    json=read_private(request),
+                    headers={
+                        "Origin": case.store.config.dashboard_url,
+                        "X-Devflow-CSRF": session.json()["csrf_token"],
+                    },
+                )
+                assert response.status_code == 200, response.text
+                return response.json()
+
+        return asyncio.run(send())
+
+    outcome = api("repair-admission-preflight")
+    assert outcome["authorized_through_iteration"] == 4
+    response = api("continue-repair")
+    assert response["run_id"] == "run-1"
+    current = case.store.effective_spec("run-1")
+    with case.store._connect() as db:
+        recovery = json.loads(
+            db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'").fetchone()[0]
+        )
+        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 6
+    assert (
+        recovery["maximum_iteration"] == 4 and recovery["session_id"] == case.result["session_id"]
+    )
+    verify_native_spec(current)
+    roots = {}
+    _gate_roots(current, execution_specs=roots)
+    assert current in roots.values() and case.spec in roots.values()
+    assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery})) == {
+        "state": "confirmed"
+    }
+    original = asyncio.run(sealed_closure(case.store, "delivery-run-1"))
+    assert original["result"] == case.state and original["result"]["cleanup"] == "unknown"
+    assert original["result"]["checks"]["local"]["state"] == "failed"
+    patch.undo()
+    print(
+        json.dumps(
+            {
+                "state": "continued",
+                "same_run": True,
+                "finite_maximum": 4,
+                "original_unknown_unchanged": True,
+                "full_resource_readback": True,
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    phase, raw_root, *rest = sys.argv[1:]
+    selected = {
+        "seed": seed,
+        "install": install,
+        "continue": continue_original,
+        "receive-bound": receive_bound,
+        "volume": volume,
+    }
+    if phase == "capture":
+        capture(Path(raw_root), rest[0] if rest else "normal")
+    else:
+        selected[phase](Path(raw_root))

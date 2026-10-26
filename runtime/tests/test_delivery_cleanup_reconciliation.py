@@ -90,3 +90,36 @@ def test_confirmed_cleanup_with_its_record_is_idempotent(stopped):
     result = reconcile_stopped_cleanup(stopped.store, 'run-owned', 2)
     assert result['state'] == 'finished' and result['changed'] is False
     assert stopped.calls == []
+
+
+@pytest.mark.parametrize('override', [None, '', 'delivery-run-owned-recovered-2'])
+def test_cleanup_resolves_default_workflow_identity_and_retains_explicit_override(
+    stopped, override,
+):
+    from devflow_temporal.delivery_cleanup_reconciliation import reconcile_stopped_cleanup
+
+    expected = override or 'delivery-run-owned'
+    with stopped.store._connect() as db:
+        db.execute('UPDATE delivery_runs SET workflow_id=?', (override,))
+    stopped.closed['workflow_id'] = expected
+    calls = []
+    original = stopped.store._completed_temporal_result
+
+    def completed(run_id, *, workflow_id):
+        calls.append((run_id, workflow_id))
+        return original(run_id, workflow_id=workflow_id)
+
+    stopped.store._completed_temporal_result = completed
+    assert reconcile_stopped_cleanup(stopped.store, 'run-owned', 2)['cleanup'] == 'confirmed'
+    assert calls == [('run-owned', expected)]
+    assert stopped.calls == ['cleanup']
+
+
+def test_cleanup_rejects_mismatched_explicit_workflow_identity(stopped):
+    from devflow_temporal.delivery_cleanup_reconciliation import reconcile_stopped_cleanup
+
+    with stopped.store._connect() as db:
+        db.execute("UPDATE delivery_runs SET workflow_id='another-execution'")
+    with pytest.raises(ValueError, match='exact closed execution'):
+        reconcile_stopped_cleanup(stopped.store, 'run-owned', 2)
+    assert stopped.calls == []

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json, digest
+from .delivery_filesystem_custody import matches as same_object
 
 
 def private_directory(path: Path) -> None:
@@ -370,17 +371,18 @@ def _remove_contents(fd: int) -> None:
             os.unlink(name, dir_fd=fd)
 
 
-def remove_directory(path: Path, identity: dict) -> None:
+def remove_directory(path: Path, identity: dict, *, spec: dict | None = None) -> None:
     _ancestors(path)
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
         try:
             info = os.fstat(fd)
-            if {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid} != identity:
+            if not same_object(spec, path, identity, current={
+                "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}):
                 raise ValueError("temporary root identity changed before deletion")
             _remove_contents(fd)
-            if _identity(path) != identity:
+            if not same_object(spec, path, identity):
                 raise ValueError("temporary root changed during deletion")
         finally:
             os.close(fd)
@@ -423,6 +425,8 @@ def retained_worktrees(spec: dict) -> dict:
     try:
         registry = RunResources(spec, read_only=True)
         with registry.locked(read_only=True) as manifest:
+            registry._observing_gate_roots = True
+            registry._observation_gate_roots = None
             roots = []
             for raw, entry in manifest["roots"].items():
                 if entry["kind"] not in {"checkout", "gate"}:
@@ -431,9 +435,12 @@ def retained_worktrees(spec: dict) -> dict:
                 registry._allowed(path, entry["kind"], finalizing=True)
                 _ancestors(path, allow_missing=True)
                 if os.path.lexists(path):
-                    if _identity(path) != entry["identity"]:
+                    if not same_object(spec, path, entry["identity"]):
                         raise ValueError("retained worktree identity changed")
                     roots.append({"path": raw, "reason": entry.get("receipt", {}).get("reason")})
+            if (registry._observation_gate_roots is not None
+                    and _gate_roots(spec) != registry._observation_gate_roots):
+                raise ValueError("resource execution authority changed during observation")
             return {"state": "observed", "count": len(roots), "roots": roots}
     except (OSError, ValueError, KeyError):
         return {"state": "unavailable", "count": None, "roots": []}
@@ -450,11 +457,20 @@ class RunResources:
         if read_only:
             _identity(self.root)
         else:
+            from .delivery_native_diagnostic import require_resource_idle
+
+            require_resource_idle(spec)
             private_directory(self.root)
         _ancestors(self.state)
 
     @contextmanager
-    def locked(self, *, read_only: bool = False):
+    def locked(self, *, read_only: bool = False, exclusive: bool = False):
+        if exclusive and not read_only:
+            raise ValueError('exclusive read-only observation requires read_only=True')
+        if not read_only:
+            from .delivery_native_diagnostic import require_resource_idle
+
+            require_resource_idle(self.spec)
         lock = self.root / "ownership.lock"
         flags = os.O_RDONLY if read_only else os.O_CREAT | os.O_RDWR
         descriptor = os.open(lock, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -469,9 +485,11 @@ class RunResources:
         try:
             if read_only:
                 authenticate()
-            fcntl.flock(descriptor, fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
+            fcntl.flock(descriptor, fcntl.LOCK_SH if read_only and not exclusive else fcntl.LOCK_EX)
             if read_only:
                 authenticate()
+            else:
+                require_resource_idle(self.spec)
             value = (
                 read_private(self.manifest)
                 if read_only or self.manifest.exists()
@@ -483,9 +501,8 @@ class RunResources:
                     "processes": [],
                 }
             )
-            if value.get("run_id") != self.spec["run_id"] or value["state_identity"] != _identity(
-                self.state
-            ):
+            if (value.get("run_id") != self.spec["run_id"]
+                    or not same_object(self.spec, self.state, value["state_identity"])):
                 raise ValueError("run resource ownership changed")
             yield value
             if read_only:
@@ -616,7 +633,7 @@ class RunResources:
                 if not any(path == root / name for name in names):
                     continue
                 self._allowed(root, entry["kind"], finalizing=finalizing)
-                if os.path.lexists(root) and _identity(root) != entry["identity"]:
+                if os.path.lexists(root) and not same_object(self.spec, root, entry["identity"]):
                     raise ValueError("generated resource parent was replaced")
                 valid = True
         if not valid or not path.is_absolute() or ".." in path.parts:
@@ -633,7 +650,7 @@ class RunResources:
                 if (
                     old.get("identity")
                     and os.path.lexists(path)
-                    and _identity(path) != old["identity"]
+                    and not same_object(self.spec, path, old["identity"])
                 ):
                     raise ValueError("registered resource root was replaced")
                 missing_scratch = (kind == 'execution-scratch' and old.get('identity')
@@ -719,7 +736,7 @@ class RunResources:
                 path.mkdir(mode=0o700)
                 entry.update(identity=_identity(path), state='created')
                 write_private(self.manifest, manifest)
-            elif _identity(path) != entry['identity']:
+            elif not same_object(self.spec, path, entry['identity']):
                 raise ValueError('registered generated output was replaced')
 
     def preserve_workspace_dependencies(
@@ -752,7 +769,8 @@ class RunResources:
         preserved = []
         with self.locked() as manifest:
             parent = manifest['roots'].get(str(checkout), {})
-            if parent.get('kind') != 'checkout' or parent.get('identity') != _identity(checkout):
+            if (parent.get('kind') != 'checkout'
+                    or not same_object(self.spec, checkout, parent.get('identity'))):
                 raise ValueError('legacy modules lost their original checkout identity')
             pending = []
             for relative, declaration in declarations.items():
@@ -789,10 +807,11 @@ class RunResources:
                         private_directory(folder)
                         _immutable(intent, saved)
                     _ancestors(destination)
-                    if _identity(source.parent) != saved['source_parent_identity']:
+                    if not same_object(self.spec, source.parent, saved['source_parent_identity']):
                         raise ValueError('legacy module parent was replaced')
                     if os.path.lexists(source):
-                        if (os.path.lexists(destination) or _identity(source) != saved['identity']):
+                        if (os.path.lexists(destination)
+                                or not same_object(self.spec, source, saved['identity'])):
                             raise ValueError(
                                 'legacy module preservation source is ambiguous or replaced')
                         if Path('/usr/sbin/lsof').is_file():
@@ -825,7 +844,8 @@ class RunResources:
                                 os.fsync(descriptor)
                             finally:
                                 os.close(descriptor)
-                    if (os.path.lexists(source) or _identity(destination) != saved['identity']):
+                    if (os.path.lexists(source)
+                            or not same_object(self.spec, destination, saved['identity'])):
                         raise ValueError('legacy module preservation destination was replaced')
                     receipt = {**saved, 'state': 'preserved', 'disposable': False}
                     _immutable(folder / 'receipt.json', receipt)
@@ -836,7 +856,8 @@ class RunResources:
         with self.locked() as manifest:
             entry = manifest["roots"][str(path)]
             identity = _identity(path)
-            if entry.get("identity") not in (None, identity):
+            if (entry.get("identity") is not None
+                    and not same_object(self.spec, path, entry["identity"])):
                 raise ValueError("resource identity changed after allocation")
             entry.update(identity=identity, state="created")
             if head is not None:
@@ -861,7 +882,7 @@ class RunResources:
                 path.mkdir(mode=0o700)
                 entry.update(identity=_identity(path), state="created")
                 write_private(self.manifest, manifest)
-            elif _identity(path) != entry["identity"]:
+            elif not same_object(self.spec, path, entry["identity"]):
                 raise ValueError("transient root changed")
         result = path / kind / key
         _ancestors(path)
@@ -884,7 +905,7 @@ class RunResources:
                 path.mkdir(mode=0o700)
                 entry.update(identity=_identity(path), state="created")
                 write_private(self.manifest, manifest)
-            elif _identity(path) != entry["identity"]:
+            elif not same_object(self.spec, path, entry["identity"]):
                 raise ValueError("execution scratch root changed")
             result = path / digest([kind, key])[:16]
             private_directory(result)
@@ -1009,7 +1030,9 @@ class RunResources:
                             or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
                             or info.st_ino != lock_path.lstat().st_ino
                             or (value.get('lifecycle_locks') is not None
-                                and value['lifecycle_locks'].get(name) != identity)):
+                                and not same_object(self.spec, lock_path,
+                                                value['lifecycle_locks'].get(name),
+                                                current=identity, directory=False))):
                         raise ValueError('native launch lease identity changed')
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if path.parent.parent == self.state / 'attempts':
@@ -1062,7 +1085,7 @@ class RunResources:
             if not os.path.lexists(path):
                 return {'path': str(path), 'kind': entry['kind'], 'state': 'already_absent',
                         'processes': observed}
-            if entry['identity'] is None or _identity(path) != entry['identity']:
+            if entry['identity'] is None or not same_object(self.spec, path, entry['identity']):
                 raise ValueError('disposable check artifact root was replaced')
             if Path('/usr/sbin/lsof').is_file():
                 users = subprocess.run(['/usr/sbin/lsof', '-nP', '-F', 'p', '+D', str(path)],
@@ -1072,7 +1095,7 @@ class RunResources:
                     raise ValueError('disposable check artifact root has a live holder')
             entry['state'] = 'removing'
             write_private(self.manifest, manifest)
-            remove_directory(path, entry['identity'])
+            remove_directory(path, entry['identity'], spec=self.spec)
             return {'path': str(path), 'kind': entry['kind'], 'state': 'removed',
                     'processes': observed}
 
@@ -1118,7 +1141,7 @@ class RunResources:
                 or entry['identity'] is not None
                 or parent.get('kind') != 'checkout' or not parent.get('identity')
                 or (os.path.lexists(checkout)
-                    and parent['identity'] != _identity(checkout))
+                    and not same_object(self.spec, checkout, parent['identity']))
                 or (not os.path.lexists(checkout) and parent.get('receipt', {}).get('state')
                     not in {'removed', 'already_absent'})):
             raise ValueError('unconfirmed output lacks its exact configured checkout authority')
@@ -1159,7 +1182,7 @@ class RunResources:
                 or marker.get('intent_sha256') != hashlib.sha256(raw).hexdigest()
                 or saved.get('destination') != str(folder / 'output')
                 or saved.get('ownership') != 'unproven' or saved.get('disposable') is not False
-                or _identity(folder) != saved['destination_parent_identity']):
+                or not same_object(self.spec, folder, saved['destination_parent_identity'])):
             raise ValueError('unconfirmed output preservation authority changed')
         for name in ('manifest.json', 'finalization.json'):
             archived = saved['original_bytes'][name].encode('utf-8')
@@ -1176,7 +1199,7 @@ class RunResources:
                 or old.get('generation', 0) != binding['generation']
                 or old.get('receipt') != failure
                 or original.get('run_id') != self.spec['run_id']
-                or original.get('state_identity') != _identity(self.state)
+                or not same_object(self.spec, self.state, original.get('state_identity'))
                 or original.get('finalization') != previous
                 or original.get('processes') != manifest['processes']
                 or original['roots'].get(binding['checkout'], {}).get('identity')
@@ -1252,13 +1275,13 @@ class RunResources:
                 'state': 'pending', 'intent_sha256': intent_sha256}
             write_private(self.manifest, manifest)
             saved, folder = self._read_generated_preservation(path, entry, manifest)
-            if (_identity(path.parent) != saved['source_parent_identity']
+            if (not same_object(self.spec, path.parent, saved['source_parent_identity'])
                     or candidate_for(checkout) != saved['candidate']):
                 raise ValueError(
                     'unconfirmed output candidate or parent changed during preservation')
             if os.path.lexists(path):
                 if (os.path.lexists(destination)
-                        or _identity(path) != saved['observed_identity']):
+                        or not same_object(self.spec, path, saved['observed_identity'])):
                     raise ValueError('unconfirmed output preservation source was replaced')
                 observed = subprocess.run(
                     ['/usr/sbin/lsof', '-nP', '-F', 'p', '+D', str(path)],
@@ -1269,9 +1292,9 @@ class RunResources:
                     raise ValueError('unconfirmed output has a live or unknown holder')
                 _ancestors(path)
                 _ancestors(destination)
-                if (_identity(path.parent) != saved['source_parent_identity']
-                        or _identity(folder) != saved['destination_parent_identity']
-                        or _identity(path) != saved['observed_identity']
+                if (not same_object(self.spec, path.parent, saved['source_parent_identity'])
+                        or not same_object(self.spec, folder, saved['destination_parent_identity'])
+                        or not same_object(self.spec, path, saved['observed_identity'])
                         or candidate_for(checkout) != saved['candidate']):
                     raise ValueError('unconfirmed output changed before exclusive preservation')
                 import ctypes
@@ -1284,7 +1307,7 @@ class RunResources:
                 if rename(os.fsencode(path), os.fsencode(destination), 0x00000004):
                     raise OSError(ctypes.get_errno(), 'exclusive output preservation failed')
             if (os.path.lexists(path)
-                    or _identity(destination) != saved['observed_identity']
+                    or not same_object(self.spec, destination, saved['observed_identity'])
                     or candidate_for(checkout) != saved['candidate']):
                 raise ValueError('unconfirmed output preservation destination was replaced')
             for directory in (path.parent, folder):
@@ -1312,7 +1335,7 @@ class RunResources:
         retained = entry['generated_output_preservation']
         receipt = folder / 'receipt.json'
         if (retained.get('state') != 'preserved' or os.path.lexists(path)
-                or _identity(folder / 'output') != saved['observed_identity']
+                or not same_object(self.spec, folder / 'output', saved['observed_identity'])
                 or retained.get('receipt') != str(receipt)
                 or hashlib.sha256(read_private(receipt, raw=True)).hexdigest()
                 != retained.get('receipt_sha256')
@@ -1330,7 +1353,8 @@ class RunResources:
             originals = {name: read_private(self.root / name, raw=True)
                          for name in ('manifest.json', 'finalization.json')
                          if os.path.lexists(self.root / name)}
-            process_receipts = [reconcile_process(Path(path)) for path in manifest["processes"]]
+            process_receipts = [reconcile_process(Path(path), spec=self.spec)
+                                for path in manifest["processes"]]
             uncertain = uncertain or any(
                 item["cleanup"] != "observed-native-confirmed" for item in process_receipts
             )
@@ -1375,7 +1399,8 @@ class RunResources:
                             state="retained",
                             reason="native process monitoring or teardown is unknown",
                         )
-                    elif entry["identity"] is None or _identity(path) != entry["identity"]:
+                    elif (entry["identity"] is None
+                          or not same_object(self.spec, path, entry["identity"])):
                         raise ValueError("resource creation or replacement has no proven ownership")
                     elif entry['kind'] == 'check-artifacts':
                         journals = [raw for raw in manifest['processes'] if Path(raw) in {
@@ -1426,7 +1451,7 @@ class RunResources:
                     else:
                         entry["state"] = "removing"
                         write_private(self.manifest, manifest)
-                        remove_directory(path, entry["identity"])
+                        remove_directory(path, entry["identity"], spec=self.spec)
                         receipt.update(state="removed")
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     receipt.update(
@@ -1520,7 +1545,7 @@ class RunResources:
                     receipt["state"] = "already_absent"
                 else:
                     self._allowed(path, entry["kind"], finalizing=True)
-                    if _identity(path) != entry["identity"]:
+                    if not same_object(self.spec, path, entry["identity"]):
                         raise ValueError("retained worktree ownership changed")
                     discarded, preserved = [], {}
                     reason = self._retain_source(path, entry["kind"], outcome,
@@ -1628,17 +1653,19 @@ class RunResources:
         return None
 
 
-def observe_finalized_resources(spec, *, unknown_allowed=False):
+def observe_finalized_resources(spec, *, unknown_allowed=False, quarantined=None):
     """Fresh read-only actor, port, lease and inode observation, never teardown."""
-    return _observe_resources(spec, unknown_allowed=unknown_allowed)
+    return _observe_resources(spec, unknown_allowed=unknown_allowed, quarantined=quarantined)
 
 
-def observe_completed_resources(spec, attempts):
+def observe_completed_resources(spec, attempts, *, quarantined=None):
     """Authenticate later blocked-run completion without changing historical finalization."""
-    return _observe_resources(spec, freshly_completed=True, attempts=attempts)
+    return _observe_resources(spec, freshly_completed=True, attempts=attempts,
+                              quarantined=quarantined)
 
 
-def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, attempts=()):
+def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, attempts=(),
+                       quarantined=None):
     registry = RunResources(spec, read_only=True)
     # Finalizers publish intermediate manifests under this same exclusive lease.
     # Authenticate one complete generation, including the returned raw-byte hashes.
@@ -1647,7 +1674,8 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
         registry._observation_gate_roots = None
         result = _observe_locked_resources(spec, registry, manifest, role_leases,
                                            unknown_allowed=unknown_allowed,
-                                           freshly_completed=freshly_completed, attempts=attempts)
+                                           freshly_completed=freshly_completed, attempts=attempts,
+                                           quarantined=quarantined)
         if (registry._observation_gate_roots is not None
                 and _gate_roots(spec) != registry._observation_gate_roots):
             raise ValueError("resource execution authority changed during observation")
@@ -1655,7 +1683,7 @@ def _observe_resources(spec, *, unknown_allowed=False, freshly_completed=False, 
 
 
 def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_allowed=False,
-                              freshly_completed=False, attempts=()):
+                              freshly_completed=False, attempts=(), quarantined=None):
     state = Path(spec["state_dir"])
     _ancestors(state / "resources/manifest.json")
     manifest_path, final_path = (
@@ -1664,7 +1692,7 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
     finalization = read_private(final_path)
     if (
         manifest.get("run_id") != spec["run_id"]
-        or manifest.get("state_identity") != _identity(state)
+        or not same_object(spec, state, manifest.get("state_identity"))
         or (freshly_completed and finalization.get('outcome') != 'blocked')
         or finalization.get("state")
         not in ({"confirmed", "unknown"} if unknown_allowed or freshly_completed else {"confirmed"})
@@ -1680,8 +1708,16 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         ))
     ):
         raise ValueError("predecessor process/root custody is unconfirmed")
-    from .delivery_native_process import listeners, lost_monitor_without_provider, process_table
+    from .delivery_native_process import (
+        interrupted_cleanup_proven,
+        listeners,
+        lost_monitor_without_provider,
+        process_table,
+    )
 
+    quarantine = (quarantined or {}).get("journal_sha256", {})
+    if not set(quarantine).issubset(manifest["processes"]):
+        raise ValueError("quarantined provider journal is no longer registered")
     table = process_table()
     journals, roots = {}, {}
     receipts = {item["journal"]: item for item in finalization.get("processes", [])}
@@ -1691,26 +1727,41 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         str(state / 'attempts' / item['job_key'] / 'native-process.json'): item
         for item in attempts
     }
-    if freshly_completed and not set(attempt_journals).issubset(manifest['processes']):
-        raise ValueError('original completed attempt is not registered')
-    execution_specs, completed_intakes = {}, []
+    execution_specs, completed_intakes, prelaunch = {}, [], {}
     if freshly_completed:
         _gate_roots(spec, execution_specs=execution_specs, completed_intakes=completed_intakes)
+        from .delivery_prelaunch_cleanup import completed_prelaunch
+
+        for raw in sorted(attempt_journals.keys() - set(manifest['processes'])):
+            attempt = attempt_journals[raw]
+            prelaunch[raw] = role_leases.enter_context(completed_prelaunch(
+                spec, attempt, execution_specs, manifest, completed_intakes=completed_intakes))
     for raw in manifest["processes"]:
         path = Path(raw)
         if not path.is_relative_to(state) or path.resolve(strict=True) != path:
             raise ValueError("predecessor journal escaped its original root")
         _ancestors(path)
-        value = read_private(path)
+        journal_bytes = read_private(path, raw=True)
+        value = json.loads(journal_bytes)
+        journal_sha256 = hashlib.sha256(journal_bytes).hexdigest()
         receipt = receipts[raw]
         # A lost monitor never completes monitoring. Only a role monitor lost
         # before GO or a lost gate monitor may substitute its bound teardown
         # proof (with the live actor and port checks below); a role attempt
         # whose provider ran keeps its unknown outcome.
         role_attempt = path.parent.parent == state / "attempts"
+        # This exception proves teardown only. The provider outcome and its
+        # unfinished monitoring remain unknown in every original record.
+        quarantined_role = (raw in quarantine
+            and journal_sha256 == quarantine[raw]
+            and role_attempt and interrupted_cleanup_proven(value)
+            and value.get("result", {}).get("provider_outcome") == "unknown")
+        if raw in quarantine and not quarantined_role:
+            raise ValueError("quarantined provider teardown binding changed")
         if not freshly_completed and (
             (receipt.get("monitoring_complete") is not True
-             and not lost_monitor_without_provider(value, role_attempt=role_attempt))
+             and not lost_monitor_without_provider(value, role_attempt=role_attempt)
+             and not quarantined_role)
             or receipt.get("owned_ports_clear") is not True
             or sorted(receipt.get("observed_pids", [])) != sorted(map(int, value.get("owned", {})))
         ):
@@ -1804,7 +1855,8 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         if (
             value.get("phase") != "finished"
             or (value.get("monitoring_complete") is not True
-                and not lost_monitor_without_provider(value, role_attempt=role_attempt))
+                and not lost_monitor_without_provider(value, role_attempt=role_attempt)
+                and not quarantined_role)
             or any(
                 table.get(int(pid), {}).get("identity") == actor["identity"]
                 and not table[int(pid)]["stat"].startswith("Z")
@@ -1813,7 +1865,9 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
             or any(listeners(port) for port in value.get("ports", []))
         ):
             raise ValueError("predecessor still has a live actor or port")
-        journals[raw] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if raw in quarantine and read_private(path, raw=True) != journal_bytes:
+            raise ValueError("quarantined provider journal changed during observation")
+        journals[raw] = journal_sha256
     for raw, entry in manifest["roots"].items():
         path = Path(raw)
         registry._allowed(path, entry["kind"], finalizing=True)
@@ -1821,7 +1875,7 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         if entry.get('generated_output_preservation'):
             registry._observe_generated_preservation(path, entry, manifest)
         if os.path.lexists(path):
-            if entry["identity"] != _identity(path):
+            if not same_object(spec, path, entry["identity"]):
                 raise ValueError("predecessor root identity changed")
             if entry.get("receipt", {}).get("state") in {"removed", "already_absent"}:
                 raise ValueError("predecessor finalized root was recreated")
@@ -1844,4 +1898,5 @@ def _observe_locked_resources(spec, registry, manifest, role_leases, *, unknown_
         "finalization_sha256": hashlib.sha256(final_path.read_bytes()).hexdigest(),
         "journal_sha256": journals,
         "roots": roots,
+        **({'prelaunch_attempts': prelaunch} if prelaunch else {}),
     }

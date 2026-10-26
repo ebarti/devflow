@@ -49,6 +49,105 @@ whose memo binds the run's request and recovery digests, whose inputs name the r
 and its recovery, and whose terminal result agrees with the run's projected outcome.
 It refuses while Temporal still retains the execution.
 
+An original six-run permanent-installation cohort can instead be blocked by two
+latest selected executions that closed while the controller was unavailable.
+When the original helper and program location are gone and retained Temporal is
+stopped, use the separate explicit local data-only owner:
+
+```sh
+devflow-delivery --config "$ORIGINAL_CONFIG" capture-retained-closures \
+  --request "$PRIVATE_CAPTURE_REQUEST"
+```
+
+This narrow native macOS operation requires the unchanged original owner, a
+private hash-bound six-member installation request, and exactly two current
+workflow/execution selections. Each selection supplies `run_id`, `workflow_id`,
+`execution_run_id`, `revision`, `protocol_revision`, `request_digest` and
+`recovery_digest`. The top-level request contains `command_id`, `migration_path`,
+`migration_sha256`, `captures`, `reader`, and `answer`. `answer` is the literal
+`Capture only the two selected closed histories from an owned copy; change no delivery.`
+The four other latest closures must already have valid authentic seals. The
+selected rows must still be the exact stopped, unprojected native executions;
+predecessor histories and terminal summaries cannot substitute.
+
+The `reader` explicitly binds the unchanged configured
+`/opt/homebrew/bin/temporal`, its resolved Homebrew CLI1.9.1/Server1.32.0
+installation, current executable SHA256, and `historical_start_binary_sha256:
+null`. Original startup version evidence and the fixed Homebrew installation
+receipts are checked. This is current copy-reader authority; it never adds an
+unrecorded historical executable hash. The original native Python3.12.13,
+framework SDK1.33 and frozen dependency proof remain required. Browser-test SDK
+and executable preparation receipts do not authorize this operation.
+
+The owner holds the original exclusive lifecycle inode and installation recovery
+lease, proves stopped service/native actors and complete original-data FD
+visibility, then streams a stable raw DB plus optional WAL into a private
+immutable master. It never opens the original Temporal SQLite connection or
+creates/checkpoints its sidecars. SHM is retained as forensic evidence and rebuilt
+locally in the working copy. A hot/unexpected journal, uncertain visibility,
+foreign FD, replaced name, changed source generation or insufficient bounded
+storage refuses capture. The pristine master admits exactly the original family
+and its manifest; an added WAL cannot acquire recovery authority. Writable reader,
+snapshot and working generations are exclusively allocated. Existing staging,
+symlink or hard-link destinations are never adopted for copy or SQLite writes.
+The disk preflight reserves all four retained copies plus headroom. Prepared
+working-directory and database descriptors remain held through the child gate;
+their names, identities and exact prepared bytes are checked before GO.
+
+Only an identity-bound copy server runs, on fresh loopback endpoints with private
+HOME/cwd/tmp and no inherited original lock/data descriptors. The pinned SDK
+fetches both complete ALL_EVENT histories with archival explicitly skipped,
+within total page/event/byte/time
+bounds (512 pages, 65,536 events, 48 MiB encoded history and 90 seconds). Its
+standalone SDK receive limit is fixed before first connection; compressed
+payloads are expansion-checked before the normal codec, with 32 MiB per payload
+and 64 MiB total decoded bounds. These are local copy-reader resource limits,
+not changes to any delivery check or provider policy. Full start, memo, recovery, current execution, native and failed terminal
+tracker/deadline authority must validate through the existing owners. Exceeding a
+bound refuses the whole history. The copy server is cleaned up before one atomic
+metadata acknowledgement appends both genuine `temporal_snapshot` closure seals.
+Immutable provenance binds the snapshot, reader, namespace, explicit workflow and
+execution IDs, raw exports and full canonical history hashes. It is not a new
+execution transport or installation permission.
+
+Complete stopped-owner authority can span more than one evidence file. Capture
+intent/final receipts and installation receipts retain the existing bounded full
+JSON form through16MiB. Larger documents use an explicit owner/document-scoped
+immutable manifest: ordered private1MiB content-addressed parts, at most64parts
+and64MiB of complete canonical authority. The small acknowledged root binds every
+part's exact index, length and hash, the whole canonical hash/length and logical
+root members. All parts and held file/directory generations are authenticated
+before replay, historical/current validation or an effect can consume facts.
+This preserves every run record, historical scope, journal hash, PID/start pair
+and native input; it neither truncates evidence nor expands generic private-file
+or history limits. Parts and a complete unacknowledged manifest remain inert
+until the existing atomic capture or all-member installation acknowledgement.
+Missing, changed, reordered, linked or excess parts refuse the entire document.
+An aggregate above64MiB refuses before publishing a final root.
+An interrupted publication retains one bounded sequential part prefix; a retry
+cannot append a different hash at an occupied index or replace it with an inline
+document. Atomic staging remains separate and grants no permission. The exact
+root, part and directory descriptors stay held through canonical validation.
+Every read validates the complete content freshly; no authority cache replaces
+current source, claim, candidate or actor checks.
+
+An earlier oversized immutable full intent remains evidence and is never
+converted or overwritten. After proving that it reached no snapshot, reader,
+export or acknowledgement, the operator may use a fresh explicit capture command
+ID with the same original run/execution selections and fresh current checks.
+This creates no replacement run or execution allowance.
+
+The same exact command replays safely after an interrupted capture or lost
+acknowledgement. A child without durable GO authorization is never signalable;
+unknown actor/cwd/port ownership refuses replacement. A complete file-only
+receipt is inert until the two seals and command/audit acknowledgement commit.
+All `delivery_runs` fields, claims, provider outcomes, original unknowns, frozen
+specifications, gates, models, capacity and allowances remain unchanged. The
+expired-history import still requires genuine NOT_FOUND. After capture, rerun
+the ordinary all-six installation preflight. Following installation, the existing
+authentic closed-projection reconciliation, public cleanup and fresh finite
+continuation preflight still apply; capture itself grants no retry or iteration.
+
 The runtime under `runtime/` is a single-host, local development service. It accepts a raw goal with an explicit, allowlisted issue and repository, runs a Temporal workflow, and exposes the same persisted run through the dashboard, CLI, and MCP. A read-only intake role investigates repository evidence, asks only blocking questions, and records a scoped plan before autonomous implementation. The managed path then owns an isolated checkout, an early open pull request, independent review and verification roles, bounded repair in the implementation session, local and required CI checks, and issue reconciliation. The default endpoint is a **published, unmerged PR**. A fresh native run can instead explicitly authorize `merged`. That endpoint keeps all original checks, independent roles and required CI, then confirms owned cleanup before requesting a head-pinned squash merge. It independently verifies the actual merged commit/tree and closes only the admitted issue before reconciling Done and releasing the claim. A divergent base, uncertain effect or failed gate blocks completion; a lost response is reconciled through the original intent without blindly repeating the mutation. Existing unmerged histories retain their endpoint. Release, deployment and personal production data remain separate authority.
 
 The older `devflow-temporal` CLI remains a disposable role-ordering demonstration. It does not publish a PR or reconcile an issue. Use the managed `devflow-delivery` service for an end-to-end delivery.
@@ -137,7 +236,99 @@ Full PDF evidence may contain up to 2,048 files within a combined 50 MiB bound. 
 
 For an ordinary published run stopped with `browser QA child cleanup is unknown` after a historical `ValueError`, the owner may use `devflow-delivery --config CONFIG reconcile-attempt --id RUN --role browser_qa --iteration N`. This requires the exact closed workflow, unchanged published candidate, one matching browser effect, and its finished native journal. It completes only retained evidence and the existing cleanup/claim transaction; it cannot launch another browser invocation or rewrite the historical workflow verdict. Read the run and repair-admission preflight again before continuing it.
 
-For an ordinary published run whose native roles have finished but whose resource cleanup remains unknown, `reconcile-attempt --id RUN --role cleanup --iteration N` authenticates the exact closed workflow and re-observes its native resources before closing its claim. It preserves the failed product verdict, dirty source, branch and PR. Pending effects, changed execution identity or live owned processes prevent closure. This observation grants no continuation or extra repair budget. Workspace dependency cleanup uses the declaration recorded when the runtime acquired custody, so permitted package script edits do not invalidate deletion of those same owned folders; replacement folders and symlinks remain protected.
+For an ordinary published run whose native roles have finished but whose resource cleanup remains unknown, `reconcile-attempt --id RUN --role cleanup --iteration N` authenticates the exact closed workflow and re-observes its native resources before closing its claim. An unpublished run is also eligible after it has an accepted plan and an exact completed implementation/source checkpoint. Its closure is recorded as `unpublished`, with the closed execution identity, original checks/results, current source and work binding, attempt/effect inventory, native observation and tracker acknowledgement. It independently observes the configured origin and absence of the owned remote branch/PR before finalization and again before claim release. Pre-intake runs, a newer issue owner, changed work bindings, uncertain effects or live native custody prevent closure. Repeating the command re-observes its exact acknowledged custody without starting another role, admitting a successor or rewriting the historical verdict. Dirty retained source, publication state, failure classification and original repair allowance remain intact. Workspace dependency cleanup uses the declaration recorded when the runtime acquired custody, so permitted package script edits do not invalidate deletion of those same owned folders; replacement folders and symlinks remain protected.
+
+After that closure, use the public `repair-admission-preflight --id RUN --request FILE` and `continue-repair --id RUN --request FILE` route with `continuation_kind: "stopped_delivery_resume"`, a stable unique `command_id`, the closed protocol `expected_revision`, `expected_iteration`, and current `expected_candidate_id`/`expected_candidate_head`. A passed implementation stopped with exact unknown prepublication cleanup resumes at the sealed iteration's checks with `additional_iterations: 0`. Its exact durable implementation result and unchanged candidate remain mandatory; all publication, independent review, QA, verification, required CI and tracker gates still run.
+
+A provider monitor lost after launch remains an unknown verdict. For the narrow original unpublished implementation checkpoint, public cleanup can independently authenticate finished teardown without completing monitoring or inventing a provider session. The closed role, durable supervisor result, exact private request/journal hashes, input candidate, current partial output, provider identity and unknown outcome are bound separately. A later explicit `stopped_delivery_resume` must grant one or two unused original iterations (`additional_iterations: 1` or `2`), starts at the next iteration in a fresh implementation home/session, and receives no invented model finding from the old infrastructure failure. The old result, role and monitoring state remain unchanged. Subsequent normal resumes retain only those exact historical teardown receipts through the immutable admission chain; a different unknown role, changed output/evidence or current live custody still blocks them. Unknown external effects are never replayed.
+
+Later published and unpublished cleanup rederive those exact historical teardown receipts from the retained admission chain. They check the same journal hashes and current actors/ports throughout observation, finalization, acknowledgement and replay, and record historical teardown provenance separately. Later completed roles and a published PR never turn an old unknown provider outcome into a completed assessment; a different unknown journal receives no exception.
+
+When ordinary maintenance records a later compact cleanup projection, its complete contiguous chain retains the published anchor's exact historical teardown and native journal observation. Replay checks those original journal hashes against fresh custody and the latest cleanup receipt; a changed anchor, foreign write, revision gap, tracker change or unbound receipt cannot supply replacement authority.
+
+Completed reservations can include a native role-preparation failure before any monitor or provider launched. Such a reservation intentionally has no registered process journal. Aggregate cleanup accepts this case only with the supervisor's original typed `prelaunch` result, exact private admitted request/job/input/workspace, no provider identity/session/usage, released existing owner and lifecycle leases, and absent journal/launch/start/result/cancellation evidence. It creates no missing evidence. The cleanup anchor separately binds the observed request/result/attempt and lease generations; finalization, claim acknowledgement and replay revalidate them, including later compact maintenance. A missing journal, null session or failure summary alone grants no exception. All registered processes, roots, live actors, ports and closed-execution guards remain required; the old blocked result and any separate finalizer exception remain unchanged.
+
+If that admitted quarantined continuation closes during `repair_preflight` before entering its next iteration, public cleanup first closes that exact later execution. A fresh `stopped_delivery_resume` request then uses the later closed protocol revision and unchanged candidate/iteration with `additional_iterations: 0`. It retains the pending next iteration and maximum already sealed by the earlier admission, even when the workflow has not advanced its iteration counter yet. The immutable predecessor admission, unchanged roles/usage/attempts/effects/source, absent next-iteration attempt, absent session and exact unused implementation home must still match. A new role, source change or a request to enlarge that pending authority refuses reentry. The old failed preflight and original unknown verdict remain intact in their separate closed records.
+
+An admitted ordinary native iteration can also stop before its provider turn when a configured dependency prerequisite launches and fails. After repairing setup, a fresh zero-additional stopped resume retains that same unused provider iteration and ceiling. It requires the one closed blocked preparation role, its unchanged role prefix/source/attempt/effect/session inventory and no provider attempt at that iteration. The last failed command must match an original configured non-test prerequisite; all retained helpers must have completed monitoring, drained output and confirmed teardown without interruption, cancellation, timeout or port conflict. Exact private journal, launch and output hashes are sealed with the pending turn and rechecked at admission and worker/resource readback. This bounded path accepts at most 64 helpers with each private evidence file at most 4 MiB. A failed product gate, unknown helper or changed receipt supplies no exception. Completing a command in a stopped checkout does not adopt newly created environments or rewrite its closed preparation role.
+
+Those historical receipt proofs retain exact canonical workspace metadata after its checkout custody ends. They do not grant current source access: admission and worker readback still independently require the registered physical source and exact candidate, and refuse missing or replaced current checkouts.
+
+An ordinary stopped file-scope amendment retains its original accepted base commit
+when the configured named branch advances. The public request cannot override that
+commit or acquire new main-branch metadata. Re-admission authenticates the same
+original source, origin, repository and publication branch, requires the original
+commit still to exist and to be an ancestor of the current named branch, and
+derives policy from that original commit and the exact private configuration delta.
+It never rebases the retained candidate or changes the two explicitly named files,
+session, finite allowance or required gates. Preparation and current worker
+readback recheck the branch/commit and registered physical checkout; rewritten
+history, a missing commit, changed branch or replaced source refuses. Historical
+custody remains readable without current source refs. Fresh submissions still
+require the configured ref to match `expected_base_sha` exactly.
+The ordinary recovery observer rejects Git replacement refs and legacy graft
+files, and reads its frozen commit/tree with both replacement and graft views
+disabled. A synthetic ancestry or substituted old tree cannot authorize recovery.
+For an acknowledged combined scope/Temporal preparation, historical custody
+reconstructs only the exact scope/configuration delta over the sealed original
+spec and rebinds its original native proof. It retains every original Temporal
+metadata, tool, evidence, command and transition check without re-admitting against
+current branch refs. That historical receipt grants no source access: current
+proposal and worker readback still enforce the physical graph and checkout.
+
+Native predecessor observation resolves resources through the current acknowledged execution and requires the exact historical predecessor to be a member of its authenticated execution bindings. Both the bindings and current gate namespaces are rechecked after observation. Supplying an old spec as current authority, an unrecorded historical graft, changed configuration/admission/evidence, or authority drift during observation remains a refusal.
+
+The local CLI can execute reviewed cleanup against already closed runs without starting or replacing the service. New continuation semantics must not be queued to an older worker: its custody/readback guards intentionally refuse them. The bundled lifecycle has no rolling-upgrade or launch-quiescence operation. Let every open native workflow finish all gates and cleanup, confirm no eligible automatic continuation or uncertain effect remains, then use the supported runtime update/start sequence before preflighting and admitting these continuations. A gap between native roles does not establish that drain.
+
+A terminal finalizer exception records structured unknown cleanup without a receipt
+path or hash. Later owner maintenance and the same public cleanup command preserve
+that exact closed result. They archive the freshly authenticated current resource
+bytes under `resources/cleanup-observations/<original-result-digest>/`, with an
+`observed_resources` inventory and `producer_receipt_source: not_recorded`. These
+are later observations; they do not reconstruct an original finalization receipt
+or claim the file was historically absent. Replay authenticates the first saved
+observation after canonical cleanup files advance. Partial/malformed declarations
+are refused, and every declared hash retains its exact validation. Fresh cleanup
+and acknowledged claim release still leave the original failure, CI verdict,
+candidate, PR, policy and repair budget intact.
+
+After a macOS reboot, legacy native/resource records may retain the same inode and
+owner while their mount device number changes. The local public CLI exposes
+`filesystem-custody-preflight --id RUN` and `adopt-filesystem-custody --id RUN --request FILE`,
+both with an explicit `--config CONFIG`; neither starts a service. Preflight returns
+`expected_revision` (the local projection revision), `expected_evidence_sha256`,
+the exact affected objects and current workflow identity. An explicitly authorized
+operator sends those two observed fields with a fresh stable `command_id` and
+`answer: "adopt_current_filesystem"`. Keep the complete request unchanged after an
+uncertain response.
+
+This grants current-object custody only. Legacy records have no historical volume
+UUID, so the receipt explicitly leaves historical volume continuity unproven. It
+archives original bytes and commits one immutable exact-path identity overlay in
+the existing command/event transaction. An unacknowledged file grants nothing.
+The grant requires only device-number drift, unchanged inode/owner, canonical
+owned paths, original registration kind/generation/source authority, acquired
+resource/attempt/native leases, stopped recorded PID/start identities and clear
+ports. An extant path whose prior receipt records removal is recreated and cannot
+be adopted; an absent root is skipped, and a new generation uses its own current
+identity. Fresh source, evidence, run/attempt/claim and uncertain-effect checks fence
+publication. Current filesystem UUID and boot UUID must remain identical when
+the grant is consumed; replacing a path, changing generation or inspection failure
+cannot inherit it. New resource allocations still record real current identities.
+Original policy, plan, claims, provider verdicts, repair ceilings and external effects
+are untouched.
+
+An open ordinary workflow is eligible only with durably quarantined unknown
+attempts and no starting/running attempts or uncertain external effects. Adoption
+itself neither completes nor repeats an attempt. Follow it with the existing
+`reconcile-attempt --job-key KEY` for the exact quarantined attempt; its original
+waiting activity can consume the independently observed cleanup and stop normally.
+A lost provider monitor remains `recovery_unknown` with an unknown provider outcome,
+never a fabricated pass or recovered session. Cancellation is not a prerequisite.
+Read the resulting run and use only an admissible existing continuation; this
+operation grants no provider retry. For a closed published run whose roles are
+finished, the existing `reconcile-attempt --id RUN --role cleanup --iteration N`
+continues to own finalization and claim closure, including default workflow IDs.
 
 A confirmed removed dependency directory can bind a newly tracked declaration when the runtime recreates that directory. Renewal requires the old path to remain absent and its removal receipt to exist; live or replaced folders retain their original custody checks. A fixed-budget ordinary run that stopped before any provider attempt can continue its exact unstarted iteration with `additional_iterations: 0` after preflight authenticates unchanged source, session, effects and admission. An actual provider attempt makes the turn consumed, and this path cannot increase the original repair ceiling.
 
@@ -165,6 +356,25 @@ uv run --frozen devflow-delivery --config /absolute/private/config.json stop
 ```
 
 Upgrade the runtime in this order: `stop`, update the checkout (`sh scripts/update.sh TAG` or `git pull`), `uv sync --frozen --python python3.12` in `runtime/`, then `start`. The long-lived API and worker import modules lazily, so a checkout that changes underneath them would mix two versions in one process; `scripts/update.sh` refuses while a worker whose readiness marker names that checkout is alive (`scripts/delivery-workers.py --runtime runtime` reports them), and names the `stop` command. `stop` never requires the checkout to match the worker source recorded with a `--deployment-name`/`--deployment-build-id` selection: stopping a drifted stack is the safe action, each member is still proven owned before it is signalled, and the selection is retained for the next start. Ensuring the service compares the recorded worker source only when it must launch a member from the current source; a ready stack is served as it is. Member identities are recorded independent of the host's locale and time zone; manifests written earlier keep proving ownership in their original form.
+
+An unversioned stopped stack with no retained worker deployment uses ordinary
+`start` after the clean source update. If stopping retained a versioned deployment
+selection, ordinary `start` preserves that selection and requires its old payload;
+select the same deployment name and a new immutable build ID explicitly on
+`start --deployment-name NAME --deployment-build-id BUILD` only after the process
+inventory is empty. A same-root clean source upgrade retains its installed-location
+acknowledgement and captured history. It does not repeat the location migration.
+
+Public run reads authenticate the complete current installation acknowledgement
+at every normal Store connection, including fresh original-row, cohort, owner and
+exact two-name guard checks. Opening its read-only database connection does not
+decode the immutable receipt twice. Retained-worktree readback derives admitted
+gate roots once under its resource observation lease, then revalidates that
+authority before returning; no observation survives the call. The run detail and
+its evidence index share the same already observed detail within one GET.
+Standalone evidence reads still observe fresh detail. Neither this reuse nor the
+read endpoint changes authority, repair ceilings, history, or the ordinary
+30-second client deadline.
 
 Nothing restarts the stack by itself after a reboot or a crash: only CLI mutations and MCP write tools ensure it. `python3.12 scripts/delivery-service.py install --config /absolute/private/config.json` stages a per-configuration launchd agent (`com.ebarti.devflow.delivery.<digest>`) under the private state root (`launchd/`), where launchd never reads it; `--activate` copies it into `~/Library/LaunchAgents` and bootstraps it, restoring the previous agent if that fails; `uninstall` boots it out and removes both copies; `inspect` reports whether the activated copy lags the staged one. The agent runs `devflow-delivery --config … supervise` at login, once a minute (`--interval`) and again after a failure, in the standard process band (a background band would throttle Temporal, the worker, the API and every role and check they run). `supervise` is the idempotent start under the state-root lock — a ready stack is probed and left alone, a dead API beside a registered worker is relaunched alone, a dead stack is started — except while the owner's `stop` stands: `stop` records that intent in `service-stopped.json` in the state root, and the next explicit `start`, `restart` or write-triggered start clears it. The agent records the installing shell's `PATH` plus the `devflow-delivery` and Temporal CLI locations, the runtime checkout it supervises (derived from the canonical launcher's journal or wrapper, or from the entry's own `.venv`; `--runtime` names it explicitly), and logs to `launchd.log`/`launchd.error.log` in the state root. `scripts/update.sh` also refuses while an activated agent supervises a stack from the checkout it would change — by its recorded runtime or by the checkout its entry point execs now — or one whose checkout it cannot tell, or a plist under the Devflow label that Devflow does not own (`scripts/delivery-service.py active --runtime runtime` reports them): uninstall it, upgrade, then install and activate it again.
 
@@ -205,9 +415,87 @@ If that resumed implementer was blocked **before any provider process launch**, 
 
 If an implementation-only role stops because a required tracked test file was omitted from the frozen edit list, an operator can issue one separate scope amendment with same-origin `POST /api/runs/{id}/amend-scope` or `devflow-delivery amend-scope --id ID --request FILE`. The request binds a unique `command_id`, expected protocol revision, iteration, post-role candidate ID, PR number/head, one or two sorted `added_paths`, and the absolute path and SHA-256 of a private amended service configuration. The amended configuration must differ from the original only in those file permissions; the original request and any earlier repair grant remain unchanged. The service reads the completed Temporal result, finished role receipt, retained claim, existing open PR, exact source candidate, sealed native ownership/finalization evidence and current-head CI diagnostics before queuing. The effective policy and predecessor are recorded separately and visible in run detail. A replay of the same command returns its receipt; a second amendment conflicts. The sole new turn resumes the original implementation session, then must pass every broker, independent role, CI and tracker gate. This command cannot convert a failed test or model assertion into a passing result, and it does not authorize arbitrary new runs or further repair turns.
 
-For a finalized stopped implementation with a released claim, the existing `stopped_delivery_resume` request to `continue-repair` can instead include `added_paths`, `amended_config_path` and `amended_config_sha256`. This works before publication and spends only unused original repair iterations. It requires the authenticated original session's completed `findings` receipt and unchanged partial implementation. One or two explicitly named files must already be tracked, remain unchanged, and have safe filesystem ancestry. The private amended configuration may differ only by appending those files to that repository's allowed paths. Preflight validates without preparing or admitting work. Admission retains the original request, accepted plan, failed result, session, endpoint, models, checks and budget; it records the effective file scope separately in the recovery receipt, event and run detail. Runtime preparation and subsequent readback recheck the sealed configuration. The original session then repairs the finding through the normal implementation, review, QA, CI and delivery gates. This path does not waive a test failure or authorize a fresh issue admission.
+For a finalized stopped implementation with a released claim, the existing `stopped_delivery_resume` request to `continue-repair` can instead include `added_paths`, `amended_config_path` and `amended_config_sha256`. This works before publication and spends only unused original repair iterations. It requires the authenticated original session's completed `findings` receipt or a completed native `blocked` assessment with nonempty findings, together with the unchanged partial implementation. A blocked assessment must retain an exact private request, raw result, process journal, launch/start records and typed SDK observation: the final turn completed without an error, its structured final assessment agrees with the enriched supervisor result, the input candidate and retained output are separately bound, and native teardown is confirmed. Missing, interrupted, unknown or mismatched evidence refuses the amendment. Admission records hashes of those original bytes and worker custody reauthenticates them; it preserves the original blocked verdict and session rather than rewriting the result. The exact operator file delta grants edit authority without classifying finding prose. One or two explicitly named files must already be tracked, remain unchanged, and have safe filesystem ancestry. The private amended configuration may differ only by appending those files to that repository's allowed paths or versioned exact-file source scope. Preflight validates without preparing or admitting work. Admission retains the original request, accepted plan, failed result, session, endpoint, models, checks and budget; it records the effective file scope separately in the recovery receipt, event and run detail. Runtime preparation and subsequent readback recheck the sealed configuration. The original session then repairs the finding through the normal implementation, review, QA, CI and delivery gates. This path does not waive a test failure or authorize a fresh issue admission.
+
+The completed blocked assessment uses the same last typed `final_answer` item as the native turn producer. Earlier terminal-labelled stream items cannot replace it. A malformed or disagreeing last assessment refuses; the verifier never searches backwards for parseable JSON.
 
 Later plain stopped resumes retain that scope amendment's original provenance in run detail. The amendment receipt describes its original admission; each continuation separately records its own remaining-iteration authority.
+
+A closed ordinary trusted-local delivery may separately acknowledge one browser setup correction on an existing `stopped_delivery_resume` request. Its optional `browser_qa_amendment` object contains `expected_recipe_sha256` (the original canonical browser recipe digest), `recipe_path` and `recipe_sha256` (exact proposed JSON bytes), and `amended_config_path` and `amended_config_sha256` (exact private configuration bytes). Both input files must be owned regular mode-600 files inside the service state root. This amendment permits only `browser_qa.env.JOBCTRL_E2E_ISOLATED` changing from the string `1` to `0`. Fresh registration still requires mode `1`; the operation cannot change argv, selected scenarios, ports, timeouts, minimum counts, rejection rules, artifact paths, source scope, models, transport, or any other configuration. It uses only explicitly requested unused original iterations and cannot combine with a file-scope amendment or grant another allowance.
+
+The original completed native browser failure must contain the two selected JUnit cases, one passed and one skipped, with the exact recipe, request, launch, process journal, log, retained artifacts and confirmed teardown. Every matching recorded failed browser effect, including earlier iterations, is authenticated and preserved separately from the new gate. The accepted command and immutable admission bind the original case identities, failed bytes, configuration and proposal hashes. Custody rechecks the original attempts/effects and authenticated lineage before worker readback, resource use and native browser launch. Later plain continuations inherit that same acknowledged recipe; they cannot graft another run's permission or substitute evidence.
+
+Mode `0` selects the existing production API/RPC test backend while retaining the reviewed owned synthetic workspace and fake action/transport setup. The amendment pins the Playwright configuration, owned E2E fixture tree, API bootstrap/fake-dispatch owner and synthetic seed source bytes, and requires the same bytes in the gate checkout. The native launcher retains its existing credential-free owned HOME, XDG cache, temporary root, exact ports and filesystem/network profile. A new gate must retain passing JUnit entries for **both original selected cases**; aggregate `min_tests: 1`, collection output, or exit zero alone cannot pass it. Any missing, skipped, renamed or failed case fails the normal browser gate with truthful cleanup. The earlier failure remains failed, and independent review, verification, required CI, tracker and cleanup gates remain mandatory. Install the corresponding custody/launch readers after a full native drain before admitting this new receipt shape.
+
+Ordinary scope and browser amendments keep scheduling capacity separate from frozen execution authority. For example, a run admitted with `policy.capacity: 6` retains that value and its original configuration snapshot after the canonical live service owner lowers the operational limit to `2`. A private amendment must contain that exact live value `2`; it cannot restore `6`, choose another value, or appoint its own file as the operational owner. The runtime derives the owner path/configuration from the original submitted run, requires the same transport and otherwise unchanged original owner authority, and records hashes of the current owner bytes in the immutable amendment. It rechecks that acknowledgement around preparation and during custody/worker readback. Missing, replaced, incompatible or changed owner evidence refuses the continuation. Native role scheduling resolves that original owner independently of the private execution path, while effective policy capacity remains `6`. This compatibility rule changes no global configuration and adds no model, repair, gate or delivery allowance.
+
+A separate ordinary `stopped_delivery_resume` may declare `temporal_test_prerequisites` with exactly `check_id`, `python_project`, `provenance_path` and `provenance_sha256`. It may compose with either the explicitly acknowledged file-scope amendment or the exact browser-mode amendment in the same public continuation, sharing one immutable command and the same original finite allowance. File-scope and browser-mode amendments remain mutually exclusive; each individual authentication and delta guard still applies. It adds no eligibility, repair iterations or gate retries: the original closed execution, own released claim, candidate, session, external effects and unused finite allowance must satisfy the normal public preflight. The declared check must remain an exact frozen native test command, including its Node wrapper, cwd, selection, timeout, JUnit and minimum count. The explicit Python project is `workers/automation`; its tracked `pyproject.toml` and `uv.lock` must match the admitted Git base and the provenance's SDK1.26.0 metadata. The runtime never interprets JavaScript to discover authority.
+
+The mode-600 provenance JSON must be an exact declared hash under the owned service state root. The supported initial tools are the official Temporal sdk-java1.32.0 macOS-arm64 test-server archive and CLI1.9.1 macOS-arm64 archive, with pinned publisher archive digests, exact safe members and executable hashes. Preparation validates those facts and every declared retained evidence file, records a distinct immutable admission/preparation lineage and rechecks it during worker/resource custody and before launch. It streams the two executables into a fresh owned check scratch generation and supplies only `JOBCTRL_TEMPORAL_TEST_SERVER_PATH` and `JOBCTRL_TEMPORAL_CLI_PATH`; caller environment variables and undocumented host caches cannot supply this declaration's paths. The existing resource owner seals each preparation under its admitted evidence/check key, registered Git subject and full candidate matching the current projected run candidate and check iteration, current own claim generation and canonical issue/repository binding, environment recipe and scratch generation. The immutable generated receipt also binds those complete owner inputs. It remains inert until that independent owner seal is recorded; an acknowledgement-loss replay cannot adopt a changed claim or resource generation. Launch rederives the subject and scratch from those owners, and refuses a rewritten receipt, replaced scratch generation, foreign working directory, candidate drift or replay into another check. Exact tool, scratch, metadata, frozen command, environment and native launch bindings remain mandatory. Original failed receipts remain failed. Bounded SDK setup probes and collected tests cannot pass a full worker gate; fresh retained JUnit and every unchanged count/rejection/review/QA/CI rule still apply. This affects only future eligible native launches after a closed continuation, and changes no global executable, PATH, cache, service environment, capacity, source scope, model or deadline.
+
+
+
+### Permanent installation location recovery
+
+An executable service belongs outside managed chat checkouts. Prepare an independent clean Git clone at `~/.local/share/devflow/developer-workflow`, with its own frozen environment, retained Git objects and the same original base Python, dependency lock, SDK and bundled CLI bytes. Its imports, entry points and dependency registrations must resolve to that permanent installation; the resolved original base interpreter remains pinned. Chat worktree cleanup can remain enabled.
+
+The standalone public commands `runtime-location-preflight`, `adopt-runtime-location` and `rollback-runtime-location` run from that installed environment with the **original owner config file path**. They route before ordinary Store bootstrap, so the original executable and helper target may already be absent. `stop` also remains available without loading a missing helper. Stop and drain the original delivery actors and publicly uninstall its own delivery launchd agent before adoption. ProjectSync retains its separate process, registration and shared database.
+
+The private request names `command_id`, `owner_before_sha256`, `owner_after_path`, `owner_after_sha256`, `destination` (exact imported `root`, `revision`, `tree`, `payload_sha256`), the complete named `runs` cohort, `host_home`, the canonical public plugin `host_cli` and `host_cli_sha256`, `baseline_revision`, and the explicit answer `Migrate this stopped installation; preserve every original run and execution allowance`. The proposed private owner JSON must live under the original state root's `operator-inputs/` and differ only in `codex_bin`, pointing to the actual permanent environment's bundled CLI. The original live capacity stays2; frozen historical capacity and every other source/model/gate/transport/budget field stay exact. `baseline_revision` authenticates the unchanged shared `state.py` and schema against the retained original source. Existing sealed COMPLETED histories, native journals, current source, claims, effects and every original run authority are observed before any pointer change.
+
+```sh
+~/.local/share/devflow/developer-workflow/runtime/.venv/bin/devflow-delivery \
+  --config /absolute/original-owner.json runtime-location-preflight \
+  --request /absolute/service-state/operator-inputs/runtime-location.json
+# Add the returned expected_evidence_sha256 to the same private request.
+~/.local/share/devflow/developer-workflow/runtime/.venv/bin/devflow-delivery \
+  --config /absolute/original-owner.json adopt-runtime-location \
+  --request /absolute/service-state/operator-inputs/runtime-location.json
+```
+
+Preflight does not publish config snapshots or migrate the database. Apply retains the exact original owner bytes and one immutable common receipt. Exact forward/reverse wrapper, physical helper-link and owner-file generations are sealed before the pending cohort transaction. File-only staging grants no execution authority. Pending intent fences new execution-critical code; existing old ProjectSync code can still write unrelated tracker data. Native/claim/source authority is revalidated under the native/resource/installation leases and final SQLite transaction. The original primary plugin changes only through its public management CLI with unrelated-state and exact-package checks. An ambiguous public plugin effect is observed before any further step and is never blindly repeated.
+
+A previously installed package can legitimately retain an older canonical skill.
+The migration does not upgrade that text. An explicit optional `plugin_origin`
+witness uses schema `devflow.original-plugin-package/v1`, the full40-hex
+`source_revision`, exact currently registered `marketplace`, `catalog_sha256`, and
+`files_sha256` for all three Codex package members. The named source must be an
+ancestor of the request's authorized `baseline_revision`, which must itself be an
+ancestor of the current installation. Git data reads ignore replacement objects
+and refuse graft interpretation; no old code runs. This bounded version requires
+the same packaging/layout owner and manifest, with the exact historical skill
+blob. Source provenance supplements protected complete catalog/package/cache
+custody and exact public enabled/installed identity, version, source and original
+stdio/configuration; it cannot bless an arbitrary skill edit or extra member.
+Cache inventories include directories, so an unregistered empty directory also
+refuses. The destination copies all authenticated original bytes and changes only
+the MCP executable command to the derived permanent entry. Original bytes,
+inventories, generations and witness are retained in the common receipt and
+rechecked through public effects, replay and rollback. Current packaging templates
+remain unchanged. Before each public plugin effect, the complete intended target
+package and catalog must exist with the sealed bytes and exact member set; current
+new registrations also revalidate that source independently of the cache. Pending
+rollback needs only its original target when no forward package was published.
+A fresh migration input may consume an already acknowledged
+historical capture; it never rewrites that capture's archived input or recaptures
+the same execution to adopt a different program source.
+
+The common receipt identifies shared physical program, interpreter, dependency,
+source and filesystem objects explicitly. Each run separately retains its full
+measured native identity, including its original browser read roots, toolchain
+roots and package-manager cache authority. A cohort may contain different frozen
+read scopes; the installer neither merges them nor copies one run's grants to
+another. Capture, migration acknowledgement/replay and late preparation,
+execution and lifecycle readers revalidate the shared objects and each applicable
+run binding. Native launch identity and complete policy/configuration checks
+remain strict. Previously acknowledged full-identity receipts retain their
+original strict comparison behavior.
+
+Legacy delivery MCP adapters may still hold the original lifecycle implementation. Apply holds the original `service.lock` inode exclusively, commits the entire pending cohort, then durably creates one exact second name of that same inode. Fresh legacy lifecycle calls refuse its two links before changing the stopped marker. The installer then requires an authoritative inode-wide open-descriptor inventory with no foreign descriptor, including descriptors opened by its own process. Any warning, incomplete visibility or foreign descriptor refuses before program/config/registration effects. A refusal or crash before that zero-descriptor observation leaves an **unfinished migration** with unchanged relocation preimages and the guard retained; it does not prove the old service stays stopped, because a previously validated legacy descriptor can still proceed when the exclusive lock is released. Retry reacquires the original lock and revalidates the complete stopped/drained/source/cohort authority. After adoption, current lifecycle commands recognize only the acknowledged original inode and its exact two owned names; the guard stays across starts and rollback. Retiring it requires separate proof that old lifecycle authority can no longer act. A queued host plugin reload acknowledgement alone does not establish MCP readiness.
+
+All named final commands and audit events commit atomically. Adoption changes **no `delivery_runs` column**, including revision, protocol, candidate, result, workflow and `updated_at`; it cannot make a stale running projection look closed or confirm unknown cleanup. For an authentic completed tracker-projection failure, the required order is adoption, normal closed-projection maintenance, public `reconcile-attempt --role cleanup`, then the existing finite continuation preflight. Old failed gates, provider uncertainty and sessions remain historical. Scope or browser amendments can compose with the existing Temporal test prerequisites in that same finite continuation. Strict native measurement and bundled-SDK equality remain required; a retained old proof is readable provenance, never launch permission. Future fresh native admissions use the permanent owner and their own new proof. Later clean committed source upgrades retain the existing native payload-update contract at the acknowledged physical installation.
+
+Replaying the same apply recovers a lost acknowledgement without changing its cohort or object generations. Rollback uses the same private request and is bounded to before any subsequent native admission/attempt; it restores only the exact retained owned registrations and owner bytes, preserves historical acknowledgement and reports the absent legacy runtime honestly. A missing/changed original plugin package, foreign registration, source/config/claim/candidate drift, or unknown public effect refuses rather than replacing that evidence. Restage the delivery launchd agent afterwards through [the existing service installer](../scripts/delivery-service.py) using the permanent `--runtime` and `--devflow-delivery`; service start remains a separate public lifecycle action.
 
 The optional [Desktop entry point](../runtime/desktop/README.md) installs a narrow local skill and MCP command for submitting and opening these same runs. Its guarded installer requires the explicit runtime, private config and Codex-home paths and preserves unrelated entries. New valid requests prepare automatically through the service.
 
@@ -268,7 +556,7 @@ A reconciled expired deadline remains admissible by `terminal_tracker_recovery`:
 the closed tail is the failed last projection bound by the completed result's
 record, and the successor starts without that record.
 
-Run lists return up to 50 observations by default (maximum 100). `/api/runs`, CLI `runs` and MCP `list_runs` accept `limit`, `cursor` and `archived`; CLI uses `--limit`, `--cursor` and `--archived`. Follow a returned `next_cursor` explicitly to read older history, keeping the same archive filter. Ordering uses last-update time and run ID. These are live observations, so concurrent updates can move rows between pages; cursors do not freeze history. The dashboard polls only the recent page every five seconds. **Load older tasks** retrieves one older page on demand and retains its rows without polling that page; toggling the archive collection resets older observations. Direct run URLs remain available, and statistics still include complete stored history.
+Run lists return up to 50 observations by default (maximum 100). `/api/runs`, CLI `runs` and MCP `list_runs` accept `limit`, `cursor` and `archived`; CLI uses `--limit`, `--cursor` and `--archived`. Follow a returned `next_cursor` explicitly to read older history, keeping the same archive filter. Ordering uses last-update time and run ID. These are live observations, so concurrent updates can move rows between pages; cursors do not freeze history. Each page shares its read connection across compact rows and historical prepared-spec lookups, then rechecks the complete current installation, owner, cohort and guard before returning. No authority object is cached between operations, and page assembly holds no write transaction. The dashboard polls only the recent page every five seconds. **Load older tasks** retrieves one older page on demand and retains its rows without polling that page; toggling the archive collection resets older observations. Direct run URLs remain available, and statistics still include complete stored history.
 
 ### Retired published-metadata admissions
 
@@ -306,3 +594,181 @@ and the exact tested whole tree before closing the issue. A divergent base requi
 fresh integration evidence. Concurrent administrative changes to branch rules are
 outside that server-enforcement guarantee. Unknown merge effects retain the claim;
 read-only terminal reconciliation never schedules another merge.
+
+### Ordinary published prerequisite recovery
+
+The existing `published_gate_retry` zero-iteration request can admit one ordinary
+published candidate whose planned locked Python prerequisite genuinely launched
+and failed before any current independent or browser assessment. This requires
+the original completed passing implementation and its raw final assessment,
+session, separate input/output candidates, exact published source, closed
+execution, complete published cleanup and released claim. The observer derives
+the dependency command and project/lock/test-selection hashes from the frozen
+plan and checks the exact native launch, journal, environment, runtime, log and
+finished nonzero result. A name, failure summary, null session, missing test
+report or cleanup flag grants no exception. Unknown monitoring, a test assertion,
+browser failure or failed implementation remains outside this cause.
+
+Admission preserves that launched failure and creates one fresh gate namespace.
+It grants no implementation turn, changes no recipe or allowance, and cannot
+repeat under another command ID. Worker readback reauthenticates the historical
+receipts and current physical resource/source/claim authority. The same native
+prerequisite must then complete and every normal required gate must run with its
+original selection, deadline, JUnit and minimum counts. No diagnostic receipt is
+an acceptance result, and no new browser, cache, environment or tool permission
+is added by this recovery.
+
+### Evidence-only frozen worker diagnostic
+
+A stopped ordinary trusted-local delivery can expose a failed native worker
+recipe after a genuinely completed blocked implementation. The public
+`native-diagnostic-preflight` and `ack-native-diagnostic` commands preserve that
+blocked assessment and every normal gate. They authorize one separate diagnostic
+of the exact recorded `worker-regressions` recipe; they do not authorize a model
+turn, change a repair ceiling, reopen a delivery or establish normal acceptance.
+The first supported recipe retains its Node wrapper, cwd, 2700-second deadline,
+xdist settings, selection, required JUnit and 1000-passing-test minimum.
+
+Both commands require `--id` and a private JSON `--request`. The preflight body
+contains `command_id`, `expected_revision`, `expected_projection_revision`,
+`expected_iteration`, `expected_candidate_id`, `expected_candidate_head`,
+`expected_content_sha256`, `expected_pr_number`, `expected_pr_head`, `check_id`
+and `expected_check_sha256`. The acknowledgement adds the returned
+`preflight_key` and the literal
+`"acknowledgement": "diagnostic_only_no_delivery_acceptance"`. The service
+rechecks the exact closed execution, completed terminal assessment, original
+session/input/output, current source and publication, released claim, original
+failed native log/journal, full resource cleanup and live operational owner.
+A caller cannot provide a replacement command, cwd, environment, spec or result.
+These commands connect only to an existing service; they do not start one.
+
+The existing acknowledged `temporal_test_preparation` remains authoritative when
+present. Otherwise the diagnostic acknowledgement may include the already
+supported `temporal_test_prerequisites` declaration with `check_id`,
+`python_project`, `provenance_path` and `provenance_sha256`. This first purpose
+accepts only the existing official prerequisite receipt
+`70e40d7284f61cfc4f3054ed9005028ec08394a6abb3ad30e10e2c59e991c0e1`.
+The normal preparation owner authenticates its project/lock, SDK, archives,
+executables and evidence. Its derived marker belongs to this diagnostic only;
+the original admitted spec and policy are unchanged. No browser acquisition,
+browser root, arbitrary environment or different tool authority is granted.
+
+The durable diagnostic acknowledgement fences writes to that stopped execution
+and claim, without changing any `delivery_runs` column or normal event history.
+The API dispatches it through the existing cross-worker native check slots. Its
+server-derived resource namespace contains an independent copy of the exact
+candidate and an independent finalization generation. NativeProcess receives
+the original admitted spec. Configured dependency preparation and native check
+environment assembly use the existing owners, including the controller's
+existing Playwright browser binding. Four fixed browser/Temporal readiness
+controls run through that environment before the full unchanged recipe. Their
+JUnit is separate readiness evidence and cannot satisfy the full gate.
+
+Read status with `native-diagnostic --id RUN --diagnostic-command-id COMMAND`.
+The immutable diagnostic intent, readiness and result receipts are also indexed
+as diagnostic-only evidence. A completed diagnostic, including a passing one,
+never becomes an implementation/review/verification/browser/CI verdict. Any
+later original-within-ceiling assessment requires its own ordinary admissible
+continuation and all normal acceptance gates.
+
+A lost monitor is never retried by this purpose. A new command ID or a different
+copy of the same tool declaration cannot mint a second invocation for the same
+closed subject and recipe. Replay the original acknowledgement to observe the
+one operation. After controller loss, replay can acknowledge an already saved
+receipt or finalize only its own fully finished, freshly observed actor-free
+resources. Missing or incomplete journals, live actors/ports, source or claim
+drift and unconfirmed finalization remain unknown and fenced. Replay neither
+launches a replacement nor kills an uncertain actor. An unacknowledged result
+cannot claim a passing diagnostic verdict.
+
+The acknowledgement also binds the clean current framework program and the
+existing controller browser-cache binding. The framework Python/SDK and its
+actual `-I` monitor stay on the installed framework lock; the declared SDK1.26
+belongs only to the separately locked worker project. Subject, native-launch
+plan and result files require their exact durable diagnostic phase hashes;
+a file-only publication grants no new invocation or source generation.
+`/api/service` reports `native_diagnostics.counts` separately from role capacity,
+so zero active roles does not imply that a diagnostic is finished. An idle
+service does not repeatedly read diagnostic authority: an acknowledgement wake
+hint or startup recovery causes a fresh durable read, and every actual body
+rechecks all authority. The hint contains no proof and grants no execution.
+
+Native runtime measurement keeps its existing finite probe resources separate
+from the canonical delivery registry. Each new probe records its exact parent
+spec digest, private preparation intent and bounded attempt index. Resource
+writes rederive that parent through the admitted configuration and original
+run/database identity before querying the same diagnostic fence. Known retained
+probe attempts can be finalized through that authenticated owning context
+without rewriting their old specs. Unknown namespaces or self-declared flags
+grant nothing. Measurement and finalization also hold the original registry's
+existing exclusive lease in read-only mode; the diagnostic ACK's shared lease
+therefore cannot overlap a separate preparation registry. Both owner checks
+and FD/name authentication run after acquisition. The original configuration
+loader, run rows, claims and canonical resource bytes remain unchanged.
+
+### Acknowledged ordinary CI execution inventory
+
+GitHub can omit genuine `workflow_dispatch` jobs from a PR's canonical status
+rollup. A successful Actions run alone does not establish PR/ruleset or merge
+eligibility. The ordinary published-unmerged endpoint supports one separately
+reviewed, compiled-hash provenance profile for its exact original subject,
+five existing attempt-1 runs and eleven frozen required names. Other subjects,
+profiles, event formats or run selections refuse. It neither dispatches nor
+reruns workflows and never changes the original policy or failed CI history.
+
+Use `ci-inventory-preflight --id RUN --request FILE`, then explicitly acknowledge
+its returned `preflight_key` with `ack-ci-inventory`. The HTTP equivalents are
+`POST /api/runs/{id}/ci-inventory-preflight` and same-origin/CSRF-protected
+`POST /api/runs/{id}/ack-ci-inventory`. The request contains `command_id`,
+`expected_revision`, `expected_projection_revision`, `expected_iteration`,
+`expected_candidate_id`, `expected_candidate_head`, `expected_content_sha256`,
+`expected_pr_number`, `profile_path` and `expected_profile_sha256`. The private
+profile is canonical JSON, mode 0600, single-link and bounded to 128 KiB; its
+hash must equal the compiled reviewed fingerprint. ACK adds `preflight_key`
+and the literal acknowledgement
+`ordinary_execution_only_no_PR_ruleset_or_merge_eligibility`. No public input,
+configuration, header or environment variable can override formats, matrix,
+source pins, reports, minima, actor, selection or the profile fingerprint.
+
+Preflight and ACK independently read the complete bounded current public
+account/repository/PR/head, canonical rollup, selected run/suite/check/job
+inventories and exact frozen source/action/main/post/dependency/selector graph.
+They join actual checkout and source-framed commands, inputs, interpreters,
+terminal reports and required uploaded artifact bytes. Required-job skips,
+zero/partial/unknown reports, missing pages, duplicates, later attempts,
+changed source/log bytes and current local authority drift refuse. Cases that
+the original source permitted to skip or retry stay explicitly recorded as
+skipped or flaky; build exits remain distinct from positive test reports.
+Unuploaded runner-local reports are not invented.
+
+Raw ANSI-bearing GitHub responses use the supported `gh api
+--allow-escape-sequences` output option only inside bounded private capture.
+Raw bytes are hashed before literal runner/report framing is parsed, and never
+rendered to a terminal or evidence UI. The profile records complete retained
+connector UTF-8 text with historical wire SHA unknown; a new successful exact
+raw read is separately required, never inferred from an old connector result.
+Transport failure or different bytes refuse without stripping or normalization
+to make a match pass.
+
+ACK appends only its own metadata/command/audit records. Every delivery-run
+column, claim, ordinary event, source, role verdict/session, allowance, gate and
+finalization remains unchanged. File-only profiles/receipts are inert. A new
+command ID cannot mint another inventory. ACK replay freshly rechecks the same
+selected IDs/bytes and current native/candidate/claim authority; it does not
+return a stale success after drift. Once a normal execution ends or its retained
+physical source is gone, use the separate data-only acknowledgement read, not an
+ACK replay to obtain execution authority. Read the acknowledgement with
+`ci-inventory --id RUN` or `GET /api/runs/{id}/ci-inventory`; historical hydration
+checks immutable bytes and commands without requiring an ended checkout or a
+new GitHub read.
+
+The existing separately admitted `published_ci_retry` with zero additional
+iterations is the only normal execution consumer. Its admission seals the exact
+ACK and original checkpoint; worker and CI readback recheck current native
+source/resources, owner, full original ledger and exact claim generation before
+and after remote observation. The existing workflow alone records CI, tracker,
+finalization and any delivered outcome. All independent local/browser/review/
+verification gates remain required. The result always states
+`PR_ruleset_eligibility: false` and `merge_context_verified: false`. Merge
+readback keeps its independent pull-request event, current-base, hosted-tree,
+ruleset and all other stronger predicates; this receipt never satisfies them.

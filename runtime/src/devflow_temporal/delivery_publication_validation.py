@@ -10,11 +10,11 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_filesystem_custody import matches
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, work_binding
 from .delivery_resources import (
     RunResources,
-    _identity,
     private_directory,
     read_private,
     write_private,
@@ -181,7 +181,7 @@ def preserve_validation_resources(root, seal):
     if (saved["checkpoint_digest"] != digest(seal) or saved["path"] != spec["checkout"]
             or saved["head"] != seal["candidate"]["head"]
             or old["roots"][spec["checkout"]] != saved["predecessor"]
-            or entry.get("identity") != _identity(Path(spec["checkout"]))
+            or not matches(spec, Path(spec["checkout"]), entry.get("identity"))
             or entry.get("generation") != saved["predecessor"].get("generation", 0) + 1
             or resources.root.joinpath("finalization.json").read_bytes()
             != root.joinpath("predecessor-resources/finalization.json").read_bytes()):

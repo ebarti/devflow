@@ -78,3 +78,17 @@ and the exact tested whole tree before closing the issue. A divergent base requi
 fresh integration evidence. Concurrent administrative changes to branch rules are
 outside that server-enforcement guarantee. Unknown merge effects retain the claim;
 read-only terminal reconciliation never schedules another merge.
+
+
+For explicitly authorized reboot recovery when the existing native cleanup reports
+changed recorded device identities, use the public local CLI with the explicit
+runtime/config paths: `filesystem-custody-preflight --id RUN`, then
+`adopt-filesystem-custody --id RUN --request FILE`. Bind the returned local
+`expected_revision` and `expected_evidence_sha256`, a fresh stable `command_id`,
+and `answer: "adopt_current_filesystem"`. This is current-object adoption, not
+proof of historical volume continuity. It preserves original bytes and grants no
+role replay, provider pass, external-effect retry or repair budget. Open workflows
+require quarantined unknown attempts; adoption does not cancel them. Reconcile
+the exact original attempt through `reconcile-attempt --job-key KEY`, then read
+its resulting run before any existing admissible continuation. Never edit the
+legacy records or substitute a global device-number exception.

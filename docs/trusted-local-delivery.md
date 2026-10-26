@@ -540,3 +540,17 @@ provider launch. The source, configuration, attempt inventory and effects are
 read again after runtime preparation and before launch. An unpublished feature
 branch must still be absent remotely. Resumed work runs the ordinary publication,
 independent review, verification, configured checks and exact-head CI gates.
+
+
+## Explicit filesystem custody after reboot
+
+The [runtime recovery reference](temporal-runtime.md) documents the public local
+`filesystem-custody-preflight` and `adopt-filesystem-custody` commands. Use them
+only under explicit operator recovery authority for the named ordinary run.
+Preflight is an observation; the mutation revalidates its exact hash and local
+projection revision under the owning leases. The immutable receipt adopts the
+inventoried current objects and preserves original evidence. It does not claim
+that a current volume UUID proves legacy volume continuity, waive inode/owner or
+registration checks, expand source authority, settle an unknown effect, manufacture
+a provider verdict, reset a budget, or cancel a running workflow. File-only staged
+receipts remain inert until the original command/event acknowledgement commits.

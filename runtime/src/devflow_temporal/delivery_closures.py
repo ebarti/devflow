@@ -195,7 +195,7 @@ def _private_root(store) -> Path:
 def _read_sealed(root: Path, sha256: str) -> bytes:
     path = root / f"{sha256}.json.xz"
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise ValueError("sealed closure history is a symlink") from exc
@@ -268,13 +268,13 @@ def sealed_record(
     return dict(rows[0]) if rows else None
 
 
-def seal(
+def prepare_seal(
     store, history: WorkflowHistory, facts: dict[str, Any], *, run_id: str, source: str,
     source_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Record one closed history once; a different history for it is refused."""
-    if source not in {"temporal", "archive"}:
-        raise ValueError("sealed closure source must be temporal or archive")
+    """Publish immutable history bytes; indexing is a separately owned transaction."""
+    if source not in {"temporal", "archive", "temporal_snapshot"}:
+        raise ValueError("unsupported sealed closure source")
     data = history_json(history)
     sha256 = _write_sealed(_private_root(store), data)
     record = {
@@ -291,46 +291,65 @@ def seal(
         "source_sha256": source_sha256,
         "sealed_at": _now().isoformat(),
     }
-    with store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        existing = db.execute(
-            "SELECT * FROM delivery_closures WHERE workflow_id=? AND execution_run_id=?",
-            (record["workflow_id"], record["execution_run_id"]),
-        ).fetchone()
-        if existing is not None:
-            existing = dict(existing)
-            # Repeated observation of one execution must preserve its exact bytes.
-            if (existing["execution_run_id"] != record["execution_run_id"]
-                    or existing["history_sha256"] != sha256 or existing["run_id"] != run_id):
-                raise SealConflict(
-                    f"a different history is already sealed for workflow {record['workflow_id']}"
-                )
-            return existing
-        predecessors = db.execute("SELECT * FROM delivery_closures WHERE workflow_id=?",
-                                  (record["workflow_id"],)).fetchall()
-        if predecessors:
-            # Only our authenticated recovery receipt permits another execution
-            # under the same workflow ID. Retain every predecessor unchanged.
-            receipts = [json.loads(row[0]) for row in db.execute(
-                "SELECT payload_json FROM delivery_events WHERE run_id=? AND "
-                "type='interrupted_execution_recovered'", (run_id,))]
-            if not any(receipt.get('workflow_id') == record['workflow_id']
-                       and receipt.get('recovered_run_id') == record['execution_run_id']
-                       and any(old['execution_run_id'] == receipt.get('execution_run_id')
-                               and old['history_sha256'] == receipt.get('history_sha256')
-                               and old['run_id'] == run_id for old in predecessors)
-                       for receipt in receipts):
-                raise SealConflict('a different history has no authenticated recovery receipt')
-        db.execute(
-            f"INSERT INTO delivery_closures ({','.join(record)}) "
-            f"VALUES ({','.join('?' for _ in record)})",
-            tuple(record.values()),
-        )
+    return record
+
+
+def insert_seal(db, record, *, clear_observation=True):
+    """Insert within the caller's transaction, retaining exact conflict custody."""
+    run_id, sha256 = record["run_id"], record["history_sha256"]
+    existing = db.execute(
+        "SELECT * FROM delivery_closures WHERE workflow_id=? AND execution_run_id=?",
+        (record["workflow_id"], record["execution_run_id"]),
+    ).fetchone()
+    if existing is not None:
+        existing = dict(existing)
+        # Repeated observation of one execution must preserve its exact bytes.
+        if (existing["execution_run_id"] != record["execution_run_id"]
+                or existing["history_sha256"] != sha256 or existing["run_id"] != run_id):
+            raise SealConflict(
+                f"a different history is already sealed for workflow {record['workflow_id']}"
+            )
+        return existing
+    predecessors = db.execute("SELECT * FROM delivery_closures WHERE workflow_id=?",
+                              (record["workflow_id"],)).fetchall()
+    if predecessors:
+        # Only our authenticated recovery receipt permits another execution
+        # under the same workflow ID. Retain every predecessor unchanged.
+        receipts = [json.loads(row[0]) for row in db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? AND "
+            "type='interrupted_execution_recovered'", (run_id,))]
+        if not any(receipt.get('workflow_id') == record['workflow_id']
+                   and receipt.get('recovered_run_id') == record['execution_run_id']
+                   and any(old['execution_run_id'] == receipt.get('execution_run_id')
+                           and old['history_sha256'] == receipt.get('history_sha256')
+                           and old['run_id'] == run_id for old in predecessors)
+                   for receipt in receipts):
+            raise SealConflict('a different history has no authenticated recovery receipt')
+    db.execute(
+        f"INSERT INTO delivery_closures ({','.join(record)}) "
+        f"VALUES ({','.join('?' for _ in record)})",
+        tuple(record.values()),
+    )
+    if clear_observation:
         db.execute(
             "DELETE FROM delivery_closure_observations WHERE workflow_id=?",
             (record["workflow_id"],),
         )
     return record
+
+
+def seal(
+    store, history: WorkflowHistory, facts: dict[str, Any], *, run_id: str, source: str,
+    source_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Record one closed history once; a different history for it is refused."""
+    if source == "temporal_snapshot":
+        raise ValueError("snapshot closure requires its public capture acknowledgement")
+    record = prepare_seal(store, history, facts, run_id=run_id, source=source,
+                          source_sha256=source_sha256)
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        return insert_seal(db, record)
 
 
 async def sealed_closure(store, workflow_id: str, *,
@@ -339,6 +358,10 @@ async def sealed_closure(store, workflow_id: str, *,
     record = sealed_record(store, workflow_id, execution_run_id=execution_run_id)
     if record is None:
         return None
+    if record["source"] == "temporal_snapshot":
+        from .delivery_retained_closures import verify_record
+
+        verify_record(store, record)
     data = _read_sealed(_private_root(store), record["history_sha256"])
     history = WorkflowHistory.from_json(workflow_id, data.decode("utf-8"))
     facts = await closure_facts(history)

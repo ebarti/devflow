@@ -10,8 +10,9 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_baseline_contract import preparation_failure, repairable_baseline
 from .delivery_broker import DeliveryBroker, _git
-from .delivery_budget_contract import fixed_budget_allows
-from .delivery_config import scope_amended_spec, scope_amendment_config
+from .delivery_browser_mode_recovery import FIELDS as BROWSER_FIELDS
+from .delivery_budget_contract import continuation_maximum, fixed_budget_allows
+from .delivery_config import ordinary_scope_base, scope_amended_spec, scope_amendment_config
 from .delivery_execution_config import load_execution_config
 from .delivery_gate_retry import prepare_runtime, transient_stop
 from .delivery_metadata_recovery import _immutable, preserve_resources
@@ -28,6 +29,7 @@ from .delivery_policy_recovery import (
 from .delivery_preparation import _lock
 from .delivery_repair import _ci_diagnostics, published_identity
 from .delivery_resources import private_directory, read_private
+from .delivery_temporal_prerequisites import FIELDS as TEMPORAL_FIELDS
 
 KIND = 'stopped_delivery_resume'
 FIELDS = {'continuation_kind', 'command_id', 'expected_revision', 'expected_iteration',
@@ -47,11 +49,15 @@ def scope_spec(store, seal, command, *, _feature_scope=None):
     else:
         latest = next((role for role in reversed(seal['state'].get('roles', []))
                        if role.get('role') == 'implement'), None)
-        if (not latest or latest.get('status') != 'findings'
+        if (not latest or latest.get('status') not in {'findings', 'blocked'}
                 or latest.get('finish_reason') != 'done' or not seal['session_id']
                 or not latest.get('findings')
                 or seal['state'].get('error') != 'implementer did not establish a pass'):
             raise ValueError('scope resume requires an authenticated implementation finding')
+        if latest['status'] == 'blocked':
+            from .delivery_session_custody import completed_blocked_finding
+
+            completed_blocked_finding(seal)
         path = command['amended_config_path']
         if not isinstance(path, str) or not isinstance(command['amended_config_sha256'], str):
             raise ValueError('scope amendment configuration must be absolute')
@@ -79,10 +85,14 @@ def scope_spec(store, seal, command, *, _feature_scope=None):
             parent = parent.parent
     # The delta is still a proposal. Keep source observation under the sealed
     # predecessor custody until admission grants the new execution namespace.
+    if not spec.get('feature_worker') and spec['provider'] == 'codex':
+        observed_preparation_cleanup(spec)
     amended = broker.candidate()
     if any(amended[key] != seal['candidate'][key] for key in (
             'id', 'head', 'content_sha256', 'base_sha', 'environment_digest')):
         raise ValueError('scope amendment changed stopped implementation bytes')
+    if not spec.get('feature_worker') and spec['provider'] == 'codex':
+        ordinary_scope_base(load_execution_config(effective), spec)
     return effective
 
 
@@ -216,6 +226,45 @@ def sealed_ci_findings(seal):
     return _ci_diagnostics(ci, seal['predecessor_spec'], state.get('pull_request'))
 
 
+def _unstarted_preflight(seal, previous, db):
+    """The admitted quarantined continuation closed before entering its new turn."""
+    inherited = previous.get('pending_repair') or {}
+    if not (previous.get('quarantined_implementation')
+            or inherited.get('kind') == 'unstarted_preflight'):
+        return None
+    spec, state, before = seal['predecessor_spec'], seal['state'], previous['state']
+    failure = state.get('checks', {}).get('failure') or {}
+    if (spec.get('provider') != 'codex' or spec.get('feature_worker')
+            or spec.get('retry_budget_version') != 1
+            or state.get('phase') != state.get('outcome') or state.get('phase') != 'blocked'
+            or state.get('execution_state') != 'blocked'
+            or state.get('cleanup') not in {'unknown', 'confirmed'}
+            or state.get('error') != 'repair authority preflight failed: ActivityError'
+            or failure != {'classification': 'terminal', 'stage': 'repair_preflight',
+                           'reason': state['error']}):
+        return None
+    ignored = {'failure', 'controller_failure', 'resource_cleanup', 'terminal_tracker_checkpoint'}
+    if (custody(db, seal['original_recovery']) != spec
+            or previous['execution_spec'] != spec or state['iteration'] != before['iteration']
+            or state.get('roles') != before.get('roles')
+            or state.get('usage') != before.get('usage')
+            or seal['attempts'] != previous['attempts'] or seal['effects'] != previous['effects']
+            or seal.get('session_id') is not None or previous.get('session_id') is not None
+            or seal['candidate'] != state.get('candidate')
+            or seal['candidate'] != previous['execution_candidate']
+            or state.get('pull_request') is not None
+            or any(a['iteration'] > state['iteration'] for a in seal['attempts'])
+            or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed'
+                   for a in seal['attempts'])
+            or any(e['state'] != 'complete' or e['observed_json'] is None for e in seal['effects'])
+            or {k: v for k, v in state.get('checks', {}).items() if k not in ignored}
+            != {k: v for k, v in before.get('checks', {}).items() if k not in ignored}):
+        raise ValueError('unstarted preflight lost its exact admission or unchanged inventory')
+    return {'kind': 'unstarted_preflight', 'iteration': state['iteration'] + 1,
+            'findings': [], 'maximum_iteration': previous['maximum_iteration'],
+            'predecessor_admission_sha256': digest(seal['original_recovery'])}
+
+
 def pending_repair(seal, *, db=None):
     """Recover unexecuted work from the sealed admission that requested it."""
     from .delivery_feature_revision_recovery import retained_recovery
@@ -224,11 +273,18 @@ def pending_repair(seal, *, db=None):
     if (previous.get('kind') != KIND
             or seal['predecessor_spec'].get('feature_worker', {}).get('kind') == 'build'):
         return None
+    if db is not None:
+        preflight = _unstarted_preflight(seal, previous, db)
+        if preflight is not None:
+            return preflight
+    unstarted = None
     if not seal.get('session_custody', {}).get('missing_rollout'):
-        if db is None or not _unstarted_repair(seal, previous, db):
+        unstarted = _unstarted_repair(seal, previous, db) if db is not None else None
+        if not unstarted:
             return None
         if previous.get('pending_repair'):
-            return previous['pending_repair']
+            return {**previous['pending_repair'], **(
+                {'implementation_preparation': unstarted} if isinstance(unstarted, dict) else {})}
     state = previous['state']
     if previous.get('resume_iteration', state['iteration'] + 1) == state['iteration']:
         # The predecessor re-ran its own sealed iteration; it requested no repair.
@@ -242,7 +298,8 @@ def pending_repair(seal, *, db=None):
         if role.get('iteration') == state['iteration']
         for finding in role.get('findings', [])]]
     return {'iteration': iteration,
-            'findings': [finding for finding in findings if finding is not None]}
+            'findings': [finding for finding in findings if finding is not None],
+            **({'implementation_preparation': unstarted} if isinstance(unstarted, dict) else {})}
 
 
 def _unstarted_repair(seal, previous, db, *, closing=False):
@@ -287,6 +344,21 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
                           for item in preparation['results'])
                   and preparation['results'][-1].get('launched') is False
                   and preparation['results'][-1].get('failure_kind') == 'preparation')
+    native_preparation = None
+    if (not closing and not unlaunched and len(remainder) == 1
+            and remainder[0].get('role') == 'implement'
+            and remainder[0].get('iteration') == iteration
+            and remainder[0].get('status') == 'blocked'
+            and remainder[0].get('session_id') is None
+            and remainder[0].get('cleanup') == 'confirmed'
+            and remainder[0].get('candidate') == candidate
+            and preparation.get('state') == 'failed'
+            and preparation.get('cleanup') == 'confirmed'
+            and preparation.get('source_unchanged') is True):
+        from .delivery_preparation_recovery import completed_prerequisite
+
+        native_preparation = completed_prerequisite(seal, previous, remainder[0])
+        unlaunched = bool(native_preparation)
     rejected_input = (rejected_input and len(remainder) == len(current_attempts) == 1
                       and remainder[0].get('role') == current_attempts[0]['role'] == 'implement'
                       and remainder[0].get('iteration') == iteration
@@ -344,7 +416,7 @@ def _unstarted_repair(seal, previous, db, *, closing=False):
         # Ordinary deliveries have no shared feature debit. The immutable
         # admission plus unchanged inventory and absent provider turn above prove
         # that this exact fixed-budget iteration has not executed yet.
-        return True
+        return native_preparation or True
     shared = registry(spec)
     owner = origin['execution_spec']['repair_allowance']['owner']
     current_owner = spec['repair_allowance']['owner']
@@ -544,9 +616,12 @@ def interrupted_resume(seal):
         seal.get('cleanup_reconciliation'), seal.get('closed'), state))
     preparation = _interrupted_preparation(seal)
     assessments = _unlaunched_assessments(seal)
-    if ((not spec.get('feature_worker') and not assessments)
+    from .delivery_unpublished_recovery import interrupted_prepublication
+
+    prepublication = interrupted_prepublication(seal)
+    if ((not spec.get('feature_worker') and not assessments and not prepublication)
             or (state.get('phase') != 'cancelled' and not cleanup and not preparation
-                and not assessments)
+                and not assessments and not prepublication)
             or any(isinstance(check, dict) and check.get('state') == 'failed'
                    and name != preparation and not (assessments and name in {'review', 'qa'})
                    for name, check in state.get('checks', {}).items())):
@@ -615,11 +690,42 @@ def executed_specs(store, spec):
         recovery = details.get('original_recovery')
 
 
-def observed_native_cleanup(spec, *, read_only=False):
+def observed_native_cleanup(spec, *, read_only=False, quarantined=None, resource_spec=None):
     """Preflight and readback observe closure without controlling any process."""
     if spec['provider'] == 'fake':
         return digest({'provider': 'fake'})
+    if quarantined:
+        from .delivery_resources import _gate_roots, observe_finalized_resources
+
+        current = resource_spec or spec
+        bindings = {}
+        authority = _gate_roots(current, execution_specs=bindings)
+        if spec not in bindings.values():
+            raise ValueError('historical cleanup lost its admitted execution')
+        observed = observe_finalized_resources(current, quarantined=quarantined)
+        after = {}
+        if (_gate_roots(current, execution_specs=after) != authority or after != bindings):
+            raise ValueError('historical cleanup resource authority changed during observation')
+        return digest(observed)
     return digest(_stopped_cleanup(spec, read_only=True) if read_only else _stopped_cleanup(spec))
+
+
+def observed_preparation_cleanup(spec, *, resource_spec=None, quarantined=None):
+    """Current native reentry needs retained source identity, not only Git bytes."""
+    from .delivery_resources import _gate_roots, observe_finalized_resources
+
+    current = resource_spec or spec
+    bindings = {}
+    authority = _gate_roots(current, execution_specs=bindings)
+    if spec not in bindings.values():
+        raise ValueError('preparation cleanup lost its admitted predecessor')
+    observed = observe_finalized_resources(current, quarantined=quarantined)
+    if observed['roots'].get(current['checkout']) is None:
+        raise ValueError('unstarted implementation lacks its registered current source')
+    after = {}
+    if _gate_roots(current, execution_specs=after) != authority or after != bindings:
+        raise ValueError('preparation resource authority changed during observation')
+    return digest(observed)
 
 
 def namespace(recovery):
@@ -659,8 +765,9 @@ def custody(db, recovery, *, retained_memo=None):
             or json.loads(command[1]).get('admission_sha256') != digest(recovery)
             or canonical_json(read_private(path)) != canonical_json(recovery)
             or recovery['predecessor_result_digest'] != digest(details['state'])
-            or recovery['maximum_iteration'] != (recovery['state']['iteration']
-                                                 + recovery['command']['additional_iterations'])):
+            or recovery['maximum_iteration'] != continuation_maximum(
+                recovery['state']['iteration'], recovery['command']['additional_iterations'],
+                recovery.get('pending_repair'))):
         raise ValueError('stopped resume lost its immutable command authority')
     if (('pending_repair' in recovery
              and pending_repair(details, db=db) != recovery['pending_repair'])
@@ -670,6 +777,22 @@ def custody(db, recovery, *, retained_memo=None):
         raise ValueError('stopped resume changed its unstarted repair authority')
     if not admission_identity_consistent(details):
         raise ValueError('stopped resume changed its admission identity')
+    from .delivery_unpublished_recovery import quarantine_history
+
+    if details.get('historical_quarantines', []) != quarantine_history(
+            details.get('original_recovery')):
+        raise ValueError('stopped resume changed its historical teardown custody')
+    quarantined = details.get('quarantined_implementation')
+    if quarantined:
+        from .delivery_unpublished_recovery import quarantined_implementation
+
+        if (details['command']['additional_iterations'] <= 0
+                or details.get('session_id') is not None or interrupted
+                or quarantined_implementation(details['predecessor_spec'], details['state'],
+                    details['attempts'], details['candidate']) != quarantined
+                or spec.get('role_home_generation') != 'stopped-resume-' + details['command_digest']
+                or spec.get('implementation_role_home_generation') is not None):
+            raise ValueError('quarantined implementation lost its new finite turn authority')
     if interrupted:
         reconciliation = details.get('cleanup_reconciliation')
         if reconciliation is not None and not any(json.loads(item[0]) == reconciliation
@@ -691,6 +814,16 @@ def custody(db, recovery, *, retained_memo=None):
                     + int(details['command']['additional_iterations'] > 0))):
             raise ValueError('revision gate resume lost its exact passed implementation evidence')
     if SCOPE_FIELDS <= recovery['command'].keys():
+        latest = next((r for r in reversed(details['state'].get('roles', []))
+                       if r.get('role') == 'implement'), {})
+        if (not details['predecessor_spec'].get('feature_worker')
+                and latest.get('status') == 'blocked'):
+            from .delivery_session_custody import completed_blocked_finding
+
+            if details.get('blocked_scope_finding') != completed_blocked_finding(details):
+                raise ValueError('blocked scope finding lost its authenticated native receipt')
+        elif details.get('blocked_scope_finding') is not None:
+            raise ValueError('scope finding proof belongs to a different assessment')
         scope = recovery['command']
         if spec.get('feature_worker'):
             from .delivery_feature_scope import MARKER, receipt_config
@@ -714,6 +847,24 @@ def custody(db, recovery, *, retained_memo=None):
         if (spec['policy']['allowed_paths'] != allowed
                 or spec['config_digest'] != digest(amended.raw)):
             raise ValueError('stopped scope resume changed its sealed file authority')
+    from .delivery_browser_mode_recovery import custody as browser_custody
+
+    browser_custody(db, spec, recovery)
+    from .delivery_temporal_prerequisites import custody as temporal_custody
+
+    temporal_custody(db, spec, recovery)
+    if details.get('operational_capacity') is not None:
+        if spec['policy']['capacity'] != details['predecessor_spec']['policy']['capacity']:
+            raise ValueError('amended execution changed frozen policy capacity')
+        from .delivery_amendment_capacity import acknowledge
+
+        if acknowledge(details['predecessor_spec'], load_execution_config(spec), db=db) != (
+                details['operational_capacity']):
+            raise ValueError('amended operational owner acknowledgement changed')
+    elif ((SCOPE_FIELDS <= details['command'].keys() or BROWSER_FIELDS <= details['command'].keys())
+            and not spec.get('feature_worker')
+            and spec['policy']['capacity'] != load_execution_config(spec).raw.get('capacity', 2)):
+        raise ValueError('amended scheduling capacity lacks its independent owner receipt')
     return spec
 
 
@@ -844,12 +995,15 @@ def _implementation_receipt(spec, role, attempt):
 
 
 def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection=None,
-               recovery=None, pending=None):
+               recovery=None, pending=None, quarantined=None, historical_quarantines=()):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
+    retained_unknown = (latest is not None and pending
+        and pending.get('kind') == 'unstarted_preflight'
+        and digest(latest) in {p['closed_role_sha256'] for p in historical_quarantines})
     if latest and latest.get('status') != 'pass':
-        if (latest.get('cleanup') != 'confirmed'
+        if ((latest.get('cleanup') != 'confirmed' and not (quarantined or retained_unknown))
                 or (latest.get('candidate') != candidate
                     and not _historical_candidate(
                         broker, state, candidate, latest, recovery, pending))):
@@ -866,15 +1020,17 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
                                    and a['iteration'] == latest['iteration'] for a in attempts))
         # A closed Temporal activity authenticates controller-only preparation failures.
         # Every provider or supervisor prelaunch receipt must also match its durable attempt.
-        if len(matches) != 1 and not no_provider:
+        if len(matches) != 1 and not no_provider and not (quarantined or retained_unknown):
             raise ValueError('blocked implementation lacks its exact supervisor receipt')
         if latest.get('session_id') is None and not no_provider and (
                 latest.get('finish_reason') != 'prelaunch'
-                and not (missing_rollout or input_rejection)):
+                and not (missing_rollout or input_rejection or quarantined or retained_unknown)):
             raise ValueError('blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
         raise ValueError('stopped candidate changed after its sealed checkpoint')
-    if (any(r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown'
+    if (any((r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown')
+            and not (quarantined and r is latest)
+            and digest(r) not in {p['closed_role_sha256'] for p in historical_quarantines}
             for r in state.get('roles', []))
             or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)):
         raise ValueError('stopped role ownership is unknown')
@@ -991,7 +1147,13 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
         broker.validate_candidate_scope()
     from .delivery_feature_revision_recovery import retained_recovery
     from .delivery_session_custody import implementation_custody
+    from .delivery_unpublished_recovery import (
+        quarantine_history,
+        quarantined_implementation,
+        teardown_checkpoint,
+    )
 
+    history = quarantine_history(previous)
     session_custody = implementation_custody(spec, state, attempts, retained_recovery(previous))
     implementations = [role for role in state.get('roles', []) if role.get('role') == 'implement']
     sessions = {role['session_id'] for role in implementations if role.get('session_id')}
@@ -1001,10 +1163,17 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
                     **({'session_custody': session_custody} if session_custody else {})}
     with store._connect() as db:
         pending = pending_repair(pending_seal, db=db)
+    retained = pending and pending.get('kind') == 'unstarted_preflight'
+    quarantined = (None if retained else
+                   quarantined_implementation(spec, state, attempts, broker.candidate()))
+    teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
+    if quarantined and (previous or not reconciled
+            or reconciled.get('quarantined_implementation') != quarantined):
+        raise ValueError('interrupted implementation lacks its separate owned cleanup closure')
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
         input_rejection=(session_custody or {}).get('input_rejection'),
-        recovery=previous, pending=pending)
+        recovery=previous, pending=pending, quarantined=quarantined, historical_quarantines=history)
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
@@ -1022,10 +1191,15 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False):
     return {'predecessor_spec': spec, 'row': row, 'attempts': attempts, 'effects': effects,
             'closed': closed, 'state': state, 'candidate': candidate, 'session_id': session,
             'publication': publication, 'original_recovery': previous,
-            **({'cleanup_reconciliation': reconciled}
-               if cleanup_only_build(spec, state) and reconciled else {}),
-            'cleanup_digest': (observed_native_cleanup(spec, read_only=True) if review_subject
-                               else observed_native_cleanup(spec)), 'work_binding': binding,
+            **({'cleanup_reconciliation': reconciled} if reconciled else {}),
+            **({'quarantined_implementation': quarantined} if quarantined else {}),
+            **({'historical_quarantines': history} if history else {}),
+            'cleanup_digest': (observed_preparation_cleanup(spec, quarantined=teardown)
+                               if (pending or {}).get('implementation_preparation') else
+                               observed_native_cleanup(spec, read_only=True) if review_subject else
+                               observed_native_cleanup(spec, **(
+                                   {"quarantined": teardown} if teardown else {}))),
+            'work_binding': binding,
             **({'session_custody': session_custody} if session_custody else {})}
 
 
@@ -1041,7 +1215,9 @@ def _unpublished_remote(broker):
 def admit(store, run_id, command, *, preflight=False, _revision=None):
     original = store.submitted_spec(run_id)
     allowed = range(0, 102) if original.get('feature_worker') else (0, 1, 2)
-    if (not isinstance(command, dict) or set(command) not in (FIELDS, FIELDS | SCOPE_FIELDS)
+    if (not isinstance(command, dict) or set(command) not in (
+            FIELDS, FIELDS | SCOPE_FIELDS, FIELDS | BROWSER_FIELDS, FIELDS | TEMPORAL_FIELDS,
+            FIELDS | SCOPE_FIELDS | TEMPORAL_FIELDS, FIELDS | BROWSER_FIELDS | TEMPORAL_FIELDS)
             or command.get('continuation_kind') != KIND
             or not isinstance(command.get('command_id'), str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', command['command_id'])
@@ -1083,7 +1259,12 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     if command['additional_iterations'] == 0 and not (pending or gate_only or interrupted):
         raise ValueError('zero additional iterations require an authenticated pending repair '
                          'or an interrupted iteration')
-    maximum = seal['state']['iteration'] + command['additional_iterations']
+    if seal.get('quarantined_implementation') and command['additional_iterations'] == 0:
+        raise ValueError('unknown implementation requires a separately authorized new iteration')
+    maximum = continuation_maximum(seal['state']['iteration'],
+                                   command['additional_iterations'], pending)
+    if maximum is None:
+        raise ValueError('unstarted preflight retains only its existing finite ceiling')
     credit = None
     if _revision is not None:
         from .delivery_feature_execution import registry
@@ -1105,6 +1286,30 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                                         pending=bool(pending or gate_only or interrupted))):
         raise ValueError('a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
+    browser_amendment = None
+    if BROWSER_FIELDS <= command.keys():
+        from .delivery_browser_mode_recovery import proposal
+
+        amended, browser_amendment = proposal(seal, command)
+    temporal_preparation = None
+    if TEMPORAL_FIELDS <= command.keys():
+        from .delivery_temporal_prerequisites import proposal as temporal_proposal
+
+        amended, temporal_preparation = temporal_proposal(seal, command, execution=amended)
+    capacity_receipt = None
+    if (not seal['predecessor_spec'].get('feature_worker')
+            and (SCOPE_FIELDS <= command.keys() or BROWSER_FIELDS <= command.keys())):
+        from .delivery_amendment_capacity import acknowledge
+
+        capacity_receipt = acknowledge(seal['predecessor_spec'], load_execution_config(amended))
+    scope_finding = None
+    if SCOPE_FIELDS <= command.keys() and not seal['predecessor_spec'].get('feature_worker'):
+        latest = next((r for r in reversed(seal['state'].get('roles', []))
+                       if r.get('role') == 'implement'), {})
+        if latest.get('status') == 'blocked':
+            from .delivery_session_custody import completed_blocked_finding
+
+            scope_finding = completed_blocked_finding(seal)
     if _revision is not None:
         from .delivery_feature_revision_recovery import validate_revision_recovery
 
@@ -1115,7 +1320,15 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         return {'run_id': run_id, 'preflight': True, 'candidate': seal['candidate'],
                 'authorized_through_iteration': maximum, 'implementation_authority': True,
                 **({'added_paths': command['added_paths']}
-                   if amended is not seal['predecessor_spec'] else {})}
+                   if SCOPE_FIELDS <= command.keys() else {}),
+                **({'browser_qa_amendment': {key: browser_amendment[key] for key in (
+                    'original_recipe_sha256', 'effective_recipe_sha256')}}
+                   if browser_amendment else {}),
+                **({'temporal_test_prerequisites': {
+                    'check_sha256': temporal_preparation['check_sha256'],
+                    'metadata': temporal_preparation['metadata'],
+                    'sdk': temporal_preparation['sdk']}}
+                   if temporal_preparation else {})}
     spec = seal['predecessor_spec']
     root = Path(spec['state_dir']) / 'stopped-resumes' / command_digest
     with _lock(Path(spec['state_dir']) / 'stopped-resumes' / 'controller.lock'):
@@ -1137,8 +1350,36 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         if _revision is not None:
             if validate_revision_recovery(store, seal['predecessor_spec'], _revision) != amended:
                 raise ValueError('adopted worker derivation changed during runtime preparation')
+        elif browser_amendment is not None:
+            from .delivery_browser_mode_recovery import _transition
+
+            checked, proof = proposal(seal, command)
+            if temporal_preparation is not None:
+                checked, temporal_proof = temporal_proposal(seal, command, execution=checked)
+                if temporal_proof != temporal_preparation:
+                    raise ValueError('combined Temporal prerequisite changed during preparation')
+            if checked != amended or proof != browser_amendment:
+                raise ValueError('browser amendment evidence changed during runtime preparation')
+            _transition(amended, execution)
+        elif temporal_preparation is not None:
+            from .delivery_temporal_prerequisites import _transition as temporal_transition
+
+            checked, proof = temporal_proposal(
+                seal, command, execution=scope_spec(store, seal, command))
+            if checked != amended or proof != temporal_preparation:
+                raise ValueError('Temporal prerequisite evidence changed during preparation')
+            temporal_transition(amended, execution)
         elif scope_spec(store, seal, command) != amended:
             raise ValueError('stopped scope configuration changed during runtime preparation')
+        if scope_finding is not None:
+            if completed_blocked_finding(seal) != scope_finding:
+                raise ValueError('blocked scope finding changed during runtime preparation')
+        if capacity_receipt is not None:
+            if execution['policy']['capacity'] != seal['predecessor_spec']['policy']['capacity']:
+                raise ValueError('amendment preparation changed frozen policy capacity')
+            if acknowledge(seal['predecessor_spec'], load_execution_config(execution)) != (
+                    capacity_receipt):
+                raise ValueError('operational owner changed during amendment preparation')
         execution.pop('repair_allowance', None)
         if authority:
             if worker_allowance(spec, seal['state']['iteration'],
@@ -1150,6 +1391,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             execution.pop('role_home_generation')
         if seal.get('session_custody'):
             execution['implementation_role_home_generation'] = seal['session_custody']['generation']
+        if seal.get('quarantined_implementation'):
+            # No old provider session is known. A new finite turn gets an isolated
+            # home and starts a new session; the original unknown turn stays sealed.
+            execution['role_home_generation'] = 'stopped-resume-' + command_digest
+            execution.pop('implementation_role_home_generation', None)
         # Admission identities belong to one admission; a predecessor's never carry over.
         for field in ('gate_admission', 'implement_admission'):
             execution.pop(field, None)
@@ -1168,6 +1414,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
                     'execution_spec': execution, 'execution_candidate': candidate,
                     'maximum_iteration': maximum,
                     'predecessor_result_digest': digest(seal['state']),
+                    **({'blocked_scope_finding': scope_finding} if scope_finding else {}),
+                    **({'browser_qa_amendment': browser_amendment} if browser_amendment else {}),
+                    **({'temporal_test_prerequisites': temporal_preparation}
+                       if temporal_preparation else {}),
+                    **({'operational_capacity': capacity_receipt} if capacity_receipt else {}),
                     **({'feature_plan_revision': _revision} if _revision is not None else {}),
                     **({'pending_repair': pending} if pending else {}),
                     **({'ci_findings': ci_findings} if ci_findings else {}),
@@ -1249,6 +1500,12 @@ def readback(store, spec, recovery):
         if attempts != details['attempts'] or effects != details['effects']:
             raise ValueError('stopped receipt inventory changed before resume')
     predecessor = details['predecessor_spec']
+    current_scope_base = (SCOPE_FIELDS <= details['command'].keys()
+                          and not predecessor.get('feature_worker')
+                          and predecessor['provider'] == 'codex')
+    if current_scope_base:
+        ordinary_scope_base(load_execution_config(spec), predecessor)
+        observed_preparation_cleanup(predecessor, resource_spec=spec)
     if recovery.get('session_custody'):
         from .delivery_session_custody import implementation_custody
 
@@ -1261,7 +1518,28 @@ def readback(store, spec, recovery):
     if (not store.owns_execution(spec)
             or digest(load_execution_config(spec).raw) != spec['config_digest']):
         raise ValueError('stopped service configuration or owner changed')
-    if observed_native_cleanup(predecessor) != details['cleanup_digest']:
+    from .delivery_unpublished_recovery import quarantine_history, teardown_checkpoint
+
+    history = quarantine_history(details.get('original_recovery'))
+    if details.get('historical_quarantines', []) != history:
+        raise ValueError('historical provider teardown changed before resume')
+    quarantined = details.get('quarantined_implementation')
+    if quarantined:
+        from .delivery_unpublished_recovery import quarantined_implementation
+
+        if (quarantined_implementation(predecessor, details['state'], details['attempts'],
+                                      details['candidate']) != quarantined
+                or recovery['session_id'] is not None
+                or spec.get('role_home_generation')
+                    != 'stopped-resume-' + recovery['command_digest']
+                or spec.get('implementation_role_home_generation') is not None):
+            raise ValueError('quarantined implementation changed before its new finite turn')
+    teardown = teardown_checkpoint([*history, *([quarantined] if quarantined else [])])
+    cleanup = (observed_preparation_cleanup(predecessor, resource_spec=spec, quarantined=teardown)
+               if (details.get('pending_repair') or {}).get('implementation_preparation') else
+               observed_native_cleanup(predecessor, **(
+                   {'quarantined': teardown, 'resource_spec': spec} if teardown else {})))
+    if cleanup != details['cleanup_digest']:
         raise ValueError('stopped predecessor process ownership changed')
     broker = DeliveryBroker(store, spec)
     if broker.candidate() != recovery['execution_candidate']:
@@ -1270,4 +1548,7 @@ def readback(store, spec, recovery):
         published_identity(broker, recovery['execution_candidate'], details['publication'])
     else:
         _unpublished_remote(broker)
+    if current_scope_base:
+        ordinary_scope_base(load_execution_config(spec), predecessor)
+        observed_preparation_cleanup(predecessor, resource_spec=spec)
     return {'state': 'confirmed'}

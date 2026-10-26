@@ -113,7 +113,11 @@ def amended_config(original, path, expected_hash):
 
 
 def _prepare(original, config, intent, intent_path):
+    from .delivery_native_diagnostic import require_resource_idle
     from .delivery_native_preparation import _measure, _validate, bind_native_spec, native_identity
+    from .delivery_preparation_resources import FIELD, binding, resource_scope
+
+    require_resource_idle(original)
 
     effective = deepcopy(original)
     effective.pop('preparation', None)
@@ -129,9 +133,11 @@ def _prepare(original, config, intent, intent_path):
     root = Path(effective['state_dir']).parents[1]
     # Preparation has its own finite, journalled resource generations. It cannot
     # recreate or rewrite the predecessor's finalized transient roots/manifest.
-    for attempt in intent['preparation_attempts']:
+    for index, attempt in enumerate(intent['preparation_attempts']):
         if attempt['state'] == 'started':
-            receipt = RunResources(attempt['spec']).finalize('blocked')
+            with resource_scope(
+                    attempt['spec'], effective['state_dir'], intent, intent_path, index):
+                receipt = RunResources(attempt['spec']).finalize('blocked')
             attempt.update(state='interrupted', cleanup=receipt)
             write_private(intent_path, intent)
             if receipt['state'] != 'confirmed':
@@ -155,19 +161,22 @@ def _prepare(original, config, intent, intent_path):
             probe = deepcopy(effective)
             probe['state_dir'] = str(intent_path.parent / 'probes'
                                     / str(len(intent['preparation_attempts'])) / original['run_id'])
+            index = len(intent['preparation_attempts'])
+            probe[FIELD] = binding(effective, intent, intent_path, index)
             attempt = {'spec': probe, 'state': 'started', 'cleanup': None}
             intent['preparation_attempts'].append(attempt)
             intent['state'] = 'preparing'
             write_private(intent_path, intent)
-            try:
-                proof = _measure(probe, identity, state_root=root)
-            except Exception as exc:
-                attempt['error'] = str(exc)[:500]
-                raise
-            finally:
-                receipt = RunResources(probe).finalize('blocked')
-                attempt.update(state='stopped', cleanup=receipt)
-                write_private(intent_path, intent)
+            with resource_scope(probe, effective['state_dir'], intent, intent_path, index):
+                try:
+                    proof = _measure(probe, identity, state_root=root)
+                except Exception as exc:
+                    attempt['error'] = str(exc)[:500]
+                    raise
+                finally:
+                    receipt = RunResources(probe).finalize('blocked')
+                    attempt.update(state='stopped', cleanup=receipt)
+                    write_private(intent_path, intent)
             if receipt['state'] != 'confirmed':
                 raise ValueError('policy preparation cleanup is unknown')
         _validate(proof, identity, root)
@@ -327,12 +336,41 @@ def _published_cleanup_chain(store, row, state, closed):
                     and datetime.fromisoformat(row['updated_at']) <= written):
                 return {'closure': 'published', 'original_result_digest': digest(state),
                         'resource_cleanup': receipt, 'tracker': record['tracker'],
+                        **{key: record[key] for key in (
+                            'historical_quarantines', 'quarantined_cleanup', 'native_observation')
+                           if key in record},
                         'maintenance_chain': {'anchor_sequence': anchor['sequence'],
                                               'anchor_sha256': digest(record),
                                               'latest_sequence': latest['sequence'],
                                               'latest_key': expected}}
     return None
 
+
+
+def _unpublished_cleanup_binding(store, row, state, closed, record):
+    """A local custody closure binds one accepted unpublished Temporal execution."""
+    if not closed or closed.get('result') != state or row['pr_json'] is not None:
+        return False
+    keys = ('workflow_id', 'execution_run_id', 'closed_at', 'request_digest', 'recovery_digest')
+    receipt = record.get('resource_cleanup') or {}
+    if (record.get('closure') != 'unpublished'
+            or not all(closed.get(key) for key in keys[:-1])
+            or record.get('closed_workflow') != {key: closed.get(key) for key in keys}
+            or record.get('original_result_digest') != digest(state)
+            or record.get('key') != digest({k: v for k, v in record.items() if k != 'key'})
+            or receipt.get('state') != receipt.get('resource_cleanup')
+            or receipt.get('state') != 'confirmed'
+            or receipt.get('process_cleanup') != 'observed-native-confirmed'):
+        return False
+    from .delivery_unpublished_recovery import cleanup_checkpoint
+
+    with store._connect() as db:
+        if store.state.claim_for(db, row['work_id']) is not None:
+            return False
+    checkpoint = cleanup_checkpoint(store, row, store.effective_spec(row['run_id']), closed)
+    return (record.get('unpublished_checkpoint') == checkpoint
+            and record.get('quarantined_implementation')
+                == checkpoint.get('quarantined_implementation'))
 
 def reconciled_cleanup(store, row, state, *, closed=None):
     """The maintenance record that later confirmed this closed result's cleanup, if any.
@@ -354,7 +392,8 @@ def reconciled_cleanup(store, row, state, *, closed=None):
     direct = next((item for item in records
                  if ((item.get('closure') == 'published'
                       and item.get('original_result_digest') == digest(state))
-                     or (build and completed_cleanup_binding(item, closed, state)))
+                     or (build and completed_cleanup_binding(item, closed, state))
+                     or _unpublished_cleanup_binding(store, row, state, closed, item))
                  and item.get('resource_cleanup') == checks.get('resource_cleanup')
                  and item.get('tracker') == json.loads(row['tracker_json'] or '{}')), None)
     return direct or _published_cleanup_chain(store, row, state, closed)
