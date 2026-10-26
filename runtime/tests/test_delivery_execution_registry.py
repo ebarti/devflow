@@ -282,3 +282,49 @@ def test_installed_allowances_keep_literal_history_and_reject_replay_and_rollbac
     fresh = registry.renew_repair_allowance(successor, {})
     assert (fresh["used"], fresh["lifetime_used"], fresh["allowance"]["sequence"]) == (0, 20, 2)
     assert fresh["allowance"]["runtime_payload_sha256"] == third["runtime_payload_sha256"]
+
+
+def test_repair_checks_exact_worker_assignment_in_same_transaction(registry, snapshot):
+    token = owner(registry, snapshot)
+    registry.reserve_worker(token, 'worker-1', 'workstream-1')
+    with registry.connect() as db:
+        assignment = dict(db.execute(
+            'SELECT * FROM execution_workers WHERE issue_id=? AND worker_key=?',
+            (token['issue_id'], 'worker-1')).fetchone())
+    with pytest.raises(OwnershipConflict, match='no original repair debit'):
+        registry.repair(token, 'worker-1:1', 'repair', worker_assignment=assignment,
+                        require_existing=True)
+    assert registry.budget(token['issue_id'])['used'] == 0
+    assert registry.repair(token, 'worker-1:1', 'repair', worker_assignment=assignment)['used'] == 1
+    assert registry.repair(token, 'worker-1:1', 'repair', worker_assignment=assignment,
+                           require_existing=True)['used'] == 1
+    with registry.connect() as db:
+        db.execute("UPDATE execution_workers SET state='unknown' WHERE worker_key='worker-1'")
+    with pytest.raises(OwnershipConflict, match='assignment changed'):
+        registry.repair(token, 'worker-1:2', 'repair', worker_assignment=assignment)
+    assert registry.budget(token['issue_id'])['used'] == 1
+
+
+def test_repair_waiting_on_assignment_change_never_debits(registry, snapshot):
+    from threading import Event
+
+    token = owner(registry, snapshot)
+    registry.reserve_worker(token, 'worker-race', 'workstream-race')
+    with registry.connect() as db:
+        assignment = dict(db.execute(
+            'SELECT * FROM execution_workers WHERE issue_id=? AND worker_key=?',
+            (token['issue_id'], 'worker-race')).fetchone())
+    entered = Event()
+    def charge():
+        entered.set()
+        return registry.repair(token, 'worker-race:1', 'repair', worker_assignment=assignment)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with registry.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute("UPDATE execution_workers SET state='unknown' "
+                       "WHERE worker_key='worker-race'")
+            pending = pool.submit(charge)
+            assert entered.wait(5)
+        with pytest.raises(OwnershipConflict, match='assignment changed'):
+            pending.result(timeout=5)
+    assert registry.budget(token['issue_id'])['used'] == 0

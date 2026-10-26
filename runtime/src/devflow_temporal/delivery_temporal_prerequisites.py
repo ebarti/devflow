@@ -451,6 +451,47 @@ def custody(db, spec, recovery, *, retained_memo=None):
     return proof
 
 
+
+def fresh_authority(spec):
+    """Authenticate normal-admission Temporal provenance without a recovery marker."""
+    value = (spec.get("policy", {}).get("readiness") or {}).get("temporal_provenance")
+    if (spec.get("readiness_version") != 1 or not isinstance(value, dict)
+            or set(value) != INPUTS or spec.get(MARKER) is not None
+            or spec.get("provider") != "codex"
+            or spec.get("policy", {}).get("host_sandbox") != "trusted-local"
+            or digest(spec.get("policy")) != spec.get("policy_digest")
+            or (spec["policy"]["readiness"].get("temporal_checks") != [value.get("check_id")])):
+        raise ValueError("fresh Temporal readiness lacks its frozen admission")
+    path = Path(value["provenance_path"])
+    root = Path(spec["state_dir"]).parents[1]
+    if not path.is_absolute() or not path.is_relative_to(root):
+        raise ValueError("Temporal prerequisite provenance must be private service-state input")
+    receipt = json.loads(_reference(str(path), value["provenance_sha256"], private=True))
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("source_facts"), dict):
+        raise ValueError("Temporal prerequisite provenance is malformed")
+    checks = [check for stage in ("baseline_checks", "prepublish_checks", "checks")
+              for check in spec["policy"].get(stage, []) if check["id"] == value["check_id"]]
+    unique = {digest(check): check for check in checks}
+    if len(unique) != 1 or next(iter(unique.values())).get("kind") != "test":
+        raise ValueError("Temporal readiness requires one frozen native test check")
+    check = next(iter(unique.values()))
+    metadata = _project(spec, value["python_project"], None)
+    if (receipt["source_facts"].get("pyproject_sha256") != metadata["pyproject.toml"]
+            or receipt["source_facts"].get("uv_lock_sha256") != metadata["uv.lock"]):
+        raise ValueError("Temporal tool compatibility differs from the frozen project")
+    try:
+        tools, evidence = _tools(receipt), _evidence(receipt)
+    except (KeyError, TypeError, AttributeError, tarfile.TarError) as exc:
+        raise ValueError("Temporal prerequisite provenance is incomplete or malformed") from exc
+    return {"schema": "devflow-temporal-test-preparation-v1", "sdk": SDK,
+            "declaration": value, "check": check, "check_sha256": digest(check),
+            "metadata": metadata, "tools": tools, "evidence": evidence,
+            "provenance": {"path": str(path), "sha256": value["provenance_sha256"]}}
+
+
+def _fresh_marker(spec, proof):
+    return {"fresh_readiness_sha256": digest(proof), "policy_digest": spec["policy_digest"]}
+
 def launch_authority(spec):
     from .delivery_execution_config import load_execution_config
     from .delivery_store import DeliveryStore
@@ -463,6 +504,9 @@ def launch_authority(spec):
             "SELECT recovery_json FROM delivery_runs WHERE run_id=?", (spec["run_id"],)
         ).fetchone()
         proof = custody(db, spec, json.loads(row[0]) if row and row[0] else None)
+        if (spec.get("readiness_version") == 1 and spec.get(MARKER) is None
+                and (spec.get("policy", {}).get("readiness") or {}).get("temporal_provenance")):
+            proof = fresh_authority(spec)
         claim = store.state.claim_for(db, spec["work_id"])
         if not claim or claim["owner"] != "external:devflow:" + spec["run_id"]:
             raise ValueError("Temporal prerequisite launch lost its current own claim")
@@ -632,12 +676,16 @@ def prepare_check(spec, checkout, evidence, check, scratch, *,
                   diagnostic_context=None, resources=None):
     marker = (diagnostic_context.snapshot['temporal_marker'] if diagnostic_context is not None
               else spec.get(MARKER))
-    if marker is None:
+    fresh = (diagnostic_context is None and marker is None and spec.get("readiness_version") == 1
+             and (spec.get("policy", {}).get("readiness") or {}).get("temporal_provenance"))
+    if marker is None and not fresh:
         return {}
     if diagnostic_context is not None:
         diagnostic_context.guard()
     proof = (diagnostic_context.snapshot['preparation'] if diagnostic_context is not None
              else launch_authority(spec))
+    if fresh:
+        marker = _fresh_marker(spec, proof)
     if check["id"] != proof["check"]["id"]:
         return {}
     if (
@@ -714,15 +762,18 @@ def check_launch(process):
         return diagnostic.temporal_launch(process)
     keys = {tool["environment"] for tool in TOOLS.values()}
     present = keys & process.environment.keys()
+    fresh = (process.spec.get("readiness_version") == 1
+             and (process.spec.get("policy", {}).get("readiness") or {}).get("temporal_provenance"))
     if not present:
-        if process.spec.get(MARKER) is not None:
+        if process.spec.get(MARKER) is not None or fresh:
             proof = launch_authority(process.spec)
             if process.folder.parent.name == proof["check"]["id"]:
                 raise ValueError("Temporal prerequisite native launch lost its tool environment")
         return
-    if present != keys or process.spec.get(MARKER) is None:
+    if present != keys or (process.spec.get(MARKER) is None and not fresh):
         raise ValueError("Temporal native launch has an undeclared tool environment")
     proof = launch_authority(process.spec)
+    marker = process.spec.get(MARKER) or _fresh_marker(process.spec, proof)
     check = proof["check"]
     from .delivery_resources import RunResources
     from .delivery_sandbox import _native_check_key
@@ -732,7 +783,7 @@ def check_launch(process):
     key = _native_check_key(process.spec, evidence, check["id"])
     with registry.locked(read_only=True) as manifest:
         seal = manifest.get("temporal_test_preparations", {}).get(key)
-        if not isinstance(seal, dict) or seal.get("preparation") != process.spec[MARKER]:
+        if not isinstance(seal, dict) or seal.get("preparation") != marker:
             raise ValueError("Temporal preparation has no acknowledged resource owner")
         checkout = Path(seal["authority"]["subject"]["path"])
         authority = _preparation_authority(
@@ -757,10 +808,22 @@ def _check_owned_launch(process, proof, recorded, authority, *, diagnostic_conte
     check = proof["check"]
     environment = {key: process.environment[key] for key in keys}
     checkout = Path(authority["subject"]["path"])
-    marker = (process.spec[MARKER] if diagnostic_context is None
-              else diagnostic_context.snapshot['temporal_marker'])
+    marker = ((process.spec.get(MARKER) or _fresh_marker(process.spec, proof))
+              if diagnostic_context is None else diagnostic_context.snapshot['temporal_marker'])
     argv, timeout, folders = (check['argv'], check.get('timeout_seconds', 600),
                               {'native', 'native-retry'})
+    if getattr(process, "readiness_tool", False):
+        if diagnostic_context is not None:
+            raise ValueError("readiness tool probe cannot replace diagnostic authority")
+        from .delivery_readiness import temporal_tool_launch_binding
+
+        argv, timeout, folders = temporal_tool_launch_binding(process, proof, authority)
+    if getattr(process, "readiness_temporal", False):
+        if diagnostic_context is not None:
+            raise ValueError("Temporal readiness cannot replace diagnostic authority")
+        from .delivery_readiness import temporal_launch_binding
+
+        argv, timeout, folders = temporal_launch_binding(process, proof, authority)
     if diagnostic_context is not None:
         argv, timeout, folders = diagnostic_context.launch_binding(process)
     if (

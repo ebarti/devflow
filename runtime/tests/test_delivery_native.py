@@ -95,6 +95,8 @@ def native_configuration(intake_fixture):
     config["repositories"]["fixture"].update(
         prepublish_checks=[check],
         checks=[check],
+        readiness={"version": 1, "generation": 0, "browser_engines": [],
+                   "temporal_checks": []},
         required_ci=["test"],
         project_url="https://github.com/users/example/projects/1",
         assignee="example",
@@ -108,6 +110,14 @@ def native_store(native_configuration):
     config, request = native_configuration
     store = DeliveryStore(config)
     store.submit(request)
+    return store, request
+
+
+@pytest.fixture
+def native_historical_store(native_configuration, monkeypatch):
+    config, request = native_configuration
+    store = DeliveryStore(config)
+    submit_historical_admission(store, request, monkeypatch)
     return store, request
 
 
@@ -421,8 +431,10 @@ async def test_real_terminal_workflow_removes_owned_temps_before_projection(
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native preparation required")
 @pytest.mark.asyncio
-async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(native_store):
-    store, request = native_store
+async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(
+    native_historical_store,
+):
+    store, request = native_historical_store
     calls = []
 
     @activity.defn(name="delivery_intake")
@@ -530,11 +542,11 @@ async def test_early_preparation_error_finalizes_registered_temporary_resources(
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS boundary required")
 @pytest.mark.asyncio
 async def test_real_worker_loss_after_directory_removal_recovers_workflow_finalization(
-    native_store, tmp_path
+    native_historical_store, tmp_path
 ):
     from fixtures.activity_liveness_workflow import FinalizationClock
 
-    store, request = native_store
+    store, request = native_historical_store
     marker = tmp_path / "removed-before-worker-loss"
     worker_script = tmp_path / "crashing-worker.py"
     worker_script.write_text("""

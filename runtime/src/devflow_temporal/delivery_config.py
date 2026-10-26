@@ -245,6 +245,7 @@ class DeliveryConfig:
         self, supplied: dict[str, Any], *, _base_ref: str | None = None,
         _feature_base: dict[str, Any] | None = None, legacy_publication: bool = False,
         _scope_base: dict[str, Any] | None = None,
+        _readiness_base: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         required = {
             "command_id",
@@ -452,6 +453,19 @@ class DeliveryConfig:
             if len(selected) != len(baseline_ids):
                 raise ValueError("baseline checks must name existing prepublication checks")
             policy["baseline_checks"] = selected
+        from .delivery_readiness import derive_declaration, validate_declaration
+
+        predecessor = (_scope_base if _scope_base is not None else
+                       _feature_base if _feature_base is not None else _readiness_base)
+        if predecessor is not None:
+            # A technical successor retains the original versioned authority.
+            if predecessor.get("readiness_version") == 1:
+                policy["readiness"] = validate_declaration(
+                    predecessor.get("policy", {}).get("readiness"), policy)
+        elif "readiness" in repository:
+            policy["readiness"] = validate_declaration(repository["readiness"], policy)
+        elif self.raw.get("provider", "codex") == "codex":
+            policy["readiness"] = derive_declaration(policy)
         if self.raw.get("execution_backend", "native-macos") != "native-macos":
             raise ValueError("Docker execution is retired; only native-macos is supported")
         if self.raw.get("provider", "codex") == "codex":
@@ -669,6 +683,9 @@ class DeliveryConfig:
             ),
             **({"terminal_tracker_version": 1} if self.raw.get("provider", "codex") == "codex"
                else {}),
+            **({"readiness_version": 1}
+               if "readiness" in policy and self.raw.get("provider", "codex") == "codex"
+               else {}),
             "provider": self.raw.get("provider", "codex"),
             "source_path": str(source),
             "origin_url": actual_remote,
@@ -817,6 +834,10 @@ def scope_amended_spec(
     else:
         effective["policy"].pop("provider_max_attempts", None)
     effective["policy"]["capacity"] = original["policy"]["capacity"]
+    if "readiness" in original["policy"]:
+        effective["policy"]["readiness"] = deepcopy(original["policy"]["readiness"])
+    else:
+        effective["policy"].pop("readiness", None)
     effective["policy_digest"] = digest(effective["policy"])
     if "projection_retry_version" in original:
         effective["projection_retry_version"] = original["projection_retry_version"]
@@ -834,8 +855,8 @@ def scope_amended_spec(
                    "assessment_batch_version", "validation_schedule_version",
                    "merge_reconciliation_version",
                    "delivery_limits_version", "delivery_admitted_at",
-                   "temporal_test_preparation", "execution_authority_version",
-                   "workspace_custody_version"):
+                   "temporal_test_preparation", "readiness_version",
+                   "execution_authority_version", "workspace_custody_version"):
         if marker in original:
             effective[marker] = original[marker]
         else:

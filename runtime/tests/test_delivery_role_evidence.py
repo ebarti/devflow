@@ -660,3 +660,29 @@ def test_dependency_copy_refuses_changed_bytes_but_launched_request_keeps_frozen
         allocate({**request, 'iteration': 2}, '9' * 64, store=store)
     with pytest.raises(RuntimeError, match='request changed'):
         supervisor.retained_request({**request, 'findings': ['Different request']})
+
+
+def test_readiness_enrichment_survives_launched_role_reattachment(service):
+    from devflow_temporal.delivery_resources import write_private
+    from devflow_temporal.supervisor import DeliverySupervisor
+
+    store, broker, request = setup(service)
+    request['spec'] = {**request['spec'], 'readiness_version': 1}
+    request['evidence_context'] = {'source': 'original'}
+    supervisor = DeliverySupervisor(store, capacity=1)
+    key = supervisor._job_key(request)
+    enriched = {**request,
+                'evidence_context': {'source': 'original', 'readiness': {'state': 'passed'}},
+                'readiness_worker_assignment': {'owner': {'generation': 1}}}
+    path = Path(broker.spec['state_dir']) / 'attempts' / key / 'request.json'
+    write_private(path, enriched)
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
+                   "state,cleanup,result_json) VALUES (?,?,'implement',0,?,"
+                   "'finished','confirmed','{}')",
+                   (key, request['spec']['run_id'], request['candidate']['id']))
+    assert supervisor.retained_request(request) == enriched
+    with pytest.raises(RuntimeError, match='request changed'):
+        supervisor.retained_request({**request, 'evidence_context': {'source': 'different'}})
+    with pytest.raises(RuntimeError, match='request changed'):
+        supervisor.retained_request({**request, 'readiness_worker_assignment': {}})

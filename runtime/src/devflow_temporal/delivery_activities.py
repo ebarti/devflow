@@ -610,6 +610,21 @@ async def delivery_prepare(request: dict[str, Any]) -> dict[str, Any]:
         pending.cancel()
 
 
+@activity.defn(name="delivery_environment_readiness")
+async def delivery_environment_readiness(request: dict[str, Any]) -> dict[str, Any]:
+    def execute(broker: DeliveryBroker) -> dict[str, Any]:
+        from .delivery_readiness import describe_requirements, prepare_and_probe
+
+        requirements = describe_requirements(request["spec"], broker.checkout)
+        return prepare_and_probe(broker.store, request["spec"], request["candidate"],
+                                 requirements, "configured", iteration=request["iteration"])
+
+    qa = request["spec"].get("policy", {}).get("browser_qa") or {}
+    return await _with_heartbeat(
+        _execute_check(request, execute, kind="readiness",
+                       ports=tuple(qa.get("ports", {}).values())), request, "readiness")
+
+
 @activity.defn(name="delivery_intake")
 async def delivery_intake(request: dict[str, Any]) -> dict[str, Any]:
     return await _with_heartbeat(_run_intake(request), request, 'intake')
@@ -774,10 +789,57 @@ def _role_context(request, store, broker, supervisor):
     return request, workspace, review_diff, retained
 
 
+def _readiness_worker_assignment(store, spec):
+    """Capture the authenticated active assignment before readiness work."""
+    from .delivery_execution_registry import OwnershipConflict
+    from .delivery_feature_execution import _worker_assignment, require_execution
+
+    require_execution(store, spec)
+    shared, current, assignment = _worker_assignment(store, spec)
+    if (current["state"] != "active"
+            or current["store_path"] != str(store.config.tracking_db)):
+        raise OwnershipConflict("worker readiness lost its active coordinator")
+    token, assignment = shared.token(current), dict(assignment)
+    require_execution(store, spec)
+    confirmed, current, observed = _worker_assignment(store, spec)
+    if confirmed.token(current) != token or dict(observed) != assignment:
+        raise OwnershipConflict("worker assignment changed while authenticated")
+    return shared, token, assignment
+
+
+def _readiness_workflow_id(store, spec):
+    from .delivery_execution_registry import OwnershipConflict
+
+    current = store.active_workflow_id(spec["run_id"])
+    if (not isinstance(current, str) or not current
+            or (activity.in_activity() and activity.info().workflow_id != current)):
+        raise OwnershipConflict("worker readiness belongs to a superseded workflow")
+    return current
+
+
+def _readiness_execution_run_id():
+    """Carry the Temporal execution identity for independent GO authentication."""
+    if not activity.in_activity():
+        return None
+    execution = activity.info().workflow_run_id
+    if not isinstance(execution, str) or not execution:
+        raise ValueError("worker readiness lacks its Temporal execution identity")
+    return execution
+
+
+def _verify_readiness_worker_assignment(store, spec, token, assignment):
+    from .delivery_execution_registry import OwnershipConflict
+
+    shared, current, observed = _readiness_worker_assignment(store, spec)
+    if current != token or observed != assignment:
+        raise OwnershipConflict("worker assignment changed during readiness")
+    return shared
+
+
 async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
     store, broker = await asyncio.to_thread(_context, request['spec'])
     if (request["spec"].get("feature_worker") and request["role"] == "implement"
-            and request["iteration"] > 0):
+            and request["iteration"] > 0 and request["spec"].get("readiness_version") != 1):
         from .delivery_feature_execution import registry
 
         shared = registry(request["spec"])
@@ -799,7 +861,86 @@ async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
         _role_context, request, store, broker, supervisor,
     )
     role, iteration, candidate = request['role'], request['iteration'], request['candidate']
-    if (role == "implement" and request["spec"].get("provider") == "codex"
+    worker_owner = None
+    worker_workflow_id = None
+    worker_execution_run_id = None
+    reservation_accounting = False
+    if (request["spec"].get("feature_worker") and role == "implement"
+            and request["spec"].get("readiness_version") == 1):
+        marker = request["spec"].get("feature_repair_reservation_version")
+        if ("feature_repair_reservation_version" in request["spec"]
+                and (type(marker) is not int or marker != 1)):
+            raise ValueError("unsupported feature repair reservation version")
+        reservation_accounting = marker == 1 and iteration > 0
+        worker_owner = await asyncio.to_thread(_readiness_worker_assignment, store, request["spec"])
+        worker_workflow_id = await asyncio.to_thread(_readiness_workflow_id, store, request["spec"])
+        worker_execution_run_id = _readiness_execution_run_id()
+    if (role == "implement" and request["spec"].get("readiness_version") == 1
+            and retained is None):
+        from .delivery_readiness import describe_requirements, prepare_and_probe, verify_receipt
+
+        requirements = await asyncio.to_thread(
+            describe_requirements, request["spec"], broker.checkout,
+            request["spec"].get("accepted_plan", ""))
+        attempt = request.get("readiness_attempt", 0)
+        if type(attempt) is not int or not 0 <= attempt <= 2:
+            raise ValueError("readiness attempt is not a bounded admitted generation")
+        if attempt:
+            from .delivery_stopped_resume import custody
+
+            with store._connect() as db:
+                row = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                                 (request["spec"]["run_id"],)).fetchone()
+                recovery = json.loads(row[0]) if row and row[0] else None
+                token = (recovery or {}).get("readiness_retry") or {}
+                if (not recovery or recovery.get("kind") != "stopped_delivery_resume"
+                        or custody(db, recovery) != request["spec"]
+                        or token.get("version") != 1 or token.get("attempt") != attempt
+                        or token.get("pending_iteration") != iteration):
+                    raise ValueError("readiness retry lost its sealed pending-turn authority")
+        readiness = await asyncio.to_thread(
+            prepare_and_probe, store, request["spec"], candidate, requirements, "plan",
+            iteration=iteration, attempt=attempt)
+        if readiness.get("state") != "passed":
+            return {"status": "blocked", "role": role, "iteration": iteration,
+                    "candidate": candidate,
+                    "cleanup": ("unknown" if any(
+                        item.get("cleanup") == "unknown"
+                        for item in readiness.get("observations", {}).values()) else "confirmed"),
+                    "summary": "Execution readiness failed before the role",
+                    "findings": [readiness.get("reason") or "Execution readiness is unavailable"],
+                    "session_id": None, "readiness": readiness}
+        await asyncio.to_thread(
+            verify_receipt, store, request["spec"], candidate, readiness, requirements)
+        from .delivery_role_evidence import historical_context
+
+        prerequisites = readiness["observations"]["plan"]["result"]
+        context = {**historical_context(store, request["spec"]),
+                   **(request.get("evidence_context") or {}),
+                   "implementation_preparation": prerequisites, "readiness": readiness}
+        request = {**request, "evidence_context": context}
+    if (request["spec"].get("feature_worker") and role == "implement" and iteration > 0
+            and request["spec"].get("readiness_version") == 1):
+        _, token, assignment = worker_owner
+        shared = await asyncio.to_thread(
+            _verify_readiness_worker_assignment, store, request["spec"], token, assignment)
+        from .delivery_execution_registry import OwnershipConflict
+
+        if worker_workflow_id != await asyncio.to_thread(
+                _readiness_workflow_id, store, request["spec"]):
+            raise OwnershipConflict("worker workflow changed during readiness")
+        if retained is None:
+            await asyncio.to_thread(
+                verify_receipt, store, request["spec"], candidate, readiness, requirements)
+        if not reservation_accounting:
+            # Until the reservation owner is installed, an already paid key may
+            # be reused, but this layer cannot create a new pre-GO debit.
+            await asyncio.to_thread(
+                shared.repair, token, f"{request['spec']['run_id']}:{iteration}",
+                "Product repair at worker iteration " + str(iteration),
+                worker_assignment=assignment, require_existing=True)
+    if (role == "implement" and request["spec"].get("readiness_version") != 1
+            and request["spec"].get("provider") == "codex"
             and request["spec"]["policy"].get("host_sandbox") == "trusted-local"
             and retained is None):
         try:
@@ -831,9 +972,32 @@ async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
                    **(request.get("evidence_context") or {}),
                    "implementation_preparation": prerequisites}
         request = {**request, "evidence_context": context}
-    result = await supervisor.run(
-        {**request, "workspace": str(workspace), "review_diff": review_diff}
-    )
+    if (role == "implement" and request["spec"].get("readiness_version") == 1
+            and retained is None and not (request["spec"].get("feature_worker") and iteration > 0)):
+        await asyncio.to_thread(
+            verify_receipt, store, request["spec"], candidate, readiness, requirements)
+    if worker_owner is not None:
+        _, token, assignment = worker_owner
+        await asyncio.to_thread(
+            _verify_readiness_worker_assignment, store, request["spec"], token, assignment)
+        from .delivery_execution_registry import OwnershipConflict
+
+        if worker_workflow_id != await asyncio.to_thread(
+                _readiness_workflow_id, store, request["spec"]):
+            raise OwnershipConflict("worker workflow changed during readiness")
+        if retained is None:
+            request = {**request, "readiness_worker_assignment": {
+                "owner": token, "assignment": assignment, "workflow_id": worker_workflow_id,
+                "workflow_run_id": worker_execution_run_id,
+                "repair_key": f"{request['spec']['run_id']}:{iteration}" if iteration > 0 else None,
+            }}
+    role_request = {**request, "workspace": str(workspace), "review_diff": review_diff}
+    if reservation_accounting:
+        require_reservation = getattr(supervisor, "require_feature_repair_reservation", None)
+        if not callable(require_reservation):
+            raise ValueError("feature repair reservation integration is unavailable")
+        await asyncio.to_thread(require_reservation, role_request, retained)
+    result = await supervisor.run(role_request)
     return await asyncio.to_thread(
         _role_result, request, broker, workspace, review_diff, result,
     )
@@ -1033,11 +1197,46 @@ async def delivery_repair_preflight(request: dict[str, Any]) -> dict[str, Any]:
     return await asyncio.to_thread(execute)
 
 
+def _check_readiness(broker, request, attempt):
+    if request["spec"].get("readiness_version") != 1:
+        return None
+    from .delivery_broker import _git
+    from .delivery_readiness import describe_requirements, prepare_and_probe, verify_receipt
+
+    workspace = broker.checkout
+    if (attempt in {101, 102} or (attempt == 100 and not _git(
+            broker.checkout, "status", "--porcelain=v1", "--untracked-files=all"))):
+        workspace = broker.gate_checkout("verify", request["iteration"], request["candidate"])
+    requirements = describe_requirements(
+        request["spec"], workspace, request["spec"].get("accepted_plan", ""))
+    generation = int(digest({"spec": request["spec"], "candidate": request["candidate"]})[:5],
+                     16) % 300000
+    probe_attempt = 10 + generation * 3 + {100: 0, 101: 1, 102: 2}[attempt]
+    readiness = prepare_and_probe(broker.store, request["spec"], request["candidate"],
+                                  requirements, "plan", iteration=request["iteration"],
+                                  attempt=probe_attempt, workspace=workspace)
+    if readiness.get("state") == "passed":
+        verify_receipt(broker.store, request["spec"], request["candidate"], readiness, requirements)
+        return readiness
+    cleanup = ("unknown" if any(item.get("cleanup") == "unknown"
+                               for item in readiness.get("observations", {}).values())
+               else "confirmed")
+    return {"state": "unknown" if readiness.get("state") == "unknown" else "failed",
+            "failure_kind": "readiness_preparation", "launched": False,
+            "cleanup": cleanup, "candidate_id": request["candidate"]["id"],
+            "source_unchanged": broker.candidate() == request["candidate"],
+            "reason": "execution readiness prevented the check", "readiness": readiness}
+
+
 @activity.defn(name="delivery_checks")
 async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
     def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            return broker.run_checks(request["iteration"], request["candidate"])
+            readiness = _check_readiness(broker, request, 101)
+            if readiness is not None and readiness.get("state") != "passed":
+                return readiness
+            result = broker.run_checks(request["iteration"], request["candidate"])
+            return {**result, "readiness": readiness} if readiness is not None else result
         except CheckPreparationFailure as exc:
             return {'state': 'failed', 'cleanup': 'confirmed',
                     'candidate_id': request['candidate']['id'],
@@ -1063,7 +1262,11 @@ async def delivery_checks(request: dict[str, Any]) -> dict[str, Any]:
 async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
     def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            return broker.run_browser_qa(request["iteration"], request["candidate"])
+            readiness = _check_readiness(broker, request, 102)
+            if readiness is not None and readiness.get("state") != "passed":
+                return readiness
+            result = broker.run_browser_qa(request["iteration"], request["candidate"])
+            return {**result, "readiness": readiness} if readiness is not None else result
         except Exception as exc:
             if (request["spec"]["provider"] != "codex"
                     or isinstance(exc, (CheckCancelledBeforeLaunch, CheckSuperseded))):
@@ -1090,7 +1293,11 @@ async def delivery_browser_qa(request: dict[str, Any]) -> dict[str, Any]:
 async def delivery_precheck(request: dict[str, Any]) -> dict[str, Any]:
     def execute(broker: DeliveryBroker) -> dict[str, Any]:
         try:
-            return broker.run_prechecks(request["iteration"], request["candidate"])
+            readiness = _check_readiness(broker, request, 100)
+            if readiness is not None and readiness.get("state") != "passed":
+                return readiness
+            result = broker.run_prechecks(request["iteration"], request["candidate"])
+            return {**result, "readiness": readiness} if readiness is not None else result
         except CheckPreparationFailure as exc:
             return {'state': 'failed', 'cleanup': 'confirmed',
                     'candidate_id': request['candidate']['id'],
@@ -1532,6 +1739,7 @@ DELIVERY_ACTIVITIES = [
     delivery_resolve_merge_conflicts,
     delivery_project,
     delivery_prepare,
+    delivery_environment_readiness,
     delivery_baseline_checks,
     delivery_finalize_resources,
     delivery_intake,
