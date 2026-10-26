@@ -159,7 +159,10 @@ def _physical(store, spec, previous, *, resource_spec=None):
 
 def _authority(store, run_id, command, profile):
     from .delivery_gate_retry import CI_KIND, snapshot
+    from .delivery_runtime_location import require_not_pending
     from .delivery_store import DeliveryStore
+
+    require_not_pending(store.config)
 
     readonly = store if store.read_only else DeliveryStore(store.config, read_only=True)
     seal = snapshot(readonly, run_id, CI_KIND)
@@ -206,6 +209,7 @@ def _authority(store, run_id, command, profile):
         or claim is not None
     ):
         raise ValueError("ordinary CI original ledger changed during observation")
+    require_not_pending(store.config)
     return seal, {**_compact(seal), **physical}
 
 
@@ -262,8 +266,43 @@ def acknowledge(store, run_id, payload):
             or prior["request_digest"] != request_digest
         ):
             raise ValueError("ordinary CI selection cannot acquire another acknowledgement")
-        archive(store, run_id)
-        return {**json.loads(prior["response_json"]), "replayed": True}
+        response, receipt, profile = archive(store, run_id)
+        _profile(command["profile_path"])
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT recovery_json FROM delivery_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        recovery = json.loads(row[0]) if row and row[0] else None
+        active = bool(recovery and recovery.get("seal", {}).get(FIELD))
+        if active:
+            from .delivery_broker import DeliveryBroker
+            from .delivery_gate_retry import _rows
+
+            spec = store.effective_spec(run_id)
+            validate(store, spec, recovery)
+            broker = DeliveryBroker(store, spec)
+            if broker.candidate() != recovery["candidate"]:
+                raise ValueError("ordinary CI replay lost its admitted current candidate")
+            before = digest(_rows(store, run_id))
+        else:
+            _, before = _authority(store, run_id, command, profile)
+            if before != receipt["authority"]:
+                raise ValueError("ordinary CI replay lost its original authority")
+        facts, _ = _observe(profile)
+        if facts != receipt["observation"]["facts"]:
+            raise ValueError("ordinary CI replay selected IDs/bytes changed")
+        if active:
+            validate(store, spec, recovery)
+            if (
+                broker.candidate() != recovery["candidate"]
+                or digest(_rows(store, run_id)) != before
+            ):
+                raise ValueError("ordinary CI current authority changed during replay")
+        else:
+            _, after = _authority(store, run_id, command, profile)
+            if after != before:
+                raise ValueError("ordinary CI original authority changed during replay")
+        return {**response, "replayed": True}
     profile, raw = _profile(command["profile_path"])
     with store._connect() as db:
         if db.execute(
@@ -358,8 +397,8 @@ def acknowledge(store, run_id, payload):
     return response
 
 
-def _document(store, reference, run_id, folder):
-    original = store.spec(run_id)
+def _document(store, reference, run_id, folder, *, original=None):
+    original = original if original is not None else store.spec(run_id)
     _reference(reference, MAX_JSON)
     path = _root(original) / folder / reference["sha256"]
     if reference.get("path") != str(path) or reference.get("bytes", MAX_JSON + 1) > MAX_JSON:
@@ -384,12 +423,23 @@ def _reference(reference, limit):
 
 def archive(store, run_id):
     """Data-only immutable proof hydration: no GitHub/source/cwd observations."""
-    saved = _saved(store, run_id)
+    # One existing connection/snapshot for this immutable proof. Reopening a
+    # writable Store for each internal query would repeatedly hydrate the same
+    # complete installation authority. No object is cached across operations.
+    with store._connect() as db:
+        if not db.in_transaction:
+            db.execute("BEGIN")
+        return _archive(store, db, run_id)
+
+
+def _archive(store, db, run_id):
+    saved = _saved(store, run_id, db)
     if not saved or saved["profile_sha256"] != APPROVED_PROFILE_SHA256:
         raise ValueError("ordinary CI inventory has no durable explicit acknowledgement")
     response = json.loads(saved["response_json"])
-    receipt = _document(store, response["receipt"], run_id, "receipts")
-    root = _root(store.spec(run_id))
+    original = store._spec(db, run_id)
+    receipt = _document(store, response["receipt"], run_id, "receipts", original=original)
+    root = _root(original)
     profile_ref = receipt["profile"]
     _reference(profile_ref, 128 * 1024)
     if profile_ref["path"] != str(root / "raw" / APPROVED_PROFILE_SHA256):
@@ -426,15 +476,14 @@ def archive(store, run_id):
         )
     ):
         raise ValueError("ordinary CI acknowledgement changed its original purpose")
-    _proof(store, run_id, receipt["observation"])
-    with store._connect() as db:
-        command = db.execute(
-            "SELECT * FROM delivery_commands WHERE command_id=?", (saved["command_id"],)
-        ).fetchone()
-        event = db.execute(
-            "SELECT response_json FROM delivery_ci_inventory_audit WHERE run_id=? AND command_id=?",
-            (run_id, saved["command_id"]),
-        ).fetchall()
+    _proof(store, run_id, receipt["observation"], original=original)
+    command = db.execute(
+        "SELECT * FROM delivery_commands WHERE command_id=?", (saved["command_id"],)
+    ).fetchone()
+    event = db.execute(
+        "SELECT response_json FROM delivery_ci_inventory_audit WHERE run_id=? AND command_id=?",
+        (run_id, saved["command_id"]),
+    ).fetchall()
     if (
         not command
         or command["request_digest"] != saved["request_digest"]
@@ -446,7 +495,7 @@ def archive(store, run_id):
     return response, receipt, profile
 
 
-def _proof(store, run_id, observation):
+def _proof(store, run_id, observation, *, original=None):
     facts = observation["facts"]
     if (
         facts.get("method") != METHOD
@@ -459,7 +508,7 @@ def _proof(store, run_id, observation):
     refs = observation["raw_observations"]
     if not isinstance(refs, list) or not 1 <= len(refs) <= 256:
         raise ValueError("ordinary CI raw evidence inventory is incomplete or excessive")
-    root = _root(store.spec(run_id)) / "raw"
+    root = _root(original if original is not None else store.spec(run_id)) / "raw"
     total = 0
     for value in refs:
         ref = value["body"]
@@ -555,6 +604,11 @@ def validate(store, spec, recovery, *, resource_spec=None):
     from .delivery_listener_verification import historical_records
     from .delivery_policy_recovery import work_binding
     from .delivery_prerequisite_gate_recovery import claim_identity
+
+    if store.read_only:
+        from .delivery_runtime_location import require_not_pending
+
+        require_not_pending(store.config)
 
     _, receipt, _ = authority(store, recovery)
     before = recovery["seal"]["original_spec"]
@@ -765,7 +819,10 @@ def validate_result(store, run_id, result):
 
 
 def info(store, run_id):
-    response, _, _ = archive(store, run_id)
+    from .delivery_store import DeliveryStore
+
+    readonly = store if store.read_only else DeliveryStore(store.config, read_only=True)
+    response, _, _ = archive(readonly, run_id)
     return response
 
 

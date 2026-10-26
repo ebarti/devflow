@@ -753,7 +753,11 @@ to make a match pass.
 ACK appends only its own metadata/command/audit records. Every delivery-run
 column, claim, ordinary event, source, role verdict/session, allowance, gate and
 finalization remains unchanged. File-only profiles/receipts are inert. A new
-command ID cannot mint another inventory. Read the acknowledgement with
+command ID cannot mint another inventory. ACK replay freshly rechecks the same
+selected IDs/bytes and current native/candidate/claim authority; it does not
+return a stale success after drift. Once a normal execution ends or its retained
+physical source is gone, use the separate data-only acknowledgement read, not an
+ACK replay to obtain execution authority. Read the acknowledgement with
 `ci-inventory --id RUN` or `GET /api/runs/{id}/ci-inventory`; historical hydration
 checks immutable bytes and commands without requiring an ended checkout or a
 new GitHub read.

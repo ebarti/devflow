@@ -359,3 +359,60 @@ def test_file_only_success_cannot_substitute_for_normal_CI_observation(ci_case):
     }
     with pytest.raises(ValueError, match="file-only"):
         owner.validate_result(c.store, "run-1", forged)
+
+
+@pytest.mark.parametrize("change", ["source", "selected_raw", "claim", "profile"])
+def test_ack_replay_reobserves_current_authority_and_selected_bytes(ci_case, change):
+    c = ci_case
+    pre = owner.preflight(c.store, "run-1", c.command)
+    ack = {**c.command, "preflight_key": pre["preflight_key"], "acknowledgement": owner.ACK}
+    response = owner.acknowledge(c.store, "run-1", ack)
+    if change == "source":
+        (c.case.broker.checkout / c.case.api).write_text("Changed after ACK\n")
+    elif change == "selected_raw":
+        endpoint = next(k for k in c.remote.data if k.endswith("/logs"))
+        c.remote.data[endpoint] += b"changed"
+    elif change == "claim":
+        with c.store._connect() as db:
+            c.store.state.claim_work(
+                db, c.case.spec["work_id"], "foreign", c.store.config.dashboard_url
+            )
+    else:
+        c.profile_path.write_text("{}")
+    with pytest.raises((ValueError, OSError)):
+        owner.acknowledge(c.store, "run-1", ack)
+    # A historical data-only acknowledgement read grants no new execution and
+    # does not depend on the ended/mutated current checkout or original input.
+    assert owner.info(c.store, "run-1") == response
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_readonly_preflight_keeps_current_installation_guard_separate_from_history(
+    ci_case, monkeypatch, when
+):
+    from devflow_temporal import delivery_runtime_location as location
+
+    c = ci_case
+    readonly = DeliveryStore(c.store.config, read_only=True)
+    actual = location.require_not_pending
+    lost = []
+
+    def require(config):
+        if lost:
+            raise ValueError("owned current service guard custody lost")
+        return actual(config)
+
+    monkeypatch.setattr(location, "require_not_pending", require)
+    if when == "before":
+        lost.append(True)
+    else:
+        observe = owner._observe
+
+        def after(*args, **kw):
+            result = observe(*args, **kw)
+            lost.append(True)
+            return result
+
+        monkeypatch.setattr(owner, "_observe", after)
+    with pytest.raises(ValueError, match="current service guard"):
+        owner.preflight(readonly, "run-1", c.command)

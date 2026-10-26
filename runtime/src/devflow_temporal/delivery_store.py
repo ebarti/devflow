@@ -1024,10 +1024,13 @@ class DeliveryStore:
             logger.debug("Run %s: Temporal closure unproven (%s: %s)",
                          run_id, type(exc).__name__, exc)
             raise ValueError("continuation predecessor Temporal closure is unproven") from exc
-        if (closed.get('result', {}).get('checks', {}).get('ci') or {}).get('execution_inventory'):
+        result = closed.get('result')
+        checks = result.get('checks') if isinstance(result, dict) else None
+        ci = checks.get('ci') if isinstance(checks, dict) else None
+        if isinstance(ci, dict) and ci.get('execution_inventory'):
             from .delivery_ci_inventory import validate_result
 
-            validate_result(self, run_id, closed['result']['checks']['ci'])
+            validate_result(self, run_id, ci)
         if not sealed:
             self._preserve_closure(run_id, closed)
         return closed
