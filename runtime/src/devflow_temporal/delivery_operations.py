@@ -631,6 +631,14 @@ def register_operations(app, service, hostguard, mutationguard):
             from .delivery_operation_temporal import reconcile
 
             result, refusal = await reconcile(service, operation)
+        if result is None and refusal is None:
+            from .delivery_operation_receipts import receipt
+
+            try:
+                result = await asyncio.to_thread(receipt, service.store, operation)
+            except (ValueError, OSError, RuntimeError, KeyError, TypeError):
+                # A missing, changed or unavailable owner receipt stays unknown.
+                pass
         if result is not None:
             await asyncio.to_thread(_set, service.store, operation_id, "succeeded", result=result)
         elif refusal is not None:
