@@ -807,6 +807,94 @@ finally:
         self.assertGreater(json.loads(result.stdout)["observational_config_loads"], 0)
         self.assertEqual(json.loads(result.stdout)["write_intents"], 0)
 
+    def test_normal_child_and_parent_exit_preserve_other_runtime_holders(self):
+        home = self.home
+        child_program = r'''
+import os, sys, time
+from pathlib import Path
+ready, release, complete, config = map(Path, sys.argv[1:])
+ready.write_text(str(os.getpid()))
+while not release.exists(): time.sleep(0.01)
+import site
+site.main()
+from devflow_temporal.delivery_config import DeliveryConfig
+DeliveryConfig.load(config)
+complete.touch()
+'''
+        parent_program = r'''
+import json, os, sys, time
+from pathlib import Path
+from devflow_temporal.delivery_config import DeliveryConfig
+from devflow_temporal.delivery_control import _launch
+config = DeliveryConfig.load(Path(sys.argv[1]))
+home, code = Path(sys.argv[2]), sys.argv[3]
+children = []
+for index in (1, 2):
+    children.append(_launch(config, 'api-' + str(index), [sys.executable, '-I', '-S', '-B', '-c', code,
+        str(home / ('normal-ready-' + str(index))), str(home / ('normal-release-' + str(index))),
+        str(home / ('normal-complete-' + str(index))), str(config.path)]))
+print(json.dumps(children), flush=True)
+pid, status = os.waitpid(children[0]['pid'], 0)
+assert pid == children[0]['pid'] and status == 0
+(home / 'normal-first-collected').touch()
+while not (home / 'normal-parent-exit').exists(): time.sleep(0.01)
+'''
+        parent = subprocess.Popen([str(self.target / "runtime/.venv/bin/python"), "-I", "-B", "-c",
+            parent_program, str(self.config), str(home), child_program], env=self.env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        children = []
+        def wait_for(path):
+            deadline = time.monotonic() + 15
+            while not path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(path.exists(), "owned runtime handoff did not reach " + path.name)
+
+        def update_is_excluded():
+            result = subprocess.run(["sh", str(self.target / "scripts/update.sh"), "owned-missing-release",
+                str(self.skills), str(self.codex)], env=self.env, text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("temporarily unavailable", result.stderr.lower())
+
+        try:
+            line = parent.stdout.readline()
+            self.assertTrue(line, parent.stderr.read() if parent.poll() is not None else "no child receipt")
+            children = json.loads(line)
+            for index in (1, 2):
+                wait_for(home / ("normal-ready-" + str(index)))
+            (home / "normal-release-1").touch()
+            wait_for(home / "normal-first-collected")
+            self.assertTrue((home / "normal-complete-1").exists())
+            self.assertIsNone(parent.poll())
+            update_is_excluded()  # Normal child exit must not unlock its parent/sibling.
+            (home / "normal-parent-exit").touch()
+            out, err = parent.communicate(timeout=15)
+            self.assertEqual(parent.returncode, 0, out + err)
+            self.assertFalse((home / "normal-complete-2").exists())
+            update_is_excluded()  # Graceful parent exit leaves the waiting child custodian.
+            (home / "normal-release-2").touch()
+            wait_for(home / "normal-complete-2")
+            import fcntl
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                descriptor = os.open(self.target.parent / ".production-install.lock", os.O_RDWR)
+                try:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.02)
+                finally:
+                    os.close(descriptor)
+            else:
+                self.fail("normal trusted runtime exits did not release their installation lease")
+        finally:
+            for index in (1, 2):
+                (home / ("normal-release-" + str(index))).touch()
+            (home / "normal-parent-exit").touch()
+            if parent.poll() is None:
+                parent.kill()
+            parent.communicate(timeout=10)
+
     def test_registration_rollback_authenticates_owner_before_foreign_code(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "source"
