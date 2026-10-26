@@ -83,6 +83,10 @@ jobs:
       - run: echo "$RUNNER_TEMP/devflow-uv/bin" >> "$GITHUB_PATH"
       - run: uv sync --locked --python python
         working-directory: runtime
+      - name: Prepare disposable native SDK and official tool fixtures
+        run: |
+          .venv/bin/python tests/portable_temporal_fixture.py "$RUNNER_TEMP/devflow-portable-temporal"
+        working-directory: runtime
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
       - name: Run assigned runtime modules and host 0 Mac source qualification

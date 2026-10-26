@@ -390,8 +390,22 @@ def auxiliary(store, index):
 
 
 def seed(root, kind):
+    from importlib.util import module_from_spec, spec_from_file_location
+
     from test_delivery_amendment_capacity import cut_operational_capacity
-    from test_delivery_temporal_prerequisites import temporal_case
+
+    # The retained runtime owns the production and scenario helpers. Its old
+    # test fixture assumed a private sibling and a fixed historical receipt;
+    # load only the current portable fixture adapter for synthetic setup.
+    fixture_directory = Path(__file__).resolve().parent
+    sys.path.append(str(fixture_directory))
+    module_spec = spec_from_file_location(
+        "portable_temporal_case_adapter",
+        fixture_directory / "test_delivery_temporal_prerequisites.py",
+    )
+    fixture_module = module_from_spec(module_spec)
+    module_spec.loader.exec_module(fixture_module)
+    temporal_case = fixture_module.temporal_case
 
     root.mkdir(parents=True)
     patch = pytest.MonkeyPatch()

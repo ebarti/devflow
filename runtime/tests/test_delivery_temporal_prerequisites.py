@@ -35,16 +35,15 @@ from devflow_temporal.delivery_resources import (
 )
 from devflow_temporal.delivery_sandbox import prepare_native_check
 
-# Acquisition/provenance is independent retained evidence. No network, unknown
-# host cache, active environment write or real provider is used by this suite.
-STAGE = Path(
-    os.environ.get(
-        "DEVFLOW_TEST_TEMPORAL_PREREQUISITES",
-        str(Path(__file__).resolve().parents[3] / "temporal-prerequisites-20261024"),
-    )
-)
-PROVENANCE = STAGE / "temporal-prerequisites.provenance.v1.json"
-PROVENANCE_SHA = "70e40d7284f61cfc4f3054ed9005028ec08394a6abb3ad30e10e2c59e991c0e1"
+
+def fixture_inputs():
+    from portable_temporal_fixture import fixture_root
+
+    stage = fixture_root()
+    provenance = stage / "temporal-prerequisites.provenance.v1.json"
+    return stage, provenance, hashlib.sha256(provenance.read_bytes()).hexdigest()
+
+
 WRAPPER = (
     "import path from 'node:path';import fs from 'node:fs';import {spawnSync} from 'n"
     "ode:child_process';const value=process.env.PYTEST_ADDOPTS||'';if(!value.startsWi"
@@ -162,10 +161,8 @@ async def test_real_same_workflow_after_worker_restart():
 
 
 def temporal_case(service, monkeypatch, *, minimum=1000, amendment=None, ports=None):
-    if not PROVENANCE.is_file():
-        pytest.skip("independently acquired official pinned prerequisite evidence is unavailable")
-    assert hashlib.sha256(PROVENANCE.read_bytes()).hexdigest() == PROVENANCE_SHA
-    source = STAGE / "immutable-source/workers/automation"
+    stage, provenance, provenance_sha = fixture_inputs()
+    source = stage / "immutable-source/workers/automation"
     extra = {
         ".gitignore": (
             "node_modules/\nworkers/automation/.venv/\n__pycache__/\n.pytest_cache/\ndist/\n"
@@ -191,7 +188,7 @@ def temporal_case(service, monkeypatch, *, minimum=1000, amendment=None, ports=N
     )
     path = case.store.config.state_root / "operator-inputs/temporal-prerequisites.json"
     path.parent.mkdir(mode=0o700)
-    path.write_bytes(PROVENANCE.read_bytes())
+    path.write_bytes(provenance.read_bytes())
     path.chmod(0o600)
     command.update(
         command_id="temporal-prerequisite-iteration4",
@@ -200,7 +197,7 @@ def temporal_case(service, monkeypatch, *, minimum=1000, amendment=None, ports=N
                 "check_id": check["id"],
                 "python_project": "workers/automation",
                 "provenance_path": str(path),
-                "provenance_sha256": PROVENANCE_SHA,
+                "provenance_sha256": provenance_sha,
             }
         },
     )
@@ -393,10 +390,8 @@ def test_actual_worker_readback_reauthenticates_provenance_and_original_custody(
 
 def owned_sdk_environment(broker, checkout=None):
     """Own only a tiny venv shell; use read-only already-verified SDK dependencies."""
-    original = os.environ.get(
-        "DEVFLOW_TEST_TEMPORAL_SDK_PYTHON",
-        str(STAGE.parent / "devflow-temporal-sdk-test-fixture/environment/bin/python"),
-    )
+    stage, _, _ = fixture_inputs()
+    original = str(stage / "immutable-source/workers/automation/.venv/bin/python")
     assert Path(original).is_file(), "stage an owned verified SDK1.26 test dependency fixture"
     checkout = checkout or broker.checkout
     result = subprocess.check_output(
@@ -844,9 +839,8 @@ async def test_composed_public_admission_actual_temporal_worker_native_sdk_and_r
     async def actual_checks(body):
         result = await delivery_checks(body)
         observed.append(result)
-        (STAGE.parent / ("devflow-temporal-composed-" + kind + "-checks.json")).write_text(
-            json.dumps(result, indent=2) + "\n"
-        )
+        output = Path(saved[0].spec["state_dir"]) / f"devflow-temporal-composed-{kind}-checks.json"
+        output.write_text(json.dumps(result, indent=2) + "\n")
         return result
 
     def create(value, patch, **kwargs):

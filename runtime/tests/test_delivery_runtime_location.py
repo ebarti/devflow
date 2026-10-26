@@ -36,16 +36,11 @@ def installed_pair(tmp_path_factory):
         "Commit the isolated candidate before testing actual installed-source authority"
     )
     root = tmp_path_factory.mktemp("location")
-    python = Path(
-        os.environ.get(
-            "DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON",
-            str(
-                Path.home()
-                / ".local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12"
-            ),
-        )
-    )
-    assert python.is_file(), "provide the original frozen native interpreter for this owner test"
+    python = Path(os.environ.get("DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON", sys._base_executable))
+    assert python.is_file(), "provide a native Python 3.12 interpreter for this owner test"
+    from portable_temporal_fixture import fixture_root
+
+    stage = fixture_root()
     home = root / "home"
     old = home / ".codex/worktrees/owned/developer-workflow"
     new = home / ".local/share/devflow/developer-workflow"
@@ -54,17 +49,10 @@ def installed_pair(tmp_path_factory):
         "HOME": str(home),
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
-        "UV_CACHE_DIR": str(Path.home() / ".cache/uv"),
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache/uv")),
         "UV_PYTHON_INSTALL_DIR": str(Path(sys.executable).resolve().parents[2]),
         "PYTHONDONTWRITEBYTECODE": "1",
-        "DEVFLOW_TEST_TEMPORAL_PREREQUISITES": os.environ.get(
-            "DEVFLOW_TEST_TEMPORAL_PREREQUISITES",
-            str(ROOT.parent / "temporal-prerequisites-20261024"),
-        ),
-        "DEVFLOW_TEST_TEMPORAL_SDK_PYTHON": os.environ.get(
-            "DEVFLOW_TEST_TEMPORAL_SDK_PYTHON",
-            str(ROOT.parent / "devflow-temporal-sdk-test-fixture/environment/bin/python"),
-        ),
+        "DEVFLOW_PORTABLE_FIXTURE_ROOT": str(stage),
     }
     for target, revision in ((old, BASE), (new, "HEAD")):
         target.parent.mkdir(parents=True, exist_ok=True)
