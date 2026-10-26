@@ -84,38 +84,8 @@ def observe_admission(store, spec):
     return GitHubDelivery().snapshot(spec["issue_url"], spec["github_repo"])
 
 
-def admit(store, db, spec, observed=None):
-    """Claim before enqueueing a coordinator, keyed by the remote issue node ID."""
-    from .delivery_store import _now
-
-    shared = ExecutionRegistry(registry_path(store.config))
-    source = str(store.config.tracking_db)
-    _require_migrated_store(shared, spec, source)
-    snapshot = shared.snapshot(spec["run_id"], source)
-    if snapshot is None:
-        # The caller holds the tracking write lock: no GitHub call may run here.
-        if observed is None:
-            raise ValueError("feature admission requires its GitHub snapshot to be "
-                             "observed before the write transaction")
-        snapshot = observed
-    predecessor = spec.pop("feature_predecessor", None)
-    retry_values = shared.checkpoints(snapshot["issue"]["id"])
-    for key, receipt in retry_values.items():
-        if (key.startswith("plan-revision:preparation-retry:")
-                and receipt["successor_id"] == spec["run_id"]):
-            from .delivery_execution_registry import preparation_lineage
-
-            public = retry_values.get("plan-revision:request:" + receipt["revision_id"])
-            with shared.connect() as claims:
-                chain = preparation_lineage(claims, public) if public else []
-            if (spec.get("feature_plan_revision_preparation_retry")
-                    != {"checkpoint_key": key, "sha256": digest(receipt)}
-                    or spec.get("feature_plan_revision_request") != public
-                    or receipt["predecessor"] != predecessor
-                    or not chain or chain[-1] != (key, receipt)):
-                raise OwnershipConflict(
-                    "preparation successor lacks its server reservation binding")
-    _require_no_legacy_custody(db, spec)
+def _prepare_snapshot_plan(spec, snapshot):
+    """Apply and authenticate the GitHub-owned plan without claiming an owner."""
     if snapshot["delivery"]:
         manifest = snapshot["delivery"]["manifest"]
         accepted = manifest["plan"]
@@ -135,6 +105,46 @@ def admit(store, db, spec, observed=None):
     if (not spec["accepted_plan"] and not snapshot["delivery"]
             or spec["accepted_plan"] and json.loads(spec["accepted_plan"]).get("version") == 2):
         spec["feature_plan_version"] = 2
+
+
+def _validate_preparation_successor(shared, spec, snapshot, predecessor):
+    """Read and authenticate any already-reserved revision preparation lineage."""
+    retry_values = shared.checkpoints(snapshot["issue"]["id"])
+    for key, receipt in retry_values.items():
+        if (key.startswith("plan-revision:preparation-retry:")
+                and receipt["successor_id"] == spec["run_id"]):
+            from .delivery_execution_registry import preparation_lineage
+
+            public = retry_values.get("plan-revision:request:" + receipt["revision_id"])
+            with shared.connect() as claims:
+                chain = preparation_lineage(claims, public) if public else []
+            if (spec.get("feature_plan_revision_preparation_retry")
+                    != {"checkpoint_key": key, "sha256": digest(receipt)}
+                    or spec.get("feature_plan_revision_request") != public
+                    or receipt["predecessor"] != predecessor
+                    or not chain or chain[-1] != (key, receipt)):
+                raise OwnershipConflict(
+                    "preparation successor lacks its server reservation binding")
+
+
+def admit(store, db, spec, observed=None):
+    """Claim before enqueueing a coordinator, keyed by the remote issue node ID."""
+    from .delivery_store import _now
+
+    shared = ExecutionRegistry(registry_path(store.config))
+    source = str(store.config.tracking_db)
+    _require_migrated_store(shared, spec, source)
+    snapshot = shared.snapshot(spec["run_id"], source)
+    if snapshot is None:
+        # The caller holds the tracking write lock: no GitHub call may run here.
+        if observed is None:
+            raise ValueError("feature admission requires its GitHub snapshot to be "
+                             "observed before the write transaction")
+        snapshot = observed
+    predecessor = spec.pop("feature_predecessor", None)
+    _validate_preparation_successor(shared, spec, snapshot, predecessor)
+    _require_no_legacy_custody(db, spec)
+    _prepare_snapshot_plan(spec, snapshot)
     token = shared.claim(
         snapshot,
         spec["run_id"],
@@ -520,11 +530,19 @@ def continue_feature(store, run_id, request, *, _revision=None):
         if response["run_id"] != successor_id:
             raise OwnershipConflict("continuation command already belongs to another request")
         return response
-    if row["revision"] != request["expected_revision"] or row["outcome"] not in {
+    if row is None or row["revision"] != request["expected_revision"] or row["outcome"] not in {
         "blocked",
         "cancelled",
     }:
-        raise OwnershipConflict("feature is not at the specified stopped checkpoint")
+        from .delivery_execution_registry import FeatureHandoffRefused
+        from .delivery_feature_handoff import feature_projection_facts
+        from .delivery_lifecycle import evaluate_transition
+
+        facts = {"operation": "continue_feature", "owner": "feature_continuation",
+                 "owner_proof": None, **feature_projection_facts(row, "continue_feature")}
+        error = FeatureHandoffRefused(evaluate_transition(facts, request))
+        error.args = ("feature is not at the specified stopped checkpoint",)
+        raise error
     shared = registry(original)
     token = original["feature_delivery"]["owner"]
     current = shared.current(token["issue_id"])
@@ -630,7 +648,16 @@ def continue_feature(store, run_id, request, *, _revision=None):
     if not replay_claim and (
         current is None or shared.token(current) != token or current["state"] != "stopped"
     ):
-        raise OwnershipConflict("feature workers or effects have not reached a safe handoff")
+        from .delivery_execution_registry import FeatureHandoffRefused
+        from .delivery_feature_handoff import handoff_facts
+        from .delivery_lifecycle import evaluate_transition
+
+        with shared.connect() as db:
+            assessment = evaluate_transition(handoff_facts(db, token), request)
+        if not assessment["eligible"]:
+            error = FeatureHandoffRefused(assessment)
+            error.args = ("feature workers or effects have not reached a safe handoff",)
+            raise error
     closed_coordinator(store, run_id)
     fields = {
         "work_id",
@@ -665,34 +692,60 @@ def continue_feature(store, run_id, request, *, _revision=None):
     return store.submit(supplied, **admission)
 
 
+def _repair_allowance_baseline(store, token, budget, *, original=None):
+    baseline = {}
+    if not budget.get("allowance"):
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT identity_json FROM delivery_dashboard_state WHERE run_id=?",
+                (token["run_id"],),
+            ).fetchone()
+        recorded = json.loads(row[0]) if row and row[0] else {}
+        if recorded.get("dirty") is not False or recorded.get("local_digest") is not None:
+            raise ValueError("predecessor has no clean recorded runtime identity")
+        native = (original if original is not None else store.spec(token["run_id"]))[
+            "policy"].get("native_identity", {})
+        from .delivery_feature_review_context import _protected_root, _sources
+
+        _, payload = _sources(_protected_root(), recorded.get("revision"))
+        if native and native.get("runtime_payload_sha256") != payload:
+            raise ValueError("predecessor runtime differs from its prepared payload")
+        baseline = {"revision": recorded["revision"], "runtime_payload_sha256": payload}
+    return baseline
+
+
+def _allowance_failure(exc, budget):
+    # A funded historic allowance remains usable if no new identity can be proved.
+    if isinstance(exc, OwnershipConflict) or budget["used"] >= budget["maximum"]:
+        raise OwnershipConflict("cannot authenticate a new installed repair allowance: "
+                                + str(exc)) from exc
+
+
 def _renew_repair_allowance(store, shared, token):
     """A supported continuation may renew only from server-written runtime evidence."""
     budget = shared.budget(token["issue_id"])
     try:
-        baseline = {}
-        if not budget.get("allowance"):
-            with store._connect() as db:
-                row = db.execute(
-                    "SELECT identity_json FROM delivery_dashboard_state WHERE run_id=?",
-                    (token["run_id"],),
-                ).fetchone()
-            recorded = json.loads(row[0]) if row and row[0] else {}
-            if recorded.get("dirty") is not False or recorded.get("local_digest") is not None:
-                raise ValueError("predecessor has no clean recorded runtime identity")
-            native = store.spec(token["run_id"])["policy"].get("native_identity", {})
-            from .delivery_feature_review_context import _protected_root, _sources
-
-            _, payload = _sources(_protected_root(), recorded.get("revision"))
-            if native and native.get("runtime_payload_sha256") != payload:
-                raise ValueError("predecessor runtime differs from its prepared payload")
-            baseline = {"revision": recorded["revision"], "runtime_payload_sha256": payload}
+        baseline = _repair_allowance_baseline(store, token, budget)
         shared.renew_repair_allowance(token, baseline)
     except (OSError, ValueError) as exc:
-        # An old, still-funded feature retains its original continuation contract.
-        # Missing or unverified identity never creates a new allowance.
-        if isinstance(exc, OwnershipConflict) or budget["used"] >= budget["maximum"]:
-            raise OwnershipConflict("cannot authenticate a new installed repair allowance: "
-                                    + str(exc)) from exc
+        _allowance_failure(exc, budget)
+
+
+def _observe_repair_allowance(store, shared, token, original):
+    """Run the same allowance prerequisites without creating any checkpoint."""
+    from .delivery_feature_review_context import current_runtime_identity
+
+    budget = shared.budget(token["issue_id"])
+    try:
+        baseline = _repair_allowance_baseline(store, token, budget, original=original)
+        current = current_runtime_identity()
+        with shared.connect() as db:
+            planned = shared.plan_repair_allowance(db, token, baseline, current)
+        return {"mode": "planned", "budget": budget, "runtime": current,
+                "plan_digest": digest(planned)}
+    except (OSError, ValueError) as exc:
+        _allowance_failure(exc, budget)
+        return {"mode": "funded_without_renewal", "budget": budget}
 
 
 def _settlement_workers(store, spec, closed):

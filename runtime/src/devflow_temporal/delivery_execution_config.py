@@ -139,6 +139,17 @@ def _read_snapshot(path: Path, expected: str) -> dict:
         os.close(descriptor)
 
 
+def verify_existing_execution_config(config: DeliveryConfig) -> None:
+    """Prove admission can reuse its exact private snapshot without publishing one."""
+    with observation_mode():
+        DeliveryConfig._from_raw(config.path, config.raw)
+        _owned_directory(config.state_root)
+        folder = config.state_root / "configuration-snapshots"
+        _owned_directory(folder)
+        expected = digest(config.raw)
+        _read_snapshot(folder / (expected + ".json"), expected)
+
+
 def preserve_execution_config(config: DeliveryConfig) -> None:
     """Only admission/service initialization publishes immutable private snapshots."""
     if _observation_mode.get():

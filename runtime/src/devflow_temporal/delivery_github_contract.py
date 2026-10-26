@@ -12,6 +12,9 @@ import json
 import os
 import re
 import subprocess
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from urllib.parse import quote, urlsplit
 
@@ -26,6 +29,24 @@ from .delivery_plan_model import (
     validate_plan,
     validate_plan_index,
 )
+
+_github_observation = ContextVar("github_delivery_observation", default=None)
+_github_snapshot_host = ContextVar("github_snapshot_host", default=False)
+
+
+@contextmanager
+def bounded_github_observation(repository):
+    """Allow only a bounded read of the exact configured GitHub repository."""
+    if not isinstance(repository, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("GitHub observation requires an exact repository")
+    token = _github_observation.set({"repository": repository.casefold(),
+                                    "deadline": time.monotonic() + 15, "calls": 0})
+    try:
+        yield
+    finally:
+        _github_observation.reset(token)
+
 
 MARKER = "<!-- devflow-delivery:v1 -->"
 MARKER_V2 = "<!-- devflow-delivery:v2 -->"
@@ -297,7 +318,26 @@ def decode_manifest(body: str, issue: dict) -> dict:
 
 class GitHubDelivery:
     def api(self, endpoint: str, *, method: str = "GET", body=None):
-        argv = [os.environ.get("DEVFLOW_GH", "gh"), "api", "--method", method, endpoint]
+        timeout = 60
+        observation = _github_observation.get()
+        if observation is not None:
+            prefix = "repos/" + observation["repository"]
+            target = urlsplit(endpoint)
+            path = target.path.casefold()
+            unsafe_path = (target.scheme or target.netloc or target.fragment or "%" in path
+                           or "\\" in path
+                           or any(part in {"", ".", ".."} for part in path.split("/")))
+            remaining = observation["deadline"] - time.monotonic()
+            if (method != "GET" or body is not None or unsafe_path
+                    or (path != prefix and not path.startswith(prefix + "/"))
+                    or observation["calls"] >= 8 or remaining <= 0.01):
+                raise ValueError("GitHub observation scope or time budget exhausted")
+            observation["calls"] += 1
+            timeout = min(timeout, remaining)
+        argv = [os.environ.get("DEVFLOW_GH", "gh"), "api"]
+        if observation is not None or _github_snapshot_host.get():
+            argv += ["--hostname", "github.com"]
+        argv += ["--method", method, endpoint]
         if body is not None:
             argv += ["--input", "-"]
         result = subprocess.run(
@@ -305,9 +345,11 @@ class GitHubDelivery:
             input=canonical_json(body) if body is not None else None,
             text=True,
             capture_output=True,
-            timeout=60,
+            timeout=timeout,
             check=False,
         )
+        if observation is not None and len(result.stdout.encode()) > 2_000_000:
+            raise ValueError("GitHub observation response exceeds its bounded size")
         if result.returncode:
             match = re.search(r"HTTP (\d{3})", result.stderr)
             status = int(match[1]) if match else None
@@ -358,6 +400,15 @@ class GitHubDelivery:
         }
 
     def snapshot(self, url: str, repository: str) -> dict:
+        # issue_identity accepts github.com only. Pin the same host for the
+        # observation and for ordinary admission, regardless of GH_HOST.
+        token = _github_snapshot_host.set(True)
+        try:
+            return self._snapshot(url, repository)
+        finally:
+            _github_snapshot_host.reset(token)
+
+    def _snapshot(self, url: str, repository: str) -> dict:
         _, number = issue_identity(url, repository)
         repo = self.api(f"repos/{repository}")
         if repo["full_name"].casefold() != repository.casefold() or not repo.get("node_id"):

@@ -625,10 +625,13 @@ class DeliveryStore:
                 f"{reload} before new admission"
             ) from exc
         if digest(live.raw) != digest(self.config.raw):
-            raise ValueError(
-                f"service configuration changed; {reload} to reload the service before "
-                "new admission"
-            )
+            message = (f"service configuration changed; {reload} to reload the service before "
+                       "new admission")
+            if supplied.get("feature_predecessor"):
+                from .delivery_feature_handoff import feature_configuration_refusal
+
+                raise feature_configuration_refusal(message)
+            raise ValueError(message)
         preserve_execution_config(self.config)
         reference = None
         if _automatic is not None:
@@ -645,26 +648,9 @@ class DeliveryStore:
             # Repeat the same custody/plan check after ordinary config admission.
             authenticate_continued_plan(self, deepcopy(supplied))
             retained = self.effective_spec(supplied["feature_predecessor"]["run_id"])
-            frozen = load_execution_config(retained)
-            scope = retained.get("feature_scope_amendment")
-            if scope:
-                from .delivery_feature_scope import authenticate_receipt
+            from .delivery_feature_handoff import validate_retained_configuration
 
-                amended = authenticate_receipt(self, scope)
-                if (amended.path != frozen.path
-                        or digest(amended.raw) != digest(frozen.raw)):
-                    raise ValueError("feature continuation changed its retained scope authority")
-                frozen = load_execution_config(
-                    self.effective_spec(scope["predecessor"]["run_id"]))
-            # Capacity schedules actors through operational_config; it never
-            # rewrites the predecessor's frozen execution authority.
-            current_authority = {key: value for key, value in self.config.raw.items()
-                                 if key != "capacity"}
-            frozen_authority = {key: value for key, value in frozen.raw.items()
-                                if key != "capacity"}
-            if (self.config.path != frozen.path
-                    or digest(current_authority) != digest(frozen_authority)):
-                raise ValueError("feature continuation changed its original service configuration")
+            validate_retained_configuration(self, retained)
         admission = {}
         if reference:
             admission["_base_ref"] = reference

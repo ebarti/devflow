@@ -58,6 +58,10 @@ def _codes(assessment):
 
 
 def _observe(store, kind="continue_feature", revision=7):
+    if kind == "revise_feature_plan":
+        from devflow_temporal.delivery_feature_handoff import observe_handoff
+
+        return observe_handoff(store, "run-1", {"expected_revision": revision}, operation=kind)
     return assess_transition(store, "run-1", kind, {"expected_revision": revision})
 
 
