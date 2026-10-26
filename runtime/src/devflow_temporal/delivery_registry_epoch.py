@@ -133,6 +133,14 @@ def verify_schema(db):
     if tables != allowed:
         raise EpochUnavailable("unsupported execution registry tables")
     expected = _triggers()
+    protected_tables = set(_KEYS) | {"execution_epoch_meta", "execution_authority_epochs"}
+    actual_triggers = {
+        row[0]
+        for row in db.execute("SELECT name,tbl_name FROM sqlite_master WHERE type='trigger'")
+        if row[1] in protected_tables
+    }
+    if actual_triggers != set(expected):
+        raise EpochUnavailable("unsupported registry authority schema: unexpected triggers")
     if (
         schema.get("execution_epoch_meta") != _META_SQL
         or schema.get("execution_authority_epochs") != _EPOCH_SQL

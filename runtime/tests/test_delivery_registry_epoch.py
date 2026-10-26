@@ -244,3 +244,37 @@ def test_unrecognized_unique_index_is_refused(setup):
         db.execute('CREATE UNIQUE INDEX unexpected ON execution_snapshots(input_digest)')
     with pytest.raises(EpochUnavailable, match='index'):
         observation(registry)
+
+
+@pytest.mark.parametrize(
+    'table', ['execution_claims', 'execution_authority_epochs', 'execution_epoch_meta']
+)
+def test_unknown_triggers_are_refused_at_observation_and_bootstrap(setup, table):
+    registry, _ = setup
+    with sqlite3.connect(registry.path) as db:
+        db.execute(f'''CREATE TRIGGER custom_reset AFTER UPDATE ON {table} BEGIN
+            UPDATE execution_authority_epochs SET epoch=1 WHERE kind='issue' AND key='i';
+        END''')
+    with pytest.raises(EpochUnavailable, match='triggers'):
+        observation(registry)
+    with pytest.raises(EpochUnavailable, match='triggers'):
+        ExecutionRegistry(registry.path)
+
+
+def test_first_bootstrap_rolls_back_if_authority_table_has_unknown_trigger(setup):
+    registry, _ = setup
+    with sqlite3.connect(registry.path) as db:
+        names = [row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'authority_epoch_%'")]
+        for name in names:
+            db.execute(f'DROP TRIGGER "{name}"')
+        db.execute('DROP TABLE execution_authority_epochs')
+        db.execute('DROP TABLE execution_epoch_meta')
+        db.execute('CREATE TRIGGER custom_reset AFTER UPDATE ON execution_claims '
+                   'BEGIN SELECT 1; END')
+    with pytest.raises(EpochUnavailable, match='triggers'):
+        ExecutionRegistry(registry.path)
+    with sqlite3.connect(registry.path) as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master "
+                              "WHERE name='execution_epoch_meta'").fetchone()
