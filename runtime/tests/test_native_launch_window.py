@@ -81,37 +81,27 @@ HOOKS = {
 }
 
 
-def _lose_monitor(monkeypatch, died_at):
+def _lose_monitor(monkeypatch, died_at, folder):
     original_popen = subprocess.Popen
     script = MONITOR_SCRIPT.format(hook=HOOKS[died_at])
 
     def popen(argv, *args, **kwargs):
-        if argv[-1] == "devflow_temporal.delivery_native_process":
+        owner = sys._getframe(1).f_locals.get("self")
+        if (argv[-1] == "devflow_temporal.delivery_native_process"
+                and getattr(owner, "folder", None) == folder):
             argv = [sys.executable, "-I", "-c", script]
         return original_popen(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", popen)
 
 
-def _assert_not_started_journal(folder, died_at):
+def _assert_unknown_journal(folder):
     journal = read_private(folder / "native-process.json")
-    assert journal["phase"] == "finished" and journal["monitoring_complete"] is False
-    assert journal["result"]["provider_outcome"] == "not_started"
-    assert journal["result"]["interrupted_monitor"] is True
-    assert journal["cleanup_reconciliation"]["previous_phase"] == "allocated"
-    assert (folder / "launch.json").exists() == (died_at != "launch")
-    assert not (folder / "start.json").exists() and not (folder / "result.json").exists()
-    observed = native.process_table()
-    assert not any(observed.get(int(pid), {}).get("identity") == entry["identity"]
-                   and not observed[int(pid)]["stat"].startswith("Z")
-                   for pid, entry in journal["owned"].items())
-    if died_at == "ready":
-        ready = read_private(folder / "ready.json")
-        assert str(ready["pid"]) in journal["owned"]
-    assert native.reconcile_process(folder / "native-process.json")["cleanup"] \
-        == "observed-native-confirmed"
+    assert journal["phase"] == "allocated"
+    assert journal["monitoring_complete"] is False
+    assert native.reconcile_process(folder / "native-process.json")["cleanup"] == "unknown"
     assert read_private(folder / "native-process.json") == journal
-    assert native.reconciled_not_started(folder)
+    assert not native.reconciled_not_started(folder)
     return journal
 
 
@@ -252,13 +242,11 @@ async def test_real_owner_paused_in_launch_window_keeps_its_slot(native_role, mo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resolution", ["waiter", "sweep"])
 @pytest.mark.parametrize("died_at", ["spawn", "ready"])
-async def test_monitor_lost_before_authorization_is_launch_absent(
+async def test_monitor_lost_before_authorization_retains_unknown_custody(
         native_role, monkeypatch, died_at, resolution):
     case = native_role
-    _lose_monitor(monkeypatch, died_at)
+    _lose_monitor(monkeypatch, died_at, case.folder)
     if resolution == "sweep":
-        # The waiting worker is lost right after its monitor; a later sweep
-        # resolves the unknown row from the journal alone.
         complete = supervisor.DeliverySupervisor._complete_native
 
         def lost(self, *args, **kwargs):
@@ -268,63 +256,49 @@ async def test_monitor_lost_before_authorization_is_launch_absent(
         unknown = await delivery_role(case.request)
         assert unknown["cleanup"] == "unknown" and attempt(case)["state"] == "unknown"
         monkeypatch.setattr(supervisor.DeliverySupervisor, "_complete_native", complete)
-        receipt = _complete_attempt(case.store, case.request["spec"], attempt(case))
-        assert receipt["cleanup"] == "observed-native-confirmed"
-        assert json.loads(attempt(case)["result_json"])["finish_reason"] == "prelaunch"
-    # A live waiter, or a later retry after the sweep, publishes the same result.
+        with pytest.raises(ValueError, match="cleanup remains unknown"):
+            _complete_attempt(case.store, case.request["spec"], attempt(case))
     result = await delivery_role(case.request)
-    row = _assert_launch_absent(case, result)
-    assert len(case.created) == 1
-    _assert_not_started_journal(case.folder, died_at)
-    assert await delivery_role(case.request) == result
-    assert attempt(case) == row
-    assert _admits(case, "review")
+    assert result["cleanup"] == "unknown" and attempt(case)["state"] == "unknown"
+    # A retry may construct a reattachment object, but its existing journal
+    # must remain allocated and no provider may receive a new GO.
+    assert len(case.created) == (2 if resolution == "sweep" else 1)
+    assert all(process.folder == case.folder for process in case.created)
+    assert not (case.state / "invocations").exists()
+    _assert_unknown_journal(case.folder)
+    assert not _admits(case, "review")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("died_at", ["spawn", "ready"])
-async def test_monitor_lost_before_authorization_passes_automatic_retry_observation(
+async def test_monitor_lost_before_authorization_blocks_automatic_retry_observation(
         native_role, monkeypatch, died_at):
     case = native_role
-    _lose_monitor(monkeypatch, died_at)
+    _lose_monitor(monkeypatch, died_at, case.folder)
     result = await delivery_role(case.request)
-    row = _assert_launch_absent(case, result)
-    _assert_not_started_journal(case.folder, died_at)
-    # Automatic retry authenticates the blocked run's attempts against their
-    # registered journals before reusing anything.
-    assert RunResources(case.request["spec"]).finalize("blocked")["outcome"] == "blocked"
-    observed = observe_completed_resources(case.request["spec"], [row])
-    assert observed["journal_sha256"]
-    assert observe_finalized_resources(case.request["spec"])["finalization_sha256"]
+    assert result["cleanup"] == "unknown" and attempt(case)["state"] == "unknown"
+    _assert_unknown_journal(case.folder)
+    assert RunResources(case.request["spec"]).finalize("blocked")["resource_cleanup"] == "unknown"
+    with pytest.raises(ValueError):
+        observe_completed_resources(case.request["spec"], [attempt(case)])
 
 
 @pytest.mark.parametrize("died_at", ["spawn", "ready"])
-def test_monitor_lost_before_authorization_is_retryable_prelaunch(
+def test_monitor_lost_before_authorization_cannot_prove_retryable_absence(
         service, monkeypatch, tmp_path, died_at):
     store, request = service
     spec, _state, command, folder = _sealed_prelaunch_retry_fixture(store, request, monkeypatch)
-    _lose_monitor(monkeypatch, died_at)
-    # The sealed fixture run is the retry's authority; only the launch itself
-    # needs the native backend the monitor insists on.
+    _lose_monitor(monkeypatch, died_at, folder)
     authority = {**spec, "policy": {**spec["policy"], "execution_backend": "native-macos"}}
     authority["policy_digest"] = digest(authority["policy"])
     outcome = native.NativeProcess(
         authority, folder, argv=[sys.executable, "-c", "pass"], cwd=tmp_path,
         environment={"PATH": os.environ["PATH"]}, timeout=10, cancelled=lambda: False,
     ).run()
-    assert outcome["interrupted_monitor"] is True
-    assert outcome["provider_outcome"] == "not_started"
-    _assert_not_started_journal(folder, died_at)
-    assert any(folder.iterdir())
-    # The folder keeps its evidence yet proves no provider ran: retry-prelaunch
-    # and the resumed implementer's readback both accept it.
-    response = store.retry_prelaunch(request["run_id"], command)
-    assert response["phase"] == "repair_prelaunch_retry_queued"
-    assert store.retry_prelaunch(request["run_id"], command) == response
-    with store._connect() as db:
-        run = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
-                         (request["run_id"],)).fetchone()
-    store.repair_preflight(spec, json.loads(run["recovery_json"]))
+    assert outcome["cleanup"] == "unknown"
+    _assert_unknown_journal(folder)
+    with pytest.raises(ValueError, match="absence or cleanup"):
+        store.retry_prelaunch(request["run_id"], command)
 
 
 @pytest.mark.asyncio
