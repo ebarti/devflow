@@ -171,7 +171,8 @@ def test_observation_batch_materializes_history_once_and_keeps_fresh_checks(chai
         observed.append(True)
         return {}
 
-    def reconcile(path):
+    def reconcile(path, *, spec):
+        assert spec == chain[0]
         reconciled.append(path)
         return {'cleanup': 'observed-native-confirmed'}
 
@@ -192,7 +193,8 @@ def test_observation_batch_refuses_admission_drift_before_next_reconciliation(ch
     paths = _process_paths(spec, root)
     reconciled = []
 
-    def reconcile(path):
+    def reconcile(path, *, spec):
+        assert spec == chain[0]
         reconciled.append(path)
         write_private(Path(spec['state_dir']) / namespace(current) / 'admission.json',
                       {**current, 'session_id': 'changed-after-first-journal'})

@@ -3,9 +3,12 @@
 import base64
 import hashlib
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 import yaml
+from test_delivery_store import service as service
 
 from devflow_temporal.delivery_broker import _git
 from devflow_temporal.delivery_native_dependencies import (
@@ -51,7 +54,11 @@ def addon(tmp_path, monkeypatch):
     for name, raw in frozen.items():
         (checkout / name).write_bytes(raw)
 
-    def git(argv):
+    real_check_output = subprocess.check_output
+
+    def git(argv, *args, **kwargs):
+        if "/readonly/source" not in argv:
+            return real_check_output(argv, *args, **kwargs)
         if "ls-tree" in argv:
             return b"100644 blob fixture\tinput\n" if argv[-1] in frozen else b""
         return frozen[argv[-1].split(":", 1)[1]]
@@ -245,15 +252,18 @@ def test_both_preparation_entries_pass_the_fresh_checkout_native_target(
 
 @pytest.mark.parametrize("install_exit", [0, 1])
 def test_target_prerequisite_runs_after_successful_original_install_before_tests(
-    addon, monkeypatch, tmp_path, install_exit
+    addon, monkeypatch, tmp_path, install_exit, service
 ):
     from devflow_temporal import delivery_native_process, delivery_preparation, delivery_sandbox
     from devflow_temporal.delivery_broker import DeliveryBroker
 
     spec, checkout, _, _, store, _ = addon
     broker = object.__new__(DeliveryBroker)
-    broker.spec = {**spec, "provider": "codex", "policy": {}}
-    broker.state_dir = tmp_path / "run-fixture"
+    fixture_store, request = service
+    fixture_store.submit(request)
+    broker.spec = {**fixture_store.spec(request["run_id"]), **spec, "provider": "codex"}
+    broker.state_dir = Path(broker.spec["state_dir"])
+    broker.diagnostic_context = None
     broker._ensure_native_dependency_store = lambda _: {"store": str(store)}
     broker._register_generated = lambda *a: []
     broker._record_generated = lambda *a: None
@@ -268,6 +278,7 @@ def test_target_prerequisite_runs_after_successful_original_install_before_tests
 
     class Process:
         def __init__(self, spec, folder, **options):
+            self.spec, self.environment = spec, options["environment"]
             self.folder, self.command = folder, options["argv"]
             self.journal = folder / "native-process.json"
 
@@ -376,7 +387,8 @@ def test_native_receipt_replay_readback_refuses_drift_without_launch(
         },
     )
     monkeypatch.setattr(delivery_resources.RunResources, "register", lambda *a: None)
-    def reconcile(_):
+    def reconcile(_, *, spec):
+        assert spec == broker.spec
         if drift == "process-exception":
             raise RuntimeError("owned fixture readback unavailable")
         return {"cleanup": "unknown" if drift == "process" else "observed-native-confirmed"}
