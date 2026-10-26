@@ -87,6 +87,11 @@ async function command<T>(path: string, body: object): Promise<T> {
   })
 }
 
+async function cancellationOperationId(commandId: string): Promise<string> {
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(commandId))
+  return `cancel:${Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
 export interface DurableOperation {
   operation_id: string
   run_id: string | null
@@ -165,7 +170,41 @@ export const api = {
     await command(`/api/runs/${encodeURIComponent(runId)}/decision`, body)
   },
   cancel: async (runId: string, body: { command_id: string; expected_revision: number; reason: string }): Promise<void> => {
-    await command(`/api/runs/${encodeURIComponent(runId)}/cancel`, body)
+    let operation: DurableOperation
+    try {
+      operation = await api.createOperation({
+        operation_id: await cancellationOperationId(body.command_id), run_id: runId, kind: 'cancel', request: body,
+      })
+    } catch (cause) {
+      // A transport or envelope-level refusal does not establish the domain
+      // outcome; preserve the caller's exact request and inspect the operation.
+      throw new ApiError(cause instanceof Error ? cause.message : 'Cancellation status is unavailable.', 0)
+    }
+    const recorded = (operation as DurableOperation & { request?: unknown })?.request
+    if (!operation || typeof operation.operation_id !== 'string' || !operation.operation_id ||
+        operation.kind !== 'cancel' || operation.run_id !== runId || !recorded ||
+        typeof recorded !== 'object' || Array.isArray(recorded)) {
+      throw new ApiError('Cancellation operation identity is unavailable.', 0)
+    }
+    const request = recorded as Record<string, unknown>
+    if (Object.keys(request).length !== 3 || request.command_id !== body.command_id ||
+        request.expected_revision !== body.expected_revision || request.reason !== body.reason) {
+      throw new ApiError('Cancellation operation does not match the retained request.', 0)
+    }
+    if (operation.state === 'succeeded') {
+      const result = operation.result as { run_id?: unknown; phase?: unknown; revision?: unknown } | null
+      if (!result || result.run_id !== runId || typeof result.phase !== 'string' ||
+          typeof result.revision !== 'number' || !Number.isInteger(result.revision)) {
+        throw new ApiError('Cancellation receipt is incomplete.', 0)
+      }
+      return
+    }
+    if (operation.state === 'refused') {
+      // The operation owner has recorded a definite refusal. CancelRun's
+      // existing 409 path refreshes the run before admitting a new intent.
+      throw new ApiError(operation.error || 'Cancellation was refused.', 409)
+    }
+    throw new ApiError(`Cancellation operation ${operation.operation_id} is ${operation.state}.`, 0)
   },
   reconcileTracker: async (runId: string, body: { command_id: string; expected_revision: number }): Promise<void> => {
     await command(`/api/runs/${encodeURIComponent(runId)}/reconcile-tracker`, body)
