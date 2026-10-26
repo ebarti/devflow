@@ -19,6 +19,10 @@ from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 @pytest.fixture
 def pending(service, monkeypatch):
+    # This component fixture controls the closed owner boundary. Actual stage
+    # authentication is qualified by test_delivery_publication_proof.py.
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.publication_stop_proof',
+                        lambda *_args: None)
     store, _request = service
     original_admit = type(store.config).admit
 

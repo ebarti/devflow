@@ -247,6 +247,10 @@ NEW_REASON = 'publication unresolved: readback deadline exhausted'
 @pytest.fixture
 def pending_v1(service, monkeypatch):
     """A current admission stopped after its push with no PR, effect bound to the head."""
+    # Component scope: exact owner stage is controlled here. The real closed
+    # history/public boundary is exercised in test_delivery_publication_proof.py.
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.publication_stop_proof',
+                        lambda *_args: None)
     store, broker, original, _gate_request = unpublished.__wrapped__(service, monkeypatch)
     spec = store.effective_spec('run-1')
     assert spec['publication_readback_version'] == 1
@@ -309,11 +313,11 @@ def test_current_admission_pending_publication_is_admitted_by_effect_identity(pe
     assert recovery['state']['error'] == error
 
 
-@pytest.mark.parametrize('drift', ['other_stop', 'bound_number'])
+@pytest.mark.parametrize('drift', ['checkpoint_state', 'bound_number'])
 def test_current_admission_pending_publication_keeps_identity_refusals(pending_v1, drift):
     store, broker, state, request, stop = pending_v1
-    if drift == 'other_stop':
-        stop('repair limit exhausted')
+    if drift == 'checkpoint_state':
+        state['phase'] = 'checks'
     else:
         with store._connect() as db:
             observed = {'head': 'a' * 40 if drift == 'bound_head' else request['expected_head'],

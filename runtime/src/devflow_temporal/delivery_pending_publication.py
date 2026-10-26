@@ -12,7 +12,8 @@ from .delivery_gate_retry import _retained_recovery, _sealed_row, prepare_runtim
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
-from .delivery_publication import stopped_at_publication
+from .delivery_publication_proof import matches as proof_matches
+from .delivery_publication_proof import observe as publication_stop_proof
 from .delivery_resources import read_private
 from .delivery_source_scope import outside_scope
 
@@ -119,7 +120,6 @@ def snapshot(store, run_id, *, observation=False):
             or state.get('phase') != 'blocked'
             or row['error'] != state.get('error')
             or state.get('checks') != json.loads(row['checks_json'] or '{}')
-            or not stopped_at_publication(state)
             or state.get('cleanup') != row['cleanup'] or state.get('outcome') != 'blocked'
             or state.get('revision') != row['protocol_revision']
             or state.get('iteration') != row['iteration']
@@ -151,6 +151,7 @@ def snapshot(store, run_id, *, observation=False):
         _refuse('publication_checkpoint_unproven',
                 'matching closed publication checkpoint and implementation evidence',
                 'inspect the original closed publication evidence', {'row': row, 'closed': closed})
+    stage_proof = publication_stop_proof(store, spec, closed)
     broker = DeliveryBroker(store, spec)
     observed = broker.candidate()
     broker._validate_publication_commits()
@@ -240,6 +241,7 @@ def snapshot(store, run_id, *, observation=False):
             'cleanup': (settlement['native_cleanup'] if settlement else
                         _stopped_cleanup(spec, read_only=True) if observation
                         else _stopped_cleanup(spec)),
+            'publication_stop_proof': stage_proof,
             **({'publication_settlement': settlement} if settlement else {})}
 
 def admit(store, run_id, payload, *, preflight=False):
@@ -345,6 +347,10 @@ def custody(db, recovery):
 
 def readback(store, spec, recovery):
     effective_spec(store, recovery['original_spec'], recovery)
+    proof = recovery['seal'].get('publication_stop_proof')
+    if proof is not None and not proof_matches(spec, recovery['state'], proof):
+        _refuse('publication_stage_proof_changed', 'original sealed publication stop proof',
+                'inspect retained publication admission', recovery)
     broker = DeliveryBroker(store, spec)
     observed = broker.candidate()
     remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])

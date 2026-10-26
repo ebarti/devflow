@@ -45,7 +45,6 @@ from .delivery_execution_config import (
     transport_difference,
 )
 from .delivery_preparation import execution_retired
-from .delivery_publication import stopped_at_publication
 
 logger = logging.getLogger(__name__)
 
@@ -1385,7 +1384,6 @@ class DeliveryStore:
             or state.get("phase") != "blocked"
             or state.get("outcome") != "blocked"
             or state.get("execution_state") != "blocked"
-            or not stopped_at_publication(state)
             or state.get("cleanup") not in {"none", "pending_publication_readback"}
             or state.get("revision") != supplied["expected_revision"]
             or type(iteration) is not int
@@ -1423,6 +1421,9 @@ class DeliveryStore:
             )
         ):
             raise ValueError("closed Temporal result is not a recoverable publication")
+        from .delivery_publication_proof import observe as publication_stop_proof
+
+        stage_proof = publication_stop_proof(self, spec, closed)
         broker = DeliveryBroker(self, spec)
         observed = broker.reconcile_publish(
             iteration,
@@ -1441,6 +1442,7 @@ class DeliveryStore:
             "expected_head": head,
             "expected_pr_number": pr_number,
             "observed_publication": observed,
+            "publication_stop_proof": stage_proof,
         }
         response = {
             "run_id": run_id,

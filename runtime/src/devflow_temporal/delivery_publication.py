@@ -14,15 +14,25 @@ _BIDI_MARKS = {"\u061c", "\u200e", "\u200f"}
 
 
 def stopped_at_publication(state: dict) -> bool:
-    """A controller stop at the publication boundary.
+    """Historical workflow compatibility hint, never fresh admission authority.
 
     New runs classify it (``publication_deadline``); stops recorded before the
-    classification carry one of the historical reasons, which keep admitting.
+    classification carry historical text. Already recorded recovery inputs keep
+    their replay branch. Fresh admission uses delivery_publication_proof instead.
     """
     failure = (state.get("checks") or {}).get("failure") or {}
     error = state.get("error") or ""
     return (failure.get("cause_type") == "publication_deadline"
             or error.startswith("publication unresolved: "))
+
+
+def admitted_recovery_stage(spec: dict, recovery: dict, *, legacy_hint: bool) -> bool:
+    """New admitted inputs bind proof; old recorded inputs keep their replay branch."""
+    if 'publication_stop_proof' not in recovery:
+        return legacy_hint
+    from .delivery_publication_proof import matches
+
+    return matches(spec, recovery.get('state') or {}, recovery['publication_stop_proof'])
 
 
 def conventional(subject: str) -> bool:
