@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -57,10 +58,12 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
         initial = DeliveryStore(DeliveryConfig.load(initial.config.path))
         c = ci_case.__wrapped__((initial, submitted), monkeypatch)
         old = copy.deepcopy(c.closed)
-        original_native = {
-            p: p.read_bytes()
-            for p in Path(c.case.spec["state_dir"]).glob("checks/3/*/native/native-process.json")
-        }
+        original_native = {}
+        for stage in ("local", "prepublish"):
+            for value in old["result"]["checks"][stage]["results"]:
+                path = Path(value["native_process"]["journal"])
+                assert path.is_relative_to(Path(c.case.spec["state_dir"]))
+                original_native[path] = path.read_bytes()
         assert len(original_native) >= 2
         program = current_runtime_identity()
         identities = []
@@ -128,9 +131,16 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
             with pytest.raises((ValueError, OSError)):
                 await delivery_gates_readback({"spec": current, "recovery": recovery})
             checkout.unlink()
+            shutil.copytree(retained, checkout, symlinks=True)
+            with pytest.raises(ValueError):
+                await delivery_gates_readback({"spec": current, "recovery": recovery})
+            shutil.rmtree(checkout)
         finally:
             if checkout.is_symlink():
                 checkout.unlink()
+            elif checkout.exists():
+                assert retained.exists()
+                shutil.rmtree(checkout)
             retained.rename(checkout)
         assert await delivery_gates_readback({"spec": current, "recovery": recovery})
 

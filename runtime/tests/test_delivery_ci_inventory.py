@@ -300,3 +300,62 @@ def test_published_ci_retry_before_ack_retains_the_original_rollup_reader(ci_cas
     assert owner.result_for(c.case.broker, c.case.publication) is None
     assert c.closed["result"]["checks"]["ci"]["state"] == "pending"
     assert not c.remote.calls
+
+
+@pytest.mark.parametrize("change", ["foreign", "same_owner", "gate_event", "gate_command"])
+def test_worker_binds_the_exact_normal_CI_claim_and_admission_generation(ci_case, change):
+    c = ci_case
+    pre = owner.preflight(c.store, "run-1", c.command)
+    owner.acknowledge(
+        c.store,
+        "run-1",
+        {**c.command, "preflight_key": pre["preflight_key"], "acknowledgement": owner.ACK},
+    )
+    c.store.continue_repair("run-1", c.gate)
+    current = c.store.effective_spec("run-1")
+    with c.store._connect() as db:
+        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
+    owner.validate(c.store, current, recovery)
+    with c.store._connect() as db:
+        if change in {"foreign", "same_owner"}:
+            c.store.state.release_work(db, current["work_id"], "external:devflow:run-1")
+            c.store.state.claim_work(
+                db,
+                current["work_id"],
+                "foreign" if change == "foreign" else "external:devflow:run-1",
+                c.store.config.dashboard_url,
+            )
+        elif change == "gate_event":
+            db.execute(
+                "UPDATE delivery_events SET payload_json='{}' WHERE type='gates_retry_queued'"
+            )
+        else:
+            db.execute(
+                "UPDATE delivery_commands SET response_json='{}' WHERE command_id=?",
+                (c.gate["command_id"],),
+            )
+    with pytest.raises(ValueError):
+        owner.validate(c.store, current, recovery)
+    with c.store._connect() as db:
+        assert not db.execute("SELECT 1 FROM delivery_ci_inventory_results").fetchone()
+
+
+def test_file_only_success_cannot_substitute_for_normal_CI_observation(ci_case):
+    c = ci_case
+    pre = owner.preflight(c.store, "run-1", c.command)
+    response = owner.acknowledge(
+        c.store,
+        "run-1",
+        {**c.command, "preflight_key": pre["preflight_key"], "acknowledgement": owner.ACK},
+    )
+    forged = {
+        "state": "passed",
+        "head": c.candidate["head"],
+        "checks": {},
+        "execution_inventory": {
+            "method": "acknowledged_original_dispatch_inventory/v1",
+            "receipt": response["receipt"],
+        },
+    }
+    with pytest.raises(ValueError, match="file-only"):
+        owner.validate_result(c.store, "run-1", forged)

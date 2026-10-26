@@ -331,6 +331,8 @@ def collect(reader, profile, *, required, expected_tree):
                     or job.get("run_id") != run["id"]
                     or job.get("head_sha") != head
                     or job.get("steps") != []
+                    or ("run_attempt" in job and job["run_attempt"] != 1)
+                    or ("head_branch" in job and job["head_branch"] != subject["branch"])
                     or job.get("conclusion") != "skipped"
                     or job.get("status") != "completed"
                 ):

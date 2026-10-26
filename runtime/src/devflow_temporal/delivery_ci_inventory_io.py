@@ -335,7 +335,11 @@ class GitHubRead:
                 raise ValueError("CI inventory aggregate observation bound exceeded")
             return raw
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
         )
         output, error = bytearray(), bytearray()
         try:
