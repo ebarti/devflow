@@ -118,6 +118,8 @@ def _compact(seal):
         "previous_digest": seal["previous_digest"],
         "stage": seal["stage"],
         "generation": seal["generation"],
+        **({'ci_inventory_historical_teardown': seal['ci_inventory_historical_teardown']}
+           if 'ci_inventory_historical_teardown' in seal else {}),
     }
 
 
@@ -166,7 +168,7 @@ def _authority(store, run_id, command, profile):
     require_not_pending(store.config)
 
     readonly = store if store.read_only else DeliveryStore(store.config, read_only=True)
-    seal = snapshot(readonly, run_id, CI_KIND)
+    seal = snapshot(readonly, run_id, CI_KIND, _inventory_profile=profile)
     spec, row, candidate = seal["original_spec"], seal["row"], seal["candidate"]
     _subject(spec, candidate, seal["publication"], profile)
     if (
@@ -561,6 +563,9 @@ def authority(store, recovery):
         raise ValueError("ordinary CI execution changed its one finite original admission")
     _subject(before, recovery["seal"]["candidate"], recovery["seal"]["publication"], profile)
     _gate_acknowledgement(store, recovery)
+    from .delivery_ci_teardown import validate as validate_teardown
+
+    validate_teardown(store, recovery, profile)
     return response, receipt, profile
 
 
