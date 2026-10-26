@@ -195,6 +195,10 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
             assert ci["state"] == "passed" and len(ci["checks"]) == 11
             assert ci["execution_inventory"]["PR_ruleset_eligibility"] is False
             assert ci["execution_inventory"]["merge_context_verified"] is False
+            assert ci["ci_assessment"]["execution"]["state"] == "observed"
+            assert ci["ci_assessment"]["delivery_policy"]["state"] == "passed"
+            assert ci["ci_assessment"]["pr_eligibility"]["state"] == "not_established"
+            assert ci["ci_assessment"]["merge_readiness"]["state"] == "unverified"
             owner.validate_result(c.store, "run-1", ci)
             assert result["checks"]["resource_cleanup"]["state"] == "confirmed"
             assert calls == ["tracker_start", "terminal_tracker"]
@@ -224,6 +228,7 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
             async with public(c) as (client, _headers):
                 detail = await client.get("/api/runs/run-1")
                 assert detail.status_code == 200, detail.text
+                assert detail.json()["checks"]["ci"]["ci_assessment"] == ci["ci_assessment"]
                 evidence_ids = {item["id"] for item in detail.json()["evidence"]}
                 assert {
                     "ordinary-ci-inventory-acknowledgement",

@@ -62,7 +62,7 @@ def historical_ci(service, monkeypatch):
     )
     initial.config.path.write_text(canonical_json(config))
     store = DeliveryStore(DeliveryConfig.load(initial.config.path))
-    historical = native_case((store, request), monkeypatch)
+    historical = native_case((store, request), monkeypatch, preserve_existing_roots=True)
     # The oldest legacy fixture replaces this consumer. Restore its actual
     # owner so the pre-ACK refusal and the purpose-specific bridge are tested.
     monkeypatch.setattr(gates, "_stopped_cleanup", policy._stopped_cleanup)

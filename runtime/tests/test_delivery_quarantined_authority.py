@@ -29,7 +29,7 @@ from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.supervisor import DeliverySupervisor
 
 
-def native_case(service, monkeypatch):
+def native_case(service, monkeypatch, *, preserve_existing_roots=False):
     store, _old_broker, state, _ = unpublished.__wrapped__(service, monkeypatch)
     spec = copy.deepcopy(store.effective_spec("run-1"))
     spec.update(
@@ -156,6 +156,7 @@ def native_case(service, monkeypatch):
             state_identity=_identity(state_dir),
             processes=[str(journal_path)],
             roots={
+                **(manifest["roots"] if preserve_existing_roots else {}),
                 str(gate): {
                     "kind": "gate",
                     "identity": None,
