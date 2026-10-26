@@ -470,11 +470,17 @@ class GitHubRead:
             value = _json(raw)
             if not isinstance(value, dict) or value.get("errors"):
                 raise ValueError("CI inventory canonical PR query is incomplete")
-            pr = (value.get("data", {}).get("repository") or {}).get("pullRequest")
-            if isinstance(pr, dict) and pr.get("headRefOid") != head:
+            data = value.get("data")
+            repository_value = data.get("repository") if isinstance(data, dict) else None
+            pr = (repository_value.get("pullRequest")
+                  if isinstance(repository_value, dict) else None)
+            if (isinstance(pr, dict) and isinstance(pr.get("headRefOid"), str)
+                    and re.fullmatch(r"[0-9a-f]{40}", pr["headRefOid"])
+                    and pr["headRefOid"] != head):
                 raise PRHeadChanged("CI inventory canonical PR head changed")
             if (
                 not isinstance(pr, dict)
+                or type(pr.get("number")) is not int
                 or pr.get("number") != number
                 or pr.get("state") != "OPEN"
                 or pr.get("isDraft") is not False
@@ -489,11 +495,14 @@ class GitHubRead:
                 original = identity
             if identity != original:
                 raise ValueError("CI inventory canonical PR changed during pagination")
-            commits = (pr.get("commits") or {}).get("nodes")
+            commit_page = pr.get("commits")
+            commits = commit_page.get("nodes") if isinstance(commit_page, dict) else None
             if (
                 not isinstance(commits, list)
                 or len(commits) != 1
-                or (commits[0].get("commit") or {}).get("oid") != head
+                or not isinstance(commits[0], dict)
+                or not isinstance(commits[0].get("commit"), dict)
+                or commits[0]["commit"].get("oid") != head
             ):
                 raise ValueError("CI inventory canonical PR commit changed")
             commit = commits[0]["commit"]
@@ -501,7 +510,8 @@ class GitHubRead:
                 if cursor is not None:
                     raise ValueError("CI inventory canonical PR rollup changed during pagination")
                 return {**original, "contexts": [], "complete": True}
-            page = (commit.get("statusCheckRollup") or {}).get("contexts")
+            rollup = commit.get("statusCheckRollup")
+            page = rollup.get("contexts") if isinstance(rollup, dict) else None
             nodes = page.get("nodes") if isinstance(page, dict) else None
             info = page.get("pageInfo") if isinstance(page, dict) else None
             count = page.get("totalCount") if isinstance(page, dict) else None
@@ -514,8 +524,18 @@ class GitHubRead:
                 or type(info.get("hasNextPage")) is not bool
                 or any(
                     not isinstance(x, dict)
+                    or not isinstance(x.get("__typename"), str)
                     or x.get("__typename") not in {"CheckRun", "StatusContext"}
-                    or not x.get("id")
+                    or not isinstance(x.get("id"), str)
+                    or not 1 <= len(x["id"]) <= 1024
+                    or not isinstance(x.get(
+                        "name" if x.get("__typename") == "CheckRun" else "context"), str)
+                    or (x.get("__typename") == "CheckRun" and (
+                        not isinstance(x.get("status"), str)
+                        or (x.get("conclusion") is not None
+                            and not isinstance(x["conclusion"], str))))
+                    or (x.get("__typename") == "StatusContext"
+                        and not isinstance(x.get("state"), str))
                     for x in nodes
                 )
             ):

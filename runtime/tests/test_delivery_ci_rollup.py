@@ -162,3 +162,38 @@ async def test_incomplete_or_changed_observations_never_pass(monkeypatch, mode):
     if mode not in {"missing", "head"}:
         assert result["ci_assessment"]["execution"]["state"] == "unknown"
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["data", "repository", "commits", "commit", "head", "number",
+                                  "rollup", "context_type", "context_id", "context_name",
+                                  "context_status", "conclusion"])
+async def test_malformed_graphql_is_unknown_readback_not_a_controller_exception(monkeypatch, mode):
+    value = json.loads(response([check("only-build")]).split(b"\r\n\r\n", 1)[1])
+    pr = value["data"]["repository"]["pullRequest"]
+    commit = pr["commits"]["nodes"][0]["commit"]
+    node = commit["statusCheckRollup"]["contexts"]["nodes"][0]
+    if mode == "data":
+        value["data"] = None
+    elif mode == "repository":
+        value["data"]["repository"] = []
+    elif mode == "commits":
+        pr["commits"] = []
+    elif mode == "commit":
+        pr["commits"]["nodes"] = [None]
+    elif mode == "head":
+        del pr["headRefOid"]
+    elif mode == "number":
+        pr["number"] = True
+    elif mode == "rollup":
+        commit["statusCheckRollup"] = ["unproven"]
+    else:
+        key = {"context_type": "__typename", "context_id": "id", "context_name": "name",
+               "context_status": "status", "conclusion": "conclusion"}[mode]
+        node[key] = {"unproven": True}
+    raw = json.dumps(value).encode()
+    framed = b"HTTP/2.0 200 OK\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw
+    result, _ = await activity(monkeypatch, [framed])
+    assert result["state"] == "pending"
+    assert result["ci_assessment"]["execution"]["state"] == "unknown"
+    assert "diagnostic" in result
+
