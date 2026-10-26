@@ -480,6 +480,9 @@ class DeliveryStore:
                 )"""
             )
 
+            from .delivery_execution_authority import initialize as initialize_execution_authority
+
+            initialize_execution_authority(db)
             from .delivery_dashboard import initialize
 
             initialize(db)
@@ -673,6 +676,7 @@ class DeliveryStore:
             require_supported_admission_limits(self.config.raw)
         spec = self.config.admit(supplied, **admission)
         spec["request_digest"] = request_digest
+        spec["execution_authority_version"] = 1
         if spec.get("delivery_limits_version") == 1:
             prior_spec = retained
             if prior_spec is None and _automatic is not None:
@@ -3275,14 +3279,18 @@ class DeliveryStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def mark_start(self, run_id: str, *, accepted: bool, error: str | None = None) -> None:
+    def mark_start(self, run_id: str, *, accepted: bool, error: str | None = None,
+                   expected_workflow_id: str | None = None) -> None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT revision,phase FROM delivery_runs WHERE run_id=?", (run_id,)
+                "SELECT revision,phase,workflow_id FROM delivery_runs WHERE run_id=?", (run_id,)
             ).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
+            if (expected_workflow_id is not None
+                    and (row[2] or "delivery-" + run_id) != expected_workflow_id):
+                raise ValueError("delivery owner changed before start acknowledgement")
             if row[1] not in {
                 "accepted",
                 "publication_recovery_queued",
@@ -3355,6 +3363,7 @@ class DeliveryStore:
 
     def record_dispatch_failure(
         self, run_id: str, reason: str, *, uncertain: bool = False, counted: bool = True,
+        expected_workflow_id: str | None = None,
     ) -> None:
         """Record why this cycle did not dispatch the run, once per distinct reason.
 
@@ -3368,12 +3377,14 @@ class DeliveryStore:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT o.state,o.last_error,o.attempts,r.revision FROM delivery_outbox o
+                """SELECT o.state,o.last_error,o.attempts,r.revision,r.workflow_id
+                   FROM delivery_outbox o
                    JOIN delivery_runs r ON r.run_id=o.run_id
                    WHERE o.run_id=? AND o.state IN ('pending','unknown')""",
                 (run_id,),
             ).fetchone()
-            if row is None:
+            if row is None or (expected_workflow_id is not None
+                    and (row[4] or "delivery-" + run_id) != expected_workflow_id):
                 return
             state = "unknown" if uncertain else row[0]
             # Accepted starts count attempts too, and admissions re-queue a row
@@ -3419,14 +3430,16 @@ class DeliveryStore:
             run_id, phase="blocked", execution_state="blocked", event_type="blocked",
             message="Temporal workflow ID is held by a different request",
             outcome="blocked", error=f"{reason}; {remedy}",
-            key=f"temporal-conflict:{workflow_id}",
+            key=f"temporal-conflict:{workflow_id}", expected_workflow_id=workflow_id,
         )
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 """UPDATE delivery_outbox SET state='conflict',last_error=?,updated_at=?
-                   WHERE run_id=? AND state IN ('pending','unknown')""",
-                (reason, _now(), run_id),
+                   WHERE run_id=? AND state IN ('pending','unknown')
+                     AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.run_id=delivery_outbox.run_id
+                       AND COALESCE(r.workflow_id, 'delivery-' || r.run_id)=?)""",
+                (reason, _now(), run_id, workflow_id),
             )
         logger.warning("Run %s is blocked: %s", run_id, reason)
 
@@ -3460,6 +3473,9 @@ class DeliveryStore:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise ValueError("run ID not found")
+            from .delivery_execution_authority import require_activity_current
+
+            require_activity_current(db, run_id)
             if expected_revision is not None and row["revision"] != expected_revision:
                 raise ValueError("projection row revision changed")
             if expected_row is not None and dict(row) != expected_row:

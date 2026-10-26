@@ -307,6 +307,10 @@ class _Description:
 async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
     api_fixture, monkeypatch,
 ):
+    async def authenticated_start(*args, **kwargs):
+        pass  # This fixture tests dispatch scheduling, not Temporal history.
+    monkeypatch.setattr("devflow_temporal.delivery_execution_authority.authenticate_original_start",
+                        authenticated_start)
     path, request = api_fixture
     service = create_app(path).state.delivery
     run_ids = _queued_runs(service, request, 3)
@@ -330,6 +334,7 @@ async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
 
         async def start_workflow(self, _workflow, **kwargs):
             started.append(kwargs["id"])
+            return SimpleNamespace(first_execution_run_id=kwargs["id"] + "-sdk")
 
     async def healthy():
         return Temporal()
@@ -402,6 +407,10 @@ async def test_poison_row_cannot_starve_newer_runs_or_churn_their_timelines(
 async def test_rejected_start_is_unknown_for_that_row_only_and_backs_off(
     api_fixture, monkeypatch,
 ):
+    async def authenticated_start(*args, **kwargs):
+        pass  # This fixture tests dispatch scheduling, not Temporal history.
+    monkeypatch.setattr("devflow_temporal.delivery_execution_authority.authenticate_original_start",
+                        authenticated_start)
     path, request = api_fixture
     service = create_app(path).state.delivery
     run_ids = _queued_runs(service, request, 2)
@@ -418,6 +427,7 @@ async def test_rejected_start_is_unknown_for_that_row_only_and_backs_off(
             if kwargs["id"] == "delivery-run-1":
                 raise RPCError("payload too large", RPCStatusCode.INVALID_ARGUMENT, b"")
             started.append(kwargs["id"])
+            return SimpleNamespace(first_execution_run_id=kwargs["id"] + "-sdk")
 
     async def healthy():
         service.temporal_status = "connected"

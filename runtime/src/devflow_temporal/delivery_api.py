@@ -83,6 +83,12 @@ async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) 
     attempted = False
     try:
         recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
+        authority = None
+        if spec.get("execution_authority_version") == 1:
+            from . import delivery_execution_authority as execution_authority
+            authority = await asyncio.to_thread(
+                execution_authority.reserve, service.store, item, spec)
+            spec = json.loads(authority["start_spec_json"])
         handle = client.get_workflow_handle(workflow_id)
         try:
             description = await handle.describe()
@@ -102,11 +108,18 @@ async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) 
                     "different request",
                 )
                 return
-            await asyncio.to_thread(service.store.mark_start, run_id, accepted=True)
+            if authority is not None:
+                await asyncio.wait_for(execution_authority.authenticate_original_start(
+                    service.store, authority, description.run_id, client=client,
+                    require_running=False), 15)
+                await asyncio.to_thread(
+                    execution_authority.bind, service.store, authority, description.run_id)
+            await asyncio.to_thread(service.store.mark_start, run_id, accepted=True,
+                **({"expected_workflow_id": workflow_id} if authority is not None else {}))
             return
         attempted = True
         try:
-            await client.start_workflow(
+            started = await client.start_workflow(
                 DeliveryWorkflow.run,
                 args=[spec, recovery],
                 id=workflow_id,
@@ -125,13 +138,22 @@ async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) 
                    else {}),
                 memo={
                     "request_digest": item["request_digest"],
+                    **({execution_authority.MEMO: authority["start_token"]}
+                       if authority is not None else {}),
                     **({"recovery_digest": digest(recovery)} if recovery else {}),
                 },
             )
         except WorkflowAlreadyStartedError:
             # The next dispatch inspects the durable remote memo before acking.
             return
-        await asyncio.to_thread(service.store.mark_start, run_id, accepted=True)
+        if authority is not None:
+            await asyncio.wait_for(execution_authority.authenticate_original_start(
+                service.store, authority, started.first_execution_run_id, client=client,
+                require_running=False), 15)
+            await asyncio.to_thread(
+                execution_authority.bind, service.store, authority, started.first_execution_run_id)
+        await asyncio.to_thread(service.store.mark_start, run_id, accepted=True,
+            **({"expected_workflow_id": workflow_id} if authority is not None else {}))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -140,7 +162,9 @@ async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) 
         try:
             # A start that was sent is unknown until the remote memo is read.
             await asyncio.to_thread(
-                service.store.record_dispatch_failure, run_id, reason, uncertain=attempted
+                service.store.record_dispatch_failure, run_id, reason, uncertain=attempted,
+                **({"expected_workflow_id": workflow_id}
+                   if spec.get("execution_authority_version") == 1 else {})
             )
         except Exception as recording:
             logger.warning("Run %s dispatch failure not recorded (%s)",

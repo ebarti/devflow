@@ -563,3 +563,22 @@ that a current volume UUID proves legacy volume continuity, waive inode/owner or
 registration checks, expand source authority, settle an unknown effect, manufacture
 a provider verdict, reset a budget, or cancel a running workflow. File-only staged
 receipts remain inert until the original command/event acknowledgement commits.
+
+## Temporal execution ownership
+
+New ordinary deliveries reserve a start identity with the selected outbox owner
+before dispatch. The first acknowledgement or activity selects exactly one
+Temporal execution only after the server's original start history matches that
+reservation, the frozen start inputs and the configured task queue. A missing or
+unavailable history leaves the outcome unknown. A copied memo or a Temporal reset
+cannot adopt the original execution's authority. Existing histories retain their
+previous protocol; they are not retroactively assigned this proof.
+
+The selected execution keeps its custody until its native work is actually
+settled. An external administrator's reset does not immediately stop a body that
+was already admitted by the application. Application-supported successors must
+wait for the original work and its lease to settle; a changed owner fences later
+handoffs from the predecessor. A local handoff verifier is useful only while the
+tracking transaction and the applicable registry assignment and debit fences are
+held through the local launch decision; a detached process must receive its
+execution identity through an authenticated private controller grant.

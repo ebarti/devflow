@@ -264,6 +264,7 @@ def _dispatcher(store, started):
 
         async def start_workflow(self, _workflow, **kwargs):
             started.append(kwargs["id"])
+            return SimpleNamespace(first_execution_run_id=kwargs["id"] + "-sdk")
 
     async def healthy():
         return Temporal()
@@ -278,7 +279,13 @@ def _second(request):
 
 
 @pytest.mark.asyncio
-async def test_dashboard_address_change_keeps_admitted_runs_owned_and_dispatchable(service):
+async def test_dashboard_address_change_keeps_admitted_runs_owned_and_dispatchable(
+    service, monkeypatch,
+):
+    async def authenticated_start(*args, **kwargs):
+        pass  # This fixture tests configuration routing, not Temporal history.
+    monkeypatch.setattr("devflow_temporal.delivery_execution_authority.authenticate_original_start",
+                        authenticated_start)
     store, request = service
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
@@ -297,7 +304,13 @@ async def test_dashboard_address_change_keeps_admitted_runs_owned_and_dispatchab
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cause", ["transport", "snapshot"])
-async def test_owner_sees_once_why_its_own_queued_run_is_not_dispatched(service, cause):
+async def test_owner_sees_once_why_its_own_queued_run_is_not_dispatched(
+    service, cause, monkeypatch,
+):
+    async def authenticated_start(*args, **kwargs):
+        pass  # This fixture tests configuration routing, not Temporal history.
+    monkeypatch.setattr("devflow_temporal.delivery_execution_authority.authenticate_original_start",
+                        authenticated_start)
     store, request = service
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
