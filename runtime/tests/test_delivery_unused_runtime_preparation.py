@@ -178,15 +178,29 @@ def test_unused_preparation_survives_released_owners_and_admits_the_same_gates(
     old_path = root / 'runtime-preparation/intent.json'
     cache = store.config.state_root / 'preparation-native'
     # Real trusted-local CLI/ancestry probes, native journals and finalization.
+    from devflow_temporal.delivery_preparation_resources import FIELD, binding, resource_scope
+
+    seed_path = root / 'runtime-preparation/cache-seed/intent.json'
+    seed_intent = {'command_digest': old_digest, 'seal_digest': 'c' * 64,
+                   'preparation_attempts': []}
     seed = deepcopy(spec)
-    seed['state_dir'] = str(root / 'runtime-preparation/seed' / spec['run_id'])
-    try:
-        proof = measured(seed, old_identity, state_root=store.config.state_root)
-    except RuntimeError:
-        for log in Path(seed['state_dir']).rglob('monitor.log'):
-            print(log.read_text())
-        raise
-    assert RunResources(seed).finalize('blocked')['state'] == 'confirmed'
+    seed['state_dir'] = str(seed_path.parent / 'probes/0' / spec['run_id'])
+    seed[FIELD] = binding(spec, seed_intent, seed_path, 0)
+    seed_attempt = {'spec': seed, 'state': 'started', 'cleanup': None}
+    seed_intent['preparation_attempts'].append(seed_attempt)
+    write_private(seed_path, seed_intent)
+    with resource_scope(seed, spec['state_dir'], seed_intent, seed_path, 0):
+        try:
+            proof = measured(seed, old_identity, state_root=store.config.state_root)
+        except RuntimeError:
+            for log in Path(seed['state_dir']).rglob('monitor.log'):
+                print(log.read_text())
+            raise
+        finally:
+            receipt = RunResources(seed).finalize('blocked')
+            seed_attempt.update(state='stopped', cleanup=receipt)
+            write_private(seed_path, seed_intent)
+    assert receipt['state'] == 'confirmed'
     observe_finalized_resources(seed)
     _write(cache / digest(old_identity) / 'proof.json', proof)
     legacy = {'command_digest': old_digest, 'seal_digest': 'c' * 64,
