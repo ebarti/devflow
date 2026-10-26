@@ -995,7 +995,10 @@ class DeliveryStore:
                     raise
                 missing = exc
             if missing is not None:
-                sealed = await closures.sealed_closure(self, handle.id)
+                if preserve:
+                    sealed = await closures.sealed_closure(self, handle.id)
+                else:
+                    sealed = await closures.sealed_closure(self, handle.id, read_only=True)
                 if sealed is None:
                     raise closures.ClosureUnavailable(handle.id) from missing
                 closed = {
@@ -1122,17 +1125,7 @@ class DeliveryStore:
         if isinstance(supplied, dict) and supplied.get('expected_pr_number') == 0:
             from .delivery_pending_publication import admit
 
-            if preflight:
-                from .delivery_lifecycle import evaluate_transition
-
-                return {"lifecycle_assessment": evaluate_transition({
-                    "operation": "recover_publication", "owner": "pending_publication",
-                    "owner_proof": None, "comparisons": [],
-                    "predicates": [{"code": "pending_publication_proof_unknown",
-                        "satisfied": None, "missing_or_unknown_fact": "pending publication custody",
-                        "next_action": "inspect pending publication custody"}],
-                }, supplied)}
-            return admit(self, run_id, supplied)
+            return admit(self, run_id, supplied, preflight=preflight)
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))

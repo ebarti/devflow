@@ -27,7 +27,25 @@ def _chain(recovery):
         recovery = recovery.get('original_recovery')
 
 
-def snapshot(store, run_id):
+def _refuse(code, fact, action, proof, *, message=None):
+    from .delivery_lifecycle import RecoveryRefused, require_transition
+
+    try:
+        require_transition({
+            'operation': 'recover_publication', 'owner': 'pending_publication',
+            'owner_proof': True, 'normalized_lifecycle': 'stopped', 'proof_digest': digest(proof),
+            'comparisons': [], 'predicates': [{
+                'code': code, 'satisfied': False, 'missing_or_unknown_fact': fact,
+                'next_action': action,
+            }],
+        }, {})
+    except RecoveryRefused as exc:
+        if message is not None:
+            exc.args = (message,)
+        raise
+
+
+def snapshot(store, run_id, *, observation=False):
     spec = store.effective_spec(run_id)
     if (spec['provider'] != 'fake' and (
             spec['policy'].get('execution_backend') != 'native-macos'
@@ -35,7 +53,8 @@ def snapshot(store, run_id):
         raise ValueError('pending publication requires its existing trusted native policy')
     row, attempts, effects, claim = _rows(store, run_id)
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
-    closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
+    closed = store._completed_temporal_result(
+        run_id, workflow_id=row['workflow_id'], **({'preserve': False} if observation else {}))
     state = closed['result']
     candidate = state.get('candidate', {})
     published = state.get('pull_request')
@@ -48,8 +67,52 @@ def snapshot(store, run_id):
     effect = pending[0] if len(pending) == 1 else None
     bound = json.loads(effect['observed_json'] or 'null') if effect else None
     settling_unknown = row['cleanup'] == state.get('cleanup') == 'unknown'
-    if sum(1 for r in _chain(previous) if r.get('kind') == KIND) >= PUBLICATION_RETRIES:
-        raise ValueError('this run already received its bounded publication retries')
+    from .delivery_lifecycle import require_transition
+
+    allowed_claim = claim is None or (settling_unknown and claim['owner'] ==
+                                     'external:devflow:' + run_id)
+    valid_effect = (len(pending) <= 1 and (effect is None or (
+        effect['effect_key'] == f"publish:{run_id}:{row['iteration']}"
+        and effect['kind'] == 'publish' and effect['state'] == 'pending'
+        and json.loads(effect['request_json']) == {
+            'iteration': row['iteration'], 'input_candidate_id': candidate.get('id')})))
+    predicates = [
+        {'code': 'publication_retry_budget_exhausted',
+         'satisfied': sum(1 for r in _chain(previous) if r.get('kind') == KIND)
+                      < PUBLICATION_RETRIES,
+         'missing_or_unknown_fact': 'remaining publication continuation allowance',
+         'next_action': 'inspect retained publication recovery history'},
+        {'code': 'publication_owner_conflict', 'satisfied': allowed_claim,
+         'missing_or_unknown_fact': 'released claim or exact original publication owner',
+         'next_action': 'reconcile current publication ownership'},
+        {'code': 'publication_cleanup_unknown',
+         'satisfied': row['cleanup'] in {'confirmed', 'unknown'}
+                      and state.get('cleanup') == row['cleanup'],
+         'missing_or_unknown_fact': 'matching closed cleanup observation',
+         'next_action': 'reconcile original cleanup evidence'},
+        {'code': 'publication_attempts_unsettled',
+         'satisfied': all(a['state'] == 'finished' and a['cleanup'] == 'confirmed'
+                          for a in attempts),
+         'missing_or_unknown_fact': 'finished attempts and confirmed native cleanup',
+         'next_action': 'reconcile original native attempt custody'},
+        {'code': 'publication_effect_unresolved', 'satisfied': valid_effect,
+         'missing_or_unknown_fact': 'single bound original publication effect',
+         'next_action': 'reconcile the original publication effect'},
+        {'code': 'publication_checks_unproven',
+         'satisfied': precheck.get('state') == 'passed'
+                      and precheck.get('source_unchanged') is True
+                      and precheck.get('candidate_id') == candidate.get('id')
+                      and bool(precheck.get('results'))
+                      and all(r.get('passed') is True and r.get('cleanup') == 'confirmed'
+                              for r in precheck.get('results', [])),
+         'missing_or_unknown_fact': 'passed checks bound to the original candidate',
+         'next_action': 'inspect original prepublication check evidence'},
+    ]
+    require_transition({
+        'operation': 'recover_publication', 'owner': 'pending_publication', 'owner_proof': True,
+        'normalized_lifecycle': 'stopped', 'proof_digest': digest({'row': row, 'closed': closed}),
+        'comparisons': [], 'predicates': predicates,
+    }, {})
     if (row['phase'] != 'blocked' or row['outcome'] != 'blocked'
             or row['execution_state'] != 'blocked'
             or row['cleanup'] not in {'confirmed', 'unknown'}
@@ -85,7 +148,9 @@ def snapshot(store, run_id):
                 or effect['kind'] != 'publish' or effect['state'] != 'pending'
                 or json.loads(effect['request_json']) != {
                     'iteration': row['iteration'], 'input_candidate_id': candidate.get('id')}))):
-        raise ValueError('pending publication lacks its closed passed-check checkpoint')
+        _refuse('publication_checkpoint_unproven',
+                'matching closed publication checkpoint and implementation evidence',
+                'inspect the original closed publication evidence', {'row': row, 'closed': closed})
     broker = DeliveryBroker(store, spec)
     observed = broker.candidate()
     broker._validate_publication_commits()
@@ -120,7 +185,10 @@ def snapshot(store, run_id):
             or (published is not None and (
                 pr is None or pr['number'] != published['number']
                 or pr['headRefOid'] not in {previous_head, observed['head']}))):
-        raise ValueError('pending publication source, remote head or scope changed')
+        _refuse('publication_source_or_remote_changed',
+                'unchanged source, authorized scope and exact remote publication',
+                'inspect candidate and remote publication evidence',
+                {'row': row, 'candidate': observed, 'remote_head': remote_head, 'pr': pr})
     load_execution_config(spec)
     settlement = None
     if settling_unknown:
@@ -129,13 +197,36 @@ def snapshot(store, run_id):
         # cleanup result. The executor lease and all native actors must be idle.
         if (spec.get('resource_cleanup_version') != 1 or effect is None or pr is None
                 or not pushed or pr['headRefOid'] != observed['head']):
-            raise ValueError('unknown publication requires its exact completed PR readback')
-        publication = broker.reconcile_publish(
-            row['iteration'], candidate, expected_head=observed['head'],
-            expected_pr_number=pr['number'], complete=False,
-        )
+            _refuse('publication_exact_readback_unknown',
+                    'exact original completed pull request and resource custody',
+                    'reconcile the original publication and native custody',
+                    {'row': row, 'candidate': observed, 'pr': pr},
+                    message='unknown publication requires its exact completed PR readback')
+        try:
+            if observation:
+                publication = broker.observe_publish(
+                    row['iteration'], candidate, expected_head=observed['head'],
+                    expected_pr_number=pr['number'])
+            else:
+                publication = broker.reconcile_publish(
+                    row['iteration'], candidate, expected_head=observed['head'],
+                    expected_pr_number=pr['number'], complete=False,
+                )
+        except (ValueError, OSError) as exc:
+            from .delivery_lifecycle import RecoveryRefused
+
+            if isinstance(exc, RecoveryRefused):
+                raise
+            _refuse('publication_executor_custody_unknown',
+                    'authenticated idle publisher and bound remote readback',
+                    'inspect the publication executor and remote evidence',
+                    {'row': row, 'candidate': observed, 'pr': pr})
         if publication.get('state') == 'pending':
-            raise ValueError('original publication executor or remote outcome remains unknown')
+            _refuse('publication_executor_or_effect_unknown',
+                    'inactive original publisher and exact remote outcome',
+                    'wait for the original publisher and reconcile its remote result',
+                    {'row': row, 'candidate': observed, 'publication': publication},
+                    message='original publication executor or remote outcome remains unknown')
         from .delivery_resources import observe_completed_resources
 
         settlement = {'publication': publication,
@@ -146,10 +237,12 @@ def snapshot(store, run_id):
             'previous_digest': digest(previous) if previous else None,
             'candidate': observed, 'pr': pr, 'published': published, 'pushed': pushed,
             'remote_head': remote_head, 'work_binding': binding,
-            'cleanup': (settlement['native_cleanup'] if settlement else _stopped_cleanup(spec)),
+            'cleanup': (settlement['native_cleanup'] if settlement else
+                        _stopped_cleanup(spec, read_only=True) if observation
+                        else _stopped_cleanup(spec)),
             **({'publication_settlement': settlement} if settlement else {})}
 
-def admit(store, run_id, payload):
+def admit(store, run_id, payload, *, preflight=False):
     fields = {'command_id', 'expected_revision', 'expected_candidate_id',
               'expected_head', 'expected_pr_number'}
     if (set(payload) != fields or type(payload['expected_pr_number']) is not int
@@ -169,12 +262,22 @@ def admit(store, run_id, payload):
         if prior['request_digest'] != command_digest:
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior['response_json'])
-    seal = snapshot(store, run_id)
+    seal = snapshot(store, run_id, observation=preflight)
     previous = _retained_recovery(store, run_id, seal)
-    if (payload['expected_revision'] != seal['row']['protocol_revision']
-            or payload['expected_candidate_id'] != seal['closed']['result']['candidate']['id']
-            or payload['expected_head'] != seal['candidate']['head']):
-        raise ValueError('stale pending publication checkpoint')
+    from .delivery_lifecycle import require_same_proof, require_transition
+
+    assessment = require_transition({
+        'operation': 'recover_publication', 'owner': 'pending_publication', 'owner_proof': True,
+        'normalized_lifecycle': 'stopped', 'proof_digest': digest(seal),
+        'revision': seal['row']['protocol_revision'],
+        'candidate_id': seal['closed']['result']['candidate']['id'],
+        'candidate_head': seal['candidate']['head'],
+        'comparisons': [('revision', 'expected_revision', 'revision_changed'),
+                        ('candidate_id', 'expected_candidate_id', 'candidate_changed'),
+                        ('candidate_head', 'expected_head', 'candidate_head_changed')],
+    }, payload)
+    if preflight:
+        return {'run_id': run_id, 'preflight': True, 'lifecycle_assessment': assessment}
     spec = seal['spec']
     generation = 1 + sum(1 for r in _chain(previous) if r.get('kind') == KIND)
     namespace = 'publication-retry' + (f'-{generation}' if generation > 1 else '')
@@ -188,8 +291,8 @@ def admit(store, run_id, payload):
                 raise ValueError('command ID already belongs to different inputs')
             return json.loads(prior['response_json'])
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
-        if digest(snapshot(store, run_id)) != digest(seal):
-            raise ValueError('pending publication changed during runtime preparation')
+        require_same_proof('recover_publication', 'pending_publication',
+                           digest(snapshot(store, run_id)), digest(seal))
         recovery = {'kind': KIND, 'command': payload, 'seal': seal,
                     'original_spec': (previous['original_spec'] if previous else spec),
                     'original_recovery': previous, 'execution_spec': execution,

@@ -69,7 +69,7 @@ def pending(service, monkeypatch):
               'recovery_digest': digest(previous), 'result': state}
     monkeypatch.setattr(store, '_completed_temporal_result', lambda *_args, **_kw: closed)
     monkeypatch.setattr('devflow_temporal.delivery_pending_publication._stopped_cleanup',
-                        lambda _: {})
+                        lambda _, **_kw: {})
     request = {'command_id': 'retry-publication-1', 'expected_revision': 13,
                'expected_candidate_id': state['candidate']['id'],
                'expected_head': broker.candidate()['head'], 'expected_pr_number': 0}
@@ -243,3 +243,53 @@ def test_published_assessment_after_publication_recovery_keeps_all_admissions(pe
         assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
     with pytest.raises(ValueError):
         store.continue_repair('run-1', {**prelaunch, 'command_id': 'another-prelaunch'})
+
+
+def test_pending_assessment_and_execution_share_exact_checkpoint(pending):
+    from devflow_temporal.delivery_lifecycle import RecoveryRefused, assess_transition
+
+    store, broker, _, request = pending
+    with store._connect() as db:
+        before = [tuple(row) for row in db.execute('SELECT * FROM delivery_commands')]
+    assessment = assess_transition(store, 'run-1', 'recover_publication', request)
+    assert assessment['eligible'] and assessment['proof_digest']
+    assert assessment['candidate']['head'] == broker.candidate()['head']
+    with store._connect() as db:
+        assert [tuple(row) for row in db.execute('SELECT * FROM delivery_commands')] == before
+    stale = {**request, 'expected_revision': request['expected_revision'] + 1}
+    refusal = assess_transition(store, 'run-1', 'recover_publication', stale)
+    with pytest.raises(RecoveryRefused) as failure:
+        store.recover_publication('run-1', stale)
+    assert refusal == failure.value.assessment
+    assert refusal['blockers'][0]['code'] == 'revision_changed'
+    admitted = store.recover_publication('run-1', request)
+    assert not admitted['implementation_authority']
+    assert store.recover_publication('run-1', request) == admitted
+
+
+@pytest.mark.asyncio
+async def test_public_pending_assessment_agrees_with_admission(pending):
+    import httpx
+
+    from devflow_temporal.delivery_api import create_app
+
+    store, _, _, request = pending
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    host = store.config.dashboard_url
+    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
+    async with httpx.AsyncClient(transport=transport, base_url=host) as client:
+        token = (await client.get('/api/session')).json()['csrf_token']
+        headers = {'Origin': host, 'X-Devflow-CSRF': token}
+        path = '/api/runs/run-1/'
+        assessment = await client.post(path + 'assess-transition', json={
+            'kind': 'recover_publication', 'request': request})
+        assert assessment.status_code == 200 and assessment.json()['eligible']
+        stale = {**request, 'expected_revision': request['expected_revision'] + 1}
+        refused = await client.post(path + 'assess-transition', json={
+            'kind': 'recover_publication', 'request': stale})
+        admission = await client.post(path + 'recover-publication', json=stale, headers=headers)
+        assert admission.status_code == 409 and admission.json()['detail'] == refused.json()
+        assert refused.json()['blockers'][0]['code'] == 'revision_changed'
+        accepted = await client.post(path + 'recover-publication', json=request, headers=headers)
+        assert accepted.status_code == 200 and not accepted.json()['implementation_authority']

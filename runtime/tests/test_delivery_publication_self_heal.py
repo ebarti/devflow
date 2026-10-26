@@ -592,6 +592,23 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
             finally:
                 actor.terminate()
                 actor.wait(timeout=5)
+            from devflow_temporal.delivery_lifecycle import assess_transition
+
+            with store._connect() as db:
+                effect_before = dict(db.execute(
+                    "SELECT * FROM delivery_effects WHERE kind='publish'").fetchone())
+                executor_before = dict(db.execute(
+                    "SELECT * FROM delivery_publication_executors").fetchone())
+            observation = await asyncio.to_thread(
+                assess_transition, store, 'run-1', 'recover_publication', recover)
+            assert observation['eligible'] is True
+            with store._connect() as db:
+                current_effect = dict(db.execute(
+                    "SELECT * FROM delivery_effects WHERE kind='publish'").fetchone())
+                assert current_effect == effect_before
+                assert dict(db.execute(
+                    "SELECT * FROM delivery_publication_executors").fetchone()) == executor_before
+            assert len(gh.mutations()) == mutations
             admitted = await asyncio.to_thread(store.recover_publication, 'run-1', recover)
             assert admitted['phase'] == 'publication_recovery_queued'
             assert admitted['implementation_authority'] is False
@@ -620,3 +637,31 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
     # object remains in the owned source repository for exact mutation evidence.
     assert _git(broker.source, 'rev-list', '--count', spec['base_sha'] + '..' + pushed) == '1'
     assert resumed['cleanup'] == 'confirmed'
+
+
+def test_observation_retains_publication_journal_and_refuses_active_executor(service, monkeypatch):
+    store, _spec, broker, checked, gh = prepared(service, monkeypatch, create_failures=1)
+    with pytest.raises(RuntimeError, match='HTTP 502'):
+        asyncio.run(delivery_activities.delivery_publish(
+            {'spec': broker.spec, 'iteration': 0, 'candidate': checked}))
+    head = _git(broker.checkout, 'rev-parse', 'HEAD')
+    gh.created = True  # Controlled later remote readback; no hosted write.
+    with store._connect() as db:
+        before_effect = dict(db.execute('SELECT * FROM delivery_effects WHERE kind=?',
+                                        ('publish',)).fetchone())
+    with execution(broker, 0, checked):
+        assert broker.observe_publish(0, checked, expected_head=head, expected_pr_number=1) == {
+            'state': 'pending', 'reason': 'publication_execution_active'}
+    # Establish the post-lease journal baseline: observation itself must not rewrite it.
+    with store._connect() as db:
+        before_executor = dict(db.execute(
+            'SELECT * FROM delivery_publication_executors').fetchone())
+    gh.commands.clear()
+    result = broker.observe_publish(0, checked, expected_head=head, expected_pr_number=1)
+    assert result['number'] == 1 and result['head'] == head
+    assert gh.mutations() == []
+    with store._connect() as db:
+        assert dict(db.execute('SELECT * FROM delivery_effects WHERE kind=?',
+                               ('publish',)).fetchone()) == before_effect
+        assert dict(db.execute(
+            'SELECT * FROM delivery_publication_executors').fetchone()) == before_executor
