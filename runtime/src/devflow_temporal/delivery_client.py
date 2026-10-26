@@ -52,6 +52,11 @@ class DeliveryClient:
                 detail = json.load(exc).get("detail", "request failed")
             except (ValueError, OSError):
                 detail = "request failed"
+            if (exc.code == 409 and isinstance(detail, dict) and detail.get("version") == 1
+                    and isinstance(detail.get("blockers"), list)):
+                from .delivery_lifecycle import RecoveryRefused
+
+                raise RecoveryRefused(detail) from None
             raise ValueError(f"service HTTP {exc.code}: {detail}") from None
         except (urllib.error.URLError, OSError) as exc:
             raise ServiceUnavailable(
@@ -166,6 +171,12 @@ class DeliveryClient:
         return self._request(
             "POST", "/api/runs/" + quote(run_id, safe="") + "/admit-gates-only", payload,
             timeout=120,
+        )
+
+    def assess_transition(self, run_id: str, kind: str, request: dict[str, Any]) -> dict:
+        return self._request(
+            "POST", "/api/runs/" + quote(run_id, safe="") + "/assess-transition",
+            {"kind": kind, "request": request}, timeout=180,
         )
 
     def repair_admission_preflight(self, run_id, request):
