@@ -282,9 +282,23 @@ async def test_reconcile_uses_only_exact_temporal_domain_receipt(api_fixture):
                 json.dumps(result),
             ),
         )
+        rejected = {**payload, "command_id": "rejected-cancel"}
+        db.execute(
+            "INSERT INTO delivery_mutations "
+            "(command_id,run_id,kind,request_digest,state,response_json) VALUES (?,?,?,?,?,?)",
+            (
+                "rejected-cancel",
+                "run-1",
+                "cancel",
+                digest(rejected),
+                "rejected",
+                json.dumps({"error": "revision changed"}),
+            ),
+        )
         for op, request in [
             ("matching", payload),
             ("different", {**payload, "reason": "changed"}),
+            ("rejected", rejected),
         ]:
             db.execute(
                 """INSERT INTO delivery_operations
@@ -308,6 +322,8 @@ async def test_reconcile_uses_only_exact_temporal_domain_receipt(api_fixture):
         ).json()
         assert same["state"] == "succeeded" and same["result"] == result
         assert different["state"] == "unknown"
+        rejected = (await client.post("/api/operations/rejected/reconcile", headers=headers)).json()
+        assert rejected["state"] == "refused" and rejected["error"] == "revision changed"
 
 
 @pytest.mark.asyncio
@@ -428,7 +444,7 @@ async def test_cancelled_dispatch_waiter_cannot_release_running_body(api_fixture
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
-    await asyncio.to_thread(_recover_abandoned, service.store, "cancelled-waiter")
+    assert not await asyncio.to_thread(_recover_abandoned, service.store, "cancelled-waiter")
     assert read(service.store, "cancelled-waiter")["state"] == "running"
     await asyncio.to_thread(_execute, service, endpoints, "cancelled-waiter")
     assert calls == ["started"]

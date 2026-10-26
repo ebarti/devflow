@@ -238,7 +238,7 @@ def _execute(service, endpoints, operation_id):
 def _recover_abandoned(store, operation_id):
     fd = _lock(store, operation_id)
     if fd is None:
-        return
+        return False
     try:
         with store._connect() as db:
             db.execute(
@@ -250,6 +250,7 @@ def _recover_abandoned(store, operation_id):
             )
     finally:
         os.close(fd)
+    return True
 
 
 def register_operations(app, service, hostguard, mutationguard):
@@ -357,8 +358,10 @@ def register_operations(app, service, hostguard, mutationguard):
     @app.post("/api/operations/{operation_id}/reconcile")
     async def reconcile_operation(request: Request, operation_id: str):
         mutationguard(request)
-        await asyncio.to_thread(_recover_abandoned, service.store, operation_id)
+        owner_settled = await asyncio.to_thread(_recover_abandoned, service.store, operation_id)
         operation = await asyncio.to_thread(read, service.store, operation_id)
+        if not owner_settled:
+            return operation
         if operation["state"] != "unknown":
             return operation
         payload, run_id, kind = (
@@ -368,6 +371,7 @@ def register_operations(app, service, hostguard, mutationguard):
         )
         command_id = payload.get("command_id")
         result = None
+        refusal = None
         with service.store._connect() as db:
             if kind == "ack-native-diagnostic" and isinstance(command_id, str):
                 row = db.execute(
@@ -412,9 +416,11 @@ def register_operations(app, service, hostguard, mutationguard):
                     "WHERE run_id=? AND command_id=? AND kind=?",
                     (run_id, command_id, domain_kind),
                 ).fetchone()
-                valid = row is not None and row[0] == digest(payload) and row[1] == "complete"
-                if valid:
+                valid = row is not None and row[0] == digest(payload)
+                if valid and row[1] == "complete":
                     result = json.loads(row[2])
+                elif valid and row[1] == "rejected":
+                    refusal = json.loads(row[2])["error"]
             else:
                 valid = False
         if valid and kind == "ack-native-diagnostic":
@@ -427,4 +433,6 @@ def register_operations(app, service, hostguard, mutationguard):
             result = await asyncio.to_thread(info, service.store, run_id)
         if result is not None:
             await asyncio.to_thread(_set, service.store, operation_id, "succeeded", result=result)
+        elif refusal is not None:
+            await asyncio.to_thread(_set, service.store, operation_id, "refused", error=refusal)
         return await asyncio.to_thread(read, service.store, operation_id)
