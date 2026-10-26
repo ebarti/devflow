@@ -205,6 +205,7 @@ def test_starting_different_version_preserves_ready_worker(tmp_path, monkeypatch
     from devflow_temporal.delivery_config import DeliveryConfig
 
     config = DeliveryConfig(tmp_path / "config.json", {"state_root": str(tmp_path),
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
         "service_start_timeout": 1})
     deployment = control._worker_deployment("delivery", "new")
     existing = {"config_path": str(config.path), "processes": {"worker": {
@@ -232,6 +233,7 @@ def test_cold_crash_restart_preserves_explicit_version_only_for_same_payload(
     from devflow_temporal.payload import payload_digest
 
     config = DeliveryConfig(tmp_path / "config.json", {"state_root": str(tmp_path),
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
         "service_start_timeout": 1})
     frozen_config = json.dumps(config.raw, sort_keys=True)
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
@@ -269,6 +271,7 @@ def test_restart_rejects_unknown_or_changed_source_before_lifecycle_effects(
     from devflow_temporal.delivery_config import DeliveryConfig
 
     config = DeliveryConfig(tmp_path / "config.json", {"state_root": str(tmp_path),
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
         "service_start_timeout": 1})
     selected = {"name": "delivery", "build_id": "retained"}
     if recorded_digest is not None:
@@ -293,6 +296,7 @@ def test_pinned_selection_survives_stop_and_repeated_start_failure(
 
     config = DeliveryConfig(tmp_path / "config.json", {
         "state_root": str(tmp_path), "service_start_timeout": 1,
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
     })
     selection = control._worker_deployment("delivery", "retained")
     control._write_manifest(config, {"worker": {
@@ -327,6 +331,7 @@ def test_pinned_selection_precedes_temporal_only_partial_start(tmp_path, monkeyp
 
     config = DeliveryConfig(tmp_path / "config.json", {
         "state_root": str(tmp_path), "service_start_timeout": 1,
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
         "temporal_bin": sys.executable,
     })
     selection = control._worker_deployment("delivery", "retained")
@@ -369,6 +374,7 @@ def test_stopped_selection_rejects_unknown_source_before_start_but_never_blocks_
 
     config = DeliveryConfig(tmp_path / "config.json", {
         "state_root": str(tmp_path), "service_start_timeout": 1,
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
     })
     control._write_manifest(config, {}, deployment={
         "name": "delivery", "build_id": "retained", "runtime_payload_sha256": digest,
@@ -395,6 +401,7 @@ def test_explicit_new_selection_requires_empty_stopped_inventory(tmp_path, monke
 
     config = DeliveryConfig(tmp_path / "config.json", {
         "state_root": str(tmp_path), "service_start_timeout": 1,
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
     })
     old = {"name": "delivery", "build_id": "retained", "runtime_payload_sha256": "0" * 64}
     control._write_manifest(config, {}, deployment=old)
@@ -418,6 +425,7 @@ def test_stop_terminates_recorded_deployment_stack_after_source_change(tmp_path)
 
     config = DeliveryConfig(tmp_path / "config.json", {
         "state_root": str(tmp_path), "service_start_timeout": 1,
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
     })
     drifted = {"name": "delivery", "build_id": "retained", "runtime_payload_sha256": "0" * 64}
     children = {name: subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
@@ -450,6 +458,7 @@ def test_ready_recorded_deployment_stack_is_served_after_source_change(tmp_path,
 
     config = DeliveryConfig(tmp_path / "config.json", {
         "state_root": str(tmp_path), "service_start_timeout": 1,
+        "tracking_db": str(tmp_path / "tracking.sqlite3"),
     })
     drifted = {"name": "delivery", "build_id": "retained", "runtime_payload_sha256": "0" * 64}
     processes = {name: {"pid": 1, "identity": "fixture"} for name in ("temporal", "worker", "api")}
