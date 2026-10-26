@@ -8,15 +8,15 @@ permission to replace the current merge or write through its run-wide row.
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
-from contextvars import ContextVar
-from datetime import UTC, timedelta
 import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import stat
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
+from datetime import UTC, timedelta
 
 from .contracts import digest
 
@@ -72,13 +72,63 @@ def identity():
     return dict(value["execution"])
 
 
+def initialize(db):
+    # A separate table preserves historical request rows and all their original
+    # command/grant evidence, including older installations without this fence.
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_merge_executions (
+        workflow_id TEXT PRIMARY KEY, execution_run_id TEXT NOT NULL,
+        run_id TEXT NOT NULL REFERENCES delivery_runs(run_id),
+        spec_sha256 TEXT NOT NULL, grant_sha256 TEXT NOT NULL)""")
+
+
+def bind_execution(db, spec, grant_sha256, execution):
+    """Bind a selected start from SDK evidence; a second run never replaces it."""
+    saved = db.execute("SELECT * FROM delivery_merge_requests WHERE run_id=?",
+                       (spec["run_id"],)).fetchone()
+    if (set(execution) != {"workflow_id", "execution_run_id"}
+            or not all(isinstance(v, str) and v for v in execution.values())
+            or not saved or saved["workflow_id"] != execution["workflow_id"]
+            or digest(json.loads(saved["grant_json"])) != grant_sha256
+            or json.loads(saved["grant_json"])["spec_sha256"] != digest(spec)):
+        raise ValueError("merge execution generation changed")
+    expected = {**execution, "run_id": spec["run_id"], "spec_sha256": digest(spec),
+                "grant_sha256": grant_sha256}
+    previous = db.execute("SELECT * FROM delivery_merge_executions WHERE workflow_id=?",
+                          (execution["workflow_id"],)).fetchone()
+    if previous and dict(previous) != expected:
+        raise ValueError("merge execution run differs from its original SDK binding")
+    if not previous:
+        db.execute("INSERT INTO delivery_merge_executions "
+                   "(workflow_id,execution_run_id,run_id,spec_sha256,grant_sha256) "
+                   "VALUES (?,?,?,?,?)", tuple(expected[key] for key in (
+                       "workflow_id", "execution_run_id", "run_id", "spec_sha256", "grant_sha256")))
+
+
+def require_effect_current(db, run_id):
+    """Fence derived broker specs using the original SDK activity authority."""
+    value = _ORIGIN.get()
+    if value is None:
+        return  # The original delivery workflow has its own authority path.
+    if value["purpose"] != "activity" or value["run_id"] != run_id:
+        raise ValueError("merge effect has no authenticated activity generation")
+    require_current(db, value["spec"], required=True)
+
+
+def require_api_current(store, run_id):
+    if _ORIGIN.get() is None:
+        return
+    with store._connect() as db:
+        require_effect_current(db, run_id)
+
+
 def require_current(db, spec, *, required=False, phase=None):
     value = _ORIGIN.get()
     if value is None:
         if required:
             raise ValueError("merge activity has no authenticated execution generation")
         return
-    saved = db.execute("SELECT * FROM delivery_merge_requests WHERE run_id=?", (spec["run_id"],)).fetchone()
+    saved = db.execute("SELECT * FROM delivery_merge_requests WHERE run_id=?",
+                       (spec["run_id"],)).fetchone()
     if (
         not saved
         or value["run_id"] != spec["run_id"]
@@ -89,23 +139,93 @@ def require_current(db, spec, *, required=False, phase=None):
         or value["purpose"] == "dispatch" and phase != "queued"
     ):
         raise ValueError("merge execution generation changed")
+    if value["purpose"] == "activity":
+        execution = db.execute("SELECT * FROM delivery_merge_executions WHERE workflow_id=?",
+                               (saved["workflow_id"],)).fetchone()
+        if (not execution or execution["execution_run_id"] != value["execution"]["execution_run_id"]
+                or execution["run_id"] != spec["run_id"]
+                or execution["spec_sha256"] != value["spec_sha256"]
+                or execution["grant_sha256"] != value["grant_sha256"]):
+            raise ValueError("merge execution run differs from its original SDK binding")
 
 
-@contextmanager
-def activity_scope(store, request):
+def _activity_origin(store, request):
     from temporalio import activity
 
     info = activity.info()  # SDK context only; never default to the current row.
     execution = {"workflow_id": info.workflow_id, "execution_run_id": info.workflow_run_id}
     if (
-        info.workflow_namespace != store.config.raw.get("temporal_namespace", "default")
+        info.namespace != store.config.raw.get("temporal_namespace", "default")
+        or info.workflow_type != "DevflowMergeWorkflow"
+        or info.task_queue != store.config.queue
         or not all(isinstance(v, str) and v for v in execution.values())
         or FIELD in request and request[FIELD] != execution
     ):
         raise ValueError("merge activity SDK execution identity differs from its request")
-    value = {"purpose": "activity", "execution": execution,
-             "run_id": request["spec"]["run_id"], "spec_sha256": digest(request["spec"]),
-             "grant_sha256": request["merge_authorization"]}
+    return {"purpose": "activity", "execution": execution,
+            "run_id": request["spec"]["run_id"], "spec_sha256": digest(request["spec"]),
+            "grant_sha256": request["merge_authorization"], "spec": deepcopy(request["spec"])}
+
+
+async def _original_start(store, request, execution):
+    """The first activity can beat start ACK, but a reset cannot adopt its grant."""
+    from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHistory
+
+    from .delivery_codec import DELIVERY_DATA_CONVERTER
+    from .delivery_retained_closures import _bounded_payloads
+
+    namespace = store.config.raw.get("temporal_namespace", "default")
+    client = await Client.connect(store.config.temporal_address, namespace=namespace,
+                                  data_converter=DELIVERY_DATA_CONVERTER)
+    handle = client.get_workflow_handle(execution["workflow_id"],
+                                        run_id=execution["execution_run_id"])
+    description = await handle.describe()
+    if (description.id != execution["workflow_id"]
+            or description.run_id != execution["execution_run_id"]
+            or description.workflow_type != "DevflowMergeWorkflow"
+            or description.status != WorkflowExecutionStatus.RUNNING):
+        raise ValueError("merge activity lacks its original running SDK start")
+    history = handle.fetch_history_events(page_size=1, skip_archival=True,
+                                          rpc_timeout=timedelta(seconds=5))
+    await history.fetch_next_page()
+    page = history.current_page or []
+    if (not page or sum(event.ByteSize() for event in page) > 32 * 1024**2
+            or page[0].event_id != 1
+            or not page[0].HasField("workflow_execution_started_event_attributes")):
+        raise ValueError("merge activity lacks its bounded original start history")
+    start = page[0].workflow_execution_started_event_attributes
+    if (start.workflow_type.name != "DevflowMergeWorkflow"
+            or start.task_queue.name != store.config.queue
+            or start.workflow_id not in ("", execution["workflow_id"])
+            or start.original_execution_run_id != execution["execution_run_id"]
+            or start.continued_execution_run_id
+            or set(start.memo.fields) != {"merge_authorization"}):
+        raise ValueError("merge activity cannot adopt a reset or foreign start")
+    _bounded_payloads(WorkflowHistory(execution["workflow_id"], [page[0]]))
+    inputs = await DELIVERY_DATA_CONVERTER.decode(list(start.input.payloads))
+    memo = await DELIVERY_DATA_CONVERTER.decode([start.memo.fields["merge_authorization"]])
+    if (inputs != [request["spec"], request["merge_authorization"]]
+            or memo != [request["merge_authorization"]]):
+        raise ValueError("merge activity start differs from its exact original spec or grant")
+
+
+async def authenticate_activity(store, request):
+    value = _activity_origin(store, request)
+    execution = value["execution"]
+    with existing_lease(store.config):
+        with store._connect() as db:
+            previous = db.execute("SELECT 1 FROM delivery_merge_executions WHERE workflow_id=?",
+                                  (execution["workflow_id"],)).fetchone()
+        if not previous:
+            await asyncio.wait_for(_original_start(store, request, execution), timeout=10)
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            bind_execution(db, request["spec"], request["merge_authorization"], execution)
+
+
+@contextmanager
+def activity_scope(store, request):
+    value = _activity_origin(store, request)
     token = _ORIGIN.set(value)
     try:
         with existing_lease(store.config):
@@ -142,12 +262,19 @@ async def _closed(store, spec, saved):
     namespace = store.config.raw.get("temporal_namespace", "default")
     client = await Client.connect(store.config.temporal_address, namespace=namespace,
                                   data_converter=DELIVERY_DATA_CONVERTER)
+    with store._connect() as db:
+        selected = db.execute("SELECT * FROM delivery_merge_executions WHERE workflow_id=?",
+                              (saved["workflow_id"],)).fetchone()
     handle = client.get_workflow_handle(saved["workflow_id"])
     description = await handle.describe()
     if (
         description.id != saved["workflow_id"]
         or description.workflow_type != "DevflowMergeWorkflow"
         or not description.run_id
+        or selected and (selected["execution_run_id"] != description.run_id
+                         or selected["run_id"] != spec["run_id"]
+                         or selected["spec_sha256"] != digest(spec)
+                         or selected["grant_sha256"] != digest(json.loads(saved["grant_json"])))
         or description.status != WorkflowExecutionStatus.COMPLETED
         or not description.close_time
     ):
@@ -181,6 +308,7 @@ async def _closed(store, spec, saved):
     start = first.workflow_execution_started_event_attributes
     if (
         start.workflow_type.name != "DevflowMergeWorkflow"
+        or start.task_queue.name != store.config.queue
         or start.workflow_id not in ("", saved["workflow_id"])
         or start.original_execution_run_id != description.run_id
         or start.continued_execution_run_id
@@ -198,7 +326,8 @@ async def _closed(store, spec, saved):
     memo = await DELIVERY_DATA_CONVERTER.decode([start.memo.fields["merge_authorization"]])
     payloads = list(last.workflow_execution_completed_event_attributes.result.payloads)
     result = await DELIVERY_DATA_CONVERTER.decode(payloads)
-    if inputs != [spec, grant] or memo != [grant] or result != [json.loads(saved["result_json"] or "null")]:
+    if (inputs != [spec, grant] or memo != [grant]
+            or result != [json.loads(saved["result_json"] or "null")]):
         raise ValueError("merge closure differs from its exact original spec, grant or result")
     raw = history_json(history)
     if len(raw) > 64 * 1024**2:

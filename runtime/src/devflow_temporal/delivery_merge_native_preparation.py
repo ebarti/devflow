@@ -53,8 +53,8 @@ def _artifacts(original, request):
 
 
 def _binding(original, request, authorization, workflow):
-    from .delivery_resources import _identity
     from .delivery_merge_execution import FIELD as EXECUTION
+    from .delivery_resources import _identity
 
     _ancestors(Path(request["workspace"]) / "unused")
     return {
@@ -155,11 +155,14 @@ def recorded(original, request, authorization, reference):
         raise ValueError("merge native preparation receipt changed")
     record = json.loads(raw)
     binding, execution = record["binding"], record["execution_spec"]
+    from .delivery_merge_execution import FIELD as EXECUTION
+
     prepared = read_private(path.parent / "runtime-preparation/intent.json")
     if (
         binding.get("schema") != SCHEMA
         or binding.get("grant_sha256") != authorization
         or binding.get("original_spec_sha256") != digest(original)
+        or binding.get(EXECUTION) != request.get(EXECUTION)
         or any(
             binding.get(key) != request.get(key)
             for key in ("role", "iteration", "candidate", "workspace", "merge_context")
@@ -177,18 +180,19 @@ def recorded(original, request, authorization, reference):
 
 def authenticate(store, original, request, bound, effect):
     """Current launch/reattachment authority; original grant remains separate."""
+    from .delivery_merge_execution import FIELD as EXECUTION
+    from .delivery_merge_execution import identity, require_current
     from .delivery_merge_followup import authorize, current
     from .delivery_preparation import verify_prepared_spec
     from .delivery_resources import _identity
-    from .delivery_merge_execution import FIELD as EXECUTION
 
     if request.get(EXECUTION) != bound.get(EXECUTION):
         raise ValueError("merge native execution changed its activity generation")
-    if effect["state"] != "complete" and EXECUTION in bound:
-        with store._connect() as db:
-            saved = current(db, original["run_id"])
-        if not saved or bound[EXECUTION]["workflow_id"] != saved["workflow_id"]:
-            raise ValueError("merge native launch belongs to an obsolete execution")
+    with store._connect() as db:
+        require_current(db, original, required=True)
+    if (effect["state"] != "complete" and EXECUTION in bound
+            and bound[EXECUTION] != identity()):
+        raise ValueError("merge native launch belongs to an obsolete execution")
 
     reference = bound.get(FIELD)
     if request.get(FIELD) != reference:
@@ -282,9 +286,9 @@ def prelaunch_receipts(store, spec, saved):
     A missing request is supported only for a typed, never-capacity-admitted
     supervisor result and an exactly empty owned folder. It is never recreated.
     """
+    from .delivery_merge_execution import FIELD as EXECUTION
     from .delivery_merge_resolution import scratch_path
     from .supervisor import DeliverySupervisor
-    from .delivery_merge_execution import FIELD as EXECUTION
 
     with store._connect() as db:
         effects = [

@@ -171,6 +171,19 @@ repair allowance or merge authorization. A caller cannot supply a replacement
 execution spec or executable path. Every current launch still verifies native
 authority, source, claim and the exact merge context.
 
+Every merge activity derives its workflow and execution run from the Temporal SDK
+context and binds that exact pair durably to the selected grant and original
+spec. A reset or a later workflow cannot adopt an earlier activity's progress,
+effect completion, publication or scratch cleanup authority. A cancelled waiter
+retains the effect lease until its synchronous body actually exits. Continuation
+requires the exclusive lease and the configured server's complete, bounded
+history for the exact completed predecessor, including original inputs, grant,
+result and close time; a running, reset, expired or otherwise unproven execution
+remains unavailable. The new command records the authenticated closure reference
+while keeping the original grant and historical role bindings intact. A lost
+start response is reconciled by workflow ID and exact SDK run before dispatch is
+acknowledged.
+
 A supervisor can fail before capacity admission and request-file creation.
 This remains a typed blocked `prelaunch` result, with no provider session or
 monitored-process cleanup claim. Merge preflight can observe such a continuation

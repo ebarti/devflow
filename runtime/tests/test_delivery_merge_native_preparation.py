@@ -14,6 +14,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from merge_activity_test_helper import activity_call, activity_call_async, selected_activity
 from test_delivery_merge_followup import delivered as delivered
 from test_delivery_merge_resolution import conflicted as conflicted
 from test_delivery_store import service as service
@@ -77,7 +78,9 @@ async def test_derived_execution_keeps_original_grant_and_replays_completed_role
     c = relocated_conflict
     from test_delivery_store import _git
 
-    result = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    result = await activity_call_async(
+        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+    )
     assert result["state"] == "pending"
     assert [r["role"] for r in c.calls] == ["implement", "review"]
     assert len(c.preparations) == 2
@@ -89,7 +92,9 @@ async def test_derived_execution_keeps_original_grant_and_replays_completed_role
     assert _git(c.remote, "show", result["head"] + ":conflict.txt") == (
         "feature requirement\nmain requirement"
     )
-    replay = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    replay = await activity_call_async(
+        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+    )
     assert replay == result and len(c.preparations) == 2 and len(c.calls) == 2
     with c.d.store._connect() as db:
         assert followup.current(db, "run-1")["grant_json"]
@@ -118,7 +123,9 @@ async def test_derived_role_rejects_unbound_preparation_or_current_drift(
     change,
 ):
     c = relocated_conflict
-    await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    await activity_call_async(
+        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+    )
     request = copy.deepcopy(c.calls[0])
     if change == "reference":
         request[native.FIELD]["sha256"] = "0" * 64
@@ -140,7 +147,7 @@ async def test_derived_role_rejects_unbound_preparation_or_current_drift(
         Path(request["merge_context"]["evidence_path"]).write_text("{}")
     else:
         request["spec"]["policy"]["max_repairs"] += 1
-    with pytest.raises((ValueError, KeyError)):
+    with selected_activity(c.d.store, c.d.spec), pytest.raises((ValueError, KeyError)):
         resolution.authenticate(request, c.d.store)
 
 
@@ -203,7 +210,8 @@ async def test_actual_empty_prelaunch_continues_original_merge_without_fabricati
     monkeypatch.setattr(delivery_preparation, "verify_prepared_spec", reject_location)
     monkeypatch.setattr(delivery_native_process, "NativeProcess", forbidden)
     monkeypatch.setattr(DeliverySupervisor, "_enter_capacity", forbidden)
-    result = await DeliverySupervisor(d.store, capacity=2).run(request)
+    with selected_activity(d.store, d.spec):
+        result = await DeliverySupervisor(d.store, capacity=2).run(request)
     assert calls == ["verify"]
     assert result["status"] == "blocked" and result["finish_reason"] == "prelaunch"
     assert result["cleanup"] == "confirmed" and result["session_id"] is None
@@ -217,7 +225,7 @@ async def test_actual_empty_prelaunch_continues_original_merge_without_fabricati
     assert all(
         row[name] is None for name in ("started_at", "pid", "process_identity", "session_id")
     )
-    followup.failed(
+    activity_call(followup.failed,
         d.store,
         d.spec,
         grant["grant_sha256"],
@@ -341,7 +349,7 @@ def test_preparation_rechecks_current_generation_after_native_measurement(
         return execution
 
     monkeypatch.setattr(gates, "prepare_runtime", changed)
-    with pytest.raises(ValueError):
+    with selected_activity(c.d.store, c.d.spec), pytest.raises(ValueError):
         native.prepare(c.d.store, c.d.spec, request, c.receipt["grant_sha256"])
     with c.d.store._connect() as db:
         assert not db.execute(

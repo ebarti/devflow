@@ -133,6 +133,9 @@ class MergeBroker:
         self.sequence = 0
 
     def api(self, endpoint, *, method="GET", body=None, raw=False):
+        from .delivery_merge_execution import require_api_current
+
+        require_api_current(self.store, self.spec["run_id"])
         if (self.cancel_event is not None and self.cancel_event.is_set()
                 or time.monotonic() >= self.deadline):
             raise RuntimeError("merge activity no longer owns a live execution boundary")
@@ -157,8 +160,11 @@ class MergeBroker:
         return stdout if raw else json.loads(stdout)
 
     def intent(self, key, kind, request):
+        from .delivery_merge_execution import require_effect_current
+
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            require_effect_current(db, self.spec["run_id"])
             previous = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
                                   (key,)).fetchone()
             if previous:
@@ -172,8 +178,11 @@ class MergeBroker:
         return True
 
     def finish(self, key, result):
+        from .delivery_merge_execution import require_effect_current
+
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            require_effect_current(db, self.spec["run_id"])
             db.execute("UPDATE delivery_effects SET state='complete',observed_json=?,updated_at=? "
                        "WHERE effect_key=?", (canonical_json(result), _now(), key))
 

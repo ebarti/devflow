@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from merge_activity_test_helper import activity_call
 from test_delivery_merge import gates
 from test_delivery_store import service as service
 
@@ -230,6 +231,35 @@ def delivered(service, monkeypatch, *, native_spec=None):
         "pr_number": 1,
         "answer": "merge",
     }
+    from devflow_temporal import delivery_merge_execution
+
+    def controlled_closure(_store, current_spec, saved):
+        selected = store._test_merge_execution
+        if saved["workflow_id"] != selected["workflow_id"]:
+            raise ValueError("predecessor workflow differs from its controlled SDK execution")
+        return {"workflow_id": selected["workflow_id"],
+                "execution_run_id": selected["execution_run_id"],
+                "namespace": store.config.raw.get("temporal_namespace", "default"),
+                "workflow_type": "DevflowMergeWorkflow", "status": "COMPLETED",
+                "closed_at": "2026-10-19T10:01:00+00:00",
+                "grant_sha256": selected["grant_sha256"],
+                "original_spec_sha256": digest(current_spec),
+                "result_sha256": digest(json.loads(saved["result_json"] or "null")),
+                "history_sha256": "0" * 64, "event_count": 2}
+
+    monkeypatch.setattr(delivery_merge_execution, "predecessor_closure", controlled_closure)
+    original_admit = followup.admit
+
+    def admit_with_origin(*args, **kwargs):
+        result = original_admit(*args, **kwargs)
+        store._test_merge_execution = {
+            "workflow_id": result["workflow_id"],
+            "execution_run_id": result["workflow_id"] + "-test-run",
+            "grant_sha256": result["grant_sha256"],
+        }
+        return result
+
+    monkeypatch.setattr(followup, "admit", admit_with_origin)
     return SimpleNamespace(
         store=store,
         spec=spec,
@@ -295,7 +325,7 @@ async def test_public_reads_remain_available_during_resultless_merge_progress(de
         for phase in ("queued", "merging", "resolving_conflicts", "waiting_ci",
                       "waiting_tracker", "waiting_cleanup"):
             if phase != "queued":
-                followup.record(d.store, d.spec, phase)
+                activity_call(followup.record, d.store, d.spec, phase)
             listed = await client.get("/api/runs")
             detail = await client.get("/api/runs/run-1")
             assert listed.status_code == detail.status_code == 200
@@ -314,7 +344,7 @@ async def test_public_reads_remain_available_during_resultless_merge_progress(de
 def test_conflict_continuation_retains_original_grant_and_is_idempotent(delivered):
     d = delivered
     original = followup.admit(d.store, "run-1", d.command)
-    followup.record(d.store, d.spec, "decision_required", {
+    activity_call(followup.record, d.store, d.spec, "decision_required", {
         "state": "decision_required", "reason": "conflicting_upstream_changes"})
     with d.store._connect() as db:
         before = followup.current(db, "run-1")
@@ -337,7 +367,7 @@ def test_conflict_continuation_retains_original_grant_and_is_idempotent(delivere
 def test_real_product_decision_cannot_be_restarted_as_a_routine_conflict(delivered):
     d = delivered
     followup.admit(d.store, "run-1", d.command)
-    followup.record(d.store, d.spec, "decision_required", {
+    activity_call(followup.record, d.store, d.spec, "decision_required", {
         "state": "decision_required", "reason": "divergent_product_direction"})
     with pytest.raises(ValueError, match="already owns"):
         followup.admit(d.store, "run-1", {**d.command, "command_id": "retry"})
@@ -381,7 +411,7 @@ def test_cleanup_wait_preserves_claim_then_merges_same_candidate(delivered, monk
     bound = admitted["grant_sha256"]
     with d.store._connect() as db:
         db.execute("UPDATE delivery_runs SET cleanup='unknown'")
-    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
     with d.store._connect() as db:
         assert followup.current(db, "run-1")["phase"] == "waiting_cleanup"
         assert d.store.state.claim_for(db, d.spec["work_id"])
@@ -391,12 +421,12 @@ def test_cleanup_wait_preserves_claim_then_merges_same_candidate(delivered, monk
         raise ValueError("fresh process observation is incomplete")
 
     monkeypatch.setattr(followup, "observe_finalized_resources", uncertain)
-    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
     assert remote.merge_calls == remote.updates == 0
     monkeypatch.setattr(followup, "observe_finalized_resources", lambda _: {"state": "confirmed"})
-    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
     remote.ci_ready = True
-    assert followup.step(d.store, d.spec, bound, Event())["state"] == "confirmed"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "confirmed"
     assert remote.updates == remote.merge_calls == 1
 
 
@@ -421,8 +451,6 @@ def test_legacy_continuation_requalifies_custody_and_owned_head_without_replayin
     d = delivered
     remote = git_remote(d, monkeypatch)
     admitted = followup.admit(d.store, "run-1", d.command)
-    assert followup.step(d.store, d.spec, admitted["grant_sha256"], Event())["state"] == "pending"
-    assert followup.step(d.store, d.spec, admitted["grant_sha256"], Event())["state"] == "pending"
     # Model a v1 grant that predated a separate immutable native evidence digest.
     with d.store._connect() as db:
         saved = followup.current(db, "run-1")
@@ -435,6 +463,10 @@ def test_legacy_continuation_requalifies_custody_and_owned_head_without_replayin
         db.execute("UPDATE delivery_merge_requests SET grant_json=?", (legacy_grant,))
         db.execute("UPDATE delivery_commands SET response_json=? WHERE command_id=?",
                    (canonical_json(response), d.command["command_id"]))
+    d.store._test_merge_execution["grant_sha256"] = bound
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
+    with d.store._connect() as db:
         checks = json.loads(db.execute("SELECT checks_json FROM delivery_runs").fetchone()[0])
         checks["resource_cleanup"]["observed_at"] = "later"
         db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
@@ -442,7 +474,7 @@ def test_legacy_continuation_requalifies_custody_and_owned_head_without_replayin
                         lambda _: {"manifest_sha256": "later-observation"})
     with pytest.raises(ValueError, match="native evidence changed"):
         followup.authorize(d.store, d.spec, bound)
-    followup.record(d.store, d.spec, "blocked", {
+    activity_call(followup.record, d.store, d.spec, "blocked", {
         "state": "blocked",
         "reason": "ValueError: predecessor process/root custody is unconfirmed"})
     remote.ci_ready = True
@@ -453,7 +485,7 @@ def test_legacy_continuation_requalifies_custody_and_owned_head_without_replayin
     with d.store._connect() as db:
         assert followup.current(db, "run-1")["grant_json"] == legacy_grant
     assert remote.updates == 1 and remote.merge_calls == 0
-    assert followup.step(d.store, d.spec, bound, Event())["state"] == "confirmed"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "confirmed"
     assert remote.updates == remote.merge_calls == 1
 
 
@@ -526,8 +558,8 @@ def test_active_merge_cannot_be_archived_and_dispatch_error_does_not_replace_com
             "archive",
             {"command_id": "archive", "expected_revision": 1, "archived": True},
         )
-    followup.record(d.store, d.spec, "merged", {"state": "confirmed"})
-    followup.record(
+    activity_call(followup.record, d.store, d.spec, "merged", {"state": "confirmed"})
+    activity_call(followup.record,
         d.store, d.spec, "queued", {"state": "pending"}, "late transport error", only_if="queued"
     )
     with d.store._connect() as db:
@@ -569,7 +601,7 @@ def test_merge_only_step_projects_result_and_settles_its_claim(delivered, monkey
         "devflow_temporal.delivery_activities._tracker_sync",
         lambda *_args, **_kw: {"state": "recorded", "pending": False},
     )
-    result = followup.step(d.store, d.spec, admitted["grant_sha256"], Event())
+    result = activity_call(followup.step, d.store, d.spec, admitted["grant_sha256"], Event())
     assert result["state"] == state and calls == ["merge"]
     with d.store._connect() as db:
         saved = followup.current(db, "run-1")
@@ -719,20 +751,20 @@ def test_merge_entry_reconciles_real_main_and_waits_for_new_ci_without_another_w
     remote.lose_merge_ack = lost == "merge"
     admitted = followup.admit(d.store, "run-1", d.command)
     bound = admitted["grant_sha256"]
-    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
     assert remote.updates == 1 and remote.merge_calls == 0
-    assert followup.step(d.store, d.spec, bound, Event())["state"] == "pending"
+    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
     assert remote.updates == 1 and remote.merge_calls == 0
     remote.ci_ready = True
-    result = followup.step(d.store, d.spec, bound, Event())
+    result = activity_call(followup.step, d.store, d.spec, bound, Event())
     if lost == "merge":
         assert result["state"] == "pending"
-        result = followup.step(d.store, d.spec, bound, Event())
+        result = activity_call(followup.step, d.store, d.spec, bound, Event())
     assert result["state"] == "confirmed", result
     assert result["base"] == remote.target and result["head"] == remote.head
     assert _git(remote.repo, "show", remote.squash + ":feature.txt") == "Reviewed source"
     assert _git(remote.repo, "show", remote.squash + ":main.txt") == "New main work"
-    assert followup.step(d.store, d.spec, bound, Event()) == result
+    assert activity_call(followup.step, d.store, d.spec, bound, Event()) == result
     assert remote.merge_calls == 1 and remote.issue_state == "closed"
     with d.store._connect() as db:
         assert d.store.state.claim_for(db, d.spec["work_id"]) is None

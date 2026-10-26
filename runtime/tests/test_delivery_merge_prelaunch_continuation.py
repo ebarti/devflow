@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from merge_activity_test_helper import activity_call, role_call
 from test_delivery_merge_followup import delivered as delivered
 from test_delivery_merge_native_preparation import relocated_conflict as relocated_conflict
 from test_delivery_merge_resolution import conflicted as conflicted
@@ -55,7 +56,7 @@ async def blocked(c, monkeypatch, role="implement", *, persisted=False):
         supervisor, "get_supervisor", lambda _: supervisor.DeliverySupervisor(c.d.store, capacity=2)
     )
     with pytest.raises(RuntimeError, match="blocked before provider launch"):
-        await resolution._role(
+        await role_call(resolution._role,
             broker, c.d.spec, workspace, context, c.receipt["grant_sha256"], role
         )
     request = requests[0]
@@ -84,7 +85,7 @@ async def blocked(c, monkeypatch, role="implement", *, persisted=False):
     assert result["session_id"] is None and "process_cleanup" not in result
     if persisted:
         write_private(folder / "request.json", request)
-    followup.failed(
+    activity_call(followup.failed,
         c.d.store,
         c.d.spec,
         c.receipt["grant_sha256"],
@@ -265,7 +266,7 @@ async def test_claim_drift_after_prelaunch_observation_cannot_settle_effect(
 
     monkeypatch.setattr(native, "prelaunch_receipts", changed)
     before = names(d.spec)
-    with pytest.raises(ValueError, match="current issue owner"):
+    with pytest.raises(ValueError, match="current issue owner|claim resource differs"):
         followup.admit(d.store, "run-1", {**d.command, "command_id": "refuse-after-claim-drift"})
     assert names(d.spec) == before
     with d.store._connect() as db:

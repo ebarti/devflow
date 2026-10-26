@@ -46,6 +46,9 @@ _FIELDS = (
 
 
 def initialize(db):
+    from .delivery_merge_execution import initialize as initialize_executions
+
+    initialize_executions(db)
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_merge_requests (
         run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
         command_id TEXT UNIQUE NOT NULL, grant_json TEXT NOT NULL,
@@ -773,8 +776,13 @@ async def dispatch(service, client):
 
     pending = await asyncio.to_thread(pending_requests)
 
-    def acknowledge(selected):
-        with service.store._connect() as db:
+    def acknowledge(selected, spec, execution_run_id):
+        from .delivery_merge_execution import bind_execution, existing_lease
+
+        with existing_lease(service.config), service.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            bind_execution(db, spec, digest(json.loads(selected["grant_json"])), {
+                "workflow_id": selected["workflow_id"], "execution_run_id": execution_run_id})
             db.execute(
                 "UPDATE delivery_merge_requests SET dispatched=1,"
                 "error=CASE WHEN phase='queued' THEN NULL ELSE error END "
@@ -810,7 +818,7 @@ async def dispatch(service, client):
                     raise
                 found = None
             if found is None:
-                await client.start_workflow(
+                started = await client.start_workflow(
                     MergeWorkflow.run,
                     args=[spec, bound],
                     id=item["workflow_id"],
@@ -819,9 +827,14 @@ async def dispatch(service, client):
                     id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
                     memo={"merge_authorization": bound},
                 )
-            elif await found.memo_value("merge_authorization", None) != bound:
-                raise ValueError("merge workflow ID belongs to another authorization")
-            await asyncio.to_thread(acknowledge, item)
+                execution_run_id = started.first_execution_run_id
+            else:
+                if (found.id != item["workflow_id"]
+                        or found.workflow_type != "DevflowMergeWorkflow"
+                        or await found.memo_value("merge_authorization", None) != bound):
+                    raise ValueError("merge workflow ID belongs to another authorization")
+                execution_run_id = found.run_id
+            await asyncio.to_thread(acknowledge, item, spec, execution_run_id)
         except WorkflowAlreadyStartedError:
             # Lost start acknowledgement: the next pass reads the memo.
             continue

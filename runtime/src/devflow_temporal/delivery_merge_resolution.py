@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
@@ -291,9 +290,9 @@ def _prepare(broker, pr, conflict, authorization):
 
 
 async def _role(broker, spec, workspace, context, authorization, role):
+    from .delivery_merge_execution import FIELD as EXECUTION
+    from .delivery_merge_execution import identity, to_thread
     from .delivery_merge_native_preparation import FIELD, prepare, recorded
-    from .delivery_merge_execution import FIELD as EXECUTION, identity
-    from .delivery_merge_execution import to_thread
     from .supervisor import DeliverySupervisor, get_supervisor
 
     key = "merge-resolution:" + spec["run_id"] + ":" + context["resolution_id"] + ":" + role
@@ -352,6 +351,10 @@ async def _role(broker, spec, workspace, context, authorization, role):
     except (ValueError, OSError, RuntimeError) as exc:
         result = {**result, "status": "blocked", "merge_decision": None,
                   "findings": [*result.get("findings", []), str(exc)]}
+    from .delivery_merge_execution import require_current
+
+    with broker.store._connect() as db:
+        require_current(db, spec, required=True)
     transient = scratch(request)
     shutil.rmtree(transient)
     if transient.exists():
@@ -363,8 +366,8 @@ async def _role(broker, spec, workspace, context, authorization, role):
 
 async def resolve(store, spec, authorization, conflict):
     from .delivery_merge import MergeBroker
-    from .delivery_merge_followup import authorize, record
     from .delivery_merge_execution import to_thread
+    from .delivery_merge_followup import authorize, record
 
     proof = await to_thread(store, spec, authorize, store, spec, authorization)
     pr = proof["pull_request"]
@@ -373,7 +376,8 @@ async def resolve(store, spec, authorization, conflict):
                 "original_head": pr["head"], "previous_head": conflict["previous_head"]}
     if conflict != expected:
         raise ValueError("merge resolver input changed its owned reconciliation")
-    _, workspace, context = await to_thread(store, spec, _prepare, broker, pr, conflict, authorization)
+    _, workspace, context = await to_thread(
+        store, spec, _prepare, broker, pr, conflict, authorization)
     record(store, spec, "resolving_conflicts", {
         "state": "pending", "conflicts": context["conflicts"], "target": conflict["target"]})
     for role in ("implement", "review") if context["conflicts"] else ():

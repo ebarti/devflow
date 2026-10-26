@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from merge_activity_test_helper import activity_call, activity_call_async, selected_activity
 from test_delivery_merge_followup import delivered as delivered
 from test_delivery_store import _git
 from test_delivery_store import service as service
@@ -60,6 +61,8 @@ def conflicted(delivered, monkeypatch, tmp_path):
     monkeypatch.setattr(followup, "authorize", lambda *_: proof)
 
     def api(_broker, path, **_kwargs):
+        if path.endswith("/pulls/1"):
+            return dict(d.remote)
         if "/git/commits/" in path:
             head = path.rsplit("/", 1)[-1]
             return {"sha": head, "tree": {"sha": _git(remote, "rev-parse", head + "^{tree}")},
@@ -134,7 +137,9 @@ def conflicted(delivered, monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_conflict_is_resolved_reviewed_and_published_as_exact_two_parent_tree(conflicted):
     c = conflicted
-    result = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    result = await activity_call_async(
+        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+    )
     assert result["state"] == "pending"
     head = _git(c.remote, "rev-parse", c.d.spec["branch"])
     assert head == result["head"]
@@ -143,7 +148,9 @@ async def test_conflict_is_resolved_reviewed_and_published_as_exact_two_parent_t
         "feature requirement\nmain requirement")
     assert [request["role"] for request in c.calls] == ["implement", "review"]
     # Reattachment keeps both native attempts and the original push, rather than replaying them.
-    again = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    again = await activity_call_async(
+        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+    )
     assert again == result and len(c.calls) == 2 and c.state["pushes"] == 1
     for request in c.calls:
         assert read_private(Path(request["merge_context"]["evidence_path"]))["conflict.txt"] == {
@@ -157,7 +164,9 @@ async def test_only_proven_product_divergence_is_a_user_decision_and_nothing_is_
 ):
     c = conflicted
     c.state[mode] = True
-    result = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    result = await activity_call_async(
+        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+    )
     assert result["state"] == ("decision_required" if mode == "decision" else "blocked")
     assert bool(result.get("decision")) == (mode == "decision")
     assert c.state["pushes"] == 0
@@ -169,7 +178,9 @@ async def test_lost_push_acknowledgement_is_reconciled_without_a_second_push(con
     c = conflicted
     c.state["lost_push"] = True
     with pytest.raises(RuntimeError, match="response lost"):
-        await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+        await activity_call_async(
+            resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+        )
     head = _git(c.remote, "rev-parse", c.d.spec["branch"])
     raw = {**c.d.remote, "head": {**c.d.remote["head"], "sha": head},
            "base": {**c.d.remote["base"], "sha": c.target}}
@@ -184,14 +195,22 @@ async def test_review_continuation_reuses_resolved_checkout_without_another_reso
     c = conflicted
     c.state["review_prelaunch"] = True
     with pytest.raises(RuntimeError, match="before provider launch"):
-        await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+        await activity_call_async(
+            resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+        )
     original_workspace = c.calls[0]["workspace"]
     with c.d.store._connect() as db:
         db.execute("UPDATE delivery_merge_requests SET workflow_id=workflow_id || '-continued'")
         db.execute("UPDATE delivery_effects SET state='complete',observed_json='{}' "
                    "WHERE kind='merge_resolution' AND state='pending'")
+    c.d.store._test_merge_execution["workflow_id"] += "-continued"
+    c.d.store._test_merge_execution["execution_run_id"] = (
+        c.d.store._test_merge_execution["workflow_id"] + "-test-run"
+    )
     c.state["review_prelaunch"] = False
-    result = await resolution.resolve(c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict)
+    result = await activity_call_async(
+        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
+    )
     assert result["state"] == "pending" and c.state["pushes"] == 1
     assert [r["role"] for r in c.calls] == ["implement", "review", "review"]
     assert all(r["workspace"] == original_workspace for r in c.calls)
@@ -277,7 +296,7 @@ def test_proven_prelaunch_continues_same_grant_without_replaying_the_failed_atte
                    "VALUES (?,'run-1','implement',0,?,'finished','confirmed',?,?)",
                    (job, request["candidate"]["id"], canonical_json(failed),
                     str(folder / "result.json")))
-    followup.record(d.store, d.spec, "unknown", {
+    activity_call(followup.record, d.store, d.spec, "unknown", {
         "state": "unknown",
         "reason": "RuntimeError: merge resolution native cleanup remains unconfirmed"})
     command = {**d.command, "command_id": "continue-proven-prelaunch"}
@@ -305,9 +324,11 @@ async def test_activity_keeps_observing_a_push_with_a_lost_acknowledgement(confl
     c.state["lost_push"] = True
     monkeypatch.setattr(
         "devflow_temporal.delivery_activities._context", lambda _: (c.d.store, None))
-    result = await delivery_resolve_merge_conflicts({
-        "spec": c.d.spec, "merge_authorization": c.receipt["grant_sha256"], "conflict": c.conflict,
-    })
+    with selected_activity(c.d.store, c.d.spec):
+        result = await delivery_resolve_merge_conflicts({
+            "spec": c.d.spec, "merge_authorization": c.receipt["grant_sha256"],
+            "conflict": c.conflict,
+        })
     assert result == {"state": "pending", "reason": "resolved_target_update_readback"}
     with c.d.store._connect() as db:
         saved = followup.current(db, c.d.spec["run_id"])

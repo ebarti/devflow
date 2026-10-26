@@ -1429,15 +1429,17 @@ async def delivery_merge(request):
 async def delivery_merge_followup(request):
     from threading import Event
 
+    from .delivery_merge_execution import activity_scope, authenticate_activity, to_thread
     from .delivery_merge_followup import step
-    from .delivery_merge_execution import activity_scope, to_thread
 
     store, _ = await asyncio.to_thread(_context, request["spec"])
+    await authenticate_activity(store, request)
     with activity_scope(store, request):
         cancelled = Event()
         try:
             return await _with_heartbeat(to_thread(
-                store, request["spec"], step, store, request["spec"], request["merge_authorization"], cancelled),
+                store, request["spec"], step, store, request["spec"],
+                request["merge_authorization"], cancelled),
                 request, "merge")
         finally:
             cancelled.set()
@@ -1445,10 +1447,11 @@ async def delivery_merge_followup(request):
 
 @activity.defn(name="delivery_merge_followup_failed")
 async def delivery_merge_followup_failed(request):
+    from .delivery_merge_execution import activity_scope, authenticate_activity, to_thread
     from .delivery_merge_followup import failed
-    from .delivery_merge_execution import activity_scope, to_thread
 
     store, _ = await asyncio.to_thread(_context, request["spec"])
+    await authenticate_activity(store, request)
     with activity_scope(store, request):
         return await to_thread(store, request["spec"], failed, store, request["spec"],
                                request["merge_authorization"], request["reason"])
@@ -1456,15 +1459,17 @@ async def delivery_merge_followup_failed(request):
 
 @activity.defn(name="delivery_resolve_merge_conflicts")
 async def delivery_resolve_merge_conflicts(request):
+    from .delivery_merge_execution import activity_scope, authenticate_activity, to_thread
     from .delivery_merge_followup import failed
     from .delivery_merge_resolution import resolve
-    from .delivery_merge_execution import activity_scope, to_thread
 
     store, _ = await asyncio.to_thread(_context, request["spec"])
+    await authenticate_activity(store, request)
     with activity_scope(store, request):
         try:
             return await _with_heartbeat(
-                resolve(store, request["spec"], request["merge_authorization"], request["conflict"]),
+                resolve(store, request["spec"], request["merge_authorization"],
+                        request["conflict"]),
                 request, "merge_resolution",
             )
         except Exception as exc:
@@ -1478,7 +1483,8 @@ async def delivery_resolve_merge_conflicts(request):
                     from .delivery_merge_followup import record
 
                     result = {"state": "pending", "reason": "resolved_target_update_readback"}
-                    await to_thread(store, request["spec"], record, store, request["spec"], "unknown", result,
+                    await to_thread(store, request["spec"], record, store, request["spec"],
+                                    "unknown", result,
                                     f"{type(exc).__name__}: {str(exc)[:500]}")
                     return result
             return await to_thread(store, request["spec"], failed, store, request["spec"],
