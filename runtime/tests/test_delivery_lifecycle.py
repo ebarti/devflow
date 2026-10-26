@@ -14,6 +14,7 @@ def test_assessment_and_execution_agree_on_exact_checkpoint(request, fixture_nam
     kind = command['continuation_kind']
     observed = assess_transition(store, 'run-1', kind, command)
     assert observed['eligible'] is True
+    assert observed['supported_next_actions'] == ['continue-repair']
     assert observed['proof_digest'] and observed['candidate']['id'] == broker.candidate()['id']
     with store._connect() as db:
         assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',

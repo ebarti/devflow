@@ -11,6 +11,32 @@ from typing import Any
 
 VERSION = 1
 
+# Public command names only; this table never selects a recovery route or grants it.
+_NEXT_ACTIONS = {
+    'repair_continuation': 'continue-repair',
+    'stopped_delivery_resume': 'continue-repair',
+    'published_gate_retry': 'continue-repair',
+    'prepublication_gate_retry': 'continue-repair',
+    'published_check_prelaunch_retry': 'continue-repair',
+    'published_ci_retry': 'continue-repair',
+    'published_controller_retry': 'continue-repair',
+    'stopped_resource_closure': 'continue-repair',
+    'abandon_pending_resource_closure': 'continue-repair',
+    'published_head_validation': 'continue-repair',
+    'investigation_gates_only': 'admit-gates-only',
+    'merge_run': 'merge',
+    'ordinary_ci_execution_inventory': 'ack-ci-inventory',
+    'native_check_diagnostic': 'ack-native-diagnostic',
+    'recover_publication': 'recover-publication',
+    'retry_prelaunch': 'retry-prelaunch',
+    'amend_scope': 'amend-scope',
+    'continue_feature': 'continue-feature',
+    'revise_feature_plan': 'revise-feature-plan',
+    'terminal_tracker_recovery': 'reconcile-tracker',
+    'adopt_filesystem_custody': 'adopt-filesystem-custody',
+    'adopt_runtime_location': 'adopt-runtime-location',
+}
+
 
 class RecoveryRefused(ValueError):
     """A refusal carrying the machine-readable predicates that failed."""
@@ -80,7 +106,10 @@ def evaluate_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) ->
             'publication': ({'number': observed['publication_number']}
                             if facts.get('publication_required') else None),
             'proof_digest': facts.get('proof_digest') if facts.get('owner_proof') is True else None,
-            'supported_next_actions': sorted({item['next_action'] for item in blockers}),
+            'supported_next_actions': (sorted({item['next_action'] for item in blockers})
+                                       if blockers else
+                                       [_NEXT_ACTIONS[operation]] if operation in _NEXT_ACTIONS
+                                       else []),
             'blockers': blockers}
 
 
