@@ -155,11 +155,33 @@ This follow-up keeps the same issue, run, PR, accepted implementation, independe
 reviews, repair count and original publication-only authorization. A separate
 durable merge command owns its Temporal workflow and claim. It mechanically
 reconciles a later main into the PR and waits for required CI on the combined
-tree, without replaying implementation/review workers. Conflicting upstream
-changes are reported for a user decision. The run's `merge` field and event
-timestamps distinguish requested, merging, waiting for CI, uncertain,
+tree, without replaying the original delivery workers. Textual conflicts use an
+isolated merge resolver and independent review against both parent versions;
+an opposing product requirement remains a user decision. The run's `merge` field
+and event timestamps distinguish requested, merging, waiting for CI, uncertain,
 decision-required and confirmed merge states. A lost update or merge response
 is observed under its existing effect identity, never blindly submitted again.
+
+After an acknowledged permanent installation move, merge roles prepare the
+same frozen bundled executable in a merge-owned native generation. Its immutable
+receipt binds the original merge grant and delivered spec, exact role/workflow,
+conflict workspace generation, both parent evidence files and derived native
+measurement. It does not rewrite the original delivered spec, gates, attempts,
+repair allowance or merge authorization. A caller cannot supply a replacement
+execution spec or executable path. Every current launch still verifies native
+authority, source, claim and the exact merge context.
+
+A supervisor can fail before capacity admission and request-file creation.
+This remains a typed blocked `prelaunch` result, with no provider session or
+monitored-process cleanup claim. Merge preflight can observe such a continuation
+without creating request, scratch or owner-lock files or deleting anything.
+The original owner lease, exact immutable merge effect/job/attempt and private
+empty folder must all authenticate; missing authority, a busy lease or any launch
+evidence refuses. Only an explicit public merge continuation settles that setup
+intent under the original grant, preserving the failed attempt byte-for-byte.
+An uncertain provider or remote write cannot use this path or be retried with a
+new identity. Use a new command ID only for the explicitly observed continuation;
+an identical command always reads back its original acknowledgement.
 
 The merge boundary rereads the recorded stack and PR IDs, verifies the exact
 native evidence and required GitHub checks, and requires strict trunk protection

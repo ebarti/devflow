@@ -58,11 +58,16 @@ async def test_public_merge_uses_real_prepared_roles_then_original_workflow_and_
     auth.chmod(0o600)
 
     def native_spec(spec):
+        from devflow_temporal.delivery_native_guard import NATIVE_OVERRIDES
+        from devflow_temporal.runtime_dependencies import locked_dependency_identity
+
         spec["policy"].update(
             codex_bin="/owned/removed-runtime/bin/codex",
             codex_bin_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
             codex_auth_path=str(auth),
             host_sandbox="trusted-local",
+            runtime_dependencies=locked_dependency_identity(),
+            config_overrides=NATIVE_OVERRIDES,
         )
 
     async with local_temporal() as environment:
