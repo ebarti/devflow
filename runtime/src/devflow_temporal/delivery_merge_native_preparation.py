@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 from contextlib import ExitStack, contextmanager
@@ -23,18 +24,39 @@ FIELD = "merge_native_preparation"
 
 def _path(original, request):
     context = request["merge_context"]
+    if not isinstance(context.get("resolution_id"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", context["resolution_id"]
+    ):
+        raise ValueError("merge native preparation has no exact resolution identity")
     root = Path(original["state_dir"]) / "merge-resolutions" / context["resolution_id"]
     if (
         Path(request["workspace"]) != root / "checkout"
         or context["effect_key"].split(":")[0] != "merge-resolution"
     ):
         raise ValueError("merge native preparation left its exact conflict workspace")
+    _ancestors(root / "preparation.json")
+    prepared = read_private(root / "preparation.json")
+    if (
+        context != {**prepared, "effect_key": context["effect_key"]}
+        or prepared.get("evidence_path") != str(root / "parent-versions.json")
+        or prepared.get("baseline_path") != str(root / "baseline.json")
+    ):
+        raise ValueError("merge native context differs from its immutable conflict preparation")
     return root / "native-executions" / digest(context["effect_key"]) / "execution.json"
+
+
+def _artifacts(original, request):
+    _path(original, request)
+    return {
+        key: hashlib.sha256(read_private(Path(request["merge_context"][key]), raw=True)).hexdigest()
+        for key in ("evidence_path", "baseline_path")
+    }
 
 
 def _binding(original, request, authorization, workflow):
     from .delivery_resources import _identity
 
+    _ancestors(Path(request["workspace"]) / "unused")
     return {
         "schema": SCHEMA,
         "grant_sha256": authorization,
@@ -46,6 +68,7 @@ def _binding(original, request, authorization, workflow):
         "workspace": request["workspace"],
         "merge_context": request["merge_context"],
         "workspace_identity": _identity(Path(request["workspace"])),
+        "conflict_artifacts_sha256": _artifacts(original, request),
     }
 
 
@@ -135,6 +158,7 @@ def recorded(original, request, authorization, reference):
         or prepared.get("command_digest") != digest(binding)
         or prepared.get("seal_digest") != digest(binding)
         or prepared.get("effective_spec") != execution
+        or binding.get("conflict_artifacts_sha256") != _artifacts(original, request)
     ):
         raise ValueError("merge native receipt lost its original grant or request")
     _same_authority(original, execution)

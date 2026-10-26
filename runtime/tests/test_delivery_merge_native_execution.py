@@ -29,7 +29,7 @@ from devflow_temporal import delivery_merge_followup as followup
 from devflow_temporal import delivery_merge_resolution as resolution
 from devflow_temporal import delivery_native_process as process_module
 from devflow_temporal.delivery_config import DeliveryConfig
-from devflow_temporal.delivery_resources import RunResources, read_private
+from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
 
 
@@ -105,8 +105,8 @@ async def test_public_merge_uses_real_prepared_roles_then_original_workflow_and_
             lambda *_args, **_kwargs: copy.deepcopy(d.closed),
         )
         registry = RunResources(d.spec)
-        with registry.locked():
-            pass
+        with registry.locked() as manifest:
+            write_private(registry.manifest, manifest)
         original_files = {
             p: p.read_bytes()
             for p in (
