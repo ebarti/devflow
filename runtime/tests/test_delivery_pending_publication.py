@@ -22,7 +22,10 @@ def pending(service, monkeypatch):
     # This component fixture controls the closed owner boundary. Actual stage
     # authentication is qualified by test_delivery_publication_proof.py.
     monkeypatch.setattr('devflow_temporal.delivery_pending_publication.publication_stop_proof',
-                        lambda *_args: None)
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.read_publication_closed',
+                        lambda store, spec, **_kwargs:
+                        (store._completed_temporal_result(spec['run_id']), None))
     store, _request = service
     original_admit = type(store.config).admit
 

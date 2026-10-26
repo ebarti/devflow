@@ -250,7 +250,10 @@ def pending_v1(service, monkeypatch):
     # Component scope: exact owner stage is controlled here. The real closed
     # history/public boundary is exercised in test_delivery_publication_proof.py.
     monkeypatch.setattr('devflow_temporal.delivery_pending_publication.publication_stop_proof',
-                        lambda *_args: None)
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.read_publication_closed',
+                        lambda store, spec, **_kwargs:
+                        (store._completed_temporal_result(spec['run_id']), None))
     store, broker, original, _gate_request = unpublished.__wrapped__(service, monkeypatch)
     spec = store.effective_spec('run-1')
     assert spec['publication_readback_version'] == 1
@@ -573,6 +576,11 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
                       'request_digest': spec['request_digest'], 'recovery_digest': None,
                       'result': stopped}
             monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_k: closed)
+            # This transport fixture controls closed-owner readback. The real
+            # bounded reader is qualified by test_delivery_publication_proof.py.
+            monkeypatch.setattr(
+                'devflow_temporal.delivery_pending_publication.read_publication_closed',
+                lambda *_a, **_k: (closed, None))
             recover = {
                 'command_id': 'after-the-real-stop', 'expected_revision': stopped['revision'],
                 'expected_candidate_id': stopped['candidate']['id'], 'expected_head': pushed,

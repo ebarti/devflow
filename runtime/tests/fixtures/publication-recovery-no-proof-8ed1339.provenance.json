@@ -1,0 +1,12 @@
+{
+  "source_revision": "8ed13392e526c072e1d5a7a1238889fedfa2fc0d",
+  "source_method": "DeliveryWorkflow._resume_publication",
+  "method_sha256": "cb795894c726f294c22c4e5cc85edfe42ec4a3d701a9cfd0e145286e93e85fca",
+  "history_sha256": "5268a9a710724a4b7dd9034bc9509ac4066e9c3622e74039f7f6e53218de34ef",
+  "execution_run_id": "01a179f9-9cd8-78b6-b038-d8fe8a05337a",
+  "workflow_type": "DevflowDeliveryWorkflow",
+  "input": "Original no-proof recovery input recorded before execution; no history/input edit",
+  "producer": "Unmodified prior recovery method with equivalent unchanged surrounding controller",
+  "seams": "Owned loopback Temporal; controlled publication/check/role/tracker activities; no hosted effects",
+  "current_replay": "passed before saving exact returned history bytes"
+}

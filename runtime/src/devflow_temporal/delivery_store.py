@@ -1368,8 +1368,9 @@ class DeliveryStore:
                     "missing_or_unknown_fact": "pending publication effect readback",
                     "next_action": "reconcile publication effects"}],
             }, supplied)}
-        closed = (self._completed_temporal_result(run_id, preserve=False) if preflight
-                  else self._completed_temporal_result(run_id))
+        from .delivery_publication_proof import read_closed as read_publication_closed
+
+        closed, history = read_publication_closed(self, spec, preserve=not preflight)
         state = closed["result"]
         candidate = state.get("candidate") if isinstance(state, dict) else None
         precheck = state.get("checks", {}).get("prepublish", {}) if isinstance(state, dict) else {}
@@ -1423,7 +1424,7 @@ class DeliveryStore:
             raise ValueError("closed Temporal result is not a recoverable publication")
         from .delivery_publication_proof import observe as publication_stop_proof
 
-        stage_proof = publication_stop_proof(self, spec, closed)
+        stage_proof = publication_stop_proof(self, spec, closed, history=history)
         broker = DeliveryBroker(self, spec)
         observed = broker.reconcile_publish(
             iteration,

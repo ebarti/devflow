@@ -14,6 +14,7 @@ from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
 from .delivery_publication_proof import matches as proof_matches
 from .delivery_publication_proof import observe as publication_stop_proof
+from .delivery_publication_proof import read_closed as read_publication_closed
 from .delivery_resources import read_private
 from .delivery_source_scope import outside_scope
 
@@ -54,8 +55,8 @@ def snapshot(store, run_id, *, observation=False):
         raise ValueError('pending publication requires its existing trusted native policy')
     row, attempts, effects, claim = _rows(store, run_id)
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
-    closed = store._completed_temporal_result(
-        run_id, workflow_id=row['workflow_id'], **({'preserve': False} if observation else {}))
+    closed, history = read_publication_closed(
+        store, spec, workflow_id=row['workflow_id'], preserve=not observation)
     state = closed['result']
     candidate = state.get('candidate', {})
     published = state.get('pull_request')
@@ -151,7 +152,7 @@ def snapshot(store, run_id, *, observation=False):
         _refuse('publication_checkpoint_unproven',
                 'matching closed publication checkpoint and implementation evidence',
                 'inspect the original closed publication evidence', {'row': row, 'closed': closed})
-    stage_proof = publication_stop_proof(store, spec, closed)
+    stage_proof = publication_stop_proof(store, spec, closed, history=history)
     broker = DeliveryBroker(store, spec)
     observed = broker.candidate()
     broker._validate_publication_commits()

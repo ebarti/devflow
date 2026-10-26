@@ -35,14 +35,22 @@ or still-pending result. A later check, role, CI stage or unknown future activit
 cannot be classified as publication. A completed exact publication belongs to
 its subsequent recovery route. No diagnostic text supplies these decisions.
 
+Both constructors use the bounded initial closure reader before the general
+closure/result decoder. It bounds any indexed sealed candidate before connecting,
+checks live exact execution identity, and selects retained evidence only on
+Temporal NotFound. It reads live history in twenty-event pages with finite RPC
+and operation deadlines. Execution alone may explicitly preserve a newly
+authenticated history after observation; assessment never seals it. No ordinary
+`handle.result()` or unbounded `sealed_closure()` precedes these checks.
+
 Limits are 50,000 events, 64 MiB of event protobuf bytes, 32 MiB compressed sealed
 history, 64 MiB expanded sealed history, 4 MiB expanded decoded payload bytes and
 a thirty-second history operation deadline. Codec expansion is checked before
 ordinary decoding. A missing, oversized, corrupt or unsupported history returns
 a typed unknown with a precise evidence/import action. It does not become
-permission or proof of absence. This observer does not seal histories or mutate
-an executor journal. The existing closure owner still authenticates the closed
-result supplied to the observer.
+permission or proof of absence. The stage observer does not seal histories or
+mutate an executor journal. Its initial closure reader authenticates the closed
+result and applies expansion bounds before decoding it.
 
 Sealed reads require canonical existing ancestors, private owned root, a regular
 0600 file with one link, a bounded descriptor read, unchanged descriptor/path
@@ -68,3 +76,10 @@ SQLite dumps and empty closure inventory establish read-only assessment. A
 separate current-controller fixture confirms its actual typed stage field.
 Older component tests explicitly control the stage-proof boundary and are not
 counted as authentication qualification.
+
+The no-proof recovery replay artifact was recorded by the unmodified
+`_resume_publication` method from revision `8ed1339` in actual loopback Temporal,
+with controlled remaining gate activities. Its original recorded recovery input
+contains no proof field. Source-method and exact-history hashes are recorded
+beside the fixture; replay uses the saved bytes without editing its input or
+history. This specifically exercises the historical recovery branch.

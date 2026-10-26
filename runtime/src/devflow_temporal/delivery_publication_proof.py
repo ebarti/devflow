@@ -14,20 +14,22 @@ import stat
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from temporalio.client import Client, WorkflowHistory
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHistory
 
 from . import delivery_closures as closures
 from .contracts import digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
+from .delivery_execution_config import is_observation_mode, observation_mode
 from .delivery_lifecycle import RecoveryRefused, require_transition
 from .delivery_publication import PUBLICATION_PROOF_VERSION
 from .delivery_publication import publication_stop_proof_matches as matches
 from .delivery_resources import _ancestors
 
-__all__ = ['matches', 'observe', 'reduce_history']
+__all__ = ['matches', 'observe', 'read_closed', 'reduce_history']
 
 VERSION = PUBLICATION_PROOF_VERSION
 MAX_HISTORY_EVENTS = 50_000
@@ -102,14 +104,7 @@ def _binding(spec, closed):
     }
 
 
-async def reduce_history(spec, closed, history):
-    """Reduce authentic history with fixed-size payload decoding and bounded scan.
-
-    The history reader authenticates origin; this reducer also checks its exact
-    closure identity, inputs and result. Unknown activity kinds fail closed as
-    later work, so a future execution stage cannot look like a publication stop.
-    """
-    binding = _binding(spec, closed)
+async def _checked_facts(history, closed):
     if (len(history.events) > MAX_HISTORY_EVENTS
             or sum(event.ByteSize() for event in history.events) > MAX_HISTORY_BYTES):
         _refuse('publication_history_bound_exceeded', closed)
@@ -124,7 +119,13 @@ async def reduce_history(spec, closed, history):
     _bounded_payloads([*start.input.payloads, *start.memo.fields.values()], closed)
     _bounded_payloads(
         history.events[-1].workflow_execution_completed_event_attributes.result.payloads, closed)
-    facts = await closures.closure_facts(history)
+    return await closures.closure_facts(history)
+
+
+async def reduce_history(spec, closed, history):
+    """Reduce a bounded authentic history; unknown later activities fail closed."""
+    binding = _binding(spec, closed)
+    facts = await _checked_facts(history, closed)
     if (any(facts.get(key) != closed.get(key) for key in (
             'workflow_id', 'execution_run_id', 'request_digest', 'recovery_digest', 'closed_at'))
             or facts['status'] != 'COMPLETED' or facts['result'] != closed['result']
@@ -245,8 +246,12 @@ async def _history(store, closed):
         data_converter=DELIVERY_DATA_CONVERTER,
     )
     handle = client.get_workflow_handle(closed['workflow_id'], run_id=closed['execution_run_id'])
+    return await _fetch_history(handle, closed)
+
+
+async def _fetch_history(handle, closed):
     events, size = [], 0
-    async for event in handle.fetch_history_events():
+    async for event in handle.fetch_history_events(page_size=20, rpc_timeout=timedelta(seconds=10)):
         size += event.ByteSize()
         if len(events) >= MAX_HISTORY_EVENTS or size > MAX_HISTORY_BYTES:
             _refuse('publication_history_bound_exceeded', closed)
@@ -254,7 +259,92 @@ async def _history(store, closed):
     return WorkflowHistory(closed['workflow_id'], events)
 
 
-def observe(store, spec: dict[str, Any], closed: dict[str, Any]) -> dict[str, Any]:
+def _run(operation, closed):
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(
+                copy_context().run,
+                lambda: asyncio.run(asyncio.wait_for(operation(), timeout=HISTORY_SECONDS)),
+            ).result(timeout=HISTORY_SECONDS + 5)
+    except RecoveryRefused:
+        raise
+    except Exception:
+        _refuse('publication_stage_unproven', closed)
+
+
+def read_closed(store, spec, *, workflow_id=None, preserve=False):
+    """Authenticate closure with limits before any result/codec decoding.
+
+    A sealed candidate is bounded before connecting, so an oversized local
+    artifact cannot escape through the general closure reader or an outage.
+    Live authority is still checked; retention NotFound alone selects the sealed
+    fallback. Only execution may explicitly preserve newly authenticated bytes.
+    """
+    workflow_id = workflow_id or 'delivery-' + spec['run_id']
+    context = {'workflow_id': workflow_id, 'request_digest': spec['request_digest']}
+    preserve = preserve and not store.read_only and not is_observation_mode()
+
+    async def read():
+        record = closures.sealed_record(store, workflow_id)
+        cached = cached_facts = None
+        if record is not None:
+            selected = {**context, 'execution_run_id': record['execution_run_id']}
+            cached = _sealed_history(store, selected)
+            cached_facts = await _checked_facts(cached, selected)
+            if any(cached_facts.get(key) != record.get(key) for key in (
+                    'workflow_id', 'execution_run_id', 'status', 'closed_at',
+                    'request_digest', 'recovery_digest', 'event_count')):
+                _refuse('publication_history_identity_changed', selected, satisfied=False)
+        client = await Client.connect(
+            store.config.temporal_address,
+            namespace=store.config.raw.get('temporal_namespace', 'default'),
+            data_converter=DELIVERY_DATA_CONVERTER,
+        )
+        handle = client.get_workflow_handle(workflow_id)
+        try:
+            description = await handle.describe()
+        except Exception as exc:
+            if not closures.not_found(exc) or cached is None:
+                raise
+            facts, history, fresh = cached_facts, cached, False
+        else:
+            if (description.status != WorkflowExecutionStatus.COMPLETED
+                    or not description.close_time
+                    or description.workflow_type != closures.WORKFLOW_TYPE):
+                _refuse('publication_closure_not_completed', context, satisfied=False)
+            if cached_facts and cached_facts['execution_run_id'] == description.run_id:
+                facts, history, fresh = cached_facts, cached, False
+            else:
+                exact = client.get_workflow_handle(workflow_id, run_id=description.run_id)
+                history = await _fetch_history(exact, context)
+                facts = await _checked_facts(history, context)
+                fresh = True
+            if (facts['workflow_id'] != description.id
+                    or facts['execution_run_id'] != description.run_id
+                    or facts['closed_at'] != description.close_time.isoformat()):
+                _refuse('publication_history_identity_changed', context, satisfied=False)
+        if facts['status'] != 'COMPLETED':
+            _refuse('publication_closure_not_completed', context, satisfied=False)
+        closed = {key: facts[key] for key in ('workflow_id', 'execution_run_id', 'closed_at',
+                                             'request_digest', 'recovery_digest', 'result')}
+        _binding(spec, closed)
+        recovery = facts['inputs'][1] if len(facts['inputs']) > 1 else None
+        if (not facts['inputs'] or facts['inputs'][0].get('run_id') != spec['run_id']
+                or (digest(recovery) if recovery is not None else None)
+                != closed['recovery_digest']):
+            _refuse('publication_history_identity_changed', closed, satisfied=False)
+        return closed, history, facts, fresh
+
+    with observation_mode():
+        if not store.owns_execution(spec):
+            _refuse('publication_execution_transport_unknown', context)
+        closed, history, facts, fresh = _run(read, context)
+    if preserve and fresh:
+        closures.seal(store, history, facts, run_id=spec['run_id'], source='temporal')
+    return closed, history
+
+
+def observe(store, spec: dict[str, Any], closed: dict[str, Any], *, history=None) -> dict[str, Any]:
     """Build bounded proof from an owner-authenticated closure, without writes."""
     binding = _binding(spec, closed)
     checks = closed['result'].get('checks')
@@ -266,16 +356,7 @@ def observe(store, spec: dict[str, Any], closed: dict[str, Any]) -> dict[str, An
         return {**binding, 'source': 'closed_result', 'failure_sha256': digest(failure)}
 
     async def read():
-        history = await _history(store, closed)
-        return await reduce_history(spec, closed, history)
+        observed = history if history is not None else await _history(store, closed)
+        return await reduce_history(spec, closed, observed)
 
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(
-                copy_context().run,
-                lambda: asyncio.run(asyncio.wait_for(read(), timeout=HISTORY_SECONDS)),
-            ).result(timeout=HISTORY_SECONDS + 5)
-    except RecoveryRefused:
-        raise
-    except Exception:
-        _refuse('publication_stage_unproven', closed)
+    return _run(read, closed)
