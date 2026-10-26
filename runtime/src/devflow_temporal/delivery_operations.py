@@ -25,7 +25,7 @@ from .contracts import digest
 # Values are existing endpoint names and the domain stage, not new workflows.
 KINDS = {
     "submit": ("submit", "admission"),
-    "issue-context": ("refresh_issue_context", "observation"),
+    "issue-context": ("refresh_issue_context", "execution"),
     "revise-feature-plan": ("revise_feature_plan", "admission"),
     "continue-feature": ("continue_feature", "admission"),
     "recover-publication": ("recover_publication", "admission"),
