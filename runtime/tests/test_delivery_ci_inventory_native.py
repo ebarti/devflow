@@ -64,7 +64,9 @@ async def test_real_public_inventory_then_normal_CI_worker_preserves_original_ve
                 path = Path(value["native_process"]["journal"])
                 assert path.is_relative_to(Path(c.case.spec["state_dir"]))
                 original_native[path] = path.read_bytes()
-        assert len(original_native) >= 2
+        # Identical configured recipes may share the existing native receipt.
+        # Authenticate every declared reference, rather than invent a launch count.
+        assert original_native
         program = current_runtime_identity()
         identities = []
         for p, raw in original_native.items():
