@@ -271,8 +271,16 @@ def _project(case):
 
 @pytest.mark.parametrize("stopped_prerequisite", ["assertion"], indirect=True)
 def test_real_worker_assertion_is_not_prerequisite_recovery(stopped_prerequisite):
+    from devflow_temporal.delivery_check_evidence import junit_counts
+
     case, local, command, _ = stopped_prerequisite
-    assert any(result.get("junit", {}).get("failures") == 1 for result in local["results"])
+    failed = local["results"][-1]
+    assert (
+        junit_counts(failed["artifacts"], local["candidate_id"], Path(case.spec["state_dir"]))[
+            "failures"
+        ]
+        == 1
+    )
     with pytest.raises(ValueError):
         case.store.repair_admission_preflight("run-1", command)
 
@@ -445,3 +453,67 @@ def test_prerequisite_does_not_grant_an_implementation_or_changed_request(stoppe
     ):
         with pytest.raises(ValueError):
             case.store.continue_repair("run-1", {**command, **fields})
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_claim",
+        "foreign_owner",
+        "same_owner_reclaim",
+        "owner_drift",
+        "native_raw",
+        "ack",
+    ],
+)
+def test_worker_rechecks_original_receipts_and_exact_current_claim(stopped_prerequisite, defect):
+    from devflow_temporal import delivery_gate_retry as gates
+
+    case, local, command, _ = stopped_prerequisite
+    response = case.store.continue_repair("run-1", command)
+    current = case.store.effective_spec("run-1")
+    with case.store._connect() as db:
+        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
+    if defect in {"missing_claim", "foreign_owner", "same_owner_reclaim"}:
+        with case.store._connect() as db:
+            case.store.state.release_work(db, current["work_id"], "external:devflow:run-1")
+            if defect != "missing_claim":
+                case.store.state.claim_work(
+                    db,
+                    current["work_id"],
+                    "foreign" if defect == "foreign_owner" else "external:devflow:run-1",
+                )
+    elif defect == "owner_drift":
+        owner = json.loads(case.store.config.path.read_text())
+        owner["capacity"] = 3
+        case.store.config.path.write_text(json.dumps(owner))
+    elif defect == "native_raw":
+        path = Path(local["results"][-1]["native_process"]["journal"])
+        value = read_private(path)
+        value["intent"]["argv"].append("--no-dev")
+        write_private(path, value)
+    elif defect == "ack":
+        response["claim_identity"]["claimed_at"] += "-changed"
+        with case.store._connect() as db:
+            db.execute(
+                "UPDATE delivery_commands SET response_json=? WHERE command_id=?",
+                (canonical_json(response), command["command_id"]),
+            )
+    with pytest.raises((ValueError, OSError)):
+        gates.readback(case.store, current, recovery)
+
+
+def test_claim_metadata_refresh_keeps_the_same_acquired_generation(stopped_prerequisite):
+    from devflow_temporal import delivery_gate_retry as gates
+
+    case, _, command, _ = stopped_prerequisite
+    response = case.store.continue_repair("run-1", command)
+    current = case.store.effective_spec("run-1")
+    with case.store._connect() as db:
+        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
+        refreshed = case.store.state.claim_work(
+            db, current["work_id"], "external:devflow:run-1", "Owned tracking metadata refresh"
+        )
+    assert refreshed["replayed"] is True
+    assert refreshed["claim"]["claimed_at"] == response["claim_identity"]["claimed_at"]
+    assert gates.readback(case.store, current, recovery)["number"] == 12

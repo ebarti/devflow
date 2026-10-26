@@ -164,6 +164,15 @@ async def test_native_published_prerequisite_reentry_runs_every_original_gate_on
             assert calls == ["review", "verify", "ci", "terminal_tracker"]
             assert result["checks"]["prepublish"]["state"] == "passed"
             assert result["checks"]["local"]["state"] == "passed"
+            from devflow_temporal.delivery_check_evidence import junit_counts
+
+            planned = result["checks"]["local"]["results"][-1]
+            assert (
+                junit_counts(
+                    planned["artifacts"], recovery["candidate"]["id"], Path(current["state_dir"])
+                )["passed"]
+                == 1
+            )
             assert result["checks"]["resource_cleanup"]["state"] == "confirmed"
             assert all(p.read_bytes() == b for p, b in original_native.items())
             with store._connect() as db:

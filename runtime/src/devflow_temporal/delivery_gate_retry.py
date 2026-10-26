@@ -1097,8 +1097,12 @@ def admit(store, run_id, payload, *, preflight=False):
                            'updated_at=? WHERE effect_key=?',
                            (canonical_json(resolved_effect(observation, seal['candidate'])),
                             store.state.now(), pending['effect_key']))
-            store.state.claim_work(db, spec['work_id'], f'external:devflow:{run_id}',
-                                   store.config.dashboard_url)
+            acquired = store.state.claim_work(
+                db, spec['work_id'], f'external:devflow:{run_id}', store.config.dashboard_url)
+            if seal.get('ordinary_prerequisite_observation'):
+                from .delivery_prerequisite_gate_recovery import claim_identity
+
+                response['claim_identity'] = claim_identity(acquired['claim'])
             if seal['prior_gate_digest'] is None:
                 db.execute('INSERT INTO delivery_gate_admissions VALUES (?,?,?)',
                            (run_id, payload['command_id'], canonical_json(recovery)))

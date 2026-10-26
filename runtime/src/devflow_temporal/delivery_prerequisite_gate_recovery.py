@@ -13,6 +13,11 @@ STAGE = "prerequisite"
 FIELD = "ordinary_prerequisite_observation"
 
 
+def claim_identity(claim):
+    """Keep source-ref/heartbeat refreshes separate from acquired ownership."""
+    return {key: claim[key] for key in ("resource", "work_id", "owner", "claimed_at")}
+
+
 def possible(spec, state):
     """A selection hint only; observe authenticates the complete native producer."""
     local = state.get("checks", {}).get("local") or {}
@@ -372,3 +377,37 @@ def validate(store, spec, recovery, *, resource_spec=None):
             or live_owner(before, db=db)[1] != proof["operational_owner"]
         ):
             raise ValueError("published prerequisite current issue or operational owner changed")
+        command = db.execute(
+            "SELECT * FROM delivery_commands WHERE command_id=?",
+            (recovery["command"]["command_id"],),
+        ).fetchone()
+        response = json.loads(command["response_json"]) if command else {}
+        expected = {
+            "run_id": spec["run_id"],
+            "phase": "gates_retry_queued",
+            "workflow_id": f"delivery-{spec['run_id']}-published-gates-retry-1",
+            "candidate_id": recovery["candidate"]["id"],
+            "implementation_authority": False,
+            "additional_iterations": 0,
+            "claim_identity": response.get("claim_identity"),
+        }
+        events = db.execute(
+            "SELECT payload_json FROM delivery_events WHERE run_id=? "
+            "AND type='gates_retry_queued' AND run_revision=? LIMIT 2",
+            (spec["run_id"], recovery["seal"]["row"]["revision"] + 1),
+        ).fetchall()
+        if (
+            not command
+            or command["run_id"] != spec["run_id"]
+            or command["request_digest"]
+            != digest({"run_id": spec["run_id"], **recovery["command"]})
+            or response != expected
+            or len(events) != 1
+            or json.loads(events[0][0]) != response
+            or not isinstance(response.get("claim_identity"), dict)
+            or (
+                (resource_spec or spec) == spec
+                and claim_identity(claim) != response["claim_identity"]
+            )
+        ):
+            raise ValueError("published prerequisite lost its exact acknowledged claim generation")
