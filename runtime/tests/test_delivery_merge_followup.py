@@ -615,7 +615,21 @@ def git_remote(d, monkeypatch, *, conflict=False):
     remote.lose_merge_ack = False
 
     def raw():
-        value = remote.raw()
+        if conflict:
+            import subprocess
+
+            try:
+                _git(repo, 'merge-base', '--is-ancestor', remote.target, remote.head)
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 1:
+                    raise
+                value = copy.deepcopy(d.remote)
+                value['head']['sha'], value['base']['sha'] = remote.head, remote.target
+                value.update(mergeable=False, merge_commit_sha=None)
+            else:
+                value = remote.raw()
+        else:
+            value = remote.raw()
         value.update(
             html_url=d.remote["html_url"],
             merged=remote.merged,
