@@ -464,9 +464,13 @@ def _unfinished_rows(store):
     # check/preparation/finalizer custody is bounded and inspected once per
     # minute, rather than walking the full historical filesystem every pump.
     with store._connect() as db:
+        held_diagnostics = {row[0] for row in db.execute(
+            "SELECT run_id FROM delivery_native_diagnostics "
+            "WHERE state IN ('queued','running','unknown')")}
         rows = [dict(row) for row in db.execute(
             "SELECT r.* FROM delivery_runs r WHERE EXISTS (SELECT 1 FROM delivery_attempts a "
             "WHERE a.run_id=r.run_id AND a.state!='finished')")]
+        rows = [row for row in rows if row['run_id'] not in held_diagnostics]
         now = time.monotonic()
         if now < getattr(store, '_native_cleanup_scan_after', 0):
             return rows
@@ -483,6 +487,8 @@ def _unfinished_rows(store):
     store._native_cleanup_seen = seen
     for row in supplemental:
         row.pop('cleanup_rowid')
+        if row['run_id'] in held_diagnostics:
+            continue
         try:
             spec = json.loads(row['request_json'])
             state = Path(spec['state_dir'])
@@ -551,10 +557,6 @@ async def reconcile_closed_native(store, client):
     rows = await asyncio.to_thread(_unfinished_rows, store)
     for row in rows:
         try:
-            from .delivery_native_diagnostic import active as diagnostic_active
-
-            if await asyncio.to_thread(diagnostic_active, store, row['run_id']):
-                continue  # Separate diagnostic resources never authorize normal finalization.
             spec = await asyncio.to_thread(_owned_native_spec, store, row['run_id'])
             if spec is None:
                 continue

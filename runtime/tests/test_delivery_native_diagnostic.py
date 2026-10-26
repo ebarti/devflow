@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 
 import httpx
@@ -514,12 +515,88 @@ def test_unjournaled_launch_never_grants_replacement_or_finalizer_cleanup(stoppe
     assert diagnostic.active(case.store, "run-1")
 
 
+def test_replaced_subject_cannot_rewrite_its_acknowledged_inode_witness(stopped_diagnostic):
+    from devflow_temporal.delivery_resources import _identity
+
+    case = stopped_diagnostic
+    context, _row, _command, _response = running_context(case)
+    context.create_subject()
+    old = context.checkout.with_name("preserved-original")
+    context.checkout.rename(old)
+    shutil.copytree(old, context.checkout, symlinks=True)
+    value = read_private(context.root / "subject.json")
+    value["identity"] = _identity(context.checkout)
+    write_private(context.root / "subject.json", value)
+    with pytest.raises(ValueError, match="exact owned generation"):
+        context.subject()
+
+
+def test_native_plan_requires_its_durable_exact_phase_hash(stopped_diagnostic):
+    case = stopped_diagnostic
+    context, _row, _command, _response = running_context(case)
+    context.create_subject()
+    context.attach()
+    process = context.broker._native_process(
+        context.state / "checks/3/worker-regressions/native",
+        argv=CHECK["argv"],
+        cwd=context.checkout,
+        timeout=2700,
+        environment={"PLAYWRIGHT_BROWSERS_PATH": context.snapshot["controller_browser_binding"]},
+    )
+    context.process(process)
+    path = next((context.root / "native-launches").glob("*.json"))
+    value = read_private(path)
+    value["intent"]["argv"] = ["/usr/bin/true"]
+    write_private(path, value)
+    with pytest.raises(ValueError, match="native plan changed"):
+        context.completed_processes()
+    assert not process.journal.exists()
+
+
+def test_scoped_source_cannot_be_used_by_an_unregistered_actor(stopped_diagnostic, monkeypatch):
+    from types import SimpleNamespace
+
+    from devflow_temporal import delivery_native_diagnostic_execution as execution
+
+    case = stopped_diagnostic
+    context, _row, _command, _response = running_context(case)
+    context.create_subject()
+    observed = []
+
+    def live(argv, **_kwargs):
+        observed.append(argv)
+        return SimpleNamespace(returncode=0, stdout="p17001\n")
+
+    monkeypatch.setattr(execution, "subprocess", SimpleNamespace(run=live))
+    with pytest.raises(ValueError, match="live user"):
+        context.subject()
+    assert observed == [["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(context.checkout)]]
+
+
+@pytest.mark.asyncio
+async def test_empty_dispatch_hint_never_rehydrates_authority_on_each_idle_pump(
+    stopped_diagnostic, monkeypatch
+):
+    case = stopped_diagnostic
+    app = create_app(case.store.config.path)
+    await diagnostic.dispatch_once(app.state.delivery)
+    assert app.state.delivery._native_diagnostic_pending is False
+
+    def unexpected():
+        pytest.fail("an idle diagnostic pump must not open another full authority connection")
+
+    monkeypatch.setattr(app.state.delivery.store, "_connect", unexpected)
+    await diagnostic.dispatch_once(app.state.delivery)
+
+
 @pytest.mark.asyncio
 async def test_public_http_preflight_ack_and_status_are_separate_from_delivery_acceptance(
     stopped_diagnostic,
 ):
     case = stopped_diagnostic
     app = create_app(case.store.config.path)
+    await diagnostic.dispatch_once(app.state.delivery)
+    assert app.state.delivery._native_diagnostic_pending is False
     host = case.store.config.dashboard_url
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
     async with httpx.AsyncClient(transport=transport, base_url=host) as client:
@@ -541,5 +618,6 @@ async def test_public_http_preflight_ack_and_status_are_separate_from_delivery_a
         )
         assert response.status_code == 200, response.text
         assert response.json()["state"] == "queued"
+        assert app.state.delivery._native_diagnostic_pending is True
         response = await client.get(path + "native-diagnostics/" + request["command_id"])
         assert response.status_code == 200 and response.json()["state"] == "queued"

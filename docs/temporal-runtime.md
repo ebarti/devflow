@@ -657,3 +657,15 @@ resources. Missing or incomplete journals, live actors/ports, source or claim
 drift and unconfirmed finalization remain unknown and fenced. Replay neither
 launches a replacement nor kills an uncertain actor. An unacknowledged result
 cannot claim a passing diagnostic verdict.
+
+The acknowledgement also binds the clean current framework program and the
+existing controller browser-cache binding. The framework Python/SDK and its
+actual `-I` monitor stay on the installed framework lock; the declared SDK1.26
+belongs only to the separately locked worker project. Subject, native-launch
+plan and result files require their exact durable diagnostic phase hashes;
+a file-only publication grants no new invocation or source generation.
+`/api/service` reports `native_diagnostics.counts` separately from role capacity,
+so zero active roles does not imply that a diagnostic is finished. An idle
+service does not repeatedly read diagnostic authority: an acknowledgement wake
+hint or startup recovery causes a fresh durable read, and every actual body
+rechecks all authority. The hint contains no proof and grants no execution.

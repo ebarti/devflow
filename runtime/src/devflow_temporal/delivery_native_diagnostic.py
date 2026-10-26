@@ -215,6 +215,9 @@ def snapshot(store, run_id, command):
     from .delivery_preparation import verify_prepared_spec
 
     verify_prepared_spec(spec)
+    from .delivery_feature_review_context import current_runtime_identity
+
+    diagnostic_runtime = current_runtime_identity()
     assessment = completed_blocked_finding(seal)
     # This is the existing acknowledged Temporal contract, not the non-native
     # role probe or a newly supplied executable/environment declaration.
@@ -293,6 +296,7 @@ def snapshot(store, run_id, command):
         "work_binding": binding,
         "operational_owner": operational,
         "controller_browser_binding": str(Path.home() / "Library/Caches/ms-playwright"),
+        "diagnostic_runtime": diagnostic_runtime,
         "claim": None,
         "cleanup_digest": seal["cleanup_digest"],
         "physical_resources": physical,
@@ -517,7 +521,10 @@ def acknowledge(store, run_id, supplied):
             reconcile_complete(store, prior)
         except BlockingIOError:
             pass  # The same acknowledged body still owns its execution lease.
-        return info(store, run_id, command["command_id"])
+        result = info(store, run_id, command["command_id"])
+        if result["state"] == "queued" and getattr(store, "_native_diagnostic_notify", None):
+            store._native_diagnostic_notify()
+        return result
     observed = snapshot(store, run_id, command)
     if digest(observed) != supplied["preflight_key"]:
         raise ValueError("native diagnostic authority changed after its public preflight")
@@ -585,6 +592,9 @@ def acknowledge(store, run_id, supplied):
                 "INSERT INTO delivery_commands VALUES (?,?,?,?)",
                 (command["command_id"], run_id, request_digest, canonical_json(response)),
             )
+    notify = getattr(store, "_native_diagnostic_notify", None)
+    if notify is not None:
+        notify()  # Wake hint only; execution freshly authenticates the durable ACK.
     return response
 
 
@@ -612,6 +622,13 @@ async def dispatch_once(service):
     """Dispatch a durable queued identity once; a running identity is never relaunched."""
     from .delivery_activities import _execute_check
 
+    if not getattr(service, "_native_diagnostic_pending", True):
+        return
+    # This is only a wake hint, cleared before the read so a concurrent ACK
+    # sets it again. Idle pumps do not hydrate the full installation receipt
+    # merely to poll an empty diagnostic table; no proof is cached here.
+    service._native_diagnostic_pending = False
+
     def queued():
         with service.store._connect() as db:
             return [
@@ -624,12 +641,21 @@ async def dispatch_once(service):
 
     if not hasattr(service, "native_diagnostic_tasks"):
         service.native_diagnostic_tasks = {}
-    for row in await asyncio.to_thread(queued):
+    try:
+        rows = await asyncio.to_thread(queued)
+    except Exception:
+        service._native_diagnostic_pending = True
+        raise
+    for row in rows:
         identity = row["identity"]
         task = service.native_diagnostic_tasks.get(identity)
         if task is not None:
             continue
-        spec = await asyncio.to_thread(service.store.effective_spec, row["run_id"])
+        try:
+            spec = await asyncio.to_thread(service.store.effective_spec, row["run_id"])
+        except Exception as exc:
+            await asyncio.to_thread(record_unknown, service.store, row, exc)
+            continue
 
         async def once(spec=spec, row=row):
             try:
@@ -667,8 +693,9 @@ def record_unknown(store, row, exc):
         saved = _saved(db, row["run_id"], identity=row["identity"])
         if saved is not None:
             previous = json.loads(saved["response_json"])
-            if previous.get("phase_result_sha256"):
-                response["phase_result_sha256"] = previous["phase_result_sha256"]
+            for name in ("subject_sha256", "native_launches", "phase_result_sha256"):
+                if name in previous:
+                    response[name] = previous[name]
         changed = db.execute(
             "UPDATE delivery_native_diagnostics SET state='unknown',response_json=? "
             "WHERE identity=? AND state IN ('queued','running')",

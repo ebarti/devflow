@@ -98,7 +98,7 @@ class DiagnosticContext:
                 candidate[k] != self.snapshot["candidate"][k]
                 for k in ("id", "head", "content_sha256")
             )
-            or entry.get("head", candidate['head']) != candidate["head"]
+            or entry.get("head", candidate["head"]) != candidate["head"]
         ):
             raise ValueError("diagnostic Temporal preparation lost current subject custody")
         registry._allowed(checkout, "checkout")
@@ -318,13 +318,27 @@ class DiagnosticContext:
                 "resource_key": self.key,
             },
         )
+        _record_phase(
+            self,
+            "subject_sha256",
+            hashlib.sha256(read_private(self.root / "subject.json", raw=True)).hexdigest(),
+        )
 
     def subject(self):
         from .delivery_resources import same_object
 
-        saved = read_private(self.root / "subject.json")
+        raw = read_private(self.root / "subject.json", raw=True)
+        saved = json.loads(raw)
+        with self.store._connect() as db:
+            phase = json.loads(
+                db.execute(
+                    "SELECT response_json FROM delivery_native_diagnostics WHERE identity=?",
+                    (self.key,),
+                ).fetchone()[0]
+            )
         if (
-            saved.get("path") != str(self.checkout)
+            hashlib.sha256(raw).hexdigest() != phase.get("subject_sha256")
+            or saved.get("path") != str(self.checkout)
             or saved.get("resource_key") != self.key
             or saved.get("candidate") != self.snapshot["candidate"]
             or not same_object(self.resource_spec, self.checkout, saved["identity"])
@@ -334,6 +348,16 @@ class DiagnosticContext:
             )
         ):
             raise ValueError("native diagnostic current subject lost its exact owned generation")
+        observed = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(self.checkout)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if observed.returncode not in (0, 1) or any(
+            line.startswith("p") and line[1:].isdecimal() for line in observed.stdout.splitlines()
+        ):
+            raise ValueError("native diagnostic subject has a live user or unreadable custody")
         return saved
 
     def attach(self):
@@ -366,7 +390,13 @@ class DiagnosticContext:
             "spec_sha256": digest(self.spec),
             "identity": self.key,
         }
-        _immutable(folder / (digest(str(process.folder)) + ".json"), binding)
+        name = digest(str(process.folder)) + ".json"
+        _immutable(folder / name, binding)
+        _record_phase(
+            self,
+            "native_launches",
+            {name: hashlib.sha256(read_private(folder / name, raw=True)).hexdigest()},
+        )
 
     def observed_process(self, process):
         if os.path.lexists(process.journal):
@@ -400,9 +430,23 @@ class DiagnosticContext:
         folder = self.root / "native-launches"
         journals = {}
         table = process_table()
+        with self.store._connect() as db:
+            phase = json.loads(
+                db.execute(
+                    "SELECT response_json FROM delivery_native_diagnostics WHERE identity=?",
+                    (self.key,),
+                ).fetchone()[0]
+            )
+        expected = phase.get("native_launches", {})
+        actual = set(p.name for p in folder.iterdir()) if folder.exists() else set()
+        if actual != set(expected):
+            raise ValueError("diagnostic native plan inventory is incomplete or changed")
         if folder.exists():
             for path in sorted(folder.iterdir()):
-                launch = read_private(path)
+                plan_raw = read_private(path, raw=True)
+                if hashlib.sha256(plan_raw).hexdigest() != expected.get(path.name):
+                    raise ValueError("diagnostic acknowledged native plan changed")
+                launch = json.loads(plan_raw)
                 journal = Path(launch["folder"]) / "native-process.json"
                 if (
                     launch["identity"] != self.key
@@ -683,6 +727,44 @@ def retained_artifacts(context, result):
     return references
 
 
+def _record_phase(context, field, value):
+    """Files remain inert until their exact subject/launch/result bytes are acknowledged."""
+    if field not in {"subject_sha256", "native_launches", "phase_result_sha256"}:
+        raise ValueError("unsupported diagnostic phase acknowledgement")
+    from .delivery_native_diagnostic import _rows
+
+    with context.store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT * FROM delivery_native_diagnostics WHERE identity=?", (context.key,)
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] != "running"
+            or row["request_digest"] != context.row["request_digest"]
+            or row["snapshot_json"] != context.row["snapshot_json"]
+            or row["intent_sha256"] != context.row["intent_sha256"]
+            or digest(_rows(db, context.spec["run_id"])) != context.snapshot["rows_sha256"]
+            or context.store.state.claim_for(db, context.spec["work_id"]) is not None
+        ):
+            raise ValueError("diagnostic phase lost its unchanged acknowledged authority")
+        response = json.loads(row["response_json"])
+        if field == "native_launches":
+            before = response.get(field, {})
+            if len(before.keys() | value.keys()) > 64 or any(
+                key in before and before[key] != sha for key, sha in value.items()
+            ):
+                raise ValueError("diagnostic native generation changed or exceeded its bound")
+            value = {**before, **value}
+        elif field in response and response[field] != value:
+            raise ValueError("diagnostic phase conflicts with its immutable acknowledgement")
+        response.update(state="running", **{field: value})
+        db.execute(
+            "UPDATE delivery_native_diagnostics SET response_json=? WHERE identity=?",
+            (canonical_json(response), context.key),
+        )
+
+
 def _save_result(context, result):
     path = context.root / "execution-result.json"
     _immutable(
@@ -690,18 +772,7 @@ def _save_result(context, result):
         {"identity": context.key, "snapshot_sha256": digest(context.snapshot), "result": result},
     )
     sha = hashlib.sha256(read_private(path, raw=True)).hexdigest()
-    with context.store._connect() as db:
-        saved = db.execute(
-            "SELECT response_json FROM delivery_native_diagnostics WHERE identity=?", (context.key,)
-        ).fetchone()
-        response = {**json.loads(saved[0]), "state": "running", "phase_result_sha256": sha}
-        changed = db.execute(
-            "UPDATE delivery_native_diagnostics SET response_json=? WHERE "
-            "identity=? AND state='running'",
-            (canonical_json(response), context.key),
-        ).rowcount
-        if changed != 1:
-            raise ValueError("diagnostic result lost its running acknowledgement")
+    _record_phase(context, "phase_result_sha256", sha)
 
 
 def verify_receipt(spec, row, receipt):
@@ -726,6 +797,23 @@ def verify_receipt(spec, row, receipt):
     ):
         raise ValueError("diagnostic immutable receipt lost its acknowledgement")
     phase_sha = json.loads(row["response_json"]).get("phase_result_sha256")
+    phases = json.loads(row["response_json"])
+    subject_sha = phases.get("subject_sha256")
+    if (
+        not subject_sha
+        or hashlib.sha256(read_private(root / "subject.json", raw=True)).hexdigest() != subject_sha
+    ):
+        raise ValueError("diagnostic subject lost its original acknowledged generation")
+    plans = phases.get("native_launches", {})
+    folder = root / "native-launches"
+    actual = set(p.name for p in folder.iterdir()) if folder.exists() else set()
+    if actual != set(plans) or len(plans) > 64:
+        raise ValueError("diagnostic native plan inventory changed")
+    for name, expected in plans.items():
+        if name != Path(name).name or hashlib.sha256(
+            read_private(folder / name, raw=True)
+        ).hexdigest() != (expected):
+            raise ValueError("diagnostic acknowledged native plan changed")
     if phase_sha:
         phase = read_private(root / "execution-result.json", raw=True)
         value = json.loads(phase)
@@ -780,9 +868,10 @@ def _ack_complete(store, row, receipt):
             read_private(_root(spec, row["identity"]) / "receipt.json", raw=True)
         ).hexdigest(),
     }
-    phase_sha = json.loads(current["response_json"]).get("phase_result_sha256")
-    if phase_sha:
-        response["phase_result_sha256"] = phase_sha
+    phases = json.loads(current["response_json"])
+    for name in ("subject_sha256", "native_launches", "phase_result_sha256"):
+        if name in phases:
+            response[name] = phases[name]
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
         if (

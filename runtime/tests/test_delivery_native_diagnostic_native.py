@@ -150,6 +150,9 @@ async def test_real_public_diagnostic_runs_same_native_readiness_and_complete_fr
             assert native_journal["intent"]["argv"] == diagnostic._check(case.spec)["argv"]
             assert native_journal["intent"]["timeout"] == 2700
             assert native_journal["monitoring_complete"] is True
+            program = read_private(root / "intent.json")["snapshot"]["diagnostic_runtime"]
+            assert {key: native_journal["runtime_identity"][key] for key in program} == program
+            assert native_journal["runtime_identity"]["dirty"] is False
         assert len(
             list(root.glob("run-1/checks/3/worker-regressions/native*/native-process.json"))
         ) == (0 if mode == "missing_browser" else 1)

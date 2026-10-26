@@ -178,6 +178,9 @@ class DeliveryService:
     def __init__(self, config_path: Path) -> None:
         self.config = DeliveryConfig.load(config_path)
         self.store = DeliveryStore(self.config)
+        self._native_diagnostic_pending = True  # Recover queued ACKs once at startup.
+        self.store._native_diagnostic_notify = lambda: setattr(
+            self, '_native_diagnostic_pending', True)
         self._seed_execution_snapshots()
         self.session = LocalSession()
         self.temporal_status = "disconnected"
@@ -480,7 +483,7 @@ def create_app(config_path: Path) -> FastAPI:
             await asyncio.wait_for(service.healthy_client(), timeout=2)
         except Exception:
             service.temporal_status = "disconnected"
-        def active_attempts() -> int:
+        def active_attempts():
             with service.store._connect() as db:
                 roles = db.execute(
                     """SELECT COUNT(*) FROM delivery_attempts
@@ -489,9 +492,11 @@ def create_app(config_path: Path) -> FastAPI:
                 merges = db.execute("SELECT COUNT(*) FROM delivery_merge_requests WHERE "
                                     "phase IN ('queued','merging','waiting_ci','waiting_tracker',"
                                     "'unknown')").fetchone()[0]
-                return roles + merges
+                diagnostics = {row[0]: row[1] for row in db.execute(
+                    'SELECT state,COUNT(*) FROM delivery_native_diagnostics GROUP BY state')}
+                return roles + merges, diagnostics
 
-        active = await asyncio.to_thread(active_attempts)
+        active, diagnostics = await asyncio.to_thread(active_attempts)
         from .delivery_dashboard import runtime_identity
 
         identity = runtime_identity()
@@ -508,6 +513,7 @@ def create_app(config_path: Path) -> FastAPI:
             "config_digest": digest(service.config.raw),
             "transport_digest": transport_digest(service.config),
             "capacity": {"limit": service.config.raw.get("capacity", 2), "active": active},
+            'native_diagnostics': {'counts': diagnostics, 'diagnostic_only': True},
             "policy": service.config.public_policy(),
             "repository_access": await asyncio.to_thread(
                 _read_repository_access, service.store),
