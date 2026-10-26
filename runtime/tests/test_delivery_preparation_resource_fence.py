@@ -374,3 +374,20 @@ def test_renewal_probe_anchor_is_insert_once(measurement_owner):
                           "delivery_native_renewal_anchors WHERE run_id=? AND namespace=?",
                           (original["run_id"], namespace)).fetchall()
     assert [tuple(row) for row in rows] == [(digest(authority), digest(original))]
+
+
+def test_renewal_anchor_schema_migrates_existing_tracking_store(measurement_owner):
+    store, original, _, _, _ = measurement_owner
+    with store._connect() as db:
+        db.execute("DROP TABLE delivery_native_renewal_anchors")
+    upgraded = DeliveryStore(DeliveryConfig.load(store.config.path))
+    with upgraded._connect() as db:
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='delivery_native_renewal_anchors'"
+        ).fetchone()
+        row = db.execute(
+            "SELECT request_digest,work_id FROM delivery_runs WHERE run_id=?",
+            (original["run_id"],),
+        ).fetchone()
+    assert tuple(row) == (original["request_digest"], original["work_id"])
