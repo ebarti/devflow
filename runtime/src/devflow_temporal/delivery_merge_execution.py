@@ -167,7 +167,7 @@ def _activity_origin(store, request):
             "grant_sha256": request["merge_authorization"], "spec": deepcopy(request["spec"])}
 
 
-async def _original_start(store, request, execution):
+async def _original_start(store, request, execution, *, require_running=True):
     """The first activity can beat start ACK, but a reset cannot adopt its grant."""
     from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHistory
 
@@ -183,8 +183,8 @@ async def _original_start(store, request, execution):
     if (description.id != execution["workflow_id"]
             or description.run_id != execution["execution_run_id"]
             or description.workflow_type != "DevflowMergeWorkflow"
-            or description.status != WorkflowExecutionStatus.RUNNING):
-        raise ValueError("merge activity lacks its original running SDK start")
+            or require_running and description.status != WorkflowExecutionStatus.RUNNING):
+        raise ValueError("merge execution lacks its original SDK start")
     history = handle.fetch_history_events(page_size=1, skip_archival=True,
                                           rpc_timeout=timedelta(seconds=5))
     await history.fetch_next_page()

@@ -834,6 +834,14 @@ async def dispatch(service, client):
                         or await found.memo_value("merge_authorization", None) != bound):
                     raise ValueError("merge workflow ID belongs to another authorization")
                 execution_run_id = found.run_id
+                from .delivery_merge_execution import _original_start
+
+                # A reset copies workflow type, inputs and memo. Only its
+                # canonical original start can reconcile an unknown start ACK.
+                await asyncio.wait_for(_original_start(
+                    service.store, {"spec": spec, "merge_authorization": bound},
+                    {"workflow_id": item["workflow_id"], "execution_run_id": execution_run_id},
+                    require_running=False), timeout=10)
             await asyncio.to_thread(acknowledge, item, spec, execution_run_id)
         except WorkflowAlreadyStartedError:
             # Lost start acknowledgement: the next pass reads the memo.

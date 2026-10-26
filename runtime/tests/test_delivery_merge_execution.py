@@ -6,12 +6,14 @@ import copy
 import json
 from contextvars import copy_context
 from dataclasses import replace
+from datetime import timedelta
 from threading import Event
 from types import SimpleNamespace
 
 import httpx
 import pytest
-from temporalio import activity
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy
 from temporalio.testing import ActivityEnvironment
 from test_delivery_merge_followup import delivered as delivered
 from test_delivery_store import service as service
@@ -22,6 +24,20 @@ from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_merge import MergeBroker
 
 _REAL_BROKER_API = MergeBroker.api
+
+
+# Legacy histories did not carry merge_execution in the activity request.
+# Keep that real former protocol so request-field equality cannot mask a
+# dispatch binding that incorrectly adopts the reset's SDK run.
+@workflow.defn(name="DevflowMergeWorkflow")
+class LegacyMergeWorkflow:
+    @workflow.run
+    async def run(self, spec: dict, grant: str) -> dict:
+        return await workflow.execute_activity("delivery_merge_followup", {
+            "spec": spec, "merge_authorization": grant},
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=1))
+
 
 
 def sdk_environment(d, grant, **overrides):
@@ -254,3 +270,103 @@ async def test_public_lost_start_reply_reconciles_exact_completed_history_and_re
             db.execute("UPDATE delivery_merge_executions SET execution_run_id='foreign-reset-run'")
         with pytest.raises(ValueError, match="not authentically closed"):
             await execution._closed(d.store, d.spec, selected)
+
+
+@pytest.mark.asyncio
+async def test_lost_start_reply_then_real_reset_cannot_bind_or_authorize_legacy_activity(
+    service, monkeypatch,
+):
+    """Reset a real pre-patch workflow while its original start ACK is unknown."""
+    from uuid import uuid4
+
+    from temporal_test_server import local_temporal
+    from temporalio.api.common.v1 import WorkflowExecution
+    from temporalio.api.workflowservice.v1 import ResetWorkflowExecutionRequest
+    from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+    from devflow_temporal.delivery_api import create_app
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    refusals = []
+
+    async with local_temporal() as environment:
+        old, submitted = service
+        raw = copy.deepcopy(old.config.raw)
+        raw["temporal_address"] = environment.client.service_client.config.target_host
+        old.config.path.write_text(json.dumps(raw))
+        store = DeliveryStore(DeliveryConfig.load(old.config.path))
+        d = delivered.__wrapped__((store, submitted), monkeypatch)
+        monkeypatch.setattr(DeliveryStore, "_completed_temporal_result",
+                            lambda *_args, **_kwargs: copy.deepcopy(d.closed))
+
+        @activity.defn(name="delivery_merge_followup")
+        async def controlled_followup(request):
+            assert execution.FIELD not in request
+            entered.set()
+            await release.wait()
+            try:
+                await execution.authenticate_activity(d.store, request)
+                with execution.activity_scope(d.store, request):
+                    raise AssertionError("reset inherited merge effect authority")
+            except ValueError as exc:
+                refusals.append((activity.info().workflow_run_id, str(exc)))
+                return {"state": "unknown", "reason": str(exc)}
+
+        host = d.store.config.dashboard_url
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(
+            app=create_app(d.store.config.path)), base_url=host) as public:
+            token = (await public.get("/api/session")).json()["csrf_token"]
+            response = await public.post("/api/runs/run-1/merge", json=d.command,
+                headers={"Origin": host, "X-Devflow-CSRF": token})
+            assert response.status_code == 200, response.text
+            admitted = response.json()
+        service = SimpleNamespace(store=d.store, config=d.store.config)
+
+        class LostStartReply:
+            def get_workflow_handle(self, *args, **kwargs):
+                return environment.client.get_workflow_handle(*args, **kwargs)
+
+            async def start_workflow(self, *args, **kwargs):
+                await environment.client.start_workflow(*args, **kwargs)
+                raise RuntimeError("owned fault: original start accepted, response lost")
+
+        async with Worker(environment.client, task_queue=d.store.config.queue,
+                          workflow_runner=UnsandboxedWorkflowRunner(),
+                          workflows=[LegacyMergeWorkflow], activities=[controlled_followup]):
+            await followup.dispatch(service, LostStartReply())
+            await asyncio.wait_for(entered.wait(), 10)
+            handle = environment.client.get_workflow_handle(admitted["workflow_id"])
+            original = await handle.describe()
+            history = await handle.fetch_history()
+            completed = next(event.event_id for event in history.events
+                if event.HasField("workflow_task_completed_event_attributes"))
+            reset = await environment.client.workflow_service.reset_workflow_execution(
+                ResetWorkflowExecutionRequest(namespace="default",
+                    workflow_execution=WorkflowExecution(workflow_id=admitted["workflow_id"],
+                                                         run_id=original.run_id),
+                    reason="owned lost-response reset negative control",
+                    workflow_task_finish_event_id=completed, request_id=str(uuid4())))
+            latest = await handle.describe()
+            assert latest.run_id == reset.run_id != original.run_id
+            assert latest.workflow_type == "DevflowMergeWorkflow"
+            assert await latest.memo_value("merge_authorization") == admitted["grant_sha256"]
+            await followup.dispatch(service, environment.client)
+            with d.store._connect() as db:
+                selected = followup.current(db, "run-1")
+                assert selected["phase"] == "queued" and selected["dispatched"] == 0
+                assert "reset or foreign start" in selected["error"]
+                assert not db.execute("SELECT 1 FROM delivery_merge_executions").fetchone()
+                effects = [dict(row) for row in db.execute("SELECT * FROM delivery_effects")]
+            release.set()
+            reset_handle = environment.client.get_workflow_handle(
+                admitted["workflow_id"], run_id=reset.run_id)
+            refused = await asyncio.wait_for(reset_handle.result(), 15)
+            assert refused["state"] == "unknown" and "reset or foreign start" in refused["reason"]
+            assert any(run == reset.run_id for run, _reason in refusals)
+            with d.store._connect() as db:
+                assert not db.execute("SELECT 1 FROM delivery_merge_executions").fetchone()
+                assert [dict(row) for row in db.execute(
+                    "SELECT * FROM delivery_effects")] == effects
+                assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == d.before

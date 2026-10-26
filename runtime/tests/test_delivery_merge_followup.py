@@ -774,7 +774,7 @@ def test_merge_entry_reconciles_real_main_and_waits_for_new_ci_without_another_w
 
 @pytest.mark.asyncio
 async def test_real_temporal_dispatch_starts_merge_only_workflow_and_recovers_lost_start_ack(
-    delivered,
+    service,
     monkeypatch,
 ):
     import asyncio
@@ -787,19 +787,25 @@ async def test_real_temporal_dispatch_starts_merge_only_workflow_and_recovers_lo
         delivery_merge_followup_failed,
     )
     from devflow_temporal.delivery_merge_workflow import MergeWorkflow
+    from devflow_temporal.delivery_store import DeliveryStore
 
-    d = delivered
-    remote = git_remote(d, monkeypatch)
-    # This workflow test starts from an already current target; the separate
-    # real-Git test above exercises both asynchronous reconciliation and CI waits.
-    remote.target = remote.original
-    remote.ci_ready = True
-    admitted = followup.admit(d.store, "run-1", d.command)
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._context", lambda _spec: (d.store, None)
-    )
-    service = SimpleNamespace(store=d.store, config=d.store.config)
     async with local_temporal() as environment:
+        old, submitted = service
+        raw = copy.deepcopy(old.config.raw)
+        raw["temporal_address"] = environment.client.service_client.config.target_host
+        old.config.path.write_text(json.dumps(raw))
+        store = DeliveryStore(DeliveryConfig.load(old.config.path))
+        d = delivered.__wrapped__((store, submitted), monkeypatch)
+        remote = git_remote(d, monkeypatch)
+        # This workflow test starts from an already current target; the separate
+        # real-Git test above exercises both asynchronous reconciliation and CI waits.
+        remote.target = remote.original
+        remote.ci_ready = True
+        admitted = followup.admit(d.store, "run-1", d.command)
+        monkeypatch.setattr(
+            "devflow_temporal.delivery_activities._context", lambda _spec: (d.store, None)
+        )
+        service = SimpleNamespace(store=d.store, config=d.store.config)
         starts = []
 
         async def start(*args, **kwargs):
