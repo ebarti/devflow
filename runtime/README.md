@@ -276,8 +276,10 @@ request with the same operation ID is refused.
 The service dispatches persisted pending work on restart. A previously running
 operation is unknown once its exclusive owner is gone; it is not launched
 again. `POST /api/operations/{id}/reconcile` checks supported original domain
-receipts without creating another command. If no exact receipt establishes the
-outcome, the operation remains unknown and requires domain-specific recovery.
+receipts without creating another command. Temporal updates record the exact
+workflow, execution run, update ID, request and transport binding before sending;
+reconciliation reads only that original update. If no exact receipt establishes
+the outcome, the operation remains unknown and requires domain-specific recovery.
 A recorded success is historical evidence and does not establish current
 execution or merge eligibility. Original preflight, acknowledgement and
 admission boundaries continue to check the current owner and authority.

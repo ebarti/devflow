@@ -441,6 +441,17 @@ def register_operations(app, service, hostguard, mutationguard):
             from .delivery_ci_inventory import info
 
             result = await asyncio.to_thread(info, service.store, run_id)
+        if temporal_pending and kind == "reconcile-tracker":
+            from .delivery_terminal_recovery import receipt
+
+            try:
+                saved = await asyncio.to_thread(receipt, service.store, run_id, payload)
+                if saved is not None:
+                    await asyncio.to_thread(service.store.finish_mutation, command_id, saved)
+                    result, temporal_pending = saved, False
+            except (ValueError, OSError, RuntimeError):
+                # A conflicting or unavailable receipt cannot establish success.
+                temporal_pending = False
         if temporal_pending:
             from .delivery_operation_temporal import reconcile
 

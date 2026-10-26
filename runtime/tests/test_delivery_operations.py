@@ -643,6 +643,13 @@ async def test_original_temporal_update_is_reconciled_after_local_receipt_loss(
                 assert reference["command_id"] == "original-decision"
                 assert reference["name"] == "decision"
                 assert reference["request_digest"] == operation["request_digest"]
+                original_address = service.config.raw["temporal_address"]
+                service.config.raw["temporal_address"] = "127.0.0.1:1"
+                different_transport = (
+                    await client.post("/api/operations/decision-op/reconcile", headers=headers)
+                ).json()
+                assert different_transport["state"] == "unknown"
+                service.config.raw["temporal_address"] = original_address
                 # The current projection may subsequently identify a different
                 # workflow; the recorded original execution remains the only
                 # authorized receipt to query.
@@ -701,3 +708,60 @@ async def test_original_temporal_update_is_reconciled_after_local_receipt_loss(
                 ).json()
                 assert missing["state"] == "unknown"
                 assert await original_workflow.query("update_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_tracker_receipt_reconciles_without_another_update(api_fixture):
+    import json
+
+    from devflow_temporal.contracts import digest
+
+    path, submit = api_fixture
+    app = create_app(path)
+    store = app.state.delivery.store
+    store.submit(submit)
+    payload = {"command_id": "tracker-original", "expected_revision": 4}
+    response = {
+        "run_id": "run-1",
+        "phase": "terminal_tracker_recovery_queued",
+        "workflow_id": "retained-successor",
+        "revision": 4,
+        "reconciliation_only": True,
+    }
+    store.begin_mutation("run-1", payload["command_id"], "reconcile_tracker", payload)
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+            (
+                payload["command_id"],
+                "run-1",
+                digest({"kind": "terminal_tracker_recovery", "run_id": "run-1", **payload}),
+                json.dumps(response),
+            ),
+        )
+        db.execute(
+            """INSERT INTO delivery_operations
+            (operation_id,run_id,kind,stage,request_digest,request_json,state,
+             created_at,updated_at,progress)
+            VALUES ('tracker-op','run-1','reconcile-tracker','execution',?,?,
+                    'unknown','2026','2026','unknown')""",
+            (
+                digest({"run_id": "run-1", "kind": "reconcile-tracker", "request": payload}),
+                json.dumps(payload),
+            ),
+        )
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as client:
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
+        operation = (
+            await client.post("/api/operations/tracker-op/reconcile", headers=headers)
+        ).json()
+        assert operation["state"] == "succeeded" and operation["result"] == response
+    with store._connect() as db:
+        assert (
+            db.execute(
+                "SELECT state FROM delivery_mutations WHERE command_id='tracker-original'"
+            ).fetchone()[0]
+            == "complete"
+        )
