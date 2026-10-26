@@ -96,6 +96,46 @@ def test_unverified_or_foreign_generation_is_never_reaped(monkeypatch, observati
         assert not control._owned({"pid": 7001, "identity": "recorded-start"})
 
 
+@pytest.mark.parametrize("observation", [
+    "nonzero", "empty", "warning", "timeout", "oserror", "foreign_group", "changed_generation",
+])
+def test_zombie_group_fallback_never_signals_without_group_and_generation_proof(
+    monkeypatch, observation,
+):
+    owned = iter((True, observation != "changed_generation"))
+    monkeypatch.setattr(control, "_owned", lambda _process: next(owned))
+
+    def missing_group(_pid):
+        raise ProcessLookupError()
+
+    def inspect(argv, **kwargs):
+        assert argv == ["ps", "-p", "7001", "-o", "pgid="]
+        assert kwargs["timeout"] == 5
+        if observation == "timeout":
+            raise subprocess.TimeoutExpired("ps", 5)
+        if observation == "oserror":
+            raise OSError("group inspection unavailable")
+        return SimpleNamespace(
+            returncode=1 if observation == "nonzero" else 0,
+            stdout=("" if observation == "empty" else
+                    "7002" if observation == "foreign_group" else "7001"),
+            stderr="incomplete observation" if observation == "warning" else "",
+        )
+
+    monkeypatch.setattr(control.os, "getpgid", missing_group)
+    monkeypatch.setattr(control.subprocess, "run", inspect)
+    monkeypatch.setattr(control.os, "killpg", lambda *_args: pytest.fail("unverified signal"))
+    process = {"pid": 7001, "identity": "recorded-start"}
+    if observation == "changed_generation":
+        assert control._terminate("fixture", process) == "already_stopped_or_changed"
+    elif observation == "foreign_group":
+        with pytest.raises(ValueError, match="not its process group leader"):
+            control._terminate("fixture", process)
+    else:
+        with pytest.raises(ProcessObservationUnknown, match="group observation is unavailable"):
+            control._terminate("fixture", process)
+
+
 def _configuration(tmp_path: Path) -> DeliveryConfig:
     path = tmp_path / "config.json"
     value = {
@@ -139,6 +179,7 @@ def test_unknown_after_partial_stop_retains_inventory_and_supervisor_hold(
         stopped.add(pid)
 
     monkeypatch.setattr(control, "_process_identity", identity)
+    monkeypatch.setattr(control, "_local_identity", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
     monkeypatch.setattr(control.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(control.os, "killpg", terminate)

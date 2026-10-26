@@ -132,6 +132,8 @@ def test_partial_stack_recovery_stops_only_recorded_identity(config, monkeypatch
     monkeypatch.setattr(
         control, "_process_identity", lambda pid: "fixture" if pid in alive else None
     )
+    monkeypatch.setattr(control, "_local_identity",
+                        lambda pid, **_kwargs: "fixture" if pid in alive else None)
     monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
     monkeypatch.setattr(control.os, "getpgid", lambda pid: pid)
 
@@ -148,6 +150,7 @@ def test_partial_stack_recovery_stops_only_recorded_identity(config, monkeypatch
 def test_stale_manifest_is_replaced_without_signalling(config, monkeypatch):
     _manifest(config)
     monkeypatch.setattr(control, "_process_identity", lambda _pid: None)
+    monkeypatch.setattr(control, "_local_identity", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
     monkeypatch.setattr(control.os, "killpg", lambda *_args: pytest.fail("stale PID was killed"))
     monkeypatch.setattr(control, "_start", lambda current, _deadline: _manifest(current))
@@ -468,6 +471,8 @@ def _fake_stack(config, monkeypatch):
     signals, launched = [], []
     monkeypatch.setattr(control, "_process_identity",
                         lambda pid: "fixture" if pid in alive else None)
+    monkeypatch.setattr(control, "_local_identity",
+                        lambda pid, **_kwargs: "fixture" if pid in alive else None)
     monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
     monkeypatch.setattr(control.os, "getpgid", lambda pid: pid)
 

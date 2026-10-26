@@ -324,18 +324,46 @@ def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
         raise
 
 
+def _owned_process_group(process: dict) -> int | None:
+    """Observe the group without treating a zombie's getpgid ESRCH as exit."""
+    try:
+        return os.getpgid(process["pid"])
+    except OSError:
+        # macOS getpgid cannot inspect a zombie that ps can still identify.
+        # Its group can retain live descendants, so absence needs reconciliation.
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(process["pid"]), "-o", "pgid="],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        # Recheck generation after the fallback read, before granting a signal.
+        if not _owned(process):
+            return None
+        if (result is not None and result.returncode == 0 and not result.stderr.strip()
+                and re.fullmatch(r"[1-9][0-9]*", result.stdout.strip())):
+            return int(result.stdout.strip())
+        raise ProcessObservationUnknown(
+            f"process {process['pid']} group observation is unavailable; ownership remains unknown"
+        ) from None
+
+
 def _terminate(name: str, process: dict) -> str:
     """Stop one owned member by its process group, escalating only after a grace period."""
     if not _owned(process):
         return "already_stopped_or_changed"
+    group = _owned_process_group(process)
+    if group is None:
+        return "already_stopped_or_changed"
+    if group != process["pid"]:
+        raise ValueError(
+            f"owned {name} is not its process group leader; refusing to stop it"
+        )
     try:
-        if os.getpgid(process["pid"]) != process["pid"]:
-            raise ValueError(
-                f"owned {name} is not its process group leader; refusing to stop it"
-            )
         os.killpg(process["pid"], signal.SIGTERM)
     except ProcessLookupError:
-        return "already_stopped"
+        return "termination_pending" if _owned(process) else "already_stopped"
     for _ in range(30):
         if not _owned(process):
             break
