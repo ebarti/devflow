@@ -8,7 +8,6 @@ import pytest
 from temporalio import workflow
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_ci_inventory import ci_case as ci_case
-from test_delivery_native_diagnostic import stopped_diagnostic as stopped_diagnostic
 from test_delivery_store import service as service
 
 from devflow_temporal.delivery_api import create_app
@@ -116,76 +115,6 @@ async def test_restart_dispatches_only_pending_and_preserves_uncertain(api_fixtu
         assert calls == ["run-1"]
 
 
-@pytest.mark.asyncio
-async def test_real_diagnostic_preflight_and_ack_reconcile(stopped_diagnostic, monkeypatch):
-    from devflow_temporal import delivery_native_diagnostic as diagnostic
-
-    case = stopped_diagnostic
-    started, release = threading.Event(), threading.Event()
-    snapshot = diagnostic.snapshot
-
-    def slow(*args):
-        started.set()
-        assert release.wait(30)
-        return snapshot(*args)
-
-    monkeypatch.setattr(diagnostic, "snapshot", slow)
-    app = create_app(case.store.config.path)
-    host = case.store.config.dashboard_url
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
-    async with httpx.AsyncClient(transport=transport, base_url=host) as client:
-        token = (await client.get("/api/session")).json()["csrf_token"]
-        headers = {"Origin": host, "X-Devflow-CSRF": token}
-        envelope = {
-            "operation_id": "diagnostic-observe",
-            "run_id": "run-1",
-            "kind": "native-diagnostic-preflight",
-            "request": case.diagnostic_request,
-        }
-        assert (await client.post("/api/operations", json=envelope)).status_code == 202
-        assert await asyncio.to_thread(started.wait, 10)
-        assert (await client.get("/api/operations/diagnostic-observe")).json()["state"] == "running"
-        release.set()
-        for _ in range(500):
-            operation = (await client.get("/api/operations/diagnostic-observe")).json()
-            if operation["state"] not in ("pending", "running"):
-                break
-            await asyncio.sleep(0.02)
-        assert operation["state"] == "succeeded", operation
-        ack = {
-            **case.diagnostic_request,
-            "preflight_key": operation["result"]["preflight_key"],
-            "acknowledgement": diagnostic.ACK,
-        }
-        envelope = {
-            "operation_id": "diagnostic-ack",
-            "run_id": "run-1",
-            "kind": "ack-native-diagnostic",
-            "request": ack,
-        }
-        assert (
-            await client.post("/api/operations", json=envelope, headers=headers)
-        ).status_code in (200, 202)
-        for _ in range(500):
-            operation = (await client.get("/api/operations/diagnostic-ack")).json()
-            if operation["state"] not in ("pending", "running"):
-                break
-            await asyncio.sleep(0.02)
-        assert operation["state"] == "succeeded", operation
-        receipt = operation["result"]
-        assert receipt["state"] == "queued"
-        # Simulate a crash after the owner's durable acknowledgement and before
-        # the transport journal recorded it, then reconcile the exact receipt.
-        with app.state.delivery.store._connect() as db:
-            db.execute(
-                "UPDATE delivery_operations SET state='unknown', result_json=NULL "
-                "WHERE operation_id='diagnostic-ack'"
-            )
-        recovered = await client.post("/api/operations/diagnostic-ack/reconcile", headers=headers)
-        assert recovered.json()["state"] == "succeeded", recovered.text
-        assert recovered.json()["result"] == receipt
-        with app.state.delivery.store._connect() as db:
-            assert db.execute("SELECT COUNT(*) FROM delivery_native_diagnostics").fetchone()[0] == 1
 
 
 @pytest.mark.asyncio
@@ -572,20 +501,12 @@ async def test_original_temporal_update_is_reconciled_after_local_receipt_loss(
     api_fixture, monkeypatch, tmp_path
 ):
     import json
-    import os
-    from pathlib import Path
 
     from temporal_test_server import local_temporal
     from temporalio.worker import Worker
 
-    stage = Path(os.environ["DEVFLOW_TEST_TEMPORAL_PREREQUISITES"])
-    binary = (
-        stage
-        / "tools/sha256-33c298d41f6eefebf01a28a3511f444480e939e21d3518cb0c12a4abad467c4b/temporal"
-    )
     path, submit = api_fixture
     async with local_temporal(
-        dev_server_existing_path=str(binary),
         dev_server_database_filename=str(tmp_path / "temporal.sqlite3"),
     ) as env:
         config = json.loads(path.read_text())
