@@ -7,6 +7,7 @@ import json
 import lzma
 import os
 import zlib
+from contextlib import contextmanager
 from datetime import timedelta
 from types import MethodType
 
@@ -27,6 +28,7 @@ from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_lifecycle import RecoveryRefused
+from devflow_temporal.delivery_publication import admitted_recovery_stage
 from devflow_temporal.delivery_store import DeliveryStore
 
 
@@ -85,6 +87,10 @@ def test_typed_closed_proof_binds_current_stage_without_history(service, monkeyp
     assert observed['source'] == 'closed_result'
     assert proof.matches(spec, closed['result'], observed)
     assert not proof.matches(spec, {**closed['result'], 'iteration': 1}, observed)
+    assert admitted_recovery_stage(spec, {'state': closed['result'],
+                                         'publication_stop_proof': observed}, legacy_hint=False)
+    assert admitted_recovery_stage(spec, {'state': closed['result']}, legacy_hint=True)
+    assert not admitted_recovery_stage(spec, {'state': closed['result']}, legacy_hint=False)
 
 
 def test_matching_english_prefix_without_evidence_stays_typed_unknown(service, monkeypatch):
@@ -233,3 +239,30 @@ async def test_public_assessment_uses_real_closed_stage_without_mutation(
                     await asyncio.to_thread(proof.observe, store, spec, closed)
             finally:
                 alias.unlink()
+            original_fdopen = os.fdopen
+            saved = artifact.with_suffix('.owned-original')
+
+            @contextmanager
+            def replaced_during_read(fd, *args, **kwargs):
+                with original_fdopen(fd, *args, **kwargs) as stream:
+                    class Reader:
+                        def read(self, *values):
+                            raw = stream.read(*values)
+                            artifact.rename(saved)
+                            artifact.write_bytes(raw)
+                            artifact.chmod(0o600)
+                            return raw
+                    yield Reader()
+
+            try:
+                with monkeypatch.context() as replacement:
+                    replacement.setattr(proof.os, 'fdopen', replaced_during_read)
+                    with pytest.raises(RecoveryRefused) as rejected:
+                        await asyncio.to_thread(proof.observe, store, spec, closed)
+                assert rejected.value.assessment['blockers'][0]['code'] == (
+                    'publication_stage_unproven')
+                assert saved.exists()
+            finally:
+                if saved.exists():
+                    artifact.unlink()
+                    saved.rename(artifact)

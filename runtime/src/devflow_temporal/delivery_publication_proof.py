@@ -23,9 +23,13 @@ from . import delivery_closures as closures
 from .contracts import digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_lifecycle import RecoveryRefused, require_transition
+from .delivery_publication import PUBLICATION_PROOF_VERSION
+from .delivery_publication import publication_stop_proof_matches as matches
 from .delivery_resources import _ancestors
 
-VERSION = 1
+__all__ = ['matches', 'observe', 'reduce_history']
+
+VERSION = PUBLICATION_PROOF_VERSION
 MAX_HISTORY_EVENTS = 50_000
 MAX_HISTORY_BYTES = 64 * 1024 * 1024
 MAX_COMPRESSED_BYTES = 32 * 1024 * 1024
@@ -96,40 +100,6 @@ def _binding(spec, closed):
         'iteration': state['iteration'],
         'candidate_id': candidate['id'], 'stop_state_sha256': digest(state),
     }
-
-
-def matches(spec, state, proof):
-    """Match a newly sealed proof inside already authenticated recovery input.
-
-    This checks bindings, not origin. The admission owner and its immutable
-    receipt authenticate origin before this pure workflow/recovery check is used.
-    """
-    valid = (isinstance(proof, dict) and isinstance(state, dict) and proof.get('version') == VERSION
-            and proof.get('source') in {'closed_result', 'closed_history'}
-            and proof.get('run_id') == spec.get('run_id')
-            and proof.get('request_digest') == spec.get('request_digest')
-            and proof.get('iteration') == state.get('iteration')
-            and proof.get('candidate_id') == (state.get('candidate') or {}).get('id')
-            and proof.get('stop_state_sha256') == digest(state)
-            and bool(proof.get('workflow_id')) and bool(proof.get('execution_run_id'))
-            and bool(proof.get('closed_at')))
-    if not valid:
-        return False
-    if proof['source'] == 'closed_result':
-        checks = state.get('checks')
-        failure = checks.get('failure') if isinstance(checks, dict) else None
-        return (isinstance(failure, dict)
-                and failure.get('classification') == 'transient'
-                and failure.get('cause_type') == 'publication_deadline'
-                and failure.get('stage') in {'publishing', 'publishing_pending'}
-                and proof.get('failure_sha256') == digest(failure))
-    return (isinstance(proof.get('history_sha256'), str)
-            and len(proof['history_sha256']) == 64
-            and type(proof.get('scheduled_event_id')) is int and proof['scheduled_event_id'] > 0
-            and type(proof.get('outcome_event_id')) is int
-            and proof['outcome_event_id'] > proof['scheduled_event_id']
-            and proof.get('activity') in _PUBLICATION
-            and proof.get('activity_outcome') in {'completed', 'failed', 'timed_out', 'cancelled'})
 
 
 async def reduce_history(spec, closed, history):

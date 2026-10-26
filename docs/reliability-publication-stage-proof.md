@@ -56,6 +56,8 @@ receipts remain exact replays. Old recorded recovery inputs lack the new field
 and retain their original deterministic workflow branch; new proof-bearing
 inputs require matching bound proof. Historical request/history bytes are not
 rewritten. A proof describes a historical stop; it never renews eligibility.
+The workflow matcher lives in the existing pure publication contract. It does
+not import the history-reading owner, network client or filesystem observers.
 
 The public fixtures use an actual loopback Temporal history from an owned
 retained producer and real assessment/store boundaries. Their legacy preparation,
