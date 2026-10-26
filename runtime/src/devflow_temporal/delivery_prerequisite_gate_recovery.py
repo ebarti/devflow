@@ -100,10 +100,10 @@ def _native(spec, recipe, item, evidence, checkout):
     return {str(path): hashlib.sha256(value).hexdigest() for path, value in raw.items()}
 
 
-def evidence(spec, state, attempts, previous, broker):
+def evidence(spec, state, attempts, previous, broker, *, resource_spec=None):
     """Read historical bytes without requiring the old gate checkout to survive."""
     from .delivery_plan_checks import planned_checks
-    from .delivery_resources import _gate_evidence_root
+    from .delivery_resources import _gate_roots
     from .delivery_session_custody import (
         completed_passing_implementation,
         implementation_custody,
@@ -157,11 +157,18 @@ def evidence(spec, state, attempts, previous, broker):
             "session_custody": custody,
         }
     )
-    evidence_root = _gate_evidence_root(spec) / "checks" / str(state["iteration"])
+    current = resource_spec or spec
+    bindings = {}
+    roots = _gate_roots(current, execution_specs=bindings)
+    namespaces = [root for root, admitted in bindings.items() if admitted == spec]
+    if len(namespaces) != 1:
+        raise ValueError("published prerequisite lost its exact admitted predecessor namespace")
+    namespace = namespaces[0]
+    evidence_root = namespace / "checks" / str(state["iteration"])
     # The original gate directory may have legitimately ended custody. Derive
     # the same admitted plan over the current physical retained candidate, then
     # substitute only that already-derived gate subject's path in the recipe.
-    historical_checkout = _gate_evidence_root(spec) / "gates" / str(state["iteration"]) / "verify"
+    historical_checkout = namespace / "gates" / str(state["iteration"]) / "verify"
     planned = planned_checks(spec, broker.checkout, evidence_root)
     recipes = local_checks(spec, spec["policy"].get("checks", []), planned)
     results = local["results"]
@@ -203,6 +210,9 @@ def evidence(spec, state, attempts, previous, broker):
         for path, expected in files.items()
     ):
         raise ValueError("published prerequisite evidence changed during observation")
+    after = {}
+    if _gate_roots(current, execution_specs=after) != roots or after != bindings:
+        raise ValueError("published prerequisite namespace changed during observation")
     return {
         "cause": "completed_planned_python_prerequisite",
         "implementation": passed,
@@ -310,7 +320,14 @@ def validate(store, spec, recovery, *, resource_spec=None):
         raise ValueError("published prerequisite closed execution changed")
     historical_records(store, recovery, resource_spec or spec)
     broker = ObservationBroker(store, before, resource_spec=resource_spec or spec)
-    observed = evidence(before, closed["result"], recovery["seal"]["attempts"], previous, broker)
+    observed = evidence(
+        before,
+        closed["result"],
+        recovery["seal"]["attempts"],
+        previous,
+        broker,
+        resource_spec=resource_spec or spec,
+    )
     if any(proof.get(key) != value for key, value in observed.items()):
         raise ValueError("published prerequisite original native authority changed")
     root = Path(spec["state_dir"]) / gate_namespace(1, STAGE) / "predecessor-resources"
