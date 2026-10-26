@@ -77,7 +77,7 @@ def test_sealed_runtime_policy_renewal_keeps_original_publication_custody(
 
 
 @pytest.fixture
-def delivered(service, monkeypatch):
+def delivered(service, monkeypatch, *, native_spec=None):
     store, request = service
     spec = store.config.admit(request)
     spec.update(
@@ -88,6 +88,8 @@ def delivered(service, monkeypatch):
     )
     spec["policy"]["required_ci"] = ["test"]
     spec["policy"]["execution_backend"] = "native-macos"
+    if native_spec is not None:
+        native_spec(spec)
     spec["policy_digest"] = digest(spec["policy"])
     monkeypatch.setattr(DeliveryConfig, "admit", lambda *_: copy.deepcopy(spec))
     store.submit(request)
@@ -588,7 +590,7 @@ def test_title_identifies_actual_change_without_altering_original_goal(delivered
     assert spec == before
 
 
-def git_remote(d, monkeypatch):
+def git_remote(d, monkeypatch, *, conflict=False):
     """Real Git trees with a controlled GitHub boundary; never a real PR."""
     from pathlib import Path
 
@@ -597,12 +599,12 @@ def git_remote(d, monkeypatch):
 
     repo = Path(d.spec["source_path"])
     base = d.spec["base_sha"]
-    (repo / "feature.txt").write_text("Reviewed source\n")
+    (repo / ("conflict.txt" if conflict else "feature.txt")).write_text("Reviewed source\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "feat: reviewed fixture")
     feature = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", "--detach", base)
-    (repo / "main.txt").write_text("New main work\n")
+    (repo / ("conflict.txt" if conflict else "main.txt")).write_text("New main work\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "chore: advance fixture main")
     target = _git(repo, "rev-parse", "HEAD")
