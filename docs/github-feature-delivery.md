@@ -175,6 +175,10 @@ A supervisor can fail before capacity admission and request-file creation.
 This remains a typed blocked `prelaunch` result, with no provider session or
 monitored-process cleanup claim. Merge preflight can observe such a continuation
 without creating request, scratch or owner-lock files or deleting anything.
+The same observation authenticates a derived native execution separately from
+the original merge grant. An existing or newly appearing scratch generation
+refuses this absent-provider route and is retained; these receipts do not grant
+filesystem cleanup authority.
 The original owner lease, exact immutable merge effect/job/attempt and private
 empty folder must all authenticate; missing authority, a busy lease or any launch
 evidence refuses. Only an explicit public merge continuation settles that setup

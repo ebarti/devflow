@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
@@ -228,7 +227,6 @@ class _PrelaunchProofs(list):
     def __init__(self, saved):
         super().__init__()
         self._checks = []
-        self._scratch = []
         self._saved = saved
 
     def unsettled(self, db, run_id):
@@ -264,21 +262,6 @@ class _PrelaunchProofs(list):
     def recheck(self):
         for check in self._checks:
             check()
-
-    def settle_scratch(self):
-        self.recheck()
-        for path in self._scratch:
-            if os.path.lexists(path):
-                info = path.lstat()
-                if (
-                    not stat.S_ISDIR(info.st_mode)
-                    or stat.S_IMODE(info.st_mode) != 0o700
-                    or info.st_uid != os.getuid()
-                    or path.resolve() != path
-                ):
-                    raise ValueError("merge prelaunch scratch has no proven private ownership")
-                shutil.rmtree(path)
-        self.recheck()
 
 
 @contextmanager
@@ -359,20 +342,34 @@ def prelaunch_receipts(store, spec, saved):
             request_raw = (
                 None if missing_request else read_private(folder / "request.json", raw=True)
             )
-            request = (
-                {
-                    "spec": spec,
-                    "role": attempt["role"],
-                    "iteration": attempt["iteration"],
-                    "candidate": bound["candidate"],
-                    "workspace": bound["workspace"],
-                    "merge_context": bound["merge_context"],
-                }
-                if missing_request and attempt
-                else json.loads(request_raw)
-                if request_raw is not None
-                else {}
-            )
+            expected = {
+                "spec": spec,
+                "role": attempt["role"] if attempt else None,
+                "iteration": attempt["iteration"] if attempt else None,
+                "candidate": bound["candidate"],
+                "workspace": bound["workspace"],
+                "merge_context": bound["merge_context"],
+            }
+            if bound.get("review_diff"):
+                expected["review_diff"] = bound["review_diff"]
+            native_binding = None
+            if FIELD in bound:
+                execution, native_binding = recorded(
+                    spec, expected, bound["merge_authorization"], bound[FIELD]
+                )
+                if (
+                    bound.get("execution_spec_sha256") != digest(execution)
+                    or native_binding["workflow_id"] != saved["workflow_id"]
+                ):
+                    raise ValueError("merge prelaunch lost its exact derived execution")
+                expected["spec"] = execution
+                expected[FIELD] = bound[FIELD]
+                if (
+                    _binding(spec, expected, bound["merge_authorization"], saved["workflow_id"])
+                    != native_binding
+                ):
+                    raise ValueError("merge prelaunch derived workspace authority changed")
+            request = expected if missing_request else json.loads(request_raw)
             if (
                 not attempt
                 or attempt["state"] != "finished"
@@ -391,7 +388,9 @@ def prelaunch_receipts(store, spec, saved):
                     and (names or attempt["started_at"] is not None or not attempt["finished_at"])
                 )
                 or (not missing_request and names - {"request.json", "native-environment.json"})
-                or request.get("spec") != spec
+                or request.get("spec") != expected["spec"]
+                or request.get(FIELD) != expected.get(FIELD)
+                or request.get("review_diff") != expected.get("review_diff")
                 or request.get("role") != attempt["role"]
                 or request.get("iteration") != attempt["iteration"]
                 or request.get("candidate") != bound["candidate"]
@@ -404,10 +403,8 @@ def prelaunch_receipts(store, spec, saved):
             ):
                 raise ValueError("merge prelaunch provider absence is unproven")
             scratch = scratch_path(request)
-            if missing_request and os.path.lexists(scratch):
-                raise ValueError("empty prelaunch retains an unbound scratch generation")
-            if not missing_request:
-                proofs._scratch.append(scratch)
+            if os.path.lexists(scratch):
+                raise ValueError("merge prelaunch retains an unbound scratch generation")
 
             stamp = _directory_stamp(info)
 
@@ -418,7 +415,8 @@ def prelaunch_receipts(store, spec, saved):
                 names=names,
                 request_raw=request_raw,
                 bound=bound,
-                missing_request=missing_request,
+                expected=expected,
+                native_binding=native_binding,
                 scratch=scratch,
                 owner=owner,
                 owner_descriptor=lock,
@@ -435,8 +433,15 @@ def prelaunch_receipts(store, spec, saved):
                         request_raw is not None
                         and read_private(folder / "request.json", raw=True) != request_raw
                     )
-                    or (missing_request and os.path.lexists(scratch))
+                    or os.path.lexists(scratch)
                     or candidate_for(Path(bound["workspace"])) != bound["candidate"]
+                    or (
+                        native_binding is not None
+                        and _binding(
+                            spec, expected, bound["merge_authorization"], saved["workflow_id"]
+                        )
+                        != native_binding
+                    )
                 ):
                     raise ValueError("merge prelaunch custody changed during admission")
 

@@ -511,8 +511,9 @@ def _admit(store, run_id, request):
             ):
                 raise ValueError("merge authority changed during admission")
             if prelaunch:
+                _exclusive(store, db, row, prelaunch=prelaunch,
+                           retained_owner="external:devflow:" + run_id)
                 prelaunch.recheck()
-                prelaunch.settle_scratch()
             for receipt in prelaunch:
                 attempt = db.execute('SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
                                      (receipt['job_key'], run_id)).fetchone()
