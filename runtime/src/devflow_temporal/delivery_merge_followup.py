@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import ExitStack
 
 from .contracts import canonical_json, digest
 from .delivery_merge import (
@@ -468,69 +469,81 @@ def _admit(store, run_id, request):
             raise ValueError("merge continuation changed its original delivered evidence")
         grant = original
         response["grant_sha256"] = digest(original)
-    prelaunch = []
-    if previous_merge and previous_merge["phase"] == "unknown":
-        from .delivery_merge_resolution import prelaunch_receipts
+    with ExitStack() as leases:
+        prelaunch = []
+        if previous_merge and previous_merge["phase"] == "unknown":
+            from .delivery_merge_resolution import prelaunch_receipts
 
-        prelaunch = prelaunch_receipts(store, spec, previous_merge)
-    with store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        prior = db.execute(
-            "SELECT * FROM delivery_commands WHERE command_id=?", (request["command_id"],)
-        ).fetchone()
-        if prior:
-            if prior["run_id"] != run_id or prior["request_digest"] != bound:
-                raise ValueError("merge command ID belongs to different inputs")
-            return json.loads(prior["response_json"])
-        row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-        if (
-            _snapshot(row) != proof["row"]
-            or current(db, run_id) != previous_merge
-            or digest(store.effective_spec(run_id)) != grant["spec_sha256"]
-        ):
-            raise ValueError("merge authority changed during admission")
-        for receipt in prelaunch:
-            found = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
-                               (receipt["effect_key"],)).fetchone()
-            if found["request_json"] != receipt["request_json"] or found["state"] == "complete":
-                raise ValueError("merge prelaunch effect changed during continuation")
-            db.execute("UPDATE delivery_effects SET state='complete',observed_json=?,updated_at=? "
-                       "WHERE effect_key=?",
-                       (canonical_json(receipt), _now(), receipt["effect_key"]))
-        _exclusive(store, db, row,
-                   retained_owner="external:devflow:" + run_id if prelaunch else None)
-        if store.state.claim_for(db, spec["work_id"]) is None:
-            store.state.claim_work(
-                db, spec["work_id"], "external:devflow:" + run_id,
-                store.config.dashboard_url + "/runs/" + run_id,
-            )
-        if previous_merge:
+            prelaunch = leases.enter_context(prelaunch_receipts(store, spec, previous_merge))
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT * FROM delivery_commands WHERE command_id=?", (request["command_id"],)
+            ).fetchone()
+            if prior:
+                if prior["run_id"] != run_id or prior["request_digest"] != bound:
+                    raise ValueError("merge command ID belongs to different inputs")
+                return json.loads(prior["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            if (
+                _snapshot(row) != proof["row"]
+                or current(db, run_id) != previous_merge
+                or digest(store.effective_spec(run_id)) != grant["spec_sha256"]
+            ):
+                raise ValueError("merge authority changed during admission")
+            if prelaunch:
+                prelaunch.recheck()
+                prelaunch.settle_scratch()
+            for receipt in prelaunch:
+                attempt = db.execute('SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
+                                     (receipt['job_key'], run_id)).fetchone()
+                if not attempt or digest(dict(attempt)) != receipt['attempt_sha256']:
+                    raise ValueError('merge prelaunch attempt changed before settlement')
+                found = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
+                                   (receipt["effect_key"],)).fetchone()
+                if found["request_json"] != receipt["request_json"] or found["state"] == "complete":
+                    raise ValueError("merge prelaunch effect changed during continuation")
+                db.execute("UPDATE delivery_effects SET state='complete',"
+                           "observed_json=?,updated_at=? "
+                           "WHERE effect_key=?",
+                           (canonical_json(receipt), _now(), receipt["effect_key"]))
+            _exclusive(store, db, row,
+                       retained_owner="external:devflow:" + run_id if prelaunch else None)
+            if store.state.claim_for(db, spec["work_id"]) is None:
+                store.state.claim_work(
+                    db, spec["work_id"], "external:devflow:" + run_id,
+                    store.config.dashboard_url + "/runs/" + run_id,
+                )
+            if previous_merge:
+                db.execute(
+                    "UPDATE delivery_merge_requests SET workflow_id=?,phase='queued',dispatched=0,"
+                    "result_json=NULL,error=NULL,updated_at=? WHERE run_id=?",
+                    (workflow_id, _now(), run_id),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO delivery_merge_requests "
+                    "(run_id,command_id,grant_json,workflow_id,phase,created_at,updated_at) "
+                    "VALUES (?,?,?,?,'queued',?,?)",
+                    (run_id, request["command_id"], canonical_json(grant), workflow_id,
+                     _now(), _now()),
+                )
             db.execute(
-                "UPDATE delivery_merge_requests SET workflow_id=?,phase='queued',dispatched=0,"
-                "result_json=NULL,error=NULL,updated_at=? WHERE run_id=?",
-                (workflow_id, _now(), run_id),
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (request["command_id"], run_id, bound, canonical_json(response)),
             )
-        else:
-            db.execute(
-                "INSERT INTO delivery_merge_requests "
-                "(run_id,command_id,grant_json,workflow_id,phase,created_at,updated_at) "
-                "VALUES (?,?,?,?,'queued',?,?)",
-                (run_id, request["command_id"], canonical_json(grant), workflow_id, _now(), _now()),
+            store._event(
+                db,
+                run_id,
+                row["revision"],
+                "merge_continued" if previous_merge else "merge_requested",
+                ("Continuing conflict resolution under the existing merge authorization"
+                 if previous_merge else "Merge authorized for the existing delivered PR"),
+                response,
             )
-        db.execute(
-            "INSERT INTO delivery_commands VALUES (?,?,?,?)",
-            (request["command_id"], run_id, bound, canonical_json(response)),
-        )
-        store._event(
-            db,
-            run_id,
-            row["revision"],
-            "merge_continued" if previous_merge else "merge_requested",
-            ("Continuing conflict resolution under the existing merge authorization"
-             if previous_merge else "Merge authorized for the existing delivered PR"),
-            response,
-        )
-    return response
+            if prelaunch:
+                prelaunch.recheck()
+        return response
 
 
 def authorize(store, spec, grant_sha256):

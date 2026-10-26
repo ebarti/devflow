@@ -75,64 +75,9 @@ def role_keys(db, run_id):
 
 
 def prelaunch_receipts(store, spec, saved):
-    """Prove absence under each native owner's lease before continuing a failed setup."""
-    from .supervisor import DeliverySupervisor
+    from .delivery_merge_native_preparation import prelaunch_receipts as observe
 
-    with store._connect() as db:
-        effects = [dict(e) for e in db.execute(
-            "SELECT * FROM delivery_effects WHERE run_id=? AND state!='complete'",
-            (spec["run_id"],),
-        )]
-    if not effects:
-        raise ValueError("merge continuation has no confirmed prelaunch failure")
-    receipts = []
-    for effect in effects:
-        bound = json.loads(effect["request_json"])
-        if (effect["kind"] != "merge_resolution"
-                or bound["merge_authorization"] != digest(json.loads(saved["grant_json"]))):
-            raise ValueError("merge continuation retains an unresolved external effect")
-        key = bound["job_key"]
-        lock = DeliverySupervisor._owner_lock(spec, key)
-        if lock is None:
-            raise ValueError("merge prelaunch owner is still active")
-        try:
-            with store._connect() as db:
-                attempt = db.execute(
-                    "SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?",
-                    (key, spec["run_id"]),
-                ).fetchone()
-            result = json.loads(attempt["result_json"] or "null") if attempt else None
-            folder = Path(spec["state_dir"]) / "attempts" / key
-            info = folder.lstat()
-            request = read_private(folder / "request.json")
-            if (not attempt or attempt["state"] != "finished"
-                    or attempt["cleanup"] != "confirmed"
-                    or any(attempt[k] is not None
-                           for k in ("pid", "process_identity", "session_id"))
-                    or not isinstance(result, dict) or result.get("status") != "blocked"
-                    or result.get("cleanup") != "confirmed"
-                    or result.get("finish_reason") != "prelaunch"
-                    or result.get("session_id") is not None
-                    or attempt["result_path"] != str(folder / "result.json")
-                    or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700
-                    or info.st_uid != os.getuid() or folder.resolve() != folder
-                    or {p.name for p in folder.iterdir()}
-                    - {"request.json", "native-environment.json"}
-                    or request["spec"] != spec
-                    or request["candidate"] != bound["candidate"]
-                    or request["workspace"] != bound["workspace"]
-                    or request.get("merge_context") != bound["merge_context"]
-                    or DeliverySupervisor._job_key(request) != key
-                    or candidate_for(Path(bound["workspace"])) != bound["candidate"]):
-                raise ValueError("merge prelaunch provider absence is unproven")
-            shutil.rmtree(scratch(request))
-            receipts.append({"effect_key": effect["effect_key"],
-                             "request_json": effect["request_json"],
-                             "job_key": key, "assessment": result,
-                             "cleanup": "confirmed_prelaunch_absent"})
-        finally:
-            os.close(lock)
-    return receipts
+    return observe(store, spec, saved)
 
 
 def authenticate(request, store):
@@ -170,9 +115,14 @@ def authenticate(request, store):
         raise ValueError("merge role changed its admitted scope, candidate or authority")
 
 
-def scratch(request):
+def scratch_path(request):
     root = Path("/private/tmp" if Path("/private/tmp").is_dir() else "/tmp")
     path = root / ("dfmerge-" + digest(request["merge_context"]["effect_key"])[:24])
+    return path
+
+
+def scratch(request):
+    path = scratch_path(request)
     private_directory(path)
     return path
 
