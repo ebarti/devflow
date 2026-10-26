@@ -501,8 +501,11 @@ def _observe_merge(store, run_id, request, previous_merge, *, preserve=False):
     spec = store.effective_spec(run_id)
     proof = evidence(store, spec)
     require_transition(_lifecycle_facts(proof), request)
-    closed = store._completed_temporal_result(
-        run_id, workflow_id=store.active_workflow_id(run_id), preserve=preserve)
+    try:
+        closed = store._completed_temporal_result(
+            run_id, workflow_id=store.active_workflow_id(run_id), preserve=preserve)
+    except RPCError as exc:
+        raise ValueError('delivered predecessor closure is unavailable') from exc
     state = closed.get("result") or {}
     if (
         closed["request_digest"] != proof["row"]["request_digest"]

@@ -168,3 +168,28 @@ async def test_first_merge_assessment_respects_existing_installation_fence(deliv
         assert _rows(d.store) == before
         admitted = await client.post('/api/runs/run-1/merge', json=d.command, headers=headers)
         assert admitted.status_code == 200, admitted.text
+
+
+@pytest.mark.asyncio
+async def test_delivered_predecessor_transport_failure_is_an_unknown_assessment(
+    delivered, monkeypatch,
+):
+    from devflow_temporal.delivery_interrupted_recovery import installation_recovery_lease
+
+    d = delivered
+    with installation_recovery_lease(d.store.config):
+        pass
+    def unavailable(*_args, **_kwargs):
+        raise RPCError('controlled outage', RPCStatusCode.UNAVAILABLE, b'')
+    monkeypatch.setattr(d.store, '_completed_temporal_result', unavailable)
+    before = _rows(d.store)
+    async with _client(d.store) as client:
+        session = (await client.get('/api/session')).json()
+        headers = {'X-Devflow-CSRF': session['csrf_token'], 'Origin': d.store.config.dashboard_url}
+        response = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': 'merge_run', 'request': d.command})
+        assert response.status_code == 200 and not response.json()['eligible']
+        assert 'owner_proof_unknown' in {b['code'] for b in response.json()['blockers']}
+        refused = await client.post('/api/runs/run-1/merge', json=d.command, headers=headers)
+        assert refused.status_code == 409
+        assert _rows(d.store) == before

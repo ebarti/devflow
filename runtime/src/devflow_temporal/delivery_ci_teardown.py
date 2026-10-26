@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 from .contracts import canonical_json, digest
@@ -27,12 +26,13 @@ An effectful caller supplies its exact current resource execution separately.
     from .delivery_feature_revision_recovery import retained_recovery
     from .delivery_resources import _gate_roots, read_private
     from .delivery_stopped_resume import custody, namespace
+    from .delivery_store import tracking_read_connection
     from .delivery_unpublished_recovery import quarantine_history
 
     approved_profile(profile)
     _subject(spec, candidate, publication, profile)
     config = load_execution_config(spec)
-    with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+    with tracking_read_connection(config.tracking_db) as db:
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA query_only=ON')
         db.execute('BEGIN')
