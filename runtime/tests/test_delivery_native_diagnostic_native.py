@@ -159,6 +159,25 @@ async def test_real_public_diagnostic_runs_same_native_readiness_and_complete_fr
         assert not (root / "run-1/checks/3/worker-regressions/native-retry").exists()
         replay = await client.post(path + "ack-native-diagnostic", json=command, headers=headers)
         assert replay.status_code == 200 and replay.json() == value
+        detail = await client.get("/api/runs/run-1")
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["run"]["outcome"] == "blocked"
+        files = [
+            entry
+            for entry in detail.json()["evidence"]
+            if entry["label"].startswith("Diagnostic only: ")
+            and entry["label"].endswith("/process.log")
+        ]
+        assert files
+        observed_log = await client.get(files[0]["url"])
+        assert observed_log.status_code == 200, observed_log.text
+        assert observed_log.json()["sha256"]
+        readiness_file = next(
+            entry
+            for entry in detail.json()["evidence"]
+            if entry["label"].endswith(": readiness.json")
+        )
+        assert (await client.get(readiness_file["url"])).status_code == 200
         (tmp_path / "native-diagnostic-result.json").write_text(json.dumps(value, indent=2) + "\n")
         if output := os.environ.get("DEVFLOW_TEST_NATIVE_DIAGNOSTIC_RESULT"):
             with open(output + "." + mode + ".json", "x") as stream:

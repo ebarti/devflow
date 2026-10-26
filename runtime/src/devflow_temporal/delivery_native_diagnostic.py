@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_metadata_recovery import _immutable
-from .delivery_resources import _ancestors, _identity, private_directory, read_private
+from .delivery_resources import _ancestors, _identity, private_directory
 
 KIND = "native_check_diagnostic"
 CHECK_ID = "worker-regressions"
@@ -39,6 +39,17 @@ FIELDS = {
 }
 ERROR = "native diagnostic holds the stopped execution"
 ACTIVE = "('queued','running','unknown')"
+
+
+def evidence_value(path, *, raw=False):
+    """Existing private FD/name/size custody, with no installation bootstrap authority."""
+    from .delivery_runtime_location import private_bytes
+
+    data = private_bytes(path)
+    return data if raw else json.loads(data)
+
+
+read_private = evidence_value
 
 
 def initialize(db):
@@ -197,6 +208,7 @@ def snapshot(store, run_id, command):
     if (
         spec.get("provider") != "codex"
         or spec.get("feature_worker")
+        or spec.get("feature_delivery")
         or spec["policy"].get("host_sandbox") != "trusted-local"
         or latest.get("status") != "blocked"
         or latest.get("finish_reason") != "done"
@@ -618,9 +630,90 @@ def info(store, run_id, command_id):
     return result
 
 
+def indexed_evidence(spec, row):
+    """Index ACK-bound diagnostics; selecting content still verifies the individual SHA."""
+    root = _root(spec, row["identity"])
+    response = json.loads(row["response_json"])
+    expected = {
+        "intent.json": row["intent_sha256"],
+        "readiness.json": response.get("readiness_sha256"),
+        "receipt.json": response.get("receipt_sha256"),
+    }
+    entries = []
+    prefix = "native-diagnostic-" + row["identity"] + "-"
+    for name, sha in expected.items():
+        path = root / name
+        if sha and os.path.lexists(path):
+            entries.append(
+                {
+                    "id": prefix + name,
+                    "path": path,
+                    "expected_sha256": sha,
+                    "label": "Diagnostic only; no delivery acceptance: " + name,
+                    "limit": 4 * 1024 * 1024,
+                }
+            )
+    if row["state"] == "complete":
+        raw = read_private(root / "receipt.json", raw=True)
+        value = json.loads(raw)
+        if (
+            hashlib.sha256(raw).hexdigest() != expected["receipt.json"]
+            or value.get("identity") != row["identity"]
+            or value.get("run_id") != row["run_id"]
+            or value.get("command_id") != row["command_id"]
+            or value.get("diagnostic_only") is not True
+            or value.get("delivery_acceptance") is not False
+        ):
+            raise ValueError("diagnostic evidence lost its exact receipt acknowledgement")
+        artifacts, total = value.get("artifacts"), 0
+        if not isinstance(artifacts, dict) or not 2 <= len(artifacts) <= 4200:
+            raise ValueError("diagnostic evidence inventory is incomplete or unbounded")
+        for index, (name, reference) in enumerate(sorted(artifacts.items())):
+            relative = Path(name)
+            if (
+                relative.is_absolute()
+                or relative.as_posix() != name
+                or ".." in relative.parts
+                or not isinstance(reference, dict)
+                or type(reference.get("bytes")) is not int
+                or not 0 <= reference["bytes"] <= 50 * 1024 * 1024
+                or not re.fullmatch("[0-9a-f]{64}", str(reference.get("sha256")))
+            ):
+                raise ValueError("diagnostic evidence has an invalid immutable reference")
+            total += reference["bytes"]
+            if total > 96 * 1024 * 1024:
+                raise ValueError("diagnostic evidence exceeds its complete aggregate bound")
+            path = root / spec["run_id"] / relative
+            if path.resolve() != path:
+                raise ValueError("diagnostic evidence path was linked")
+            entries.append(
+                {
+                    "id": prefix + "artifact-" + str(index),
+                    "path": path,
+                    "expected_sha256": reference["sha256"],
+                    "label": "Diagnostic only: " + name,
+                    "limit": reference["bytes"],
+                }
+            )
+    else:
+        for name in ("manifest.json", "finalization.json"):
+            path = root / spec["run_id"] / "resources" / name
+            if path.exists() and path.resolve() == path:
+                entries.append(
+                    {
+                        "id": prefix + "observed-" + name,
+                        "path": path,
+                        "label": "Unfinished diagnostic resource observation: " + name,
+                        "limit": 4 * 1024 * 1024,
+                    }
+                )
+    return entries
+
+
 async def dispatch_once(service):
     """Dispatch a durable queued identity once; a running identity is never relaunched."""
     from .delivery_activities import _execute_check
+    from .delivery_preparation import execution_retired
 
     if not getattr(service, "_native_diagnostic_pending", True):
         return
@@ -653,8 +746,13 @@ async def dispatch_once(service):
             continue
         try:
             spec = await asyncio.to_thread(service.store.effective_spec, row["run_id"])
-        except Exception as exc:
-            await asyncio.to_thread(record_unknown, service.store, row, exc)
+            if execution_retired(spec) or not await asyncio.to_thread(
+                service.store.owns_execution, spec
+            ):
+                continue
+        except (ValueError, RuntimeError, OSError, KeyError):
+            # Unknown/foreign ownership grants neither a native body nor a
+            # write to that owner's diagnostic acknowledgement.
             continue
 
         async def once(spec=spec, row=row):
@@ -693,7 +791,12 @@ def record_unknown(store, row, exc):
         saved = _saved(db, row["run_id"], identity=row["identity"])
         if saved is not None:
             previous = json.loads(saved["response_json"])
-            for name in ("subject_sha256", "native_launches", "phase_result_sha256"):
+            for name in (
+                "subject_sha256",
+                "native_launches",
+                "phase_result_sha256",
+                "readiness_sha256",
+            ):
                 if name in previous:
                     response[name] = previous[name]
         changed = db.execute(

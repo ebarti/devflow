@@ -16,11 +16,11 @@ from pathlib import Path
 from .candidate import candidate_for
 from .contracts import canonical_json, digest
 from .delivery_metadata_recovery import _immutable
+from .delivery_native_diagnostic import evidence_value as read_private
 from .delivery_resources import (
     RunResources,
     _identity,
     private_directory,
-    read_private,
 )
 
 
@@ -705,6 +705,11 @@ def run_readiness(context):
     context.guard()
     context.subject()
     _immutable(context.root / "readiness.json", result)
+    _record_phase(
+        context,
+        "readiness_sha256",
+        hashlib.sha256(read_private(context.root / "readiness.json", raw=True)).hexdigest(),
+    )
     return result
 
 
@@ -750,7 +755,12 @@ def retained_artifacts(context, result):
 
 def _record_phase(context, field, value):
     """Files remain inert until their exact subject/launch/result bytes are acknowledged."""
-    if field not in {"subject_sha256", "native_launches", "phase_result_sha256"}:
+    if field not in {
+        "subject_sha256",
+        "native_launches",
+        "phase_result_sha256",
+        "readiness_sha256",
+    }:
         raise ValueError("unsupported diagnostic phase acknowledgement")
     from .delivery_native_diagnostic import _rows
 
@@ -819,6 +829,13 @@ def verify_receipt(spec, row, receipt):
         raise ValueError("diagnostic immutable receipt lost its acknowledgement")
     phase_sha = json.loads(row["response_json"]).get("phase_result_sha256")
     phases = json.loads(row["response_json"])
+    if receipt["result"].get("readiness") is not None:
+        raw = read_private(root / "readiness.json", raw=True)
+        if (
+            hashlib.sha256(raw).hexdigest() != phases.get("readiness_sha256")
+            or json.loads(raw) != receipt["result"]["readiness"]
+        ):
+            raise ValueError("diagnostic readiness differs from its acknowledged phase")
     subject_sha = phases.get("subject_sha256")
     if (
         not subject_sha
@@ -890,7 +907,7 @@ def _ack_complete(store, row, receipt):
         ).hexdigest(),
     }
     phases = json.loads(current["response_json"])
-    for name in ("subject_sha256", "native_launches", "phase_result_sha256"):
+    for name in ("subject_sha256", "native_launches", "phase_result_sha256", "readiness_sha256"):
         if name in phases:
             response[name] = phases[name]
     with store._connect() as db:

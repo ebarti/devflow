@@ -35,6 +35,7 @@ from devflow_temporal import delivery_native_diagnostic as diagnostic
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
+from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_native_diagnostic_execution import DiagnosticContext
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
@@ -496,6 +497,15 @@ def test_acknowledged_generation_is_never_recreated_or_reattributed(stopped_diag
     assert not (context.root / "receipt.json").exists()
 
 
+def test_private_intent_has_a_bound_before_decoding(stopped_diagnostic):
+    case = stopped_diagnostic
+    context, _row, _command, _response = running_context(case)
+    with (context.root / "intent.json").open("r+b") as stream:
+        stream.truncate(4 * 1024 * 1024 + 1)
+    with pytest.raises(ValueError, match="bounded private owned file"):
+        context.guard()
+
+
 def test_unjournaled_launch_never_grants_replacement_or_finalizer_cleanup(stopped_diagnostic):
     case = stopped_diagnostic
     context, row, command, _response = running_context(case)
@@ -625,6 +635,26 @@ def test_visible_ack_waits_for_its_generation_fd_without_replacing_a_running_bod
         result = task.result(timeout=5)
     assert len(called) == (1 if state == "queued" else 0)
     assert result["state"] == ("unit-observed-lease" if state == "queued" else "running")
+
+
+@pytest.mark.asyncio
+async def test_shared_database_does_not_dispatch_or_modify_foreign_transport(stopped_diagnostic):
+    from types import SimpleNamespace
+
+    case = stopped_diagnostic
+    ack(case)
+    raw = copy.deepcopy(case.store.config.raw)
+    raw["queue"] = "foreign-native-diagnostic-queue"
+    path = case.store.config.state_root / "operator-inputs/foreign-owner.json"
+    write_private(path, raw)
+    foreign = DeliveryStore(DeliveryConfig.load(path), read_only=True)
+    service = SimpleNamespace(store=foreign, _native_diagnostic_pending=True)
+    await diagnostic.dispatch_once(service)
+    assert service.native_diagnostic_tasks == {}
+    assert (
+        diagnostic.info(case.store, "run-1", case.diagnostic_request["command_id"])["state"]
+        == "queued"
+    )
 
 
 @pytest.mark.asyncio

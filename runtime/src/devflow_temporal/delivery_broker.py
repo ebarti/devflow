@@ -121,6 +121,9 @@ class CheckSuperseded(RuntimeError):
 
 
 class DeliveryBroker:
+    # Spec-only resource helpers also retain the ordinary, unscoped default.
+    diagnostic_context = None
+
     # Journals of the native gates a broker ran or joined, so an unknown
     # teardown can be re-proven against the processes they recorded.
     native_journals: tuple[Path, ...] = ()

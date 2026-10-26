@@ -4312,19 +4312,12 @@ class DeliveryStore:
         if diagnostic_root.is_dir() and not diagnostic_root.is_symlink():
             with self._connect() as db:
                 diagnostics = db.execute(
-                    'SELECT identity FROM delivery_native_diagnostics WHERE run_id=?',
+                    'SELECT * FROM delivery_native_diagnostics WHERE run_id=?',
                     (run_id,)).fetchall()
+            from .delivery_native_diagnostic import indexed_evidence
+
             for diagnostic in diagnostics:
-                identity = diagnostic['identity']
-                for name in ('intent.json', 'readiness.json', 'receipt.json',
-                             run_id + '/resources/manifest.json',
-                             run_id + '/resources/finalization.json'):
-                    path = diagnostic_root / identity / name
-                    if path.is_file() and not path.is_symlink():
-                        indexed.append({'id': 'native-diagnostic-' + identity + '-'
-                                        + name.replace('/', '-'),
-                                        'label': 'Diagnostic only; no delivery acceptance: ' + name,
-                                        'path': path, 'limit': 4 * 1024 * 1024})
+                indexed.extend(indexed_evidence(spec, diagnostic))
         context_root = root / "issue-context"
         if context_root.is_dir() and not context_root.is_symlink():
             for path in sorted(context_root.glob("*.json")):
