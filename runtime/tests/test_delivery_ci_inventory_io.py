@@ -1,4 +1,5 @@
 """Owned protocol/evidence bounds; no remote CI execution or success assertion."""
+
 from __future__ import annotations
 
 import json
@@ -14,8 +15,11 @@ from devflow_temporal import delivery_ci_inventory_io as io
 def test_exact_hash_publication_and_crash_prefix_replay(tmp_path, monkeypatch):
     root, raw = tmp_path / "observed", b"complete immutable source bytes"
     link = io.os.link
-    monkeypatch.setattr(io.os, "link", lambda *_a, **_k: (_ for _ in ()).throw(
-        RuntimeError("owned crash after staging fsync")))
+    monkeypatch.setattr(
+        io.os,
+        "link",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("owned crash after staging fsync")),
+    )
     with pytest.raises(RuntimeError, match="owned crash"):
         io.publish(root, raw, limit=1024)
     stage = root / (".stage-" + io.sha256(raw))
@@ -100,7 +104,9 @@ def test_replaced_directory_cannot_redirect_publication_writes(tmp_path, monkeyp
 
 @pytest.mark.parametrize("change", ["member", "prefix", "alias", "total", "count"])
 def test_partial_namespace_and_limits_refuse_before_another_publication(
-    tmp_path, monkeypatch, change,
+    tmp_path,
+    monkeypatch,
+    change,
 ):
     root, raw = tmp_path / "observed", b"bounded"
     root.mkdir(mode=0o700)
@@ -129,7 +135,7 @@ def test_complete_bounded_pages_are_joined_without_truncation(change):
     calls = []
 
     def run(command, _limit, _remaining):
-        endpoint = command[-1]
+        endpoint = next(x for x in command if x.startswith("repos/"))
         calls.append(endpoint)
         page = 1 if "page=1&" in endpoint else 2
         ids = list(range(1, 101)) if page == 1 else [101]
@@ -142,23 +148,25 @@ def test_complete_bounded_pages_are_joined_without_truncation(change):
             ids = [1]
         elif change == "overbound":
             total = 1001
-        return json.dumps({"total_count": total, "jobs": [{"id": i} for i in ids]}).encode()
+        body = json.dumps({"total_count": total, "jobs": [{"id": i} for i in ids]}).encode()
+        return b"HTTP/2.0 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
 
     reader = io.GitHubRead(repositories={"example/fixture"}, runner=run)
     if change:
         with pytest.raises(ValueError):
             reader.pages("repos/example/fixture/actions/runs/1/jobs", "jobs", head="a" * 40)
     else:
-        assert len(reader.pages("repos/example/fixture/actions/runs/1/jobs", "jobs",
-                                head="a" * 40)) == 101
+        assert (
+            len(reader.pages("repos/example/fixture/actions/runs/1/jobs", "jobs", head="a" * 40))
+            == 101
+        )
         assert len(calls) == 2 and all("head_sha=" + "a" * 40 in p for p in calls)
 
 
 @pytest.mark.parametrize("mode", ["bytes", "deadline"])
 def test_real_owned_transport_child_is_bounded_and_reaped(mode):
     code = "import os;os.write(1,b'x'*100000)" if mode == "bytes" else "import time;time.sleep(2)"
-    reader = io.GitHubRead(repositories={"example/fixture"},
-                           timeout=1 if mode == "bytes" else 0.05)
+    reader = io.GitHubRead(repositories={"example/fixture"}, timeout=1 if mode == "bytes" else 0.05)
     began = time.monotonic()
     with pytest.raises(ValueError, match="bound|deadline"):
         reader._bytes([sys.executable, "-I", "-c", code], 1024)
@@ -167,8 +175,9 @@ def test_real_owned_transport_child_is_bounded_and_reaped(mode):
 
 def test_foreign_repository_is_refused_before_transport():
     calls = []
-    reader = io.GitHubRead(repositories={"example/fixture"},
-                           runner=lambda *args: calls.append(args))
+    reader = io.GitHubRead(
+        repositories={"example/fixture"}, runner=lambda *args: calls.append(args)
+    )
     with pytest.raises(ValueError, match="endpoint is invalid"):
         reader.get("repos/foreign/fixture/actions/runs/1")
     assert calls == []

@@ -2006,6 +2006,13 @@ class DeliveryBroker:
         required = set(self.spec["policy"].get("required_ci", []))
         if not required:
             return {"state": "unverified", "reason": "no required CI checks configured"}
+        if getattr(self, "store", None) is not None:
+            from .delivery_ci_inventory import result_for
+
+            inventory = await asyncio.to_thread(
+                result_for, self, pr, timeout_seconds=timeout_seconds)
+            if inventory is not None:
+                return inventory
         patient = "ci_wait_seconds" in self.spec["policy"]
         if timeout_seconds is None:
             timeout_seconds = self.spec["policy"].get("ci_wait_seconds", 1200)

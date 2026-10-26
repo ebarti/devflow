@@ -699,6 +699,36 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post('/api/runs/{run_id}/ci-inventory-preflight')
+    async def ci_inventory_preflight(request: Request, run_id: str):
+        _host(request)
+        from .delivery_ci_inventory import preflight
+
+        try:
+            return await asyncio.to_thread(preflight, service.store, run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/ack-ci-inventory')
+    async def ack_ci_inventory(request: Request, run_id: str):
+        _mutation(request)
+        from .delivery_ci_inventory import acknowledge
+
+        try:
+            return await asyncio.to_thread(acknowledge, service.store, run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get('/api/runs/{run_id}/ci-inventory')
+    async def ci_inventory(request: Request, run_id: str):
+        _host(request)
+        from .delivery_ci_inventory import info
+
+        try:
+            return await asyncio.to_thread(info, service.store, run_id)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.post('/api/runs/{run_id}/native-diagnostic-preflight')
     async def native_diagnostic_preflight(request: Request, run_id: str):
         _host(request)

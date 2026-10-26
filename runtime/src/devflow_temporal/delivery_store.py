@@ -477,6 +477,9 @@ class DeliveryStore:
             from .delivery_native_diagnostic import initialize as initialize_native_diagnostics
 
             initialize_native_diagnostics(db)
+            from .delivery_ci_inventory import initialize as initialize_ci_inventory
+
+            initialize_ci_inventory(db)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -1021,6 +1024,10 @@ class DeliveryStore:
             logger.debug("Run %s: Temporal closure unproven (%s: %s)",
                          run_id, type(exc).__name__, exc)
             raise ValueError("continuation predecessor Temporal closure is unproven") from exc
+        if (closed.get('result', {}).get('checks', {}).get('ci') or {}).get('execution_inventory'):
+            from .delivery_ci_inventory import validate_result
+
+            validate_result(self, run_id, closed['result']['checks']['ci'])
         if not sealed:
             self._preserve_closure(run_id, closed)
         return closed
@@ -4308,6 +4315,11 @@ class DeliveryStore:
         spec = self.spec(run_id)
         root = Path(spec["state_dir"])
         indexed: list[dict[str, Any]] = []
+        inventory_root = root / 'ci-execution-inventory'
+        if inventory_root.is_dir() and not inventory_root.is_symlink():
+            from .delivery_ci_inventory import indexed_evidence
+
+            indexed.extend(indexed_evidence(self, run_id))
         diagnostic_root = root / 'native-diagnostics'
         if diagnostic_root.is_dir() and not diagnostic_root.is_symlink():
             with self._connect() as db:

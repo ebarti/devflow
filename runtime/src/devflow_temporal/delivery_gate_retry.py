@@ -844,7 +844,7 @@ def snapshot(store, run_id, kind=KIND):
                          or (digest(prior_gate) != attribution_observation['prior_gate_digest']
                              if attribution_retry else prior_gate != ancestor)):
             raise ValueError('this run already received its bounded gate assessment retry')
-    return {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
+    result = {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
             'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
             'cleanup': (prerequisite_observation['resources'] if prerequisite_retry
@@ -883,6 +883,12 @@ def snapshot(store, run_id, kind=KIND):
                            or (prelaunch and not browser_prelaunch)
                            or (browser_prelaunch and spec.get('gate_retry_stage') == 'published')
                            else 1)}
+    if ci_only:
+        from .delivery_ci_inventory import FIELD, for_seal
+
+        if observation := for_seal(store, spec, result):
+            result[FIELD] = observation
+    return result
 
 
 def admit(store, run_id, payload, *, preflight=False):
@@ -1066,7 +1072,8 @@ def admit(store, run_id, payload, *, preflight=False):
             row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
             if canonical_json(_sealed_row(row)) != canonical_json(seal['row']):
                 raise ValueError('gate retry admission lost its stopped projection')
-            if verification or ordering or seal.get('ordinary_prerequisite_observation'):
+            if (verification or ordering or seal.get('ordinary_prerequisite_observation')
+                    or seal.get('ordinary_ci_inventory')):
                 if store.state.claim_for(db, spec['work_id']) is not None:
                     raise ValueError('listener verification admission lost its released claim')
                 for table, key, expected in [('delivery_attempts', 'job_key', seal['attempts']),
@@ -1099,7 +1106,7 @@ def admit(store, run_id, payload, *, preflight=False):
                             store.state.now(), pending['effect_key']))
             acquired = store.state.claim_work(
                 db, spec['work_id'], f'external:devflow:{run_id}', store.config.dashboard_url)
-            if seal.get('ordinary_prerequisite_observation'):
+            if seal.get('ordinary_prerequisite_observation') or seal.get('ordinary_ci_inventory'):
                 from .delivery_prerequisite_gate_recovery import claim_identity
 
                 response['claim_identity'] = claim_identity(acquired['claim'])
@@ -1184,6 +1191,10 @@ def effective_spec(store, original, recovery):
         from .delivery_prerequisite_gate_recovery import authority
 
         authority(recovery['execution_spec'], recovery)
+    if recovery.get('seal', {}).get('ordinary_ci_inventory'):
+        from .delivery_ci_inventory import authority
+
+        authority(store, recovery)
     return recovery['execution_spec']
 
 
@@ -1195,6 +1206,10 @@ def readback(store, spec, recovery, *, resource_spec=None):
               if resource_spec is not None else DeliveryBroker(store, spec))
     if effective != spec or broker.candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
+    if recovery['seal'].get('ordinary_ci_inventory'):
+        from .delivery_ci_inventory import validate
+
+        validate(store, spec, recovery, resource_spec=resource_spec or spec)
     if recovery['seal'].get('ordinary_prerequisite_observation'):
         from .delivery_prerequisite_gate_recovery import validate
 

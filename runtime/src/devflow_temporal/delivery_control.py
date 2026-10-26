@@ -846,6 +846,9 @@ _COMMANDS = (
     "native-diagnostic-preflight",
     "ack-native-diagnostic",
     "native-diagnostic",
+    "ci-inventory-preflight",
+    "ack-ci-inventory",
+    "ci-inventory",
     "gates-only-preflight",
     "admit-gates-only",
     "continue-repair",
@@ -928,6 +931,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         print(json.dumps(operation(config, supplied), sort_keys=True, indent=2))
         return
     read_commands = {"merge-preflight",
+        'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
         "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
         'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "filesystem-custody-preflight",
@@ -1007,6 +1011,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "revise-feature-plan",
         "retry-prelaunch",
         "amend-scope",
+        'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
     }:
         request = json.loads(args.request.read_text(encoding="utf-8")) if args.request else None
         if args.command in {
@@ -1020,6 +1025,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "recover-publication",
             "repair-admission-preflight",
             'native-diagnostic-preflight', 'ack-native-diagnostic',
+            'ci-inventory-preflight', 'ack-ci-inventory',
             "admit-gates-only",
             "continue-repair",
             "continue-feature",
@@ -1043,6 +1049,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "recover-publication",
                 "repair-admission-preflight",
                 'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
+                'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
                 "gates-only-preflight",
                 "admit-gates-only",
                 "continue-repair",
@@ -1086,6 +1093,9 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                     args.id, request),
                 'native-diagnostic-preflight': lambda: caller.native_diagnostic_preflight(
                     args.id, request),
+                'ci-inventory-preflight': lambda: caller.ci_inventory_preflight(args.id, request),
+                'ack-ci-inventory': lambda: caller.ack_ci_inventory(args.id, request),
+                'ci-inventory': lambda: caller.ci_inventory(args.id),
                 'ack-native-diagnostic': lambda: caller.ack_native_diagnostic(args.id, request),
                 'native-diagnostic': lambda: caller.native_diagnostic(
                     args.id, args.diagnostic_command_id),

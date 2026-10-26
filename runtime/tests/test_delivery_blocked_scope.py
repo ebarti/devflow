@@ -86,7 +86,7 @@ def prepared_spec(spec):
 
 def scope_case(
     service, monkeypatch, *, browser_qa=None, extra_sources=None, checks=None, named_base=False,
-    prepublish_checks=None,
+    prepublish_checks=None, required_ci=None,
 ):
     owner, submitted = service
     source = owner.config.path.parent / "source"
@@ -121,7 +121,7 @@ def scope_case(
         checks=[{"id": "local", "argv": ["/usr/bin/true"]}],
         prepublish_checks=(prepublish_checks if prepublish_checks is not None else
                            [{"id": "prepublish", "argv": ["/usr/bin/true"]}]),
-        required_ci=["ci"],
+        required_ci=required_ci if required_ci is not None else ["ci"],
         project_url="https://github.com/users/example/projects/1",
         assignee="example",
         source_scope={

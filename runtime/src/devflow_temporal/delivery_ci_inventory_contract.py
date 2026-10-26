@@ -3,6 +3,7 @@
 This parses workflow formats and evaluates their authored literal conditions.
 It does not infer test coverage from names, prose or script contents.
 """
+
 from __future__ import annotations
 
 import itertools
@@ -16,21 +17,30 @@ from .contracts import digest
 SCHEMA = "devflow.ordinary-ci-existing-dispatch-profile/v1"
 # No declaration can authorize observations until the reviewed complete source,
 # original selection and report profile is bound in this versioned owner.
-APPROVED_PROFILE_SHA256 = "0" * 64
+APPROVED_PROFILE_SHA256 = "789eb2474a2ae4c8e52fde7c7624b14cb344398ecbdabeda60c18fa359714c2b"
 UNKNOWN = object()
 
 
 def approved_profile(value):
-    if (not isinstance(value, dict) or value.get("schema") != SCHEMA
-            or digest(value) != APPROVED_PROFILE_SHA256):
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != SCHEMA
+        or digest(value) != APPROVED_PROFILE_SHA256
+    ):
         raise ValueError("ordinary CI inventory requires its exact reviewed provenance profile")
     return value
 
 
 def relative(value):
-    if (not isinstance(value, str) or not value or value.startswith("/")
-            or any(part in {"", ".", ".."} for part in value.split("/"))
-            or str(PurePosixPath(value)) != value or "\\" in value or "\x00" in value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("/")
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or str(PurePosixPath(value)) != value
+        or "\\" in value
+        or "\x00" in value
+    ):
         raise ValueError("ordinary CI source path is not canonical")
     return value
 
@@ -43,12 +53,12 @@ class _WorkflowLoader(yaml.SafeLoader):
 
 
 _WorkflowLoader.yaml_implicit_resolvers = {
-    key: [(tag, pattern) for tag, pattern in values
-          if tag != "tag:yaml.org,2002:bool"]
+    key: [(tag, pattern) for tag, pattern in values if tag != "tag:yaml.org,2002:bool"]
     for key, values in yaml.SafeLoader.yaml_implicit_resolvers.items()
 }
 _WorkflowLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.I), list("tTfF"))
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.I), list("tTfF")
+)
 
 
 def _mapping(loader, node, deep=False):
@@ -71,8 +81,10 @@ def document(raw):
     return value
 
 
-TOKEN = re.compile(r"\s*(==|!=|&&|\|\||\(|\)|'[^']*'|true\b|false\b|"
-                   r"[A-Za-z_][A-Za-z0-9_.-]*)")
+TOKEN = re.compile(
+    r"\s*(==|!=|&&|\|\||\(|\)|'[^']*'|true\b|false\b|"
+    r"[A-Za-z_][A-Za-z0-9_.-]*)"
+)
 
 
 def condition(value, context):
@@ -109,8 +121,11 @@ def condition(value, context):
         if item in {"true", "false"}:
             return item == "true"
         if index < len(tokens) and tokens[index] == "(":
-            if (item not in {"success", "always"} or index + 1 >= len(tokens)
-                    or tokens[index + 1] != ")"):
+            if (
+                item not in {"success", "always"}
+                or index + 1 >= len(tokens)
+                or tokens[index + 1] != ")"
+            ):
                 raise ValueError("ordinary CI workflow condition function is unsupported")
             index += 2
             return True if item == "always" else context.get("prior_steps_success", UNKNOWN)
@@ -125,8 +140,11 @@ def condition(value, context):
             operator = tokens[index]
             index += 1
             right = atom()
-            return UNKNOWN if left is UNKNOWN or right is UNKNOWN else (
-                left == right if operator == "==" else left != right)
+            return (
+                UNKNOWN
+                if left is UNKNOWN or right is UNKNOWN
+                else (left == right if operator == "==" else left != right)
+            )
         return left
 
     def both():
@@ -169,12 +187,14 @@ def condition(value, context):
 
 def expand(value, context):
     if isinstance(value, str):
+
         def replace(match):
             key = match[1].strip()
             result = context.get(key, UNKNOWN)
             if result is UNKNOWN or not isinstance(result, (str, int, bool)):
                 raise ValueError("ordinary CI workflow expansion is unsupported")
             return str(result).lower() if type(result) is bool else str(result)
+
         result = re.sub(r"\$\{\{([^{}]+)\}\}", replace, value)
         if "${{" in result:
             raise ValueError("ordinary CI workflow expansion is incomplete")
@@ -190,30 +210,50 @@ def expand(value, context):
 
 def workflow_plan(raw, *, repository, branch, inputs):
     value = document(raw)
+    if value.get("defaults") or value.get("env"):
+        raise ValueError("ordinary CI workflow defaults/global environment are unsupported")
     if not isinstance(value.get("on"), dict) or "workflow_dispatch" not in value["on"]:
         raise ValueError("ordinary CI workflow has no original dispatch entry")
     jobs = value.get("jobs")
     if not isinstance(jobs, dict) or not 1 <= len(jobs) <= 16:
         raise ValueError("ordinary CI workflow job set is unsupported")
-    context = {"github.event_name": "workflow_dispatch", "github.repository": repository,
-               "github.ref": "refs/heads/" + branch, "runner.os": "Linux",
-               "runner.environment": "github-hosted", "prior_steps_success": True,
-               **{"inputs." + key: item for key, item in inputs.items()}}
+    context = {
+        "github.event_name": "workflow_dispatch",
+        "github.repository": repository,
+        "github.ref": "refs/heads/" + branch,
+        "runner.os": "Linux",
+        "runner.environment": "github-hosted",
+        "prior_steps_success": True,
+        **{"inputs." + key: item for key, item in inputs.items()},
+    }
     result = []
     for identity, job in jobs.items():
-        if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", identity)
-                or not isinstance(job, dict) or job.get("uses")):
+        if (
+            not isinstance(identity, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", identity)
+            or not isinstance(job, dict)
+            or job.get("uses")
+            or job.get("defaults")
+        ):
             raise ValueError("ordinary CI reusable job contract is unsupported")
         strategy = job.get("strategy") or {}
         if not isinstance(strategy, dict):
             raise ValueError("ordinary CI workflow strategy is unsupported")
         matrix = strategy.get("matrix") or {}
-        if (not isinstance(matrix, dict) or any(key in matrix for key in ("include", "exclude"))
-                or any(not isinstance(key, str) or not re.fullmatch(
-                    r"[A-Za-z_][A-Za-z0-9_-]*", key) for key in matrix)
-                or any(not isinstance(v, list) or not 1 <= len(v) <= 8
-                       or any(type(x) not in (str, int, bool) for x in v)
-                       for v in matrix.values())):
+        if (
+            not isinstance(matrix, dict)
+            or any(key in matrix for key in ("include", "exclude"))
+            or any(
+                not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key)
+                for key in matrix
+            )
+            or any(
+                not isinstance(v, list)
+                or not 1 <= len(v) <= 8
+                or any(type(x) not in (str, int, bool) for x in v)
+                for v in matrix.values()
+            )
+        ):
             raise ValueError("ordinary CI workflow matrix is unsupported")
         combinations = list(itertools.product(*matrix.values()))
         if len(combinations) > 16:
@@ -230,23 +270,42 @@ def workflow_plan(raw, *, repository, branch, inputs):
                 raise ValueError("ordinary CI workflow step set is unsupported")
             compiled = []
             for index, step in enumerate(steps):
-                if (not isinstance(step, dict) or not isinstance(step.get("name"), str)
-                        or ("uses" in step) == ("run" in step)):
+                if (
+                    not isinstance(step, dict)
+                    or not isinstance(step.get("name"), str)
+                    or ("uses" in step) == ("run" in step)
+                ):
                     raise ValueError("ordinary CI workflow step identity is unsupported")
                 enabled = active and condition(step.get("if"), selected)
                 # Excluded deploy/secret-bearing steps remain literal source
                 # data. No secret/environment value is read or defaulted.
-                compiled.append({"index": index, "enabled": enabled,
-                                 "source": {key: expand(item, selected) if key != "if" else item
-                                            for key, item in step.items()} if enabled else step})
+                compiled.append(
+                    {
+                        "index": index,
+                        "enabled": enabled,
+                        "source": {
+                            key: expand(item, selected) if key != "if" else item
+                            for key, item in step.items()
+                        }
+                        if enabled
+                        else step,
+                    }
+                )
             names = [step["source"]["name"] for step in compiled]
             if len(set(names)) != len(names):
                 raise ValueError("ordinary CI workflow step names are ambiguous")
-            result.append({"id": identity, "name": expand(job.get("name", identity), selected),
-                           "matrix": selection, "enabled": active,
-                           "runs_on": runner,
-                           "environment": expand(job.get("env") or {}, selected),
-                           "timeout_minutes": job.get("timeout-minutes"), "steps": compiled})
+            result.append(
+                {
+                    "id": identity,
+                    "name": expand(job.get("name", identity), selected),
+                    "matrix": selection,
+                    "enabled": active,
+                    "runs_on": runner,
+                    "environment": expand(job.get("env") or {}, selected),
+                    "timeout_minutes": job.get("timeout-minutes"),
+                    "steps": compiled,
+                }
+            )
     if len({job["name"] for job in result}) != len(result):
         raise ValueError("ordinary CI workflow job names are ambiguous")
     return result

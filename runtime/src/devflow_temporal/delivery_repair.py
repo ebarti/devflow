@@ -214,12 +214,18 @@ def current_head_ci_evidence(
         raise ValueError("current-head required CI job log is unavailable") from exc
     if len(diagnostics) != len(failed):
         raise ValueError("current-head required CI diagnostics are incomplete")
+    if result.get('execution_inventory'):
+        from .delivery_ci_inventory import validate_result
+
+        validate_result(broker.store, broker.spec['run_id'], result)
     return {
         "head": pr["head"],
         "state": result["state"],
         "failed": failed,
         "diagnostics": diagnostics,
         "diagnostics_digest": digest(diagnostics),
+        **({'execution_inventory': result['execution_inventory']}
+           if result.get('execution_inventory') else {}),
     }
 
 
