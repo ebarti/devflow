@@ -208,22 +208,42 @@ def handoff_facts(db, token, *, operation="continue_feature"):
     exact = bool(
         claim and all(claim.get(k) == token.get(k) and token.get(k) is not None for k in keys)
     )
-    workers = [
-        dict(item)
-        for item in db.execute(
-            "SELECT worker_key,generation,state FROM execution_workers "
-            "WHERE issue_id=? AND state!='finished'",
-            (issue_id,),
-        )
-    ]
-    effects = [
-        dict(item)
-        for item in db.execute(
-            "SELECT effect_key,generation,state FROM execution_effects "
-            "WHERE issue_id=? AND (state NOT IN ('complete','absent') OR result_json IS NULL)",
-            (issue_id,),
-        )
-    ]
+    workers = [dict(item) for item in db.execute(
+        "SELECT worker_key,generation,state,receipt_json FROM execution_workers WHERE issue_id=?",
+        (issue_id,))]
+    effects = [dict(item) for item in db.execute(
+        "SELECT effect_key,generation,state,result_json FROM execution_effects WHERE issue_id=?",
+        (issue_id,))]
+
+    def worker_proof(item):
+        if item["state"] in {"reserved", "running"}:
+            return False
+        if item["state"] != "finished":
+            return None
+        try:
+            receipt = json.loads(item["receipt_json"])
+        except (TypeError, ValueError):
+            return None
+        return True if isinstance(receipt, dict) and receipt.get("cleanup") == "confirmed" else None
+
+    def effect_proof(item):
+        if item["state"] == "pending":
+            return False
+        if item["state"] not in {"complete", "absent"}:
+            return None
+        try:
+            receipt = json.loads(item["result_json"])
+        except (TypeError, ValueError):
+            return None
+        return True if isinstance(receipt, dict) else None
+
+    def all_proven(values):
+        if any(value is None for value in values):
+            return None
+        return all(values)
+
+    workers_proven = all_proven([worker_proof(item) for item in workers])
+    effects_proven = all_proven([effect_proof(item) for item in effects])
     return {
         "operation": operation,
         "owner": "feature_registry",
@@ -246,13 +266,13 @@ def handoff_facts(db, token, *, operation="continue_feature"):
             },
             {
                 "code": "feature_workers_unsettled",
-                "satisfied": not workers,
+                "satisfied": workers_proven,
                 "missing_or_unknown_fact": "finished feature worker custody",
                 "next_action": "reconcile feature workers",
             },
             {
                 "code": "feature_effects_unsettled",
-                "satisfied": not effects,
+                "satisfied": effects_proven,
                 "missing_or_unknown_fact": "settled feature external effects",
                 "next_action": "reconcile feature effects",
             },

@@ -119,21 +119,70 @@ def test_revision_observes_existing_budget_without_changing_it(feature):
     assert shared.budget("feature") == before
 
 
-@pytest.mark.parametrize("state", ["pending", "unknown"])
-def test_unsettled_effect_blocks_preview_and_takeover_with_same_predicate(feature, state):
+@pytest.mark.parametrize("state,receipt,expected", [
+    ("pending", None, False), ("unknown", None, None), ("complete", None, None),
+    ("absent", None, None), ("complete", "null", None), ("complete", "{", None),
+])
+def test_unsettled_effect_blocks_preview_and_takeover_with_same_predicate(
+    feature, state, receipt, expected,
+):
     store, shared, snapshot, token = feature
     shared.intent(token, "publish:one", "publish", {"head": "abc"})
     with shared.connect() as db:
         db.execute("UPDATE execution_claims SET state='stopped' WHERE issue_id='feature'")
-        db.execute("UPDATE execution_effects SET state=? WHERE effect_key='publish:one'", (state,))
+        db.execute("UPDATE execution_effects SET state=?,result_json=? "
+                   "WHERE effect_key='publish:one'", (state, receipt))
     before = shared.budget("feature")
     preview = _observe(store)
-    assert "feature_effects_unsettled" in _codes(preview)
+    blocker = next(item for item in preview["blockers"]
+                   if item["code"] == "feature_effects_unsettled")
+    assert blocker["satisfied"] is expected
     with pytest.raises(RecoveryRefused) as failure:
         shared.claim(snapshot, "run-2", str(store.config.tracking_db), predecessor=token)
-    assert "feature_effects_unsettled" in _codes(failure.value.assessment)
-    assert shared.effect("feature", "publish:one")["state"] == state
+    blocker = next(item for item in failure.value.assessment["blockers"]
+                   if item["code"] == "feature_effects_unsettled")
+    assert blocker["satisfied"] is expected
+    with shared.connect() as db:
+        assert db.execute("SELECT state,result_json FROM execution_effects WHERE effect_key=?",
+                          ("publish:one",)).fetchone()[:] == (state, receipt)
     assert shared.budget("feature") == before
+
+
+@pytest.mark.parametrize("state,receipt,expected", [
+    ("reserved", None, False), ("running", None, False), ("unknown", None, None),
+    ("finished", None, None), ("finished", "null", None),
+    ("finished", '{"cleanup":"unknown"}', None),
+])
+def test_unsettled_worker_blocks_preview_and_takeover_with_same_predicate(
+    feature, state, receipt, expected,
+):
+    store, shared, snapshot, token = feature
+    shared.reserve_worker(token, "worker-1", "stream-1")
+    with shared.connect() as db:
+        db.execute("UPDATE execution_claims SET state='stopped' WHERE issue_id='feature'")
+        db.execute("UPDATE execution_workers SET state=?,receipt_json=? "
+                   "WHERE worker_key='worker-1'", (state, receipt))
+    before = shared.budget("feature")
+    preview = _observe(store)
+    blocker = next(item for item in preview["blockers"]
+                   if item["code"] == "feature_workers_unsettled")
+    assert blocker["satisfied"] is expected
+    with pytest.raises(RecoveryRefused) as failure:
+        shared.claim(snapshot, "run-2", str(store.config.tracking_db), predecessor=token)
+    blocker = next(item for item in failure.value.assessment["blockers"]
+                   if item["code"] == "feature_workers_unsettled")
+    assert blocker["satisfied"] is expected
+    assert shared.budget("feature") == before
+
+
+def test_confirmed_worker_receipt_remains_eligible_for_exact_takeover(feature):
+    store, shared, snapshot, token = feature
+    shared.reserve_worker(token, "worker-1", "stream-1")
+    shared.finish_worker(token, "worker-1", {"cleanup": "confirmed"})
+    shared.stop(token, "stop-1", {})
+    assert "feature_workers_unsettled" not in _codes(_observe(store))
+    successor = shared.claim(snapshot, "run-2", str(store.config.tracking_db), predecessor=token)
+    assert successor["generation"] == token["generation"] + 1
 
 
 def test_historical_absent_effect_and_identical_successor_replay(feature):

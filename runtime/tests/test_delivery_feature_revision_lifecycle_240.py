@@ -187,7 +187,8 @@ def test_public_reconsideration_without_workers_is_read_only(native_configuratio
 
     fixture, command, *_ = _genuine_fixture(native_configuration, monkeypatch, tmp_path,
                                             retain_kind=None)
-    store, spec, shared, record, *_ = fixture
+    store, spec, shared, _, _, _, prior, *_ = fixture
+    record = prior["record"]
     closed = _closed_revision_fixture(store, spec["run_id"])
     monkeypatch.setattr("devflow_temporal.delivery_feature_closure.closed_coordinator",
                         lambda *_a, **_kw: deepcopy(closed))
