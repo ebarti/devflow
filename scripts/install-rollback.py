@@ -275,7 +275,7 @@ def restore_checkout(previous):
         subprocess.run(["git", "-C", str(source), "checkout", "--detach", previous["head"]], check=True)
 
 
-def backup_directory(codex):
+def backup_anchor(codex):
     anchor = codex if codex.exists() else codex.parent
     while True:
         while not anchor.exists():
@@ -288,6 +288,11 @@ def backup_directory(codex):
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
             raise ValueError("backup parent must be owned and protected: " + str(anchor))
         break
+    return anchor
+
+
+def backup_directory(codex):
+    anchor = backup_anchor(codex)
     directory = Path(tempfile.mkdtemp(prefix="devflow-install-rollback-", dir=anchor))
     directory.chmod(0o700)
     sync_directories(anchor, directory)
