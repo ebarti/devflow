@@ -578,6 +578,22 @@ def native_binding(spec, carrier):
             "state_dir": carrier["state_dir"], "identity": carrier["identity"]}
 
 
+def observed_native_binding(spec):
+    """Read an existing writer witness without creating or granting custody."""
+    if spec.get("workspace_custody_version") != 1:
+        return None
+    canonical, path, identity = _witness(spec)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if (_identity(os.fstat(descriptor)) != identity
+                or _identity(path.lstat()) != identity):
+            raise ValueError("native writer observation witness changed")
+        return {"schema": "devflow-native-writer-binding-v1", "run_id": canonical["run_id"],
+                "state_dir": canonical["state_dir"], "identity": identity}
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def native_guard(spec, carrier):
     """Keep an independent trusted monitor description away from provider tools."""

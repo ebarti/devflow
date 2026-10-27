@@ -488,6 +488,8 @@ def native_sha_case(api_fixture):
     raw["repositories"]["fixture"].update(
         base_ref=sha,
         checks=[{"id": "local", "argv": ["/usr/bin/true"]}],
+        readiness={"version": 1, "generation": 0, "browser_engines": [],
+                   "temporal_checks": []},
         prepublish_checks=[{"id": "prepublish", "argv": ["/usr/bin/true"]}],
         required_ci=["ci"],
         project_url="https://github.com/users/example/projects/1",

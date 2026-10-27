@@ -158,16 +158,19 @@ def test_internal_automatic_admission_cannot_bypass_exhausted_budget(service, ar
     store = configured(store, max_attempts=1)
     store.submit(request)
     finish(store, request, archived=archived)
-    successor = next_request(request, 2)
+    successor = next_request(request, 2, work_id=request['work_id'],
+                             supersedes_run_id=request['run_id'])
     with store._connect() as db:
         predecessor = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
                                       (request['run_id'],)).fetchone())
+        original_work = store.state.row(db, 'works', request['work_id'])
     with pytest.raises(ValueError, match='issue attempt budget'):
         store.submit(successor, _automatic={'row': predecessor})
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
         assert db.execute('SELECT COUNT(*) FROM delivery_outbox').fetchone()[0] == 1
-        assert store.state.row(db, 'works', successor['work_id']) is None
+        assert store.state.row(db, 'works', successor['work_id']) == original_work
+        assert store.state.claim_for(db, request['work_id']) is None
 
 
 def test_reloading_configuration_does_not_extend_an_admitted_repair_limit(service):

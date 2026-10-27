@@ -244,6 +244,10 @@ def _native_rejected_fixture(native_configuration, monkeypatch, *, prior_cycles=
             "run_id": child["run_id"], "chunk_id": chunk["id"], "kind": kind,
             "store_path": str(store.config.tracking_db),
         })
+        from devflow_temporal.delivery_workspace_custody import ensure_owner
+
+        # The real activity admits this owner before the broker observes it.
+        ensure_owner(child)
         broker = DeliveryBroker(store, child)
         broker.prepare()
         candidate = broker.candidate()
