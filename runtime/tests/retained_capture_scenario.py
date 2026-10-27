@@ -577,6 +577,60 @@ def capture(root, mode):
     print(json.dumps({"state": "captured", "rows_unchanged": True, "histories": 2}))
 
 
+def helper_compatibility_refusals(root, config, supplied, request):
+    """A valid public migration cannot turn its legacy DB grant into allocation."""
+    import shutil
+
+    from devflow_temporal import delivery_runtime_installation as installation
+    from devflow_temporal import delivery_runtime_location as location
+
+    inputs = installation.bootstrap_inputs(config, supplied)
+    database = config.tracking_db
+    retained = root / "retained-compatibility-database.sqlite3"
+    for mode in ("missing", "replacement", "alias"):
+        with location.bootstrap(config, inputs):
+            database.rename(retained)
+            try:
+                if mode == "replacement":
+                    shutil.copyfile(retained, database)
+                    database.chmod(0o600)
+                elif mode == "alias":
+                    database.symlink_to(retained)
+                for entry in (location.helper_path, location.require_not_pending):
+                    refusal = ("another original owner/transport" if mode == "alias"
+                               else "legacy helper compatibility")
+                    with pytest.raises(ValueError, match=refusal):
+                        entry(config)
+                if mode == "missing":
+                    assert not database.exists()  # Neither entry recreated the DB.
+            finally:
+                database.unlink(missing_ok=True)
+                retained.rename(database)
+    # Even an existing owned namespace DB cannot consume this legacy profile.
+    namespace = Path.home() / ".local/state/devflow/namespaces" / ("a" * 32)
+    namespace.mkdir(mode=0o700, parents=True)
+    namespace_db = namespace / "tracking.sqlite3"
+    try:
+        shutil.copyfile(database, namespace_db)
+        namespace_db.chmod(0o600)
+        changed = DeliveryConfig._from_raw(
+            config.path, {**config.raw, "tracking_db": str(namespace_db)}
+        )
+        with pytest.raises(ValueError, match="canonical non-namespace DB"):
+            installation.bootstrap_inputs(changed, supplied)
+    finally:
+        namespace_db.unlink(missing_ok=True)
+        namespace.rmdir()
+    # A different real historical helper is not appointed by a caller's baseline.
+    unknown = {**supplied, "baseline_revision": "6c94df10a6b9f9298eeffd6ba8c215fbade7ff06"}
+    refused_request = request.with_name("unreviewed-helper-request.json")
+    write_private(refused_request, unknown)
+    refused = fixture.control(
+        config, "runtime-location-preflight", refused_request, success=False
+    )
+    assert "changed the original shared state helper/schema" in refused
+
+
 def install(root):
     case = fixture.restored(root)
     config = DeliveryConfig.load(Path(case.owner))
@@ -585,16 +639,6 @@ def install(root):
     assert rows == captured["rows"]
     request = Path(captured["migration"])
     original_capture_input = (request, request.read_bytes())
-    archived = Path(captured["response"]["receipt"]).parent / "owner-before.json"
-    original_archive = archived.read_bytes()
-    try:
-        archived.write_bytes(original_archive + b" ")
-        with pytest.raises(SystemExit) as rejected:
-            public(config, "runtime-location-preflight", request=request)
-        assert rejected.value.code == 1
-    finally:
-        archived.write_bytes(original_archive)
-    assert fixture.original_rows(config) == rows
     # Preserve the original capture input/proposal/ACK. A later compatible
     # migration names current source and the original package witness separately.
     supplied = read_private(request)
@@ -613,8 +657,21 @@ def install(root):
     }
     request = config.state_root / "operator-inputs/after-capture-package-v1.json"
     write_private(request, supplied)
+    # Use the current authenticated proposal: the historical capture proposal
+    # would refuse at exact-source identity before examining this archive.
+    archived = Path(captured["response"]["receipt"]).parent / "owner-before.json"
+    original_archive = archived.read_bytes()
+    try:
+        archived.write_bytes(original_archive + b" ")
+        refused = fixture.control(config, "runtime-location-preflight", request, success=False)
+        assert "snapshot closure original input archive changed" in refused
+    finally:
+        archived.write_bytes(original_archive)
+    assert fixture.original_rows(config) == rows
     preflight = fixture.control(config, "runtime-location-preflight", request)
     assert len(preflight["authority"]["runs"]) == 6
+    helper_compatibility_refusals(root, config, supplied, request)
+    assert fixture.original_rows(config) == rows
     supplied = read_private(request)
     supplied["expected_evidence_sha256"] = preflight["expected_evidence_sha256"]
     write_private(request, supplied)

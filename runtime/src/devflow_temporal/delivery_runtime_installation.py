@@ -64,6 +64,67 @@ BASE_FIELDS = {
 MEASURED_PATHS = {"codex_bin", "protected_commands", "runtime_payload_sha256"}
 ROW_METADATA = {"revision", "updated_at", "tracker_json"}
 
+# Reviewed forward-only changes: extract the unchanged claim validation, then
+# guard fresh namespace connections. Neither changes an existing legacy DB's
+# connect/claim behavior, and both retain the exact original schema.
+_LEGACY_STATE = "22fb07e05bd11d788437fbb0f2a5ae306adeda97e369c8ccf322e01e9b4c7992"
+_CLAIM_STATE = "426b99939f1d814c53d34666494f91b58c177e13ef1d3325bca8d8b268e46e33"
+_NAMESPACE_STATE = "a314be0cc592816f503680ffbdf9b7a78f021234c4af5126585320a7426bd68a"
+_LEGACY_SCHEMA = "ac0a0794e44581e67e5b90039cb9870ce985ef9ab15520e153d09b2440073fce"
+_LEGACY_HELPER_PAIRS = {
+    (_LEGACY_STATE, _CLAIM_STATE),
+    (_LEGACY_STATE, _NAMESPACE_STATE),
+    (_CLAIM_STATE, _NAMESPACE_STATE),
+}
+
+
+def _legacy_database(config, *, descriptor=None):
+    """Observe an existing legacy inode; never create or enroll a namespace."""
+    path = config.tracking_db
+    namespace = Path.home().resolve(strict=True) / ".local/state/devflow/namespaces"
+    try:
+        resolved = path.resolve(strict=True)
+        if (not path.is_absolute() or path != resolved
+                or path.is_relative_to(namespace) or resolved.is_relative_to(namespace)):
+            raise ValueError("legacy helper compatibility requires a canonical non-namespace DB")
+        opened = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ValueError("legacy helper compatibility requires an existing owned DB") from exc
+    try:
+        before, named = os.fstat(opened), path.lstat()
+        fields = ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink")
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                or any(getattr(before, key) != getattr(named, key) for key in fields)
+                or path.resolve(strict=True) != path):
+            raise ValueError("legacy helper compatibility DB custody changed")
+        if descriptor is not None:
+            held = os.fstat(descriptor)
+            if any(getattr(before, key) != getattr(held, key) for key in fields):
+                raise ValueError("legacy helper compatibility DB generation changed")
+        return {
+            "path": str(path), "namespace": str(namespace),
+            "device": before.st_dev, "inode": before.st_ino,
+            "uid": before.st_uid, "mode": stat.S_IMODE(before.st_mode),
+            "links": before.st_nlink,
+        }
+    finally:
+        os.close(opened)
+
+
+def verify_helper_compatibility(config, profile, *, descriptor=None):
+    """Recheck the reviewed pair and the same legacy inode at every bootstrap use."""
+    from .delivery_runtime_registrations import _read
+
+    if ((profile["old_state_sha256"], profile["state_sha256"])
+            not in _LEGACY_HELPER_PAIRS or profile["schema_sha256"] != _LEGACY_SCHEMA):
+        raise ValueError("unreviewed legacy shared helper compatibility profile")
+    root = source_root() / "skills/devflow/scripts"
+    if (hashlib.sha256(_read(root / "state.py")).hexdigest() != profile["state_sha256"]
+            or hashlib.sha256(_read(root / "schema.sql")).hexdigest() != _LEGACY_SCHEMA
+            or _legacy_database(config, descriptor=descriptor) != profile["database"]):
+        raise ValueError("legacy helper compatibility source or DB custody changed")
+
 
 def _hash(path):
     path = Path(path)
@@ -612,23 +673,35 @@ def bootstrap_inputs(config, supplied):
         raise ValueError(
             "permanent owner proposal may change only its acknowledged bundled CLI path"
         )
-    for name in ("state.py", "schema.sql"):
-        from .delivery_feature_review_context import _git as git_bytes
+    from .delivery_feature_review_context import _git as git_bytes
+    from .delivery_runtime_registrations import _read
 
-        old = git_bytes(
+    previous, actual = {}, {}
+    for name in ("state.py", "schema.sql"):
+        previous[name] = hashlib.sha256(git_bytes(
             root, "show", supplied["baseline_revision"] + ":skills/devflow/scripts/" + name
-        )
-        actual = (root / "skills/devflow/scripts" / name).read_bytes()
-        if old != actual:
+        )).hexdigest()
+        actual[name] = hashlib.sha256(_read(root / "skills/devflow/scripts" / name)).hexdigest()
+    compatibility = None
+    if previous != actual:
+        if ((previous["state.py"], actual["state.py"]) not in _LEGACY_HELPER_PAIRS
+                or previous["schema.sql"] != _LEGACY_SCHEMA
+                or actual["schema.sql"] != _LEGACY_SCHEMA):
             raise ValueError(
                 "permanent installation changed the original shared state helper/schema"
             )
+        compatibility = {
+            "old_state_sha256": previous["state.py"],
+            "state_sha256": actual["state.py"], "schema_sha256": _LEGACY_SCHEMA,
+            "database": _legacy_database(config),
+        }
     return {
         "helpers_dir": before_raw["helpers_dir"],
         "before": original,
         "after": after,
         "proposed": proposed,
         "folder": folder,
+        **({"helper_compatibility": compatibility} if compatibility else {}),
     }
 
 
@@ -908,7 +981,11 @@ def _authority(config, supplied, inputs, leases, *, service_descriptor, read_onl
         helpers_dir=inputs["helpers_dir"],
         transport=_transport(config),
         registrations=registrations,
+        **({"helper_compatibility": inputs["helper_compatibility"]}
+           if "helper_compatibility" in inputs else {}),
     )
+    if "helper_compatibility" in inputs:
+        verify_helper_compatibility(config, inputs["helper_compatibility"])
     from .delivery_runtime_service_guard import describe
 
     authority["service_guard"] = describe(config, supplied["command_id"], service_descriptor)
@@ -1152,6 +1229,8 @@ def _rows_current(store, receipt, db):
     from .delivery_native_renewal import _old_proof
     from .delivery_policy_recovery import work_binding
 
+    if "helper_compatibility" in receipt:
+        verify_helper_compatibility(store.config, receipt["helper_compatibility"])
     _stopped(store.config)
     if _native_inputs(store, db) != receipt["native_inputs"]:
         raise ValueError("installation has a new or changed native execution input")
@@ -1376,6 +1455,8 @@ def apply(config, supplied):
         )
         if receipt and receipt["command"] != supplied:
             raise ValueError("installation command ID already belongs to different authority")
+        if receipt and receipt.get("helper_compatibility") != inputs.get("helper_compatibility"):
+            raise ValueError("installation legacy helper compatibility custody changed")
         if receipt:
             sealed_objects(receipt)
             if reversed_reference(config, reference):
@@ -1543,6 +1624,8 @@ def rollback(config, supplied):
         or receipt.get("owner_path") != str(config.path)
     ):
         raise ValueError("rollback has no exact original installation receipt")
+    if receipt.get("helper_compatibility") != inputs.get("helper_compatibility"):
+        raise ValueError("rollback legacy helper compatibility custody changed")
     sealed_objects(receipt)
     with (
         installation_recovery_lease(config, exclusive=True),

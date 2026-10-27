@@ -435,13 +435,25 @@ def compatible_owner(spec, frozen, live):
     return before == after
 
 
-def helper_path(config, *, read_only=False):
+def _bootstrap_scope(config):
     boot = _BOOTSTRAP.get()
-    if (
-        boot
-        and _transport(config) == boot["transport"]
-        and (str(config.helpers_dir) == boot["helpers_dir"])
-    ):
+    if boot is None:
+        return None
+    if (_transport(config) != boot["transport"]
+            or str(config.helpers_dir) != boot["helpers_dir"]
+            or str(config.path) != boot["owner_path"]):
+        raise ValueError("installation bootstrap belongs to another original owner/transport")
+    if "helper_compatibility" in boot:
+        from .delivery_runtime_installation import verify_helper_compatibility
+
+        verify_helper_compatibility(
+            config, boot["helper_compatibility"], descriptor=boot["database_descriptor"]
+        )
+    return boot
+
+
+def helper_path(config, *, read_only=False):
+    if _bootstrap_scope(config):
         return source_root() / "skills/devflow/scripts/state.py"
     from .delivery_runtime_service_guard import GuardCustodyError
 
@@ -476,7 +488,7 @@ def helper_path(config, *, read_only=False):
 
 def require_not_pending(config):
     """A new-code writer cannot pass a staged, unacknowledged location intent."""
-    if _BOOTSTRAP.get():
+    if _bootstrap_scope(config):
         return
     pending = config.state_root / "runtime-installations/pending.json"
     if not os.path.lexists(pending):
@@ -510,7 +522,7 @@ def require_not_pending(config):
 
 def require_ready(config):
     """Fence execution-critical new code; this does not fence old tracker writers."""
-    if _BOOTSTRAP.get():
+    if _bootstrap_scope(config):
         return
     require_not_pending(config)
     pending = config.state_root / "runtime-installations/pending.json"
@@ -574,10 +586,19 @@ def validate_destination(expected, original, *, strict_source=True, installed_id
 @contextmanager
 def bootstrap(config, authenticated):
     """Only the public installation owner supplies already authenticated inputs."""
-    token = _BOOTSTRAP.set(
-        {"transport": _transport(config), "helpers_dir": authenticated["helpers_dir"]}
-    )
+    value = {"transport": _transport(config), "helpers_dir": authenticated["helpers_dir"],
+             "owner_path": str(config.path)}
+    descriptor = None
+    if "helper_compatibility" in authenticated:
+        descriptor = os.open(config.tracking_db, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        value.update(helper_compatibility=deepcopy(authenticated["helper_compatibility"]),
+                     database_descriptor=descriptor)
+    token = _BOOTSTRAP.set(value)
     try:
+        _bootstrap_scope(config)
         yield
+        _bootstrap_scope(config)
     finally:
         _BOOTSTRAP.reset(token)
+        if descriptor is not None:
+            os.close(descriptor)
