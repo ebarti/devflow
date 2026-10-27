@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 
 import pytest
-from test_delivery_pause_intake import controlled_no_start
+from test_delivery_pause_intake import begin_intake_settlement, controlled_no_start
 from test_delivery_pause_intake import unstarted as source_unstarted
 from test_delivery_store import service as service
 
@@ -21,7 +21,7 @@ def test_intake_snapshot_rejects_aba_between_observation_and_fence(unstarted, mo
     store, spec, row = unstarted
     root = spec["run_id"]
     pause.request_pause(store, root, "pause", 0, intake_only=True)
-    pause.begin_settlement(store, root, 1)
+    begin_intake_settlement(store, root)
     if action == "activate":
         intake.seal_unstarted(
             store, root, 1, row["revision"], prove_unstarted=controlled_no_start(store)
@@ -62,7 +62,7 @@ def test_intake_capture_and_hash_do_not_run_under_root(unstarted, monkeypatch, a
     store, spec, row = unstarted
     root = spec["run_id"]
     pause.request_pause(store, root, "pause", 0, intake_only=True)
-    pause.begin_settlement(store, root, 1)
+    begin_intake_settlement(store, root)
     if action == "activate":
         intake.seal_unstarted(
             store, root, 1, row["revision"], prove_unstarted=controlled_no_start(store)
@@ -106,7 +106,7 @@ def test_intake_seal_replays_same_receipt_before_and_after_paused(unstarted):
     store, spec, row = unstarted
     root = spec["run_id"]
     pause.request_pause(store, root, "pause", 0, intake_only=True)
-    pause.begin_settlement(store, root, 1)
+    begin_intake_settlement(store, root)
     receipt = intake.seal_unstarted(
         store, root, 1, row["revision"], prove_unstarted=controlled_no_start(store)
     )

@@ -43,9 +43,6 @@ def initialize(db):
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pause_commands (
         command_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, request_digest TEXT NOT NULL,
         response_json TEXT NOT NULL)""")
-    db.execute("""CREATE TABLE IF NOT EXISTS delivery_pause_notifications (
-        root_id TEXT NOT NULL, revision INTEGER NOT NULL, state TEXT NOT NULL,
-        PRIMARY KEY(root_id, revision))""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pause_steps (
         root_id TEXT NOT NULL, operation_key TEXT NOT NULL, step TEXT NOT NULL,
         epoch INTEGER NOT NULL, workflow_id TEXT NOT NULL, execution_run_id TEXT NOT NULL,
@@ -130,12 +127,6 @@ def root_mutex(store, root_id):
         os.close(fd)
 
 
-def _notice(db, root_id):
-    row = _row(db, root_id)
-    db.execute("INSERT OR IGNORE INTO delivery_pause_notifications VALUES (?, ?, 'pending')",
-               (root_id, row["revision"]))
-
-
 def _row(db, root_id):
     row = db.execute("SELECT * FROM delivery_pause_control WHERE root_id=?", (root_id,)).fetchone()
     if row is None:
@@ -182,27 +173,7 @@ def request_pause(store, root_id, command_id, expected_revision, *, intake_only=
                     "epoch": epoch}
         db.execute("INSERT INTO delivery_pause_commands VALUES (?, ?, ?, ?)",
                    (command_id, root_id, request_digest, canonical_json(response)))
-        db.execute("INSERT INTO delivery_pause_notifications VALUES (?, ?, 'pending')",
-                   (root_id, revision))
         return response
-
-
-def begin_settlement(store, root_id, epoch):
-    """Record that the fenced owner is observing its in-flight work."""
-    _epoch(epoch)
-    with root_mutex(store, root_id), store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = _row(db, root_id)
-        if row["epoch"] != epoch:
-            raise ValueError("pause epoch changed")
-        if row["state"] == "pausing":
-            return row
-        if row["state"] != "pause_requested":
-            raise ValueError("pause is not awaiting settlement")
-        db.execute("""UPDATE delivery_pause_control SET state='pausing', revision=revision+1,
-                      updated_at=? WHERE root_id=?""", (_now(), root_id))
-        _notice(db, root_id)
-        return _row(db, root_id)
 
 
 def publish_paused(store, root_id, epoch):
@@ -220,7 +191,6 @@ def publish_paused(store, root_id, epoch):
                    (root_id, epoch, stamp))
         db.execute("""UPDATE delivery_pause_control SET state='paused', revision=revision+1,
                       updated_at=? WHERE root_id=?""", (stamp, root_id))
-        _notice(db, root_id)
         return _row(db, root_id)
 
 
@@ -257,8 +227,6 @@ def begin_resume(store, root_id, command_id, expected_revision, epoch):
                     "epoch": epoch}
         db.execute("INSERT INTO delivery_pause_commands VALUES (?, ?, ?, ?)",
                    (command_id, root_id, request_digest, canonical_json(response)))
-        db.execute("INSERT INTO delivery_pause_notifications VALUES (?, ?, 'pending')",
-                   (root_id, revision))
         return response
 
 

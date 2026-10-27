@@ -73,7 +73,6 @@ def _begin(store, root_id, selected):
         pause.require_no_expiry(db, root_id, selected['epoch'])
         db.execute("""UPDATE delivery_pause_control SET state='pausing', revision=revision+1,
             updated_at=? WHERE root_id=?""", (pause._now(), root_id))
-        pause._notice(db, root_id)
         return pause._row(db, root_id)
 
 

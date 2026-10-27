@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from temporal_test_server import local_temporal
 from temporalio.client import Client
+from test_delivery_pause_intake import begin_intake_settlement
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_pause as pause
@@ -49,7 +50,7 @@ async def test_exact_sdk_no_start_pause_then_explicit_same_run_dispatch(service,
             revision = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
                                   (root,)).fetchone()[0]
         pause.request_pause(store, root, "sdk-intake-pause", 0, intake_only=True)
-        pause.begin_settlement(store, root, 1)
+        begin_intake_settlement(store, root)
         other = await Client.connect(store.config.temporal_address, namespace="wrong-namespace")
         with pytest.raises(ValueError, match="endpoint or namespace changed"):
             await intake.seal_with_sdk(store, root, 1, revision, client=other)
@@ -124,7 +125,7 @@ async def test_sdk_no_start_proof_refuses_an_existing_selected_workflow(service,
             revision = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
                                   (root,)).fetchone()[0]
         pause.request_pause(store, root, "pause-before-observation", 0, intake_only=True)
-        pause.begin_settlement(store, root, 1)
+        begin_intake_settlement(store, root)
         # No worker is connected: this owned foreign execution cannot run a role.
         await environment.client.start_workflow(
             DeliveryWorkflow.run, args=[spec, None], id="delivery-" + root,

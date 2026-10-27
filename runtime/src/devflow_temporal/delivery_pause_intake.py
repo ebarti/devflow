@@ -182,7 +182,6 @@ def seal_unstarted(store, root_id, epoch, expected_revision, *, prove_unstarted)
                 db.execute("""UPDATE delivery_pause_control SET checkpoint_json=?,
                     revision=revision+1,updated_at=? WHERE root_id=?""",
                     (encoded_receipt, pause._now(), root_id))
-                pause._notice(db, root_id)
                 db.commit()
                 return receipt
 
@@ -209,7 +208,6 @@ def activate_unstarted(store, root_id, epoch, expected_revision, *, prove_unstar
                     WHERE root_id=? AND state='running'""", (root_id,))
                 db.execute("""UPDATE delivery_pause_control SET state='running',revision=revision+1,
                     updated_at=? WHERE root_id=?""", (stamp, root_id))
-                pause._notice(db, root_id)
                 result = pause._row(db, root_id)
                 db.commit()
                 return result

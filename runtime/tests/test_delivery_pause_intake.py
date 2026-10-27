@@ -15,6 +15,15 @@ from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workspace_custody import source_for
 
 
+def begin_intake_settlement(store, root):
+    """Run the same selected-owner transition used by the production pump."""
+    from devflow_temporal.delivery_pause_intake_pump import _begin, _selected
+
+    selected = _selected(store, root)
+    assert selected is not None and selected["epoch"] == 1
+    assert _begin(store, root, selected)["state"] == "pausing"
+
+
 def controlled_no_start(store):
     """The real SDK observation is exercised in the separate Temporal fixture."""
     def validate(db, spec, control):
@@ -64,7 +73,7 @@ def test_unstarted_checkpoint_preserves_claim_outbox_and_owned_source(unstarted)
     store, spec, row = unstarted
     root = spec["run_id"]
     pause.request_pause(store, root, "pause-intake", 0, intake_only=True)
-    pause.begin_settlement(store, root, 1)
+    begin_intake_settlement(store, root)
     with pytest.raises(ValueError, match="no-start outcome is not proven"):
         intake.seal_unstarted(store, root, 1, row["revision"], prove_unstarted=lambda *_: False)
     with store._connect() as db:
@@ -114,7 +123,7 @@ def test_intake_resume_refuses_changed_outbox_or_boolean_revision(unstarted):
     store, spec, row = unstarted
     root = spec["run_id"]
     pause.request_pause(store, root, "pause-intake", 0, intake_only=True)
-    pause.begin_settlement(store, root, 1)
+    begin_intake_settlement(store, root)
     with pytest.raises(ValueError, match="run revision"):
         intake.seal_unstarted(store, root, 1, True, prove_unstarted=controlled_no_start(store))
     intake.seal_unstarted(store, root, 1, row["revision"],

@@ -1,5 +1,6 @@
 """Owned dispatcher custody tests: no Temporal or provider is contacted."""
 import asyncio
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -106,6 +107,11 @@ async def test_actual_dispatcher_retains_lease_during_readback_and_failure_ack(
     from devflow_temporal import delivery_pause_namespace
 
     store, spec, item = fixture(tmp_path)
+    from devflow_temporal import delivery_execution_authority
+
+    spec["execution_authority_version"] = 1
+    monkeypatch.setattr(delivery_execution_authority, "reserve",
+                        lambda *_args: {"start_spec_json": json.dumps(spec)})
     # Controlled installation seam; this test exercises dispatcher custody only.
     monkeypatch.setattr(delivery_pause_namespace, "intake_namespace_scope", lambda _: nullcontext())
     entered, release = asyncio.Event(), asyncio.Event()
@@ -190,3 +196,18 @@ async def test_dispatch_preflight_does_not_record_after_pause(tmp_path, monkeypa
     monkeypatch.setattr(delivery_api, "execution_retired", lambda _spec: False)
     await delivery_api.DeliveryService.dispatch_once(SimpleNamespace(store=store))
     assert calls == []
+
+
+def test_dispatch_custody_requires_live_scope_and_unchanged_inventory(tmp_path):
+    store, spec, _item = fixture(tmp_path)
+    custody = PauseWriterCustody(store, spec)
+    with store._connect() as db, pytest.raises(ValueError, match="inventory changed"):
+        custody.verify(db)
+    with custody:
+        with store._connect() as db:
+            db.execute("INSERT INTO delivery_pause_dispatch_leases VALUES "
+                       "('root','delivery-root',1,'{}',1,'new-owner')")
+        with store._connect() as db, pytest.raises(ValueError, match="inventory changed"):
+            custody.verify(db)
+    with store._connect() as db, pytest.raises(ValueError, match="inventory changed"):
+        custody.verify(db)
