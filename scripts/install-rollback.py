@@ -43,7 +43,7 @@ def exchange(left, right):
         raise OSError(error, os.strerror(error), str(right))
 
 
-def identity(path, *, saved=None):
+def identity(path, *, saved=None, maximum=None):
     if not os.path.lexists(path):
         return {"type": "absent"}
     info = path.lstat()
@@ -51,8 +51,8 @@ def identity(path, *, saved=None):
     if path.is_symlink():
         result.update(type="link", target=os.readlink(path))
     elif stat.S_ISREG(info.st_mode):
-        if info.st_size > MAX_OBJECT_BYTES:
-            raise ValueError("installer object exceeds its bounded 4 MiB snapshot: " + str(path))
+        if maximum is not None and info.st_size > maximum:
+            raise ValueError("installer object exceeds its explicit snapshot bound: " + str(path))
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             fields = ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink",
@@ -62,11 +62,25 @@ def identity(path, *, saved=None):
             if tuple(getattr(opened, field) for field in fields) != observation:
                 raise ValueError("installer path changed while reading: " + str(path))
             info = opened
-            raw = stream.read(info.st_size + 1)
+            if saved is not None:
+                raw = stream.read(info.st_size + 1)
+                count = len(raw)
+                sha = hashlib.sha256(raw).hexdigest()
+            else:
+                # Observation does not need a second in-memory copy of a large
+                # existing hooks/agent file. Capture retains its legacy format.
+                whole, count = hashlib.sha256(), 0
+                while count <= info.st_size:
+                    chunk = stream.read(min(1024 * 1024, info.st_size - count + 1))
+                    if not chunk:
+                        break
+                    whole.update(chunk)
+                    count += len(chunk)
+                sha = whole.hexdigest()
             after = os.fstat(stream.fileno())
-            if len(raw) != info.st_size or tuple(getattr(after, field) for field in fields) != observation:
+            if count != info.st_size or tuple(getattr(after, field) for field in fields) != observation:
                 raise ValueError("installer file changed while reading: " + str(path))
-            result.update(type="file", sha256=hashlib.sha256(raw).hexdigest(),
+            result.update(type="file", sha256=sha,
                           version=[info.st_nlink, info.st_size, info.st_mtime_ns])
             if saved is not None:
                 saved.update(bytes=base64.b64encode(raw).decode(), mode=stat.S_IMODE(info.st_mode))

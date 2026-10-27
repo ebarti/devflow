@@ -195,7 +195,7 @@ m.effect(backup,target,stage)
         self.assertIn("sync-parent", events[moved_at:deleted])
         self.assertIn("sync-backup", events[deleted + 1:])
 
-    def test_oversized_snapshot_object_is_refused_before_opening_its_content(self):
+    def test_explicit_snapshot_bound_refuses_before_opening_oversized_content(self):
         target = self.home / "oversized"
         with target.open("wb") as stream:
             stream.truncate(self.rollback.MAX_OBJECT_BYTES + 1)
@@ -207,9 +207,30 @@ m.effect(backup,target,stage)
             return opened(path, *args, **kwargs)
 
         with mock.patch.object(os, "open", no_content):
-            with self.assertRaisesRegex(ValueError, "bounded 4 MiB snapshot"):
-                self.rollback.identity(target, saved={})
+            with self.assertRaisesRegex(ValueError, "explicit snapshot bound"):
+                self.rollback.identity(target, saved={}, maximum=self.rollback.MAX_OBJECT_BYTES)
         self.assertEqual(target.stat().st_size, self.rollback.MAX_OBJECT_BYTES + 1)
+
+    def test_large_valid_legacy_hooks_capture_and_restore_preserve_every_byte(self):
+        target = self.home / "hooks.json"
+        raw = b'{"hooks": {}}' + b" " * (self.rollback.MAX_OBJECT_BYTES + 1)
+        target.write_bytes(raw)
+        self.assertEqual(json.loads(raw), {"hooks": {}})
+        observed = self.rollback.identity(target)
+        self.assertEqual(observed["sha256"], hashlib.sha256(raw).hexdigest())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.rollback.capture(self.source, self.skills, self.home)
+        backup = Path(output.getvalue().strip())
+        self.addCleanup(shutil.rmtree, backup, True)
+        saved = json.loads((backup / "snapshot.json").read_text())[str(target)]
+        self.assertEqual(base64.b64decode(saved["bytes"]), raw)
+        stage = self.home / "replacement-hooks"
+        stage.write_bytes(b'{"hooks": {"requested": []}}')
+        self.rollback.effect(backup, target, stage)
+        self.rollback.restore(backup)
+        self.assertEqual(target.read_bytes(), raw)
+        self.assertFalse(backup.exists())
 
     def test_native_exchange_preserves_foreign_pointer_swapped_at_boundary(self):
         exchange = self.rollback.exchange
