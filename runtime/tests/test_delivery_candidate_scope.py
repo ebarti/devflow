@@ -125,6 +125,12 @@ def native_completion_diagnostic(state_dir, attempt, result):
     def choice(value, allowed):
         return value if isinstance(value, str) and value in allowed else 'other'
 
+    def boolean(value):
+        return value if type(value) is bool else None
+
+    def exit_code(value):
+        return value if type(value) is int and -255 <= value <= 255 else None
+
     states = {'starting', 'running', 'unknown', 'finished', 'confirmed', 'blocked',
               'pass', 'recovery_unknown', 'observed-native-confirmed'}
     reasons = {'native monitoring/provider outcome ambiguous', 'native prelaunch identity gap',
@@ -151,13 +157,20 @@ def native_completion_diagnostic(state_dir, attempt, result):
         'activity_cleanup': choice(result.get('cleanup'), states),
         'activity_reason': choice(result.get('summary'), reasons),
         'native_journal': journal_state,
-        'native_phase': choice(journal.get('phase'), {'allocated', 'running', 'finished'}),
-        'monitoring_complete': journal.get('monitoring_complete') is True,
+        'native_phase': choice(journal.get('phase'),
+                               {'allocated', 'authorized', 'finished', 'unknown'}),
+        'monitoring_complete': boolean(journal.get('monitoring_complete')),
+        'native_state': choice(native.get('state'), {'finished', 'unknown'}),
         'native_cleanup': choice(native.get('cleanup'), states),
         'native_provider_outcome': choice(native.get('provider_outcome'),
                                          {'not_started', 'unknown'}),
-        'observed_owned_stopped': native.get('observed_owned_stopped') is True,
-        'owned_ports_clear': native.get('owned_ports_clear') is True,
+        'native_exit_code': exit_code(native.get('exit_code')),
+        'timed_out': boolean(native.get('timed_out')),
+        'cancelled': boolean(native.get('cancelled')),
+        'listener_conflict': boolean(native.get('listener_conflict')),
+        'native_monitoring_complete': boolean(native.get('monitoring_complete')),
+        'stdio_drained': boolean(native.get('stdio_drained')),
+        'interrupted_monitor': boolean(native.get('interrupted_monitor')),
     }
 
 
