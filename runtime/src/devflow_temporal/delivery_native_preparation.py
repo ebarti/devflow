@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
+import stat
 import subprocess
 import sys
+from collections import OrderedDict
 from copy import deepcopy
 from importlib.metadata import distribution, version
 from pathlib import Path
+from threading import RLock
 
 from .contracts import digest
 from .delivery_native_guard import NATIVE_OVERRIDES, protected_commands
@@ -30,6 +34,38 @@ from .payload import payload_digest
 from .runtime_dependencies import locked_dependency_identity
 
 SCHEMA = "devflow-native-macos-environment-v1"
+_EXECUTABLE_HASHES = OrderedDict()
+_EXECUTABLE_HASH_LOCK = RLock()
+
+
+def _executable_hash(path: Path) -> str:
+    """Reuse bytes only while the opened executable and its name stay unchanged."""
+    def stamp(info):
+        return tuple(getattr(info, field) for field in (
+            "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+            "st_size", "st_mtime_ns", "st_ctime_ns"))
+
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise PreparationError("native executable is not a regular file")
+        key = (str(path), stamp(before))
+        with _EXECUTABLE_HASH_LOCK:
+            value = _EXECUTABLE_HASHES.get(key)
+            if value is None:
+                with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                    value = hashlib.file_digest(stream, "sha256").hexdigest()
+            if (stamp(os.fstat(descriptor)) != stamp(before)
+                    or stamp(path.lstat()) != stamp(before)):
+                raise PreparationError("native executable changed while measured")
+            _EXECUTABLE_HASHES[key] = value
+            _EXECUTABLE_HASHES.move_to_end(key)
+            while len(_EXECUTABLE_HASHES) > 16:
+                _EXECUTABLE_HASHES.popitem(last=False)
+            return value
+    finally:
+        os.close(descriptor)
 
 
 def native_identity(spec: dict) -> dict:
@@ -65,9 +101,9 @@ def native_identity(spec: dict) -> dict:
         "os_version": platform.mac_ver()[0],
         "architecture": platform.machine(),
         "python": str(Path(sys.executable).resolve()),
-        "python_sha256": _hash(Path(sys.executable).resolve()),
+        "python_sha256": _executable_hash(Path(sys.executable).resolve()),
         "codex_bin": str(binary),
-        "codex_bin_sha256": _hash(binary),
+        "codex_bin_sha256": _executable_hash(binary),
         "packages": actual,
         "runtime_dependencies": dependencies,
         "runtime_payload_sha256": payload_digest(PACKAGE),
