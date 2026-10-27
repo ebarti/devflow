@@ -44,6 +44,8 @@ def measurement_owner(service):
         required_ci=["owned-ci"],
         project_url="https://github.com/users/example/projects/1",
         assignee="example",
+        readiness={"version": 1, "generation": 0, "browser_engines": [],
+                   "temporal_checks": []},
     )
     old.config.path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(old.config.path))
