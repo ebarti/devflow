@@ -45,7 +45,8 @@ write_private(Path(request['result_path']), {'status':'blocked','summary':'Fixtu
 
 
 @pytest.fixture
-def native_role(api_fixture, tmp_path, monkeypatch):
+def native_role(api_fixture, tmp_path, monkeypatch, request):
+    prewarm_readiness = getattr(request, 'param', True)
     path, submission = api_fixture
     raw = json.loads(path.read_text())
     raw.update(provider='codex', execution_mode='trusted-local', codex_bin=str(
@@ -76,9 +77,10 @@ def native_role(api_fixture, tmp_path, monkeypatch):
         from devflow_temporal.delivery_writer_custody import shared
 
         custody = shared(spec)
-    with custody:
-        readiness = prepare_and_probe(store, spec, request['candidate'], requirements, 'plan')
-    assert readiness['state'] == 'passed', readiness
+    if prewarm_readiness:
+        with custody:
+            readiness = prepare_and_probe(store, spec, request['candidate'], requirements, 'plan')
+        assert readiness['state'] == 'passed', readiness
     owner = get_supervisor(store)
     key = owner._job_key(request)
     state = Path(spec['state_dir'])

@@ -18,6 +18,7 @@ def test_legacy_native_automatic_retry_preserves_frozen_readiness(
 ):
     config, request = native_configuration
     source = config.raw['repositories']['fixture']['source_path']
+    subprocess.run(['git', '-C', source, 'update-ref', 'refs/heads/main', 'HEAD'], check=True)
     subprocess.run(['git', '-C', source, 'update-ref', 'refs/remotes/origin/main', 'HEAD'],
                    check=True)
     config.raw['repositories']['fixture']['base_ref'] = 'main'

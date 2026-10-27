@@ -185,6 +185,7 @@ def test_role_credential_copy_keeps_the_newest_token(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native_role", [False], indirect=True)
 async def test_refreshed_credential_does_not_block_the_next_implement_iteration(
     native_role, monkeypatch, tmp_path,
 ):
