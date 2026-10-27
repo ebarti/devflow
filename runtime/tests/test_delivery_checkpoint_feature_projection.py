@@ -30,6 +30,7 @@ from devflow_temporal.delivery_github_contract import ordered_chunks
 from devflow_temporal.delivery_registry_epoch import observe, ordered_writer_fences
 from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_store import DeliveryStore
+from devflow_temporal.delivery_workspace_custody import ensure_owner
 
 
 def _checkout(store, spec):
@@ -111,6 +112,8 @@ def test_feature_create_restore_and_worker_parent_projection_reuse_fenced_regist
     child = worker_spec(parent, chunk, {"url": "https://github.com/example/fixture/issues/10"},
                         kind="build", base_sha=parent["base_sha"], base_branch="main")
     register_worker(store, parent, child)
+    # The real worker activity admits custody before the broker observes it.
+    ensure_owner(child)
     child_broker, child_revision = _checkout(store, child)
     # This fixture's durable pause receipt permits retaining the still-owned
     # worker assignment; it does not invent a completed native worker verdict.

@@ -677,12 +677,16 @@ async def delivery_feature_worker_result(request):
 
 def _worker_wait_spec(request):
     from .delivery_config import DeliveryConfig
+    from .delivery_execution_config import load_execution_config, observation_mode
     from .delivery_store import DeliveryStore
 
     store = DeliveryStore(DeliveryConfig.load(Path(request["config_path"])), read_only=True)
     spec = store.effective_spec(request["run_id"])
     if digest(spec) != request["spec_digest"]:
         raise OwnershipConflict("feature wait no longer matches its frozen specification")
+    # Authenticate frozen authority without repairing or publishing configuration.
+    with observation_mode():
+        load_execution_config(spec)
     from .delivery_execution_registry import ExecutionRegistry
 
     token = spec["feature_delivery"]["owner"]
