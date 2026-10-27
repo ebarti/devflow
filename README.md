@@ -185,13 +185,16 @@ historical fixtures and separately checks the runtime and dashboard. These
 checks do not perform live installation, model-driven delivery, target-project
 checks, merges or deployment.
 
-The runtime suite runs in four isolated macOS jobs. `runtime/runtime_ci.py`
-collects the full suite on each host and assigns whole modules using the measured
-weights in `runtime/ci_timings.json`; new modules are included automatically.
-Cases within a module retain their order and share no host with another shard.
+The runtime suite runs in two macOS jobs with two pytest parents per host.
+`runtime/runtime_ci.py` collects the full suite in each parent and assigns whole
+modules to four partitions using the measured weights in `runtime/ci_timings.json`;
+new modules are included automatically. Host 0 runs partitions 0 and 2, and host 1
+runs partitions 1 and 3. Cases within a module retain their order and run in one
+parent. Host 0 completes the Mac source checks before starting its runtime parents.
 Each job uploads its test inventory, result and JUnit timings. The required
-`temporal-runtime-macos` check passes only when all four jobs pass and their
-inventories prove complete, non-overlapping coverage of the same Git revision.
+`temporal-runtime-macos` check passes only when both Mac jobs and the portable
+source job pass, and all four partition reports prove every collected test
+finished exactly once at the same Git revision.
 Update the timing weights from the uploaded results as the suite grows. From
 `runtime/`, `uv run --frozen pytest` still runs the complete suite. To run one
 partition locally:
@@ -199,6 +202,12 @@ partition locally:
 ```sh
 uv run --frozen python runtime_ci.py --index 0 --count 4 --revision "$(git rev-parse HEAD)"
 ```
+
+Keep future tests focused on high-value user, workflow, integrity and security
+regressions or integration behavior. Do not add small isolated unit tests,
+implementation-mirror assertions or trivial parameter expansions. Prefer extending
+an existing meaningful scenario when it covers the risk. See [AGENTS.md](AGENTS.md)
+for the repository contribution rules, including conventional PR titles.
 
 [Architecture](docs/architecture.md)
 

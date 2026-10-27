@@ -60,10 +60,10 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # Six Mac hosts each run two partitions; host 0 also qualifies source tests.
-      max-parallel: 3
+      # Two Mac hosts each run two partitions; host 0 also qualifies source tests.
+      max-parallel: 2
       matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+        shard: [0, 1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,7 +98,7 @@ jobs:
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
       - name: Run assigned runtime modules and host 0 Mac source qualification
-        # Keep two pytest parents per host and preserve all 12 partitions.
+        # Four complete, disjoint partitions; at most two pytest parents per host.
         run: |
           result=0
           processes=()
@@ -118,8 +118,8 @@ jobs:
             processes=()
           fi
           for lane in 0 1; do
-            index=$(( ${{ matrix.shard }} + lane * 6 ))
-            .venv/bin/python runtime_ci.py --index "$index" --count 12 \
+            index=$(( ${{ matrix.shard }} + lane * 2 ))
+            .venv/bin/python runtime_ci.py --index "$index" --count 4 \
               --basetemp "$RUNNER_TEMP/devflow-pytest-$index" &
             processes+=("$!")
           done
@@ -156,7 +156,7 @@ jobs:
           path: runtime/ci-results/
           merge-multiple: true
       - name: Verify complete and disjoint coverage at this revision
-        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 12
+        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 4
   temporal-dashboard:
     runs-on: ubuntu-latest
     timeout-minutes: 5
