@@ -320,7 +320,8 @@ def install(arguments):
                 recovery.restore(backup, checkout_only=True)
             state.pop("backup")
             state["phase"] = "ready"
-            save(journal, state)
+            # Rollback may restore ROOT to a revision without these controller helpers.
+            paths.write_json(journal, state)
             raise
         # Commit the durable outcome before discarding its recovery evidence.
         state["phase"] = "verified"
