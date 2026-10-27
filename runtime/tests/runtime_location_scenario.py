@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import distribution
 from pathlib import Path
@@ -624,7 +625,7 @@ def restored(root):
 def original_rows(config):
     import sqlite3
 
-    with sqlite3.connect(config.tracking_db) as db:
+    with closing(sqlite3.connect(config.tracking_db)) as db, db:
         db.row_factory = sqlite3.Row
         return [dict(row) for row in db.execute("SELECT * FROM delivery_runs ORDER BY run_id")]
 
@@ -758,7 +759,7 @@ def cohort_faults(root, config, request, rows):
 
     from devflow_temporal import delivery_runtime_location as location
 
-    with sqlite3.connect(config.tracking_db) as db:
+    with closing(sqlite3.connect(config.tracking_db)) as db, db:
         db.execute(
             "CREATE TRIGGER owned_partial_intent BEFORE INSERT ON delivery_commands "
             "WHEN NEW.run_id='run-6' AND NEW.command_id LIKE 'runtime-location-intent-%' "
@@ -766,7 +767,7 @@ def cohort_faults(root, config, request, rows):
         )
     control(config, "adopt-runtime-location", request, success=False)
     assert original_rows(config) == rows
-    with sqlite3.connect(config.tracking_db) as db:
+    with closing(sqlite3.connect(config.tracking_db)) as db, db:
         assert (
             db.execute(
                 "SELECT COUNT(*) FROM delivery_events WHERE type IN (?,?)",
@@ -825,7 +826,7 @@ def cohort_faults(root, config, request, rows):
         pending = config.state_root / "runtime-installations/pending.json"
         assert pending.is_file()
         assert (config.state_root / "service.lock").stat().st_nlink == 2
-        with sqlite3.connect(config.tracking_db) as db:
+        with closing(sqlite3.connect(config.tracking_db)) as db, db:
             assert (
                 db.execute(
                     "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.PENDING,)
@@ -853,7 +854,7 @@ def reject_partial_membership(config):
 
     receipt = location._acknowledged(config)
     key = location.command_id(receipt, "run-6")
-    with sqlite3.connect(config.tracking_db) as db:
+    with closing(sqlite3.connect(config.tracking_db)) as db, db:
         saved = db.execute("SELECT * FROM delivery_commands WHERE command_id=?", (key,)).fetchone()
         db.execute("DELETE FROM delivery_commands WHERE command_id=?", (key,))
     try:
@@ -861,7 +862,7 @@ def reject_partial_membership(config):
         with pytest.raises(ValueError, match="not completely acknowledged"):
             DeliveryStore(config)
     finally:
-        with sqlite3.connect(config.tracking_db) as db:
+        with closing(sqlite3.connect(config.tracking_db)) as db, db:
             db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)", saved)
 
 
@@ -895,7 +896,7 @@ def pending_rollback(root, case, config, request, rows, before):
     reference = read_private(config.state_root / "runtime-installations/pending.json")
     receipt = json.loads(location.receipt_bytes(Path(reference["receipt"])))
     assert all(_state(item) == "before" for item in receipt["installed_objects"])
-    with sqlite3.connect(config.tracking_db) as db:
+    with closing(sqlite3.connect(config.tracking_db)) as db, db:
         assert (
             db.execute(
                 "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.PENDING,)
@@ -926,7 +927,7 @@ def pending_rollback(root, case, config, request, rows, before):
         original_rows(config) == rows
         and not (config.state_root / "runtime-installations/current.json").exists()
     )
-    with sqlite3.connect(config.tracking_db) as db:
+    with closing(sqlite3.connect(config.tracking_db)) as db, db:
         assert (
             db.execute(
                 "SELECT COUNT(*) FROM delivery_events WHERE type=?", (location.KIND,)
