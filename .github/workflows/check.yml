@@ -38,7 +38,8 @@ jobs:
                       yield test
 
           discovered = list(cases(unittest.defaultTestLoader.discover('tests')))
-          mac_modules = {'test_reconcile', 'test_service_entry_installation',
+          mac_modules = {'test_reconcile', 'test_production_installation',
+                         'test_service_entry_installation',
                          'test_upgrade_installation'}
           native = [test for test in discovered
                     if type(test).__module__ in mac_modules
