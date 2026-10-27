@@ -120,6 +120,43 @@ def test_pending_exact_revision_can_be_observed_and_replayed(stopped, monkeypatc
     assert revise_feature_plan(store, spec["run_id"], command) == result
 
 
+def test_admitted_revision_recovers_lost_outer_response_without_another_successor(
+    stopped, monkeypatch,
+):
+    from devflow_temporal import delivery_feature_execution
+    from devflow_temporal.delivery_execution_registry import OwnershipConflict
+
+    store, spec, shared, _, command = stopped
+    real_continue = delivery_feature_execution.continue_feature
+    admitted = []
+
+    def lose_response(*args, **kwargs):
+        admitted.append(real_continue(*args, **kwargs))
+        raise ConnectionError("successor admitted before outer receipt")
+
+    monkeypatch.setattr(delivery_feature_execution, "continue_feature", lose_response)
+    with pytest.raises(ConnectionError, match="before outer receipt"):
+        revise_feature_plan(store, spec["run_id"], command)
+    token = spec["feature_delivery"]["owner"]
+    budget = shared.budget(token["issue_id"])
+    owner = shared.current(token["issue_id"])
+    assert owner["run_id"] == admitted[0]["run_id"]
+    assert owner["generation"] == token["generation"] + 1
+    monkeypatch.setattr(delivery_feature_execution, "continue_feature", real_continue)
+    result = revise_feature_plan(store, spec["run_id"], command)
+    assert result["run_id"] == admitted[0]["run_id"]
+    assert revise_feature_plan(store, spec["run_id"], command) == result
+    assert shared.current(token["issue_id"]) == owner
+    assert shared.budget(token["issue_id"]) == budget
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM delivery_outbox WHERE run_id=?",
+                          (result["run_id"],)).fetchone()[0] == 1
+    for changed in ({**command, "reason": "Different inputs under the same command"},
+                    {**command, "command_id": "another-revision-command"}):
+        with pytest.raises(OwnershipConflict):
+            revise_feature_plan(store, spec["run_id"], changed)
+
+
 def test_stale_plan_is_unknown_and_does_not_reconcile(stopped, monkeypatch):
     store, spec, shared, record, command = stopped
     record["manifest"]["plan"]["scope"] = "Changed by the GitHub owner"

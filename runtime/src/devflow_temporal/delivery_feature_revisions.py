@@ -617,22 +617,24 @@ def revise_feature_plan(store, run_id, request):
     from .delivery_execution_registry import FeatureHandoffRefused
     from .delivery_lifecycle import evaluate_transition
 
-    initial = _revision_owner_facts(shared, token, row, request, admission=saved)
-    # Reservation and budget have their own historical, detailed refusals below.
-    initial["predicates"] = [p for p in initial["predicates"] if p["code"] not in {
-        "feature_product_budget_exhausted", "feature_revision_reservation_conflict"}]
-    assessment = evaluate_transition(initial, request)
-    if not assessment["eligible"]:
-        error = FeatureHandoffRefused(assessment)
-        error.args = ("feature workers or effects have not reached a safe handoff",)
-        raise error
     if saved:
+        # Its continuation owns any admitted successor. Replaying that exact
+        # command must not require the predecessor to own the feature again.
         if saved["request_digest"] != command_digest or saved["request"] != request:
             raise OwnershipConflict("recorded revision admission changed")
         _checkpoint_proof(shared, token["issue_id"], _values(spec),
                           [PREFIX + "request:" + revision_id])
         admission = saved
     else:
+        initial = _revision_owner_facts(shared, token, row, request)
+        # Reservation and budget have their own historical, detailed refusals below.
+        initial["predicates"] = [p for p in initial["predicates"] if p["code"] not in {
+            "feature_product_budget_exhausted", "feature_revision_reservation_conflict"}]
+        assessment = evaluate_transition(initial, request)
+        if not assessment["eligible"]:
+            error = FeatureHandoffRefused(assessment)
+            error.args = ("feature workers or effects have not reached a safe handoff",)
+            raise error
         closed = closed_coordinator(store, run_id)
         if closed["result"].get("cleanup") != "confirmed":
             raise OwnershipConflict("revision predecessor cleanup is unconfirmed")
