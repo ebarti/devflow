@@ -13,7 +13,7 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_feature_merge as merger
 from devflow_temporal import delivery_feature_publication as publications
-from devflow_temporal.delivery_execution_registry import OwnershipConflict
+from devflow_temporal.delivery_execution_registry import OwnershipConflict, UnresolvedEffect
 from devflow_temporal.delivery_feature_execution import register_worker, registry, worker_spec
 from devflow_temporal.delivery_github_contract import ordered_chunks
 
@@ -210,6 +210,14 @@ def test_nonzero_merge_response_stays_pending_until_remote_outcome(
     assert merge_effect(spec)[0]["result"]["submissions"][0]["state"] == "unknown"
     # Delayed successful readback settles the original submission without another merge.
     gh.merged.update({20, 21, 22})
+    with pytest.raises(UnresolvedEffect, match="no original intent"):
+        merger.merge(store, spec, requested, command, gh=gh, execute=refuse, settlement=True)
+    assert gh.closed == set()
+    assert not any(method == "PATCH" for method, _path, _body in gh.calls)
+    # The normal owner may now originate closure. Later settlement only reads
+    # those existing effects and still cannot issue another stack submission.
+    settled = merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
+    assert settled["state"] == "confirmed"
     assert merger.merge(store, spec, requested, command, gh=gh, execute=refuse,
                         settlement=True)["state"] == "confirmed"
 
