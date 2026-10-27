@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,163 @@ class InstallRollback(unittest.TestCase):
         stage.symlink_to(self.helper)
         self.rollback.remember(self.backup, self.compatibility, self.rollback.identity(stage))
         os.replace(stage, self.compatibility)
+
+    def test_crashed_forward_capture_cannot_discard_unverified_replacement_on_restore(self):
+        for staged, oversized in ((False, False), (True, False), (False, True)):
+            with self.subTest(staged=staged, oversized=oversized):
+                case = self.root / ("forward-crash-" + str(staged) + str(oversized))
+                case.mkdir(mode=0o700)
+                target = case / "owned.plist"
+                target.write_bytes(b"original registration")
+                backup = self.rollback.backup_directory(case)
+                self.addCleanup(shutil.rmtree, backup, True)
+                saved = {}
+                before = self.rollback.identity(target, saved=saved)
+                saved.update(type=before["type"], before=before)
+                self.rollback.save_snapshot(backup / "snapshot.json", {str(target): saved})
+                (backup / "prior-checkout.json").write_text("null")
+                program = r"""
+import importlib.util,os,sys
+from pathlib import Path
+loader=importlib.util.spec_from_file_location('crashed_rollback',sys.argv[1])
+m=importlib.util.module_from_spec(loader);loader.loader.exec_module(m)
+backup,target=Path(sys.argv[2]),Path(sys.argv[3])
+replace,exchange=m.os.replace,m.exchange
+
+def replacement():
+    stage=target.with_name('older-writer');stage.write_bytes(b'foreign replacement')
+    if sys.argv[5]=='True':
+        with stage.open('r+b') as stream: stream.truncate(4*1024*1024+1)
+    replace(stage,target)
+
+def moved(source,destination):
+    if Path(source)==target:
+        replacement();replace(source,destination);os._exit(77)
+    return replace(source,destination)
+
+def exchanged(source,destination):
+    if Path(destination)==target:
+        replacement();exchange(source,destination);os._exit(77)
+    return exchange(source,destination)
+
+m.os.replace=moved;m.exchange=exchanged
+stage=None
+if sys.argv[4]=='True':
+    stage=target.with_name('requested');stage.write_bytes(b'requested new registration')
+m.effect(backup,target,stage)
+"""
+                result = subprocess.run([sys.executable, "-I", "-B", "-c", program,
+                    str(ROOT / "scripts/install-rollback.py"), str(backup), str(target), str(staged), str(oversized)],
+                    text=True, capture_output=True)
+                self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+                captured = list(backup.glob("forward-*"))
+                self.assertEqual(len(captured), 1)
+                with captured[0].open("rb") as stream:
+                    self.assertEqual(stream.read(19), b"foreign replacement")
+                captured_inode = captured[0].stat().st_ino
+                restored = subprocess.run([sys.executable, "-I", "-B",
+                    str(ROOT / "scripts/install-rollback.py"), "restore", str(backup)],
+                    text=True, capture_output=True)
+                self.assertEqual(restored.returncode, 1, restored.stdout + restored.stderr)
+                self.assertIn("unverified displaced object", restored.stderr)
+                self.assertTrue(backup.exists())
+                with captured[0].open("rb") as stream:
+                    self.assertEqual(stream.read(19), b"foreign replacement")
+                if oversized:
+                    self.assertEqual(target.stat().st_size, 4 * 1024 * 1024 + 1)
+                    self.assertEqual(target.stat().st_ino, captured_inode)
+                    with target.open("rb") as stream:
+                        self.assertEqual(stream.read(19), b"foreign replacement")
+                else:
+                    self.assertEqual(target.read_bytes(), b"original registration" if staged
+                                     else b"foreign replacement")
+
+    def test_snapshot_sync_failure_precedes_any_public_retirement(self):
+        target = self.home / "hooks.json"
+        target.write_bytes(b"original")
+        backup = self.rollback.backup_directory(self.home)
+        self.addCleanup(shutil.rmtree, backup, True)
+        saved = {}
+        before = self.rollback.identity(target, saved=saved)
+        saved.update(type=before["type"], before=before)
+        self.rollback.save_snapshot(backup / "snapshot.json", {str(target): saved})
+        original_snapshot = (backup / "snapshot.json").read_bytes()
+        sync = os.fsync
+
+        def fail_journal(descriptor):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("owned snapshot fsync fault")
+            return sync(descriptor)
+
+        with mock.patch.object(os, "fsync", fail_journal):
+            with self.assertRaisesRegex(OSError, "snapshot fsync fault"):
+                self.rollback.effect(backup, target)
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertEqual(list(backup.glob("forward-*")), [])
+        self.assertEqual((backup / "snapshot.json").read_bytes(), original_snapshot)
+
+    def test_retirement_syncs_journal_and_capture_before_deleting_prior_object(self):
+        target = self.home / "hooks.json"
+        target.write_bytes(b"original")
+        backup = self.rollback.backup_directory(self.home)
+        self.addCleanup(shutil.rmtree, backup, True)
+        saved = {}
+        before = self.rollback.identity(target, saved=saved)
+        saved.update(type=before["type"], before=before)
+        self.rollback.save_snapshot(backup / "snapshot.json", {str(target): saved})
+        snapshot = backup / "snapshot.json"
+        captured = backup / ("forward-" + hashlib.sha256(str(target).encode()).hexdigest())
+        original_inode = target.stat().st_ino
+        directories = {backup.stat().st_ino: "backup", target.parent.stat().st_ino: "parent"}
+        events = []
+        sync, replace, unlink = os.fsync, os.replace, Path.unlink
+
+        def synced(descriptor):
+            info = os.fstat(descriptor)
+            sync(descriptor)
+            if stat.S_ISDIR(info.st_mode):
+                events.append("sync-" + directories.get(info.st_ino, "other-directory"))
+            else:
+                events.append("sync-captured" if info.st_ino == original_inode else "sync-journal")
+
+        def moved(source, destination):
+            events.append("public-move" if Path(source) == target else "snapshot-publish"
+                          if Path(destination) == snapshot else "other-move")
+            return replace(source, destination)
+
+        def retired(path, *args, **kwargs):
+            if path == captured:
+                events.append("capture-delete")
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(os, "fsync", synced), mock.patch.object(os, "replace", moved), \
+                mock.patch.object(Path, "unlink", retired):
+            self.rollback.effect(backup, target)
+        published, moved_at, deleted = map(events.index,
+                                         ("snapshot-publish", "public-move", "capture-delete"))
+        self.assertIn("sync-journal", events[:published])
+        self.assertIn("sync-backup", events[published:moved_at])
+        self.assertIn("sync-parent", events[published:moved_at])
+        self.assertIn("sync-captured", events[moved_at:deleted])
+        self.assertIn("sync-backup", events[moved_at:deleted])
+        self.assertIn("sync-parent", events[moved_at:deleted])
+        self.assertIn("sync-backup", events[deleted + 1:])
+
+    def test_oversized_snapshot_object_is_refused_before_opening_its_content(self):
+        target = self.home / "oversized"
+        with target.open("wb") as stream:
+            stream.truncate(self.rollback.MAX_OBJECT_BYTES + 1)
+        opened = os.open
+
+        def no_content(path, *args, **kwargs):
+            if Path(path) == target:
+                self.fail("oversized object was opened before bounded refusal")
+            return opened(path, *args, **kwargs)
+
+        with mock.patch.object(os, "open", no_content):
+            with self.assertRaisesRegex(ValueError, "bounded 4 MiB snapshot"):
+                self.rollback.identity(target, saved={})
+        self.assertEqual(target.stat().st_size, self.rollback.MAX_OBJECT_BYTES + 1)
 
     def test_native_exchange_preserves_foreign_pointer_swapped_at_boundary(self):
         exchange = self.rollback.exchange
