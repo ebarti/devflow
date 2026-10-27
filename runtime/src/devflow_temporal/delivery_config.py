@@ -834,7 +834,8 @@ def scope_amended_spec(
                    "assessment_batch_version", "validation_schedule_version",
                    "merge_reconciliation_version",
                    "delivery_limits_version", "delivery_admitted_at",
-                   "temporal_test_preparation"):
+                   "temporal_test_preparation", "execution_authority_version",
+                   "workspace_custody_version"):
         if marker in original:
             effective[marker] = original[marker]
         else:

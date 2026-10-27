@@ -20,8 +20,13 @@ from temporalio.exceptions import (
     TimeoutError,
     TimeoutType,
 )
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import ActivityInboundInterceptor, UnsandboxedWorkflowRunner, Worker
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
+from temporalio.worker import (
+    ActivityInboundInterceptor,
+    ExecuteActivityInput,
+    UnsandboxedWorkflowRunner,
+    Worker,
+)
 from test_delivery_store import service as service
 
 from devflow_temporal.contracts import digest
@@ -109,14 +114,15 @@ async def test_worker_interceptor_types_sqlite_contention_as_transient(message):
 
     inbound = DatabaseContentionInterceptor().intercept_activity(
         Failing(sqlite3.OperationalError(message)))
+    request = ExecuteActivityInput(fn=_locked_store_probe, args=[], executor=None, headers={})
     with pytest.raises(ApplicationError) as failure:
-        await inbound.execute_activity(None)
+        await ActivityEnvironment().run(inbound.execute_activity, request)
     assert failure.value.type == 'DatabaseBusy' and not failure.value.non_retryable
     assert 'database busy' in str(failure.value)
     other = DatabaseContentionInterceptor().intercept_activity(
         Failing(sqlite3.OperationalError('no such table: delivery_runs')))
     with pytest.raises(sqlite3.OperationalError, match='no such table'):
-        await other.execute_activity(None)
+        await ActivityEnvironment().run(other.execute_activity, request)
 
 
 @activity.defn(name='locked_store_probe')
