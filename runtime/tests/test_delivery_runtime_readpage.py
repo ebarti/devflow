@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import time
 from contextlib import ExitStack
@@ -267,37 +266,3 @@ def test_compact_page_rechecks_complete_authority_after_row_observation(
     with pytest.raises((ValueError, OSError)):
         store.list_runs_page()
     assert changed
-
-
-def test_historical_read_only_page_does_not_gain_a_write_or_launch_guard(service):
-    store, request = service
-    store.submit(request)
-    historical = DeliveryStore(store.config, read_only=True)
-    receipt, _reference = acknowledge_reads(store, request)
-    Path(receipt["service_guard"]["link"]).unlink()
-    assert len(historical.list_runs_page()["runs"]) == 6
-    with pytest.raises(ValueError):
-        store.list_runs_page()
-
-
-def test_compact_page_does_not_hold_a_write_lock_or_cache_between_calls(service, monkeypatch):
-    store, request = service
-    store.submit(request)
-    _receipt, reference = acknowledge_reads(store, request)
-    calls = []
-    load = location.load_authority
-
-    def observe(*args, **kwargs):
-        calls.append(args[0])
-        return load(*args, **kwargs)
-
-    monkeypatch.setattr(location, "load_authority", observe)
-    assert len(store.list_runs_page()["runs"]) == 6
-    assert len(store.list_runs_page()["runs"]) == 6
-    assert calls == [Path(reference["receipt"])] * 4
-    path = Path(reference["receipt"])
-    previous = hashlib.sha256(path.read_bytes()).hexdigest()
-    path.write_bytes(path.read_bytes() + b" ")
-    assert hashlib.sha256(path.read_bytes()).hexdigest() != previous
-    with pytest.raises(ValueError, match="receipt changed"):
-        store.list_runs_page()

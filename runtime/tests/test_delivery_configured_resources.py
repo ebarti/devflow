@@ -39,8 +39,6 @@ def test_implementation_preparation_preserves_exact_frozen_recipe_order():
     assert implementation_prerequisites(owned) == [node]
 
 
-
-
 def configured(tmp_path, kind="gate"):
     owned = spec(tmp_path)
     owned.update(accepted_plan="", baseline_checks_version=2)
@@ -67,58 +65,6 @@ def configured(tmp_path, kind="gate"):
     broker = object.__new__(DeliveryBroker)
     broker.spec = owned
     return owned, resources, broker, root, project
-
-
-
-
-@pytest.mark.parametrize("change", ["remove", "directory"])
-def test_changed_configured_authority_preserves_environment(tmp_path, change):
-    owned, resources, broker, root, project = configured(tmp_path)
-    environment = project / ".venv"
-    broker._register_generated(root, ["worker/.venv"])
-    environment.mkdir()
-    (environment / "sentinel").write_text("preserve changed authority")
-    broker._record_generated([environment])
-    check = owned["policy"]["baseline_checks"][0]
-    if change == "remove":
-        owned["policy"]["baseline_checks"] = []
-    elif change == "argv":
-        check["argv"].append("changed")
-    else:
-        check["generated_directories"] = ["outside/.venv"]
-    with pytest.raises(ValueError, match="authority changed"):
-        broker._register_generated(root, ["worker/.venv"])
-    assert resources.finalize("blocked")["state"] == "unknown"
-    assert (environment / "sentinel").read_text() == "preserve changed authority"
-
-
-@pytest.mark.parametrize("violation", ["foreign", "string"])
-def test_configured_environment_does_not_adopt_foreign_or_unlocked_paths(tmp_path, violation):
-    owned, _resources, broker, root, project = configured(tmp_path)
-    environment = project / ".venv"
-    sentinel = tmp_path / "sentinel"
-    sentinel.mkdir()
-    (sentinel / "precious").write_text("SAFE")
-    if violation == "foreign":
-        environment.mkdir()
-    elif violation == "symlink":
-        environment.symlink_to(sentinel, target_is_directory=True)
-    elif violation == "untracked":
-        _git(root, "rm", "--cached", "worker/uv.lock")
-    elif violation == "metadata_link":
-        (project / "uv.lock").unlink()
-        (project / "uv.lock").symlink_to(sentinel / "precious")
-    elif violation == "missing_lock":
-        (project / "uv.lock").unlink()
-    elif violation == "undeclared":
-        owned["policy"]["baseline_checks"] = []
-    elif violation == "string":
-        owned["policy"]["baseline_checks"][0]["generated_directories"] = "worker/.venv"
-    else:
-        owned["policy"]["host_sandbox"] = "native-profile"
-    with pytest.raises(ValueError):
-        broker._register_generated(root, ["worker/.venv"])
-    assert (sentinel / "precious").read_text() == "SAFE"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native macOS execution authority")

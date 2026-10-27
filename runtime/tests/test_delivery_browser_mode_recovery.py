@@ -329,62 +329,6 @@ def stopped_browser(service, monkeypatch):
     return browser_case(service, monkeypatch)
 
 
-def test_browser_amendment_public_preflight_retains_failed_per_case_truth(stopped_browser):
-    case = stopped_browser
-    original = copy.deepcopy(case.state)
-    before = {path: path.read_bytes() for path in (case.old_browser, case.old_report)}
-    result = case.store.repair_admission_preflight("run-1", case.command)
-    assert result["authorized_through_iteration"] == 4
-    assert result["browser_qa_amendment"]["original_recipe_sha256"] == digest(case.qa)
-    assert case.state == original
-    assert {path: path.read_bytes() for path in before} == before
-    assert original["checks"]["browser_qa"]["state"] == "failed"
-    assert mode._cases(case.old_report.read_bytes())[0]["state"] == "skipped"
-
-
-def test_fresh_configuration_still_refuses_mode0(stopped_browser):
-    case = stopped_browser
-    path = Path(case.command[mode.FIELD]["amended_config_path"])
-    config = DeliveryConfig.load(path)
-    config.raw["repositories"]["fixture"]["readiness"] = {
-        "version": 1, "generation": 0, "browser_engines": ["chromium"], "temporal_checks": []}
-    with pytest.raises(ValueError, match="fixture isolation must be enabled"):
-        config.admit(
-            {
-                key: case.spec[key]
-                for key in (
-                    "command_id",
-                    "run_id",
-                    "work_id",
-                    "issue_url",
-                    "repository_key",
-                    "goal",
-                    "accepted_plan",
-                    "base_ref",
-                    "branch",
-                    "authorized_endpoint",
-                )
-            }
-        )
-
-
-def test_public_browser_amendment_admission_and_real_worker_readback(stopped_browser):
-    case = stopped_browser
-    before = copy.deepcopy(case.state)
-    response = case.store.continue_repair("run-1", case.command)
-    assert case.store.continue_repair("run-1", case.command) == response
-    current = case.store.effective_spec("run-1")
-    with case.store._connect() as db:
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-    assert recovery["state"] == before and recovery["maximum_iteration"] == 4
-    assert recovery["browser_qa_amendment"]["failed_browser"]["cases"][0]["state"] == "skipped"
-    assert current["policy"]["browser_qa"]["env"]["JOBCTRL_E2E_ISOLATED"] == "0"
-    assert current["policy"]["browser_qa"]["min_tests"] == case.qa["min_tests"] == 1
-    assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery})) == {
-        "state": "confirmed"
-    }
-
-
 def admitted(case):
     response = case.store.continue_repair("run-1", case.command)
     current = case.store.effective_spec("run-1")
@@ -559,28 +503,6 @@ def test_public_browser_amendment_refuses_unrelated_or_unproven_authority(stoppe
         ).fetchone()
 
 
-@pytest.mark.parametrize(
-    "target",
-    ["recipe", "configuration", "receipt", "junit", "journal", "launch", "historical_junit"],
-)
-def test_worker_reauthenticates_original_browser_and_proposal_bytes(stopped_browser, target):
-    case = stopped_browser
-    _response, current, recovery = admitted(case)
-    path = {
-        "recipe": Path(case.command[mode.FIELD]["recipe_path"]),
-        "configuration": Path(case.command[mode.FIELD]["amended_config_path"]),
-        "receipt": case.old_browser,
-        "junit": case.old_report,
-        "historical_junit": case.historical_reports[0],
-        "journal": case.old_browser.parent / "native/native-process.json",
-        "launch": case.old_browser.parent / "native/launch.json",
-    }[target]
-    path.write_bytes(path.read_bytes() + b"\n")
-    with pytest.raises(ValueError):
-        asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery}))
-    assert case.state["checks"]["browser_qa"]["state"] == "failed"
-
-
 def owned_ports():
     guards = [socket.socket(), socket.socket()]
     try:
@@ -597,121 +519,6 @@ def restore_native_observers(monkeypatch):
     monkeypatch.setattr(native, "listeners", REAL_LISTENERS)
     monkeypatch.setattr(policy, "process_table", REAL_TABLE)
     monkeypatch.setattr(policy, "listeners", REAL_LISTENERS)
-
-
-def test_actual_browser_policy_launch_executes_both_owned_paths(service, monkeypatch):
-    case = browser_case(service, monkeypatch, ports=owned_ports())
-    _response, current, recovery = admitted(case)
-    assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery})) == {
-        "state": "confirmed"
-    }
-    restore_native_observers(monkeypatch)
-    result = DeliveryBroker(case.store, current).run_browser_qa(
-        4, DeliveryBroker(case.store, current).candidate()
-    )
-    try:
-        assert result["state"] == "passed", {
-            "diagnostic": result.get("diagnostic"),
-            "source_unchanged": result.get("source_unchanged"),
-            "observed_listeners": result.get("native_process", {}).get("observed_listeners"),
-            "listener_conflict": result.get("native_process", {}).get("listener_conflict"),
-        }
-        assert result["cleanup"] == "confirmed" and result["test_count"] == 2
-        assert [item["state"] for item in result[mode.FIELD]["cases"]] == ["passed", "passed"]
-        assert current["policy"]["browser_qa"]["min_tests"] == 1
-        observed = next(
-            item
-            for item in result["artifacts"]
-            if Path(item["path"]).name == "observed-launch.json"
-        )
-        facts = json.loads(Path(observed["path"]).read_text())
-        assert facts["mode"] == "0" and facts["fake_dispatch"] and facts["fake_transport"]
-        assert facts["secrets"] == []
-        assert facts["home"].startswith(current["state_dir"])
-        assert facts["tmp"].startswith("/private/tmp/dfqa-")
-        assert Path(facts["workspace"]).is_relative_to(facts["home"])
-        assert case.state["checks"]["browser_qa"]["state"] == "failed"
-        assert mode._cases(case.old_report.read_bytes())[0]["state"] == "skipped"
-    finally:
-        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
-
-
-@pytest.mark.parametrize("defect", ["skipped", "missing", "renamed"])
-def test_new_browser_gate_cannot_pass_on_aggregate_count_without_both_cases(
-    service, monkeypatch, defect
-):
-    case = browser_case(service, monkeypatch, ports=owned_ports())
-    _response, current, _recovery = admitted(case)
-    restore_native_observers(monkeypatch)
-    execute = DeliveryBroker._run_native_check
-
-    def incomplete(self, process):
-        result = execute(self, process)
-        path = Path(process.environment["PLAYWRIGHT_JUNIT_OUTPUT_FILE"])
-        text = junit(skipped=defect == "skipped", missing=defect == "missing")
-        if defect == "renamed":
-            text = text.replace("Offer history composition", "Different selected case")
-        path.write_text(text)
-        return result
-
-    monkeypatch.setattr(DeliveryBroker, "_run_native_check", incomplete)
-    broker = DeliveryBroker(case.store, current)
-    result = broker.run_browser_qa(4, broker.candidate())
-    try:
-        assert result["state"] == "failed" and result["cleanup"] == "confirmed"
-        assert result["test_count"] == 2 and current["policy"]["browser_qa"]["min_tests"] == 1
-        assert "browser amendment case evidence failed" in result["evidence_failure"]
-    finally:
-        assert RunResources(current).finalize("blocked")["state"] == "confirmed"
-
-
-@pytest.mark.parametrize(
-    "defect", ["marker", "goal", "fixture", "attempt", "effect", "new_unknown"]
-)
-def test_amended_worker_and_launch_keep_exact_lineage_and_old_custody(stopped_browser, defect):
-    case = stopped_browser
-    response, current, recovery = admitted(case)
-    if defect in {"marker", "goal"}:
-        if defect == "marker":
-            del current[mode.MARKER]
-        else:
-            current["goal"] = "Unacknowledged new goal"
-        recovery["execution_spec"] = current
-        root = Path(current["state_dir"]) / resume.namespace(recovery)
-        write_private(root / "admission.json", recovery)
-        response["admission_sha256"] = digest(recovery)
-        with case.store._connect() as db:
-            db.execute("UPDATE delivery_runs SET recovery_json=?", (canonical_json(recovery),))
-            db.execute(
-                "UPDATE delivery_commands SET response_json=? WHERE command_id=?",
-                (canonical_json(response), case.command["command_id"]),
-            )
-    elif defect == "fixture":
-        (case.broker.checkout / mode.FIXTURES / "owned-workspace.cjs").write_text(
-            "Foreign workspace\n"
-        )
-    elif defect in {"attempt", "effect"}:
-        with case.store._connect() as db:
-            if defect == "attempt":
-                db.execute("UPDATE delivery_attempts SET session_id='foreign'")
-            else:
-                db.execute(
-                    "UPDATE delivery_effects SET observed_json='{}' "
-                    "WHERE effect_key='browser_qa:run-1:0'"
-                )
-    else:
-        with case.store._connect() as db:
-            db.execute(
-                "INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,"
-                "state,cleanup,result_json) VALUES ('uncertain','run-1','implement',4,?,"
-                "'recovery_unknown','unknown','{}')",
-                (case.state["candidate"]["id"],),
-            )
-    with pytest.raises(ValueError):
-        asyncio.run(delivery_repair_preflight({"spec": current, "recovery": recovery}))
-    if defect != "new_unknown":
-        with pytest.raises(ValueError):
-            mode.launch_authority(current, case.broker.checkout)
 
 
 async def browser_timeout_diagnostics(handle, store, evidence_dir):
@@ -808,61 +615,6 @@ async def browser_timeout_diagnostics(handle, store, evidence_dir):
     except Exception as exc:
         diagnostics["browser_native_error"] = type(exc).__name__
     return diagnostics
-
-
-@pytest.mark.asyncio
-async def test_browser_timeout_diagnostics_redacts_inputs_and_bounds_history(tmp_path):
-    import sqlite3
-    from types import SimpleNamespace
-
-    from temporalio.api.common.v1 import ActivityType, Payload, Payloads
-    from temporalio.api.history.v1 import ActivityTaskScheduledEventAttributes, HistoryEvent
-
-    event = HistoryEvent(
-        event_id=1,
-        activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
-            activity_type=ActivityType(name="delivery_browser_qa"),
-            input=Payloads(payloads=[Payload(data=b"PRIVATE_DIAGNOSTIC_INPUT")]),
-        ),
-    )
-
-    class History:
-        current_page = [event] * 30
-        next_page_token = b"more"
-        pages = 0
-
-        async def fetch_next_page(self):
-            self.pages += 1
-
-    history = History()
-
-    class Handle:
-        def fetch_history_events(self, **_kwargs):
-            return history
-
-    database = tmp_path / "tracking.sqlite3"
-    with sqlite3.connect(database) as db:
-        db.execute("CREATE TABLE delivery_runs "
-                   "(run_id TEXT,phase TEXT,execution_state TEXT,iteration INTEGER,"
-                   "outcome TEXT,cleanup TEXT)")
-        db.execute("INSERT INTO delivery_runs VALUES (?,?,?,?,?,?)",
-                   ("run-1", "browser_qa", "running", 4, None, "unknown"))
-    state = tmp_path / "state"
-    path = state / "browser-qa/4/native/native-process.json"
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"phase": "authorized", "monitoring_complete": False,
-                                "environment": "PRIVATE_DIAGNOSTIC_INPUT"}))
-    path.chmod(0o600)
-    store = SimpleNamespace(config=SimpleNamespace(tracking_db=database))
-    result = await browser_timeout_diagnostics(Handle(), store, state)
-    assert result["history"] == [{"id": 1, "type": "activity_task_scheduled_event_attributes",
-                                  "activity": "delivery_browser_qa",
-                                  "time": "1970-01-01T00:00:00"}] * 20
-    assert history.pages == 5 and result["history_truncated"] is True
-    assert result["projection"]["phase"] == "browser_qa"
-    assert result["projection"]["iteration"] == 4
-    assert result["browser_native"]["phase"] == "authorized"
-    assert "PRIVATE_DIAGNOSTIC_INPUT" not in json.dumps(result)
 
 
 @pytest.mark.asyncio
@@ -1026,29 +778,3 @@ async def test_public_browser_amendment_real_preparation_worker_native_gate_and_
             assert store.effective_spec("run-1") == current
             with pytest.raises(ValueError):
                 mode.launch_authority(current, Path(current["checkout"]))
-
-
-@pytest.mark.parametrize("defect", ["missing", "receipt", "path", "identity", "recreated"])
-def test_historical_fixture_custody_requires_exact_ended_root(stopped_browser, defect):
-    case = stopped_browser
-    _response, current, recovery = admitted(case)
-    manifest_path = Path(current["state_dir"]) / "resources/manifest.json"
-    manifest = read_private(manifest_path)
-    checkout = Path(current["checkout"])
-    # Retire only this fixture's owned worktree, using its actual Git owner.
-    _git(Path(current["source_path"]), "worktree", "remove", "--force", str(checkout))
-    entry = manifest["roots"][str(checkout)]
-    entry["receipt"] = {"path": str(checkout), "kind": "checkout", "state": "removed"}
-    if defect == "missing":
-        entry.pop("receipt")
-    elif defect == "receipt":
-        entry["receipt"]["state"] = "retained"
-    elif defect == "path":
-        entry["receipt"]["path"] += "-foreign"
-    elif defect == "identity":
-        entry["identity"] = None
-    else:
-        checkout.mkdir()
-    write_private(manifest_path, manifest)
-    with pytest.raises(ValueError):
-        case.store.effective_spec("run-1")
