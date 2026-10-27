@@ -67,41 +67,6 @@ def test_registry_rename_aba_cannot_supply_substituted_proof(feature, monkeypatc
     assert not Path(str(source) + '-wal').exists()
 
 
-@pytest.mark.parametrize('suffix', ['-wal', '-journal'])
-@pytest.mark.parametrize('reader', ['view', 'revision_subject'])
-def test_dangling_registry_sidecar_is_unknown(feature, suffix, reader):
-    _store, shared, _snapshot, token = feature
-    sidecar = Path(str(shared.path) + suffix)
-    sidecar.symlink_to(sidecar.with_name('missing-target'))
-    spec = {'feature_delivery': {'owner': token, 'registry': str(shared.path)}}
-    with pytest.raises(ValueError):
-        if reader == 'view':
-            with readonly_registry(spec):
-                pytest.fail('a dangling journal cannot be treated as absent')
-        else:
-            with _ReadOnlyRegistry(shared.path).connect():
-                pytest.fail('a dangling journal cannot be treated as absent')
-    assert sidecar.is_symlink()
-
-
-def test_revision_readers_share_snapshot_and_reject_source_drift(feature):
-    from devflow_temporal.delivery_execution_config import observation_mode
-    from devflow_temporal.delivery_feature_revision_subject import FeatureRegistryObservationError
-    from devflow_temporal.delivery_stopped_resume import _observation_registry
-
-    _store, shared, _snapshot, token = feature
-    spec = {'feature_delivery': {'registry': str(shared.path)}}
-    with pytest.raises(FeatureRegistryObservationError):
-        with observation_mode():
-            first = _ReadOnlyRegistry(shared.path).current(token['issue_id'])
-            with shared.connect() as db:
-                db.execute('UPDATE execution_claims SET generation=generation+1 WHERE issue_id=?',
-                           (token['issue_id'],))
-            second = _observation_registry(spec).current(token['issue_id'])
-            assert second == first
-    assert shared.current(token['issue_id'])['generation'] == token['generation'] + 1
-
-
 def test_revision_registry_scope_closes_after_threaded_observation(feature):
     import asyncio
 

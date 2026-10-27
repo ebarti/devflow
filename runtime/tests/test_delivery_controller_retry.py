@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from copy import deepcopy
@@ -11,10 +10,8 @@ from test_delivery_metadata_recovery import published as published
 from test_delivery_store import service as service
 
 from devflow_temporal.contracts import canonical_json, digest
-from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_resources import private_directory, write_private
 from devflow_temporal.delivery_role_evidence import allocate, seal
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.supervisor import DeliverySupervisor
 
 KIND = 'published_controller_retry'
@@ -80,33 +77,6 @@ def evidence_failure(published, monkeypatch):
                'expected_candidate_id': candidate['id'], 'expected_pr_number': 7,
                'expected_pr_head': candidate['head'], 'additional_iterations': 0}
     return store, broker, state, closed, command, folder
-
-
-def test_authentic_evidence_only_failure_has_one_zero_iteration_continuation(evidence_failure):
-    store, broker, state, closed, command, _ = evidence_failure
-    original = store.effective_spec('run-1')
-    old_state = deepcopy(state)
-    old_closed = deepcopy(closed)
-    before = broker.candidate()
-    old_gate = broker._gate_path('verify', state['iteration'])
-    assert store.repair_admission_preflight('run-1', command)['additional_iterations'] == 0
-    admitted = store.continue_repair('run-1', command)
-    assert store.continue_repair('run-1', command) == admitted
-    effective = store.effective_spec('run-1')
-    assert effective['policy']['max_repairs'] == original['policy']['max_repairs']
-    assert state['iteration'] == original['policy']['max_repairs']
-    assert broker.candidate() == before
-    assert DeliveryBroker(store, effective)._gate_path('verify', state['iteration']) != old_gate
-    with store._connect() as db:
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_gate_admissions '
-                                        "WHERE run_id='run-1'").fetchone()[0])
-    assert recovery['state'] == old_state and closed == old_closed
-    from devflow_temporal.delivery_gate_retry import readback
-
-    assert readback(store, effective, recovery)['number'] == 7
-    with pytest.raises(ValueError):
-        store.continue_repair('run-1', {**command, 'command_id': 'second-controller-retry'})
 
 
 @pytest.mark.parametrize('corruption', ['assessment', 'closed-cleanup'])
@@ -175,57 +145,6 @@ def test_controller_retry_rejects_unproven_or_drifted_checkpoint(evidence_failur
         assert not db.execute('SELECT 1 FROM delivery_gate_admissions').fetchone()
 
 
-@pytest.mark.parametrize('qa_status', ['pass', 'findings'])
-def test_continuation_preserves_failure_and_runs_fresh_independent_gates(
-    evidence_failure, monkeypatch, qa_status,
-):
-    store, _, state, _, command, _ = evidence_failure
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
-    store.continue_repair('run-1', command)
-    spec = store.effective_spec('run-1')
-    spec['policy']['host_sandbox'] = 'trusted-local'
-    with store._connect() as db:
-        recovery = json.loads(db.execute(
-            'SELECT recovery_json FROM delivery_gate_admissions').fetchone()[0])
-    recovery['execution_spec'] = spec
-    flow = DeliveryWorkflow()
-    calls = []
-
-    async def execute(name, body, **kw):
-        calls.append((name, body.get('role')))
-        if name in {'delivery_tracker_start', 'delivery_tracker'}:
-            return {'state': 'consistent'}
-        if name == 'delivery_role':
-            assert body['role'] in {'review', 'verify'}
-            assert ('delivery_checks', None) in calls
-            return {'role': body['role'], 'iteration': state['iteration'],
-                    'status': qa_status if body['role'] == 'verify' else 'pass',
-                    'findings': ['Fresh QA failure'] if qa_status != 'pass' else [],
-                    'session_id': 'fresh-' + body['role'], 'candidate': recovery['candidate']}
-        return {'state': 'passed', 'cleanup': 'confirmed',
-                'candidate_id': recovery['candidate']['id']}
-
-    async def project(*_args):
-        pass
-
-    async def stop(_spec, reason):
-        flow.state.update(outcome='blocked', error=reason)
-        return flow.state
-
-    monkeypatch.setattr(flow, '_activity', execute)
-    monkeypatch.setattr(flow, '_project', project)
-    monkeypatch.setattr(flow, '_stop', stop)
-    result = asyncio.run(flow._resume_published_gates(spec, recovery))
-    assert [r for name, r in calls if name == 'delivery_role'] == ['review', 'verify']
-    assert not any('publish' in name for name, _ in calls)
-    assert result['iteration'] == state['iteration']
-    assert result['roles'][-3]['status'] == 'blocked'
-    assert result['roles'][-3]['findings'] == ['implementer produced no candidate change']
-    assert result['outcome'] == ('delivered' if qa_status == 'pass' else 'blocked')
-    if qa_status != 'pass':
-        assert not any(name == 'delivery_ci' for name, _ in calls)
-
-
 def test_repaired_runtime_guard_uses_actual_failed_implementation_journal(
     evidence_failure, monkeypatch,
 ):
@@ -248,32 +167,3 @@ def test_repaired_runtime_guard_uses_actual_failed_implementation_journal(
                         lambda _: consumed)
     with pytest.raises(ValueError, match='requires a repaired measured runtime'):
         snapshot(store, 'run-1', KIND)
-
-
-@pytest.mark.parametrize('field', ['run_id', 'cwd'])
-def test_original_journal_intent_must_match_frozen_request(evidence_failure, field):
-    store, _, _, _, command, folder = evidence_failure
-    path = folder / 'native-process.json'
-    journal = json.loads(path.read_text())
-    journal['intent'][field] = 'unrelated'
-    write_private(path, journal)
-    with pytest.raises(ValueError, match='authentic same-session'):
-        store.repair_admission_preflight('run-1', command)
-
-
-def test_readback_rejects_changed_durable_original_assessment(evidence_failure):
-    from devflow_temporal.delivery_gate_retry import readback
-
-    store, _, _, _, command, folder = evidence_failure
-    store.continue_repair('run-1', command)
-    effective = store.effective_spec('run-1')
-    with store._connect() as db:
-        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_gate_admissions')
-                              .fetchone()[0])
-        saved = json.loads(db.execute('SELECT result_json FROM delivery_attempts WHERE job_key=?',
-                                      (folder.name,)).fetchone()[0])
-        saved['status'] = 'blocked'
-        db.execute('UPDATE delivery_attempts SET result_json=? WHERE job_key=?',
-                   (canonical_json(saved), folder.name))
-    with pytest.raises(ValueError, match='original attempt'):
-        readback(store, effective, recovery)

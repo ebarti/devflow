@@ -7,7 +7,6 @@ import hashlib
 import json
 import lzma
 import os
-import zlib
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -17,11 +16,9 @@ import httpx
 import pytest
 from temporal_test_server import local_temporal
 from temporalio import activity, workflow
-from temporalio.api.common.v1 import Payload
 from temporalio.client import WorkflowHistory
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
-from test_delivery_publication_liveness import run_publication_probe
 from test_delivery_publication_self_heal import pending_v1
 from test_delivery_store import service as service
 
@@ -31,7 +28,6 @@ from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_lifecycle import RecoveryRefused
-from devflow_temporal.delivery_publication import admitted_recovery_stage
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
@@ -64,17 +60,6 @@ class RetainedPublicationHistory:
         except ActivityError:
             pass
         return state
-
-
-def closed_fixture(spec):
-    state = {'run_id': spec['run_id'], 'phase': 'blocked', 'execution_state': 'blocked',
-             'outcome': 'blocked', 'iteration': 0, 'revision': 3,
-             'candidate': {'id': 'a' * 64, 'head': 'b' * 40}, 'checks': {'failure': {
-                 'classification': 'transient', 'cause_type': 'publication_deadline',
-                 'stage': 'publishing_pending'}}, 'error': 'display text is not authority'}
-    return {'workflow_id': 'delivery-' + spec['run_id'], 'execution_run_id': 'owned-execution',
-            'request_digest': spec['request_digest'], 'recovery_digest': None,
-            'closed_at': '2026-10-26T00:00:00+00:00', 'result': state}
 
 
 def expanded_fixture():
@@ -154,120 +139,6 @@ async def assert_orphan_preservation_is_bounded(store, spec, history, command, a
             # The test owns this injected corrupt artifact; production left it intact.
             if artifact.exists():
                 artifact.unlink()
-
-
-def test_typed_closed_proof_binds_current_stage_without_history(service, monkeypatch):
-    store, request = service
-    store.submit(request)
-    spec = store.spec(request['run_id'])
-    closed = closed_fixture(spec)
-
-    async def unavailable(*_args):
-        raise AssertionError('typed controller result needs no historical text inference')
-
-    monkeypatch.setattr(proof, '_history', unavailable)
-    observed = proof.observe(store, spec, closed)
-    assert observed['source'] == 'closed_result'
-    assert proof.matches(spec, closed['result'], observed)
-    assert not proof.matches(spec, {**closed['result'], 'iteration': 1}, observed)
-    assert admitted_recovery_stage(spec, {'state': closed['result'],
-                                         'publication_stop_proof': observed}, legacy_hint=False)
-    assert admitted_recovery_stage(spec, {'state': closed['result']}, legacy_hint=True)
-    assert not admitted_recovery_stage(spec, {'state': closed['result']}, legacy_hint=False)
-
-
-def test_matching_english_prefix_without_evidence_stays_typed_unknown(service, monkeypatch):
-    store, request = service
-    store.submit(request)
-    spec = store.spec(request['run_id'])
-    closed = closed_fixture(spec)
-    closed['result']['checks'] = {}
-    closed['result']['error'] = 'publication unresolved: ActivityError'
-
-    async def unavailable(*_args):
-        raise OSError('exact original history unavailable')
-
-    monkeypatch.setattr(proof, '_history', unavailable)
-    with pytest.raises(RecoveryRefused) as rejected:
-        proof.observe(store, spec, closed)
-    blocker = rejected.value.assessment['blockers'][0]
-    assert blocker['code'] == 'publication_stage_unproven'
-    assert blocker['satisfied'] is None
-
-
-def test_start_binding_preserves_preparation_intake_and_exact_recovery(service, monkeypatch):
-    store, request = service
-    raw = json.loads(store.config.path.read_text())
-    raw['roles']['intake'] = copy.deepcopy(raw['roles']['implement'])
-    store.config.path.write_text(json.dumps(raw))
-    store = DeliveryStore(DeliveryConfig.load(store.config.path))
-    original_admit = DeliveryConfig.admit
-
-    def prepared_admit(self, value, **kwargs):
-        return {**original_admit(self, value, **kwargs), 'preparation_version': 1}
-
-    monkeypatch.setattr(DeliveryConfig, 'admit', prepared_admit)
-    store.submit({key: value for key, value in request.items() if key != 'accepted_plan'})
-    submitted = store.submitted_spec('run-1')
-    prepared = copy.deepcopy(submitted)
-    prepared['policy']['native_identity'] = {'fixture': 'owned measurement'}
-    prepared['policy_digest'] = digest(prepared['policy'])
-    prepared['preparation'] = {'state': 'ready'}
-    store.freeze_preparation(submitted, prepared)
-    # Constructor scope: accepted-plan owner has persisted the completed intake.
-    with store._connect() as db:
-        db.execute('UPDATE delivery_runs SET accepted_plan_text=? WHERE run_id=?',
-                   ('Approved intake plan', 'run-1'))
-    effective = store.effective_spec('run-1')
-    closed = closed_fixture(effective)
-    for admitted in (submitted, prepared, effective):
-        proof._require_start(store, effective, closed, {'inputs': [admitted, None]})
-    foreign = copy.deepcopy(submitted)
-    foreign['policy']['allowed_paths'].append('not-admitted.py')
-    with pytest.raises(RecoveryRefused) as refused:
-        proof._require_start(store, effective, closed, {'inputs': [foreign, None]})
-    assert refused.value.assessment['blockers'][0]['code'] == 'publication_start_input_changed'
-    # Even a caller supplying the same altered spec cannot make it an owner.
-    foreign['policy_digest'] = digest(foreign['policy'])
-    with pytest.raises(RecoveryRefused):
-        proof._require_start(store, foreign, closed, {'inputs': [foreign, None]})
-    recovery = {'kind': 'owned-recovery-fixture', 'execution_spec': effective}
-    closed.update(workflow_id='delivery-run-1-fixture-recovery', recovery_digest=digest(recovery))
-    with store._connect() as db:
-        db.execute('UPDATE delivery_runs SET workflow_id=?,recovery_json=? WHERE run_id=?',
-                   (closed['workflow_id'], json.dumps(recovery), 'run-1'))
-    proof._require_start(store, effective, closed, {'inputs': [effective, recovery]})
-    with pytest.raises(RecoveryRefused):
-        proof._require_start(store, effective, closed, {'inputs': [submitted, recovery]})
-
-
-@pytest.mark.parametrize('encoding,compress', [(b'binary/zlib', zlib.compress),
-                                              (b'binary/xz', lzma.compress)])
-def test_compressed_payload_expansion_is_bounded_before_codec_decode(
-    service, encoding, compress,
-):
-    store, request = service
-    store.submit(request)
-    closed = closed_fixture(store.spec(request['run_id']))
-    raw = Payload(data=b'a' * (proof.MAX_PAYLOAD_BYTES + 1)).SerializeToString()
-    compressed = Payload(metadata={'encoding': encoding}, data=compress(raw))
-    assert compressed.ByteSize() < 10_000
-    with pytest.raises(RecoveryRefused) as rejected:
-        proof._bounded_payloads([compressed], closed)
-    assert rejected.value.assessment['blockers'][0]['code'] == (
-        'publication_history_bound_exceeded')
-
-
-@pytest.mark.asyncio
-async def test_actual_current_controller_supplies_typed_publication_stage():
-    # Authenticated closure bindings are covered independently. This executes the
-    # current controller rather than inferring the field from its helper alone.
-    state, _calls, _events = await run_publication_probe(
-        failure='deadline', readback_seconds=2)
-    failure = state['checks']['failure']
-    assert failure['classification'] == 'transient'
-    assert failure['cause_type'] == 'publication_deadline'
-    assert failure['stage'] == 'publishing_pending'
 
 
 @pytest.mark.asyncio

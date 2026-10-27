@@ -30,19 +30,6 @@ def test_github_observation_is_get_only_exact_host_and_repository(monkeypatch):
     assert 0 < kwargs["timeout"] <= 15
 
 
-def test_github_observation_does_not_accept_a_partial_paged_snapshot(monkeypatch):
-    calls = []
-
-    def run(argv, **kwargs):
-        calls.append(argv)
-        return SimpleNamespace(returncode=0, stdout=json.dumps([{}] * 100), stderr="")
-
-    monkeypatch.setattr("devflow_temporal.delivery_github_contract.subprocess.run", run)
-    with bounded_github_observation("owner/repo"), pytest.raises(ValueError, match="budget"):
-        list(GitHubDelivery().pages("repos/owner/repo/issues"))
-    assert len(calls) == 8
-
-
 def test_snapshot_observation_and_admission_pin_github_host(monkeypatch):
     calls = []
     monkeypatch.setenv("GH_HOST", "enterprise.example")

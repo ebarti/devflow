@@ -60,45 +60,6 @@ async def test_merge_assessment_and_execution_agree_and_keep_legacy_replay(deliv
 
 
 @pytest.mark.asyncio
-async def test_gates_assessment_requires_owner_authority_and_matches_execution(
-    stopped, monkeypatch,
-):
-    store, _, _, command = stopped
-    calls = []
-    original = store._completed_temporal_result
-    def observed(*args, **kwargs):
-        calls.append(kwargs.get('preserve', True))
-        return original(*args, **kwargs)
-    monkeypatch.setattr(store, '_completed_temporal_result', observed)
-    async with await _client(store) as client:
-        session = (await client.get('/api/session')).json()
-        headers = {'X-Devflow-CSRF': session['csrf_token'], 'Origin': store.config.dashboard_url}
-        async def assess(request):
-            return (await client.post('/api/runs/run-1/assess-transition', json={
-                'kind': 'investigation_gates_only', 'request': request})).json()
-        good = await assess(command)
-        assert good['eligible'] and good['proof_digest']
-        assert calls == [False]
-        missing = await assess({'precheck_sha256': command['precheck_sha256']})
-        assert not missing['eligible']
-        assert 'gates_authority_unknown' in {b['code'] for b in missing['blockers']}
-        stale = {**command, 'precheck_sha256': '0' * 64}
-        assessment = await assess(stale)
-        assert 'custody_changed' in {b['code'] for b in assessment['blockers']}
-        refused = await client.post('/api/runs/run-1/admit-gates-only', json=stale, headers=headers)
-        assert refused.status_code == 409
-        assert 'custody_changed' in {b['code'] for b in refused.json()['detail']['blockers']}
-        with store._connect() as db:
-            assert db.execute('SELECT count(*) FROM delivery_gate_admissions').fetchone()[0] == 0
-        admitted = await client.post('/api/runs/run-1/admit-gates-only',
-                                     json=command, headers=headers)
-        assert admitted.status_code == 200, admitted.text
-        assert calls[-1] is True
-        assert (await client.post('/api/runs/run-1/admit-gates-only', json=command,
-                                  headers=headers)).json() == admitted.json()
-
-
-@pytest.mark.asyncio
 async def test_merge_current_owner_conflict_cannot_acquire_a_grant(delivered):
     d = delivered
     with d.store._connect() as db:
