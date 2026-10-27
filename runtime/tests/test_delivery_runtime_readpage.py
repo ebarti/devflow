@@ -139,6 +139,8 @@ def node_heavy_page(service, monkeypatch):
     original_admit = DeliveryConfig.admit
 
     def admit(config, body, **kwargs):
+        # These controlled historical ACK records predate execution readiness.
+        kwargs.setdefault("_readiness_base", {})
         return prepared_spec(original_admit(config, body, **kwargs))
 
     monkeypatch.setattr(DeliveryConfig, "admit", admit)
