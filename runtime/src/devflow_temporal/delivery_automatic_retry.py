@@ -406,7 +406,9 @@ def unpublished(store, spec):
         if db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='publish'",
                       (spec['run_id'],)).fetchone():
             raise ValueError('publication was attempted')
-    source = Path(spec['source_path'])
+    from .delivery_workspace_custody import source_for
+
+    source = source_for(spec)
     if _git(source, 'remote', 'get-url', 'origin') != spec['origin_url']:
         raise ValueError('configured origin changed')
     if _git(source, 'ls-remote', '--heads', 'origin', 'refs/heads/' + spec['branch']):
@@ -417,7 +419,9 @@ def unpublished(store, spec):
 
 def fresh_unpublished_base(store, spec):
     unpublished(store, spec)
-    source = Path(spec['source_path'])
+    from .delivery_workspace_custody import source_for
+
+    source = source_for(spec)
     branch = spec.get('publication_base_ref')
     if not branch:
         raise ValueError('fresh attempt needs an approved named publication branch')

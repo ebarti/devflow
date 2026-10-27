@@ -97,9 +97,14 @@ def ordinary_scope_base(config: DeliveryConfig, original: dict[str, Any]) -> dic
             or repository.get("github_repo") != original.get("github_repo")
             or repository.get("expected_base_sha") not in (None, original["base_sha"])):
         raise ValueError("ordinary scope continuation changed its frozen base authority")
-    source = Path(repository["source_path"]).resolve(strict=True)
-    if (str(source) != original.get("source_path")
-            or _git(source, "rev-parse", "--show-toplevel") != str(source)
+    from .delivery_workspace_custody import source_for
+
+    configured_source = Path(repository["source_path"])
+    source = source_for(original)
+    if (str(configured_source) != original.get("source_path")
+            or (original.get("workspace_custody_version") != 1
+                and (configured_source.resolve(strict=True) != configured_source
+                     or _git(source, "rev-parse", "--show-toplevel") != str(source)))
             or _git(source, "remote", "get-url", "origin") != original["origin_url"]):
         raise ValueError("ordinary scope continuation changed its frozen source identity")
     try:
@@ -138,6 +143,11 @@ class DeliveryConfig:
         """Validate an already authenticated frozen configuration without reopening it."""
         if not isinstance(value, dict) or value.get("version") != 1:
             raise ValueError("unsupported service configuration")
+        if ("workspace_custody_version" in value
+                and (value.get("provider") != "fake"
+                     or type(value["workspace_custody_version"]) is not int
+                     or value["workspace_custody_version"] != 1)):
+            raise ValueError("workspace custody test opt-in requires fake provider and version 1")
         for key in ("tracking_db", "state_root", "helpers_dir", "codex_bin"):
             if not Path(value[key]).is_absolute():
                 raise ValueError(f"{key} must be absolute")
@@ -250,6 +260,7 @@ class DeliveryConfig:
         _feature_base: dict[str, Any] | None = None, legacy_publication: bool = False,
         _scope_base: dict[str, Any] | None = None,
         _readiness_base: dict[str, Any] | None = None,
+        _workspace_base: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         required = {
             "command_id",
@@ -341,12 +352,37 @@ class DeliveryConfig:
             or supersedes == supplied["run_id"]
         ):
             raise ValueError("superseded run ID is invalid")
-        source = Path(repository["source_path"]).resolve(strict=True)
-        if not source.is_dir() or _git(source, "rev-parse", "--show-toplevel") != str(source):
-            raise ValueError("configured source is not a Git working-copy root")
+        original_source = _workspace_base or _feature_base or _scope_base
+        if _workspace_base is not None and (
+                _feature_base is not None or _scope_base is not None
+                or supplied.get("supersedes_run_id") != _workspace_base.get("run_id")
+                or any(supplied.get(key) != _workspace_base.get(key) for key in (
+                    "work_id", "issue_url", "repository_key"))):
+            raise ValueError("workspace continuation changed its authenticated predecessor")
+        if original_source and original_source.get("workspace_custody_version") == 1:
+            from .delivery_workspace_custody import source_for
+
+            logical_source = Path(original_source["source_path"])
+            if (str(logical_source) != repository["source_path"]
+                    or original_source.get("origin_url") != repository["origin_url"]
+                    or original_source.get("github_repo") != owner_repo
+                    or original_source.get("repository_key") != supplied["repository_key"]
+                    or original_source.get("provider") != self.raw.get("provider", "codex")):
+                raise ValueError("workspace continuation changed its frozen source identity")
+            source = source_for(original_source)
+        else:
+            source = Path(repository["source_path"]).resolve(strict=True)
+            logical_source = source
+            if not source.is_dir() or _git(source, "rev-parse", "--show-toplevel") != str(source):
+                raise ValueError("configured source is not a Git working-copy root")
         actual_remote = _git(source, "remote", "get-url", "origin")
         if actual_remote != repository["origin_url"]:
             raise ValueError("configured Git origin changed")
+        if (self.raw.get("provider", "codex") == "codex"
+                or self.raw.get("workspace_custody_version") == 1):
+            from .delivery_workspace_custody import require_durable_locations
+
+            require_durable_locations(self, logical_source)
         resolved_ref = supplied["base_ref"]
         if _base_ref is not None:
             branch = _base_ref.removeprefix("refs/remotes/origin/")
@@ -374,7 +410,7 @@ class DeliveryConfig:
             if (not owner or supplied.get("feature_predecessor") != owner
                     or owner.get("store_path") != str(self.tracking_db)
                     or _feature_base.get("provider") != self.raw.get("provider", "codex")
-                    or _feature_base.get("source_path") != str(source)
+                    or _feature_base.get("source_path") != str(logical_source)
                     or _feature_base.get("origin_url") != actual_remote
                     or _feature_base.get("github_repo") != owner_repo
                     or any(supplied.get(key) != _feature_base.get(key) for key in (
@@ -666,6 +702,9 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            **({"workspace_custody_version": 1}
+               if (self.raw.get("provider", "codex") == "codex"
+                   or self.raw.get("workspace_custody_version") == 1) else {}),
             "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             "tracker_retry_version": 1,
@@ -691,7 +730,7 @@ class DeliveryConfig:
                if "readiness" in policy and self.raw.get("provider", "codex") == "codex"
                else {}),
             "provider": self.raw.get("provider", "codex"),
-            "source_path": str(source),
+            "source_path": str(logical_source),
             "origin_url": actual_remote,
             "github_repo": owner_repo,
             "base_sha": base_sha,

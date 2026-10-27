@@ -359,6 +359,7 @@ class NativeProcess:
         ports: tuple[int, ...] = (),
         cancelled: Callable[[], bool] = lambda: False,
         register_resources: bool = True,
+        writer_custody: dict | None = None,
     ) -> None:
         if spec["policy"].get("execution_backend") != "native-macos":
             raise ValueError("native process did not receive native authority")
@@ -366,6 +367,10 @@ class NativeProcess:
 
         reject_nested_controller()
         self.spec, self.folder = spec, folder
+        self.writer_custody = writer_custody
+        from .delivery_writer_custody import native_descriptors
+
+        native_descriptors(spec, writer_custody)
         self.register_resources = register_resources
         self.argv, self.cwd, self.environment = argv, cwd, environment
         self.timeout, self.ports, self.cancelled = timeout, ports, cancelled
@@ -378,6 +383,11 @@ class NativeProcess:
             RunResources(spec).process(self.journal)
 
     def run(self) -> dict:
+        from .delivery_writer_custody import native_custody, native_descriptors
+
+        if self.writer_custody is None:
+            self.writer_custody = native_custody(self.spec)
+        writer_descriptors = native_descriptors(self.spec, self.writer_custody)
         # The monitor owns stdio and teardown independently of the activity
         # worker. Its inherited lock survives worker loss, so a replacement
         # waits for the same invocation instead of launching it again.
@@ -415,7 +425,7 @@ class NativeProcess:
                 monitor = subprocess.Popen(
                     [sys.executable, "-I", "-m", __name__],
                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=descriptor,
-                    pass_fds=(lock,), start_new_session=True,
+                    pass_fds=(lock, *writer_descriptors), start_new_session=True,
                 )
             finally:
                 os.close(descriptor)
@@ -426,6 +436,7 @@ class NativeProcess:
                     "cwd": str(self.cwd), "environment": self.environment,
                     "timeout": self.timeout, "ports": self.ports, "monitor_lock": lock,
                     "register_resources": self.register_resources,
+                    "writer_custody": self.writer_custody,
                 }).encode())
             finally:
                 monitor.stdin.close()
@@ -454,12 +465,26 @@ class NativeProcess:
             os.close(lock)
 
     def _intent(self) -> dict:
-        return {
+        from .delivery_writer_custody import native_binding
+
+        intent = {
             "run_id": self.spec["run_id"], "policy_digest": self.spec["policy_digest"],
             "argv": self.argv, "cwd": str(self.cwd),
             "environment_sha256": digest(self.environment),
             "timeout": self.timeout, "ports": list(self.ports),
         }
+        binding = native_binding(self.spec, self.writer_custody)
+        if os.path.lexists(self.journal):
+            # Reattachment preserves original provenance. New custody cannot
+            # retroactively certify a historical invocation's inherited lease.
+            recorded = read_private(self.journal).get("intent", {}).get("writer_custody")
+            if recorded is not None:
+                if binding is not None and binding != recorded:
+                    raise ValueError("native writer witness changed its original invocation")
+                intent["writer_custody"] = recorded
+        elif binding is not None:
+            intent["writer_custody"] = binding
+        return intent
 
     def _request_cancel(self) -> None:
         if self.journal.exists():
@@ -485,6 +510,13 @@ class NativeProcess:
                         os.close(directory)
 
     def _run(self, *, monitor: bool = False, monitor_lock: int | None = None) -> dict:
+        from .delivery_writer_custody import native_guard
+
+        with native_guard(self.spec, self.writer_custody) as guard:
+            self._writer_guard = guard
+            return self._run_owned(monitor=monitor, monitor_lock=monitor_lock)
+
+    def _run_owned(self, *, monitor: bool = False, monitor_lock: int | None = None) -> dict:
         lock = os.open(
             self.folder / "native-process.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
         )
@@ -544,6 +576,15 @@ class NativeProcess:
                             raise ValueError("native lifecycle lock changed before allocation")
                         journal["lifecycle_locks"][name] = {
                             "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}
+                if intent.get("writer_custody") is not None:
+                    # This detached monitor has authenticated the actual
+                    # inherited descriptor before any child receives GO.
+                    journal["writer_custody"] = {
+                        "schema": "devflow-native-writer-proof-v2",
+                        "binding": intent["writer_custody"],
+                        "guard": self._writer_guard,
+                        "journal": str(self.journal), "intent_sha256": digest(intent),
+                    }
             write_private(self.journal, journal)
             if self.register_resources:
                 RunResources(self.spec).process(self.journal)
@@ -580,6 +621,8 @@ class NativeProcess:
                         data = data[os.write(descriptor, data):]
 
             try:
+                from .delivery_writer_custody import native_descriptors
+
                 process = subprocess.Popen(
                     [
                         sys.executable,
@@ -594,6 +637,7 @@ class NativeProcess:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
+                    pass_fds=native_descriptors(self.spec, self.writer_custody),
                 )
                 assert process.stdout is not None
                 os.set_blocking(process.stdout.fileno(), False)

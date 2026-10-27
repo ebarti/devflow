@@ -57,12 +57,14 @@ def existing_lease(config, *, exclusive=False):
 
 async def to_thread(store, spec, function, *args, **kwargs):
     """A cancelled asyncio waiter cannot drop its still-running body's lease."""
+    from .delivery_writer_custody import to_thread as writer_thread
+
     def execute():
         with existing_lease(store.config):
             with store._connect() as db:
                 require_current(db, spec, required=True)
             return function(*args, **kwargs)
-    return await asyncio.to_thread(execute)
+    return await writer_thread(spec, execute)
 
 
 def identity():

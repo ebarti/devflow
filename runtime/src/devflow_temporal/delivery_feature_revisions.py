@@ -3049,14 +3049,15 @@ def revision_checkpoint_key(spec, key):
     return "revision:" + str(superseding[1]["identity"]["plan_revision"]) + ":" + key
 
 
-def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup=None):
+def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup=None, shared=None):
     if not spec.get("feature_delivery") or spec.get("feature_worker"):
         return None
     from .delivery_feature_execution import plan_for
     from .delivery_github_contract import ordered_chunks
     from .delivery_source_scope import authority
 
-    values = _values(spec)
+    shared = _registry(spec, shared)
+    values = _values(spec, shared)
     receipt = _latest(values)
     attempts = [value for key, value in values.items() if key.startswith(PREFIX + "begin:")]
     current = (
@@ -3067,7 +3068,7 @@ def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup
     public = spec.get("feature_plan_revision_request")
     reference = spec.get("feature_plan_revision_preparation_retry")
     if public and reference:
-        chain = _preparation_lineage(_registry(spec), public, values)
+        chain = _preparation_lineage(shared, public, values)
         key = reference.get("checkpoint_key")
         retry = next((value for name, value in chain if name == key), None)
         if (not retry or retry["successor_id"] != spec["run_id"]
@@ -3080,7 +3081,6 @@ def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup
     selected = terminal or proposal or current or {}
     diagnostic = selected.get("diagnostic") or (current or {}).get("diagnostic") or {}
     plan = receipt["plan"] if receipt else (plan_for(spec) if spec.get("accepted_plan") else None)
-    shared = _registry(spec)
     token = spec["feature_delivery"]["owner"]
     budget = shared.budget(token["issue_id"])
     reason = None
@@ -3108,7 +3108,7 @@ def local_revision_readback(spec, *, expected_revision=None, phase=None, cleanup
         if not reason and shared._pending_revision(db, token["issue_id"]):
             reason = "recorded revision remains in custody"
     return {
-        "plan_identity": adopted_plan_identity(spec),
+        "plan_identity": adopted_plan_identity(spec, shared=shared),
         "phase": selected.get("phase", "current" if plan else "unplanned"),
         "revision_id": selected.get("revision_id"),
         "reason": selected.get("reason")

@@ -24,15 +24,17 @@ from .delivery_output import observed_test_count, rejection_causes, visible_outp
 from .delivery_publication import conventional, publication_summary
 from .delivery_source_scope import outside_scope, require_authorized
 from .delivery_store import DeliveryStore, _now
+from .delivery_writer_custody import writer_method
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str:
-    from .delivery_publication_execution import inherited_descriptors
+    from .delivery_publication_execution import inherited_descriptors as publication_descriptors
+    from .delivery_writer_custody import inherited_descriptors as writer_descriptors
 
     nul_output = argv[0] == 'git' and '-z' in argv
     result = subprocess.run(
         argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False,
-        pass_fds=inherited_descriptors(),
+        pass_fds=tuple(dict.fromkeys((*publication_descriptors(), *writer_descriptors()))),
     )
     stdout = result.stdout.decode('utf-8', 'surrogateescape') if nul_output else result.stdout
     stderr = result.stderr.decode('utf-8', 'surrogateescape') if nul_output else result.stderr
@@ -140,7 +142,9 @@ class DeliveryBroker:
         require_native_execution(spec)
         self.store = store
         self.spec = spec
-        self.source = Path(spec["source_path"])
+        from .delivery_workspace_custody import source_for
+
+        self.source = source_for(spec)
         self.checkout = Path(spec["checkout"])
         self.state_dir = Path(spec["state_dir"])
         from .delivery_resources import _gate_evidence_root
@@ -211,6 +215,7 @@ class DeliveryBroker:
                 (canonical_json(result), _now(), key),
             )
 
+    @writer_method
     def prepare(self) -> dict[str, Any]:
         key = f"prepare:{self.spec['run_id']}"
         local_branch_name = self.spec.get("local_branch", self.spec["branch"])
@@ -447,6 +452,7 @@ class DeliveryBroker:
         return bool(row and row[0] and json.loads(row[0]).get("candidate") == candidate
                     and not _git(self.checkout, "ls-files", "-u"))
 
+    @writer_method
     def gate_checkout(self, role: str, iteration: int, candidate: dict[str, Any]) -> Path:
         if role not in {"review", "verify"}:
             raise ValueError("only independent gates use gate checkouts")
@@ -1324,6 +1330,7 @@ class DeliveryBroker:
         return result
 
 
+    @writer_method
     def _prepare_generated_outputs(self, checkout: Path) -> None:
         from .delivery_configured_resources import declared_generated_directories
 
@@ -1914,8 +1921,11 @@ class DeliveryBroker:
         create_missing: bool = False,
     ) -> dict[str, Any]:
         from .delivery_publication_execution import PublicationUncertain, execution
+        from .delivery_writer_custody import reconciliation_read_only
 
-        with execution(self, iteration, input_candidate) as owner:
+        read_only = reconciliation_read_only(self.spec)
+        create_missing = create_missing and not read_only
+        with execution(self, iteration, input_candidate, read_only=read_only) as owner:
             if owner is None:
                 return {"state": "pending", "reason": "publication_execution_active"}
             try:

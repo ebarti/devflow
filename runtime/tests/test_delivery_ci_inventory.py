@@ -36,6 +36,9 @@ from devflow_temporal.delivery_store import DeliveryStore
 
 @pytest.fixture
 def ci_case(service, monkeypatch):
+    service[0].config.raw["repositories"]["fixture"]["readiness"] = {
+        "version": 1, "generation": 0, "browser_engines": [], "temporal_checks": []
+    }
     case = scope_case(service, monkeypatch, required_ci=NAMES)
     raw = {**case.raw, "status": "pass", "summary": "Owned completed change.", "findings": []}
     rewrite_assessment(case, raw)

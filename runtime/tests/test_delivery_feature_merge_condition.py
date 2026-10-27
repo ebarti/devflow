@@ -131,6 +131,30 @@ def test_historical_not_started_stack_is_settleable_but_not_resubmittable(servic
     assert not gh.closed
 
 
+def test_nested_readonly_settlement_never_creates_issue_closure(service, monkeypatch):
+    from devflow_temporal.delivery_execution_registry import UnresolvedEffect
+    from devflow_temporal.delivery_feature_readback import settle_one
+    from devflow_temporal.delivery_writer_custody import require_writer, shared as custody
+
+    service[0].config.raw["workspace_custody_version"] = 1
+    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
+    key = previously_submitted(store, spec, record, requested, command)
+    gh.merged = {20, 21, 22}
+    reg = registry(spec)
+    with reg.connect() as db:
+        entry = dict(db.execute("SELECT * FROM execution_effects WHERE effect_key=?", (key,))
+                     .fetchone())
+    with custody(spec):
+        require_writer(spec)
+        with pytest.raises(UnresolvedEffect, match="no original intent"):
+            settle_one(store, spec, entry, gh)
+        require_writer(spec)  # Scope downgrade ends with the readback.
+    with reg.connect() as db:
+        assert db.execute("SELECT count(*) FROM execution_effects "
+                          "WHERE kind='close_merged_issue'").fetchone()[0] == 0
+    assert not gh.closed and all(method == "GET" for method, _, _ in gh.calls)
+
+
 @pytest.mark.parametrize("reconciling", [False, True], ids=["retained", "current"])
 @pytest.mark.parametrize("submission", ["started", "submitted", "unknown"])
 def test_existing_native_submission_keeps_readback_and_exact_receipt_obligations(

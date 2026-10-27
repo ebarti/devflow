@@ -157,7 +157,7 @@ def _status(row: dict, observations: list[dict], receipt: dict | None = None,
     return "In Progress"
 
 
-def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
+def transition(db: sqlite3.Connection, config: Any, run_id: str, *, registry_view=None) -> None:
     """Called in the SAME transaction as a delivery event or PR observation."""
     row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
     if row is None:
@@ -167,17 +167,19 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
     if spec.get("feature_worker"):
         from .delivery_feature_execution import registry
 
-        actual = registry(spec).current(spec["feature_delivery"]["owner"]["issue_id"])
+        shared = registry_view.for_spec(spec) if registry_view is not None else registry(spec)
+        actual = shared.current(spec["feature_delivery"]["owner"]["issue_id"])
         if actual and actual["store_path"] == str(config.tracking_db):
-            transition(db, config, actual["run_id"])
+            transition(db, config, actual["run_id"], registry_view=registry_view)
         return
     key = issue_key(row["issue_url"])
     owner = spec.get("feature_delivery", {}).get("owner")
     if owner:
         from .delivery_feature_execution import registry
 
-        actual = registry(spec).current(owner["issue_id"])
-        if actual is None or registry(spec).token(actual) != owner:
+        shared = registry_view.for_spec(spec) if registry_view is not None else registry(spec)
+        actual = shared.current(owner["issue_id"])
+        if actual is None or shared.token(actual) != owner:
             return
     newest = db.execute(NEWEST_RUN_SQL, (key,)).fetchone()
     if not owner and newest[0] != run_id:
@@ -230,21 +232,21 @@ def transition(db: sqlite3.Connection, config: Any, run_id: str) -> None:
         and row["execution_state"] not in {"terminal", "blocked", "cancelled"},
         "pull_requests": observations,
         **({"legacy_publication_binding": publication_binding} if publication_binding else {}),
-        **({"execution_owner": owner, "repair_budget": registry(spec).budget(owner["issue_id"]),
-            "github_record": registry(spec).checkpoints(owner["issue_id"]).get("github-record")}
+        **({"execution_owner": owner, "repair_budget": shared.budget(owner["issue_id"]),
+            "github_record": shared.checkpoints(owner["issue_id"]).get("github-record")}
            if owner else {}),
     }
     if owner:
         from .delivery_feature_pass import checkpoints as current_checkpoints
 
-        checkpoints = current_checkpoints(spec)
+        checkpoints = current_checkpoints(spec, shared=shared)
         from .delivery_feature_revisions import adopted_plan, local_revision_readback
 
-        shared = registry(spec)
         raw_plan = row.get("accepted_plan_text") or spec.get("accepted_plan")
         plan = adopted_plan(spec, shared=shared) or (json.loads(raw_plan) if raw_plan else {})
         payload["feature_plan"] = local_revision_readback(
-            spec, expected_revision=row["revision"], phase=row["phase"], cleanup=row["cleanup"])
+            spec, expected_revision=row["revision"], phase=row["phase"], cleanup=row["cleanup"],
+            shared=shared)
         members = (receipt or {}).get("pull_requests", [])
         observation_by_url = {item["url"]: item for item in observations}
         member_by_chunk = {member["chunk_id"]: member for member in members

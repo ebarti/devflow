@@ -26,6 +26,53 @@ def observation(registry, issue="i", url=URL, store=STORE):
     return observe(registry.path, issue, url, store)
 
 
+@pytest.mark.parametrize("oversize", ["rows", "cell", "total"])
+def test_bounded_observation_rejects_metadata_before_loading_fact_payloads(
+    setup, monkeypatch, oversize,
+):
+    from devflow_temporal import delivery_registry_epoch as epochs
+
+    registry, token = setup
+    if oversize == "rows":
+        for number in range(8):
+            registry.checkpoint(token, "owned-bound-" + str(number), {"small": True})
+        limits = epochs.FactLimits(5, 100000, 50000)
+    else:
+        registry.checkpoint(token, "owned-large", {"value": "é" * 4096})
+        limits = epochs.FactLimits(100, 3000 if oversize == "total" else 100000,
+                                  50000 if oversize == "total" else 3000)
+    queries = []
+    original = sqlite3.connect
+
+    def traced(*args, **kwargs):
+        db = original(*args, **kwargs)
+        db.set_trace_callback(queries.append)
+        return db
+
+    monkeypatch.setattr(epochs.sqlite3, "connect", traced)
+    with pytest.raises(EpochUnavailable, match="bounded fact"):
+        epochs.observe(registry.path, "i", URL, STORE, fact_limits=limits)
+    assert not any(query.startswith("SELECT * FROM execution_checkpoints") for query in queries)
+
+
+def test_transaction_token_uses_preverified_schema_and_refuses_schema_change(setup, monkeypatch):
+    from devflow_temporal import delivery_registry_epoch as epochs
+
+    registry, _ = setup
+    with observation(registry) as observed:
+        def forbidden(_db):
+            pytest.fail("writer-held token rescanned registry schema")
+
+        monkeypatch.setattr(epochs, "verify_schema", forbidden)
+        with observed.writer_fence() as db:
+            observed.validate_transaction_token(db)
+        with registry.connect() as db:
+            db.execute("CREATE TABLE owned_schema_change (value TEXT)")
+        with pytest.raises(EpochUnavailable, match="authenticated schema changed"):
+            with observed.writer_fence():
+                pytest.fail("changed schema reached tracking acknowledgement")
+
+
 def test_old_writer_aba_and_unrelated_issue_isolation(setup):
     registry, token = setup
     with observation(registry) as observed:
@@ -232,49 +279,231 @@ def test_observation_refuses_active_writer_without_waiting(setup):
 
 
 def test_missing_registry_is_not_created(tmp_path):
-    path = tmp_path / 'missing' / 'registry'
+    path = tmp_path / "missing" / "registry"
     with pytest.raises(EpochUnavailable):
-        observe(path, 'i', URL, STORE)
+        observe(path, "i", URL, STORE)
     assert not path.parent.exists()
 
 
 def test_unrecognized_unique_index_is_refused(setup):
     registry, _ = setup
     with sqlite3.connect(registry.path) as db:
-        db.execute('CREATE UNIQUE INDEX unexpected ON execution_snapshots(input_digest)')
-    with pytest.raises(EpochUnavailable, match='index'):
+        db.execute(
+            "CREATE UNIQUE INDEX unexpected ON execution_snapshots(input_digest)"
+        )
+    with pytest.raises(EpochUnavailable, match="index"):
         observation(registry)
 
 
 @pytest.mark.parametrize(
-    'table', ['execution_claims', 'execution_authority_epochs', 'execution_epoch_meta']
+    "table", ["execution_claims", "execution_authority_epochs", "execution_epoch_meta"]
 )
 def test_unknown_triggers_are_refused_at_observation_and_bootstrap(setup, table):
     registry, _ = setup
     with sqlite3.connect(registry.path) as db:
-        db.execute(f'''CREATE TRIGGER custom_reset AFTER UPDATE ON {table} BEGIN
+        db.execute(f"""CREATE TRIGGER custom_reset AFTER UPDATE ON {table} BEGIN
             UPDATE execution_authority_epochs SET epoch=1 WHERE kind='issue' AND key='i';
-        END''')
-    with pytest.raises(EpochUnavailable, match='triggers'):
+        END""")
+    with pytest.raises(EpochUnavailable, match="triggers"):
         observation(registry)
-    with pytest.raises(EpochUnavailable, match='triggers'):
+    with pytest.raises(EpochUnavailable, match="triggers"):
         ExecutionRegistry(registry.path)
 
 
 def test_first_bootstrap_rolls_back_if_authority_table_has_unknown_trigger(setup):
     registry, _ = setup
     with sqlite3.connect(registry.path) as db:
-        names = [row[0] for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='trigger' "
-            "AND name LIKE 'authority_epoch_%'")]
+        names = [
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'authority_epoch_%'"
+            )
+        ]
         for name in names:
             db.execute(f'DROP TRIGGER "{name}"')
-        db.execute('DROP TABLE execution_authority_epochs')
-        db.execute('DROP TABLE execution_epoch_meta')
-        db.execute('CREATE TRIGGER custom_reset AFTER UPDATE ON execution_claims '
-                   'BEGIN SELECT 1; END')
-    with pytest.raises(EpochUnavailable, match='triggers'):
+        db.execute("DROP TABLE execution_authority_epochs")
+        db.execute("DROP TABLE execution_epoch_meta")
+        db.execute(
+            "CREATE TRIGGER custom_reset AFTER UPDATE ON execution_claims "
+            "BEGIN SELECT 1; END"
+        )
+    with pytest.raises(EpochUnavailable, match="triggers"):
         ExecutionRegistry(registry.path)
     with sqlite3.connect(registry.path) as db:
-        assert not db.execute("SELECT 1 FROM sqlite_master "
-                              "WHERE name='execution_epoch_meta'").fetchone()
+        assert not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='execution_epoch_meta'"
+        ).fetchone()
+
+
+def test_registry_fence_blocks_old_writer_through_tracking_commit(setup, tmp_path):
+    import subprocess
+    import sys
+
+    registry, _ = setup
+    tracking = tmp_path / "tracking.db"
+    with sqlite3.connect(tracking) as db:
+        db.execute("CREATE TABLE acknowledgements (value TEXT)")
+    with observation(registry) as observed:
+        with observed.writer_fence() as registry_db:
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                registry_db.execute("UPDATE execution_claims SET state='stopped'")
+            script = (
+                "import sqlite3,sys; db=sqlite3.connect(sys.argv[1],timeout=0); "
+                'db.execute("BEGIN IMMEDIATE")'
+            )
+            child = subprocess.run(
+                [sys.executable, "-c", script, str(registry.path)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            assert child.returncode != 0 and "database is locked" in child.stderr
+            with sqlite3.connect(tracking, timeout=0) as db:
+                db.execute("BEGIN IMMEDIATE")
+                observed.validate_transaction(registry_db)
+                db.execute("INSERT INTO acknowledgements VALUES ('accepted')")
+                db.commit()
+        with sqlite3.connect(tracking) as db:
+            assert (
+                db.execute("SELECT value FROM acknowledgements").fetchone()[0]
+                == "accepted"
+            )
+
+
+def test_registry_fence_rejects_aba_and_preserves_original_baseline(setup):
+    registry, _ = setup
+    with observation(registry) as observed:
+        with sqlite3.connect(registry.path) as db:
+            db.execute(
+                "UPDATE execution_claims SET state='draining' WHERE issue_id='i'"
+            )
+            db.execute("UPDATE execution_claims SET state='active' WHERE issue_id='i'")
+        with pytest.raises(EpochUnavailable, match="authority changed"):
+            with observed.writer_fence():
+                pytest.fail("changed observation reached ACK")
+        with pytest.raises(EpochUnavailable, match="authority changed"):
+            with observed.writer_fence():
+                pytest.fail("baseline was improperly refreshed")
+
+
+def test_registry_fence_nonblocking_and_rejects_replacement(setup, tmp_path):
+    registry, _ = setup
+    with observation(registry) as observed:
+        with sqlite3.connect(registry.path) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with pytest.raises(EpochUnavailable, match="writer fence unavailable"):
+                with observed.writer_fence():
+                    pytest.fail("busy registry reached ACK")
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(registry.path.read_bytes())
+        replacement.chmod(0o600)
+        os.replace(replacement, registry.path)
+        with pytest.raises(EpochUnavailable, match="identity"):
+            with observed.writer_fence():
+                pytest.fail("replacement reached ACK")
+
+
+def test_generic_registry_fence_holds_lock_without_feature_issue(setup):
+    from devflow_temporal.delivery_registry_epoch import PinnedRegistry
+
+    registry, _ = setup
+    with PinnedRegistry(registry.path) as pin:
+        with pin.writer_fence() as db:
+            assert (
+                db.execute("SELECT count(*) FROM execution_claims").fetchone()[0] == 1
+            )
+            with sqlite3.connect(registry.path, timeout=0) as writer:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    writer.execute("BEGIN IMMEDIATE")
+
+
+def test_transaction_validation_rejects_other_database_with_copied_uuid(
+    setup, tmp_path
+):
+    registry, _ = setup
+    copied = tmp_path / "copied.db"
+    with sqlite3.connect(registry.path) as source, sqlite3.connect(copied) as target:
+        source.backup(target)
+    copied.chmod(0o600)
+    with observation(registry) as observed, sqlite3.connect(copied) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN IMMEDIATE")
+        with pytest.raises(EpochUnavailable, match="transaction database changed"):
+            observed.validate_transaction(db)
+
+
+def test_fence_rechecks_exact_snapshot_assignment(setup):
+    registry, token = setup
+    registry.reserve_worker(token, "worker", "stream")
+    with observation(registry) as observed:
+        assignment = observed.facts["execution_workers"][0]
+        with observed.writer_fence(assignment=assignment) as db:
+            observed.validate_transaction(db, assignment=assignment)
+        changed = {**assignment, "state": "unknown"}
+        with pytest.raises(EpochUnavailable, match="worker assignment changed"):
+            with observed.writer_fence(assignment=changed):
+                pytest.fail("mismatched assignment reached ACK")
+
+
+def test_generic_ordered_fences_share_paths_and_sort_distinct_paths(setup, tmp_path):
+    from devflow_temporal.delivery_registry_epoch import (
+        PinnedRegistry,
+        ordered_writer_fences,
+    )
+
+    registry, _ = setup
+    second = ExecutionRegistry(tmp_path / "another" / "registry.db")
+    with observation(registry) as feature, PinnedRegistry(registry.path) as pin:
+        with ordered_writer_fences([pin, feature]) as fences:
+            fences.validate()
+            assert len(fences.connections) == 1
+            assert fences.connection(pin.path) is fences.connection(feature.path)
+            with sqlite3.connect(registry.path, timeout=0) as writer:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    writer.execute("BEGIN IMMEDIATE")
+    with PinnedRegistry(registry.path) as first, PinnedRegistry(second.path) as other:
+        with ordered_writer_fences([first, other]) as fences:
+            assert list(fences.connections) == sorted([first.path, other.path], key=str)
+            fences.validate()
+            for path in (first.path, other.path):
+                with sqlite3.connect(path, timeout=0) as writer:
+                    with pytest.raises(sqlite3.OperationalError, match="locked"):
+                        writer.execute("BEGIN IMMEDIATE")
+
+
+def test_generic_ordered_fences_refuse_identity_collision_and_release_prior_locks(
+    setup, tmp_path
+):
+    from devflow_temporal.delivery_registry_epoch import (
+        PinnedRegistry,
+        ordered_writer_fences,
+    )
+
+    registry, _ = setup
+    with PinnedRegistry(registry.path) as first:
+
+        class Mismatched:
+            path = first.path
+            identity = ("different",)
+
+            def validate_identity(self):
+                pass
+
+        with pytest.raises(EpochUnavailable, match="disagree"):
+            with ordered_writer_fences([first, Mismatched()]):
+                pass
+        with pytest.raises(EpochUnavailable, match="needs an observation"):
+            with ordered_writer_fences([]):
+                pass
+    other = ExecutionRegistry(tmp_path / "z-last" / "db")
+    paths = sorted([registry.path, other.path], key=str)
+    with PinnedRegistry(paths[0]) as first, PinnedRegistry(paths[1]) as last:
+        with sqlite3.connect(last.path, timeout=0) as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+            with pytest.raises(EpochUnavailable, match="writer fence unavailable"):
+                with ordered_writer_fences([last, first]):
+                    pass
+            with sqlite3.connect(first.path, timeout=0) as probe:
+                probe.execute("BEGIN IMMEDIATE")
+                probe.rollback()

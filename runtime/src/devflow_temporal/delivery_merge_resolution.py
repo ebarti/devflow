@@ -254,7 +254,10 @@ def _prepare(broker, pr, conflict, authorization):
         return spec, workspace, context
     if workspace.exists():
         raise ValueError("incomplete merge checkout preparation retained for inspection")
-    _git(root, "clone", "--shared", "--no-checkout", spec["source_path"], str(workspace))
+    from .delivery_workspace_custody import source_for
+    from .delivery_writer_custody import inherited_descriptors
+
+    _git(root, "clone", "--no-hardlinks", "--no-checkout", str(source_for(spec)), str(workspace))
     _git(workspace, "remote", "set-url", "origin", f"https://github.com/{spec['github_repo']}.git")
     _git(workspace, "fetch", "--no-tags", "origin", previous, target)
     _git(workspace, "checkout", "--detach", previous)
@@ -265,6 +268,7 @@ def _prepare(broker, pr, conflict, authorization):
     merged = subprocess.run(
         ["git", "-C", str(workspace), "merge", "--no-commit", "--no-ff", target],
         capture_output=True, text=True, check=False,
+        pass_fds=inherited_descriptors(),
     )
     if merged.returncode not in {0, 1}:
         raise RuntimeError("merge preparation failed: " + merged.stderr[-1000:])
@@ -277,7 +281,8 @@ def _prepare(broker, pr, conflict, authorization):
         versions[path] = {}
         for name, head in (("base", base), ("feature", previous), ("main", target)):
             result = subprocess.run(["git", "-C", str(workspace), "show", head + ":" + path],
-                                    capture_output=True, text=True, check=False)
+                                    capture_output=True, text=True, check=False,
+                                    pass_fds=inherited_descriptors())
             versions[path][name] = result.stdout if result.returncode == 0 else None
     write_private(root / "parent-versions.json", versions)
     write_private(root / "baseline.json", file_hashes(workspace))
