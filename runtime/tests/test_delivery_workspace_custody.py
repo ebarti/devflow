@@ -8,8 +8,8 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pytest
 import httpx
+import pytest
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_store import service as service
 
@@ -170,7 +170,8 @@ async def test_public_refused_admission_allows_corrected_retry(api_fixture):
                                      headers=headers)
         assert accepted.status_code == 200, accepted.text
         assert accepted.json()["run_id"] == "run-2"
-        assert json.loads((state / "workspace-owner.json").read_text())["binding"]["work_id"] == "work-2"
+        assert (json.loads((state / "workspace-owner.json").read_text())["binding"]["work_id"]
+                == "work-2")
 
 
 def _die_during_owner_publication(store, spec, point):

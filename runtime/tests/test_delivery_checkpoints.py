@@ -28,8 +28,8 @@ from devflow_temporal.delivery_checkpoints import (
 )
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_filesystem_custody import matches
-from devflow_temporal.delivery_resources import RunResources, _identity as checkpoints_identity
-from devflow_temporal.delivery_resources import read_private, write_private
+from devflow_temporal.delivery_resources import RunResources, read_private, write_private
+from devflow_temporal.delivery_resources import _identity as checkpoints_identity
 from devflow_temporal.delivery_store import DeliveryStore
 
 
@@ -633,7 +633,8 @@ def test_restore_file_process_loss_replays_only_authenticated_stage(stopped, kin
     shutil.rmtree(broker.checkout)
     filename = "owned-untracked.txt" if kind == "source" else "report.bin"
     process = multiprocessing.get_context("fork").Process(
-        target=_crash_restored_file, args=(store, spec, receipt, row["revision"], filename, boundary))
+        target=_crash_restored_file,
+        args=(store, spec, receipt, row["revision"], filename, boundary))
     process.start()
     process.join(30)
     assert process.exitcode == 77
@@ -700,7 +701,8 @@ async def test_public_restore_process_loss_reserves_and_preserves_unknown(stoppe
     assert intent["phase"] == ("git_active" if boundary == "git_active" else "reserved")
     app = create_app(store.config.path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url=store.config.dashboard_url) as client:
+    async with httpx.AsyncClient(
+            transport=transport, base_url=store.config.dashboard_url) as client:
         csrf = (await client.get("/api/session")).json()["csrf_token"]
         response = await client.post(
             f"/api/runs/{spec['run_id']}/checkpoints/{receipt['checkpoint_id']}/restore",
@@ -1063,7 +1065,8 @@ async def test_unproven_effect_never_grants_checkpoint_resume(stopped, state, ob
             "unproven-effect", spec["run_id"], "fixture", "{}", state, observed, "now"))
     app = create_app(store.config.path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url=store.config.dashboard_url) as client:
+    async with httpx.AsyncClient(
+            transport=transport, base_url=store.config.dashboard_url) as client:
         csrf = (await client.get("/api/session")).json()["csrf_token"]
         response = await client.post(
             f"/api/runs/{spec['run_id']}/checkpoints",
@@ -1291,7 +1294,8 @@ async def test_public_checkpoint_routes_require_csrf_and_return_verified_readbac
 async def test_public_ci_preflight_refuses_missing_owner_lock_without_creating_it(
     stopped, monkeypatch
 ):
-    from devflow_temporal import delivery_ci_inventory as ci, delivery_gate_retry as gate
+    from devflow_temporal import delivery_ci_inventory as ci
+    from devflow_temporal import delivery_gate_retry as gate
 
     store, spec, _broker, _row = stopped
     lock = Path(spec["state_dir"]) / "workspace-owner.lock"
@@ -1319,7 +1323,8 @@ async def test_public_ci_preflight_refuses_missing_owner_lock_without_creating_i
     }
     app = create_app(store.config.path)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url=store.config.dashboard_url) as client:
+    async with httpx.AsyncClient(
+            transport=transport, base_url=store.config.dashboard_url) as client:
         response = await client.post(
             "/api/runs/" + spec["run_id"] + "/ci-inventory-preflight", json=command
         )
@@ -1658,6 +1663,7 @@ def test_checkpoint_accepts_unchanged_feature_registry(service, monkeypatch):
 
 def test_feature_effect_without_receipt_blocks_checkpoint_resume(service, monkeypatch):
     from test_delivery_feature_execution import feature_service
+
     from devflow_temporal.delivery_feature_execution import registry
 
     configured, request, _ = feature_service(service, monkeypatch)
@@ -1695,6 +1701,7 @@ def test_feature_effect_without_receipt_blocks_checkpoint_resume(service, monkey
 @pytest.mark.parametrize("current", ["new_pending_effect", "unavailable"])
 def test_feature_checkpoint_readback_rechecks_current_registry(service, monkeypatch, current):
     from test_delivery_feature_execution import feature_service
+
     from devflow_temporal import delivery_checkpoints as checkpoints
     from devflow_temporal.delivery_feature_execution import registry
 
@@ -1715,7 +1722,8 @@ def test_feature_checkpoint_readback_rechecks_current_registry(service, monkeypa
         "registry_authority_changed" if current == "new_pending_effect"
         else "registry_observation_unknown") for item in read["resume_blockers"])
     if current == "new_pending_effect":
-        assert any(item.get("effect_key") == "new-feature-effect" for item in read["resume_blockers"])
+        assert any(item.get("effect_key") == "new-feature-effect"
+                   for item in read["resume_blockers"])
         shutil.rmtree(broker.checkout)
         with pytest.raises(ValueError, match="shared external effects require reconciliation"):
             restore_checkpoint(store, spec["run_id"], receipt["checkpoint_id"],

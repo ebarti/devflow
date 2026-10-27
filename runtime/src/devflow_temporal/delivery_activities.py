@@ -878,8 +878,10 @@ async def _run_role(request: dict[str, Any]) -> dict[str, Any]:
                 and (type(marker) is not int or marker != 1)):
             raise ValueError("unsupported feature repair reservation version")
         reservation_accounting = marker == 1 and iteration > 0
-        worker_owner = await writer_thread(request["spec"], _readiness_worker_assignment, store, request["spec"])
-        worker_workflow_id = await writer_thread(request["spec"], _readiness_workflow_id, store, request["spec"])
+        worker_owner = await writer_thread(
+            request["spec"], _readiness_worker_assignment, store, request["spec"])
+        worker_workflow_id = await writer_thread(
+            request["spec"], _readiness_workflow_id, store, request["spec"])
         worker_execution_run_id = _readiness_execution_run_id()
     if (role == "implement" and request["spec"].get("readiness_version") == 1
             and retained is None):

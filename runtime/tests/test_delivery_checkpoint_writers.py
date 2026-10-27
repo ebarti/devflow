@@ -130,7 +130,8 @@ def test_readonly_body_cannot_promote_or_mutate_direct_workspace_entry(stopped):
 
 def test_nested_readonly_scope_cannot_use_outer_writer_authority(stopped):
     from devflow_temporal.delivery_writer_custody import (
-        reconciliation_read_only, require_current_writer,
+        reconciliation_read_only,
+        require_current_writer,
     )
 
     _store, spec, _broker, _row = stopped

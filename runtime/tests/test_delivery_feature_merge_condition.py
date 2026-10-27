@@ -134,7 +134,8 @@ def test_historical_not_started_stack_is_settleable_but_not_resubmittable(servic
 def test_nested_readonly_settlement_never_creates_issue_closure(service, monkeypatch):
     from devflow_temporal.delivery_execution_registry import UnresolvedEffect
     from devflow_temporal.delivery_feature_readback import settle_one
-    from devflow_temporal.delivery_writer_custody import require_writer, shared as custody
+    from devflow_temporal.delivery_writer_custody import require_writer
+    from devflow_temporal.delivery_writer_custody import shared as custody
 
     service[0].config.raw["workspace_custody_version"] = 1
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)

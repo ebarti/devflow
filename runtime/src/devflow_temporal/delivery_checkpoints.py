@@ -1497,7 +1497,8 @@ def _restore_file(db, key, intent, target, raw, mode, *, mtime_ns=None, adjust_m
                 or target.read_bytes() != raw
                 or (not adjust_mode and stat.S_IMODE(info.st_mode) != mode)
                 or (mtime_ns is not None and info.st_mtime_ns != mtime_ns)):
-            raise ValueError("checkpoint original evidence or restored file changed: " + identity_key)
+            raise ValueError(
+                "checkpoint original evidence or restored file changed: " + identity_key)
         if record is not None and record.get("identity") != stat_identity(info):
             raise CheckpointRestoreUnknown("checkpoint restored file identity changed")
         if os.path.lexists(temporary):
@@ -1767,7 +1768,8 @@ def _populate_restore(
         if current_index != _git(staging, "rev-parse", "HEAD^{tree}").decode().strip():
             raise ValueError("checkpoint allocated index has unknown changes")
         if staged:
-            _restore_git(db, key, intent, staging, "apply", "--index", "--binary", "-", input=staged)
+            _restore_git(
+                db, key, intent, staging, "apply", "--index", "--binary", "-", input=staged)
     unstaged = read_private(root / "unstaged.patch", raw=True)
     current_diff = _git(staging, "diff", "--binary", "--full-index")
     if current_diff != unstaged:
