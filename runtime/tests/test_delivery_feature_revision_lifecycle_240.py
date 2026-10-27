@@ -312,10 +312,10 @@ async def test_public_revision_unreadable_closure_is_unknown(stopped, monkeypatc
     monkeypatch.setattr('devflow_temporal.delivery_feature_closure.closed_coordinator', unavailable)
     budget = shared.budget(spec['feature_delivery']['owner']['issue_id'])
     before = _contents(shared.path)
-    with store._connect() as db:
-        tracking_before = list(db.iterdump())
     app = create_app(store.config.path)
     app.state.delivery.store = store
+    with store._connect() as db:
+        tracking_before = list(db.iterdump())
     origin = store.config.dashboard_url.rstrip('/')
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
         session = (await client.get('/api/session')).json()

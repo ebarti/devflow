@@ -87,8 +87,9 @@ def failed_assessment(seed, monkeypatch, generation=2):
                   candidate=state['candidate'], pull_request=state['pull_request'],
                   iteration=state['iteration'], protocol_revision=state['revision'],
                   event_type='blocked', message=state['error'])
-    monkeypatch.setattr(store, '_completed_temporal_result', lambda _run, *, workflow_id=None:
-                        deepcopy(closed if workflow_id == closed['workflow_id'] else old_closed))
+    monkeypatch.setattr(store, '_completed_temporal_result',
+                        lambda _run, *, workflow_id=None, **_kwargs: deepcopy(
+                            closed if workflow_id == closed['workflow_id'] else old_closed))
     # Modern local tracking uses its real producer. Only the legacy remote
     # transport is doubled; both paths release the actual owned claim.
     def track(_spec, _status, **_kw):

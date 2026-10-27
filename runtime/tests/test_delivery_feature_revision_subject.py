@@ -279,11 +279,11 @@ def test_registry_observer_reads_actual_rollback_database_and_refuses_wal_or_uns
     for suffix in ("-wal", "-shm", "-journal"):
         sidecar = Path(str(shared.path) + suffix)
         sidecar.write_bytes(b"Unsettled original observation")
-        with pytest.raises(ValueError, match="settled rollback"):
+        with pytest.raises(ValueError, match="cannot be observed immutably"):
             view.current(issue["id"])
         sidecar.unlink()
     shared.path.chmod(0o644)
-    with pytest.raises(ValueError, match="private owned file"):
+    with pytest.raises(ValueError, match="cannot be observed immutably"):
         view.current(issue["id"])
     shared.path.chmod(0o600)
     # Closing the last real WAL writer removes sidecars but retains the WAL header.

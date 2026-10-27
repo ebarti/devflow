@@ -54,10 +54,10 @@ async def test_public_preparation_retry_preview_and_execute(
     index_before = index.read_bytes()
     budget = shared.budget(token['issue_id'])
     registry = shared.path.read_bytes()
-    with store._connect() as db:
-        tracking = list(db.iterdump())
     app = create_app(store.config.path)
     app.state.delivery.store = store
+    with store._connect() as db:
+        tracking = list(db.iterdump())
     origin = store.config.dashboard_url.rstrip('/')
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
         session = (await client.get('/api/session')).json()

@@ -182,7 +182,8 @@ def missing_session(stopped, monkeypatch):
             "" if current == spec else current.get("role_home_generation", "")
         ),
     )
-    monkeypatch.setattr(resume, "observed_native_cleanup", lambda _: "closed-native-fixture")
+    monkeypatch.setattr(resume, "observed_native_cleanup",
+                        lambda _, **_kwargs: "closed-native-fixture")
     monkeypatch.setattr(resume, "prepare_runtime", lambda selected, *_: copy.deepcopy(selected))
     return store, state, command, spec, attempts, previous, transcript
 

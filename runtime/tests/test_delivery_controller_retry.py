@@ -73,7 +73,8 @@ def evidence_failure(published, monkeypatch):
                    "workflow_id='delivery-run-1',iteration=2 WHERE run_id='run-1'",
                    (state['error'],))
         store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
-    monkeypatch.setattr('devflow_temporal.delivery_gate_retry._stopped_cleanup', lambda _: {})
+    monkeypatch.setattr('devflow_temporal.delivery_gate_retry._stopped_cleanup',
+                        lambda _, **_kwargs: {})
     command = {'continuation_kind': KIND, 'command_id': 'controller-retry-1',
                'expected_revision': state['revision'], 'expected_iteration': state['iteration'],
                'expected_candidate_id': candidate['id'], 'expected_pr_number': 7,

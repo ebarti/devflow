@@ -415,6 +415,9 @@ async def _history(spec, calls, *, workflow_id="delivery-run-1"):
         event_id=1, workflow_execution_started_event_attributes=
         WorkflowExecutionStartedEventAttributes(
             workflow_type=WorkflowType(name="DevflowDeliveryWorkflow"),
+            workflow_id=workflow_id, original_execution_run_id="isolated-closed-execution",
+            memo={"fields": {"request_digest": (
+                await DELIVERY_DATA_CONVERTER.encode([spec["request_digest"]]))[0]}},
             input=Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([spec, None]))))]
     for index, (name, request, result) in enumerate(calls):
         event_id = 10 + 3 * index
@@ -429,6 +432,13 @@ async def _history(spec, calls, *, workflow_id="delivery-run-1"):
             {"activity_task_completed_event_attributes": ActivityTaskCompletedEventAttributes(
                 scheduled_event_id=event_id,
                 result=Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([result])))})))
+    # Projection IDs above are consumed by the forgery assertions. Retain them
+    # while making this explicitly synthetic envelope complete for sealing.
+    selected = {event.event_id: event for event in events}
+    events = [selected.get(event_id) or HistoryEvent(
+        event_id=event_id, marker_recorded_event_attributes={
+            "marker_name": "owned-unrelated-fixture-event"})
+        for event_id in range(1, events[-1].event_id + 1)]
     return _History(workflow_id, events)
 
 
@@ -458,6 +468,7 @@ def _closed_client(spec, state, history, *, workflow_id="delivery-run-1"):
             # A COMPLETED execution's history ends with its result, as Temporal records it.
             closed = HistoryEvent(
                 event_id=history.events[-1].event_id + 1,
+                event_time=description.close_time,
                 workflow_execution_completed_event_attributes=(
                     WorkflowExecutionCompletedEventAttributes(result=Payloads(
                         payloads=await DELIVERY_DATA_CONVERTER.encode([copy.deepcopy(state)])))))
