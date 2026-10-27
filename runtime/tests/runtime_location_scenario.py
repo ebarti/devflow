@@ -1253,6 +1253,51 @@ def worker_failure_diagnostic(result, calls, native_checks, *, state_dir=None):
     def number(value):
         return value if type(value) is int and -2**31 <= value < 2**31 else None
 
+    def cleanup_summary(value):
+        import re
+
+        summary = {"state": "other", "refusal_category": "other"}
+        if not isinstance(value, dict):
+            return summary
+        summary["state"] = choice(value.get("state"), {
+            "removed", "already_absent", "failed_unknown",
+        })
+        reason = value.get("reason")
+        if (summary["state"] != "failed_unknown" or not isinstance(reason, str)
+                or len(reason) > 300):
+            return summary
+        categories = {
+            "disposable check artifact root was replaced": "root_replaced",
+            "disposable check output lost an original native journal": "journal_changed",
+            "registered native processes or ports remain active": "native_actor_or_port_live",
+        }
+        if reason in categories:
+            summary["refusal_category"] = categories[reason]
+            return summary
+        holders = re.fullmatch(
+            r"disposable check artifact root has a live holder "
+            r"\(count=([1-9][0-9]{0,6}), pids=([1-9][0-9]{0,9}(?:,[1-9][0-9]{0,9}){0,7})\)",
+            reason,
+        )
+        if holders:
+            count = int(holders.group(1))
+            pids = [int(value) for value in holders.group(2).split(",")]
+            if (count <= 1_000_000 and len(pids) == min(count, 8)
+                    and len(set(pids)) == len(pids) and all(pid < 2**31 for pid in pids)):
+                summary.update(refusal_category="live_holder", holder_count=count,
+                               holder_pids=pids)
+            return summary
+        inspection = re.fullmatch(
+            r"disposable check artifact root holder inspection failed "
+            r"\(returncode=(-?[1-9][0-9]{0,2})\)", reason,
+        )
+        if inspection:
+            returncode = int(inspection.group(1))
+            if -255 <= returncode <= 255 and returncode != 1:
+                summary.update(refusal_category="inspection_failed",
+                               inspection_returncode=returncode)
+        return summary
+
     def check_summary(check):
         summary = {
             "id": choice(check.get("id"), {"worker-regressions", "owned-python-layout"}),
@@ -1264,6 +1309,8 @@ def worker_failure_diagnostic(result, calls, native_checks, *, state_dir=None):
             "rejection_count": count(check.get("rejection_causes")),
             "diagnostic_present": bool(check.get("diagnostic")),
         }
+        if "artifact_cleanup" in check:
+            summary["artifact_cleanup"] = cleanup_summary(check["artifact_cleanup"])
         if state_dir is not None and check.get("id") == "worker-regressions":
             summary["inner_junit"] = owned_probe_failure_diagnostic(result, check, state_dir)
         return summary

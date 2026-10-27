@@ -163,7 +163,7 @@ async def test_public_permanent_location_owner_and_continuation(installed_pair, 
 
 
 def test_worker_failure_diagnostic_retains_verdict_without_untrusted_text(tmp_path):
-    from runtime_location_scenario import worker_failure_diagnostic
+    from runtime_location_scenario import assert_native_checks_passed, worker_failure_diagnostic
 
     sentinel = "Bearer synthetic-secret-do-not-log"
     result = {"outcome": "blocked", "error": sentinel, "findings": [sentinel],
@@ -222,6 +222,52 @@ def test_worker_failure_diagnostic_retains_verdict_without_untrusted_text(tmp_pa
     assert diagnostic["checks"][0]["results"][0]["inner_junit"] == {
         "state": "unavailable", "exception_type": "ValueError",
     }
+
+    def refused_cleanup(receipt):
+        with pytest.raises(AssertionError) as failure:
+            assert_native_checks_passed(result, ["checks"], [{"state": "failed", "results": [
+                {"id": "worker-regressions", "passed": False, "artifact_cleanup": receipt},
+            ]}])
+        assert sentinel not in str(failure.value)
+        reported = json.loads(str(failure.value))
+        assert reported["outcome"] == "blocked"
+        assert reported["checks"][0]["results"][0]["passed"] is False
+        return reported["checks"][0]["results"][0]["artifact_cleanup"]
+
+    def receipt(reason):
+        return {"state": "failed_unknown", "reason": reason, "path": sentinel,
+                "provider_output": sentinel, "log": sentinel}
+
+    assert refused_cleanup(receipt(
+        "disposable check artifact root has a live holder (count=2, pids=123,456)"
+    )) == {"state": "failed_unknown", "refusal_category": "live_holder",
+           "holder_count": 2, "holder_pids": [123, 456]}
+    assert refused_cleanup(receipt(
+        "disposable check artifact root holder inspection failed (returncode=-9)"
+    )) == {"state": "failed_unknown", "refusal_category": "inspection_failed",
+           "inspection_returncode": -9}
+    for reason, category in [
+        ("disposable check artifact root was replaced", "root_replaced"),
+        ("disposable check output lost an original native journal", "journal_changed"),
+        ("registered native processes or ports remain active", "native_actor_or_port_live"),
+    ]:
+        assert refused_cleanup(receipt(reason)) == {
+            "state": "failed_unknown", "refusal_category": category,
+        }
+    for reason in [
+        sentinel, {"reason": sentinel},
+        "disposable check artifact root has a live holder (count=2, pids=123)",
+        "disposable check artifact root has a live holder (count=1, pids=2147483648)",
+        "disposable check artifact root has a live holder (count=1000001, pids=123)",
+        "disposable check artifact root has a live holder (count=1, pids=123) " + sentinel,
+        "disposable check artifact root holder inspection failed (returncode=1)",
+        "disposable check artifact root holder inspection failed (returncode=256)",
+    ]:
+        assert refused_cleanup(receipt(reason)) == {
+            "state": "failed_unknown", "refusal_category": "other",
+        }
+    for malformed in [None, [sentinel], {"state": [sentinel], "reason": sentinel}]:
+        assert refused_cleanup(malformed) == {"state": "other", "refusal_category": "other"}
 
 def test_native_check_assertion_omits_untrusted_failure_output():
     from runtime_location_scenario import assert_native_checks_passed
