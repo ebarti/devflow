@@ -28,8 +28,8 @@ def service(tmp_path, monkeypatch):
     store.config.path.write_text(json.dumps(store.config.raw))
     original_admit = type(store.config).admit
 
-    def admit(configuration, body):
-        value = original_admit(configuration, body)
+    def admit(configuration, body, **kwargs):
+        value = original_admit(configuration, body, **kwargs)
         # Freeze custody before submission. Provider and remote transports are
         # modeled; filesystem and host resource observation remain real.
         value['policy']['host_sandbox'] = 'trusted-local'
