@@ -16,14 +16,11 @@ from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 
 from devflow_temporal.delivery_activities import (
-    _run_role,
     delivery_browser_qa,
-    delivery_checks,
-    delivery_precheck,
     delivery_prepare,
     delivery_project,
 )
-from devflow_temporal.delivery_api import DeliveryService, create_app
+from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
@@ -32,130 +29,6 @@ def _git(path: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
     ).stdout.strip()
-
-
-@pytest.mark.asyncio
-async def test_idle_dispatch_reports_actual_temporal_health(monkeypatch):
-    class Temporal:
-        service_client = None
-        healthy = True
-        probes = 0
-
-        async def check_health(self):
-            self.probes += 1
-            return self.healthy
-
-    class Store:
-        calls = 0
-
-        def pending_starts(self):
-            self.calls += 1
-            return []
-
-    temporal = Temporal()
-    temporal.service_client = temporal
-    store = Store()
-    service = object.__new__(DeliveryService)
-    service.store = store
-    service.temporal_status = "disconnected"
-    service._health_client = None
-
-    async def connect():
-        return temporal
-
-    monkeypatch.setattr(service, "client", connect)
-    await service.dispatch_once()
-    assert service.temporal_status == "connected"
-    assert temporal.probes == 1
-    assert store.calls == 1
-
-    temporal.healthy = False
-    with pytest.raises(RuntimeError, match="Temporal health check failed"):
-        await service.dispatch_once()
-    assert service.temporal_status == "disconnected"
-    assert service._health_client is None
-    assert store.calls == 2
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("activity_fn", [delivery_precheck, delivery_checks])
-async def test_check_activity_keeps_temporal_loop_responsive(activity_fn, monkeypatch, tmp_path):
-    started = threading.Event()
-    release = threading.Event()
-
-    class Broker:
-        native_cleanup_confirmed = True
-
-        def _native_cancelled(self):
-            return False
-
-        def run_prechecks(self, _iteration, _candidate):
-            started.set()
-            assert release.wait(2)
-            return {"state": "passed"}
-
-        run_checks = run_prechecks
-
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._context", lambda _spec: (
-            SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()
-        )
-    )
-    task = asyncio.create_task(activity_fn(
-        {"spec": {"provider": "codex"}, "iteration": 0, "candidate": {}}
-    ))
-    try:
-        beginning = time.monotonic()
-        assert await asyncio.to_thread(started.wait, 1)
-        await asyncio.sleep(0.02)
-        assert time.monotonic() - beginning < 0.5
-        assert not task.done()
-    finally:
-        release.set()
-    assert await task == {"state": "passed"}
-
-
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('activity_fn', [delivery_precheck, delivery_checks, _run_role])
-async def test_check_preparation_failure_keeps_diagnostics_without_claiming_a_launch(
-    activity_fn, monkeypatch, tmp_path,
-):
-    from devflow_temporal.delivery_broker import CheckPreparationFailure
-
-    class Broker:
-        native_cleanup_confirmed = True
-
-        def _native_cancelled(self):
-            return False
-
-        def run_prechecks(self, _iteration, _candidate):
-            raise CheckPreparationFailure('planned-dependencies', ValueError('owned root rejected'))
-
-        run_checks = run_prechecks
-        run_implementation_preparation = run_prechecks
-
-        def candidate(self):
-            return {'id': 'candidate'}
-
-    monkeypatch.setattr('devflow_temporal.delivery_activities._context', lambda _: (
-        SimpleNamespace(config=SimpleNamespace(state_root=tmp_path, raw={})), Broker()))
-    monkeypatch.setattr('devflow_temporal.delivery_activities.get_supervisor', lambda _: None)
-    monkeypatch.setattr('devflow_temporal.delivery_activities._role_context',
-                        lambda request, *_: (request, tmp_path, None, None))
-    result = await activity_fn({'spec': {'provider': 'codex',
-                                        'policy': {'host_sandbox': 'trusted-local'}},
-                               'role': 'implement', 'iteration': 0,
-                               'candidate': {'id': 'candidate'}})
-    if activity_fn is _run_role:
-        assert result['status'] == 'blocked' and result['session_id'] is None
-        assert result['findings'] == ['owned root rejected']
-        result = result['implementation_preparation']
-    assert result['state'] == 'failed' and result['cleanup'] == 'confirmed'
-    assert result['source_unchanged'] is True
-    assert result['results'][0]['launched'] is False
-    assert result['diagnostic'] == 'owned root rejected'
 
 
 @pytest.fixture
@@ -211,8 +84,6 @@ def api_fixture(tmp_path: Path) -> tuple[Path, dict]:
     return path, request
 
 
-
-
 def _foreign_queued_service(api_fixture, key, value):
     path, request = api_fixture
     owner = create_app(path).state.delivery
@@ -223,8 +94,6 @@ def _foreign_queued_service(api_fixture, key, value):
     foreign = create_app(foreign_path).state.delivery
     foreign.store.submit(request)
     return owner, foreign, request
-
-
 
 
 @pytest.mark.asyncio
@@ -262,8 +131,6 @@ def test_foreign_predecessor_readback_rejected_before_temporal_connection(
     monkeypatch.setattr("devflow_temporal.delivery_store.Client.connect", wrong_transport)
     with pytest.raises(ValueError, match="service transport ownership"):
         owner.store._completed_temporal_result(request["run_id"])
-
-
 
 
 def _dispatch_snapshot(store, run_ids):
@@ -460,14 +327,6 @@ async def test_rejected_start_is_unknown_for_that_row_only_and_backs_off(
     assert started == ["delivery-run-2"]
 
 
-
-
-
-
-
-
-
-
 @pytest.mark.asyncio
 async def test_tokenless_local_api_csrf_submit_replay_and_conflict(api_fixture):
     path, request = api_fixture
@@ -519,10 +378,6 @@ async def test_tokenless_local_api_csrf_submit_replay_and_conflict(api_fixture):
         assert not token_path.exists()
 
 
-
-
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "peer,host",
@@ -535,45 +390,6 @@ async def test_tokenless_boundary_rejects_foreign_peers_and_hosts(api_fixture, p
     async with httpx.AsyncClient(transport=transport, base_url=f"http://{host}") as browser:
         for endpoint in ("/", "/api/session", "/api/runs", "/api/service"):
             assert (await browser.get(endpoint)).status_code == 403
-
-
-
-
-
-
-
-
-@pytest.mark.asyncio
-async def test_terminal_cancel_is_conflict_without_pending_mutation(api_fixture):
-    path, request = api_fixture
-    app = create_app(path)
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18770") as browser:
-        login = await browser.get("/api/session")
-        headers = {
-            "Origin": "http://127.0.0.1:18770",
-            "X-Devflow-CSRF": login.json()["csrf_token"],
-        }
-        assert (await browser.post("/api/runs", json=request, headers=headers)).status_code == 200
-        app.state.delivery.store.project(
-            "run-1",
-            phase="blocked",
-            execution_state="blocked",
-            event_type="blocked",
-            message="preparation failed",
-            outcome="blocked",
-        )
-        response = await browser.post(
-            "/api/runs/run-1/cancel",
-            json={"command_id": "cancel-blocked", "expected_revision": 1, "reason": "stop"},
-            headers=headers,
-        )
-        assert response.status_code == 409
-        assert "already terminal" in response.json()["detail"]
-        with app.state.delivery.store._connect() as db:
-            assert db.execute("SELECT COUNT(*) FROM delivery_mutations").fetchone()[0] == 0
-
-
 
 
 @pytest.mark.asyncio

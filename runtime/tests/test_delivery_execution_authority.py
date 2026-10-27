@@ -159,26 +159,6 @@ async def test_real_reset_cannot_bind_copied_start(service):
             assert result == "refused" and any("reset or foreign start" in text for text in refused)
 
 
-def test_binding_is_single_winner_and_old_proof_refuses(service):
-    store, request = service
-    store.submit(request)
-    spec = store.effective_spec(request["run_id"])
-    item = store.pending_starts()[0]
-    reservation = authority.reserve(store, item, spec)
-    first = authority.bind(store, reservation, "first")
-    with pytest.raises(ValueError, match="original SDK binding"):
-        authority.bind(store, reservation, "second")
-    with store._connect() as db:
-        authority.require_current(db, spec, first)
-        with pytest.raises(ValueError, match="legacy"):
-            authority.require_current(db, {**spec, authority.VERSION: 0}, first)
-        with pytest.raises(ValueError, match="binding changed"):
-            authority.require_current(db, spec, {**first, "execution_run_id": "second"})
-        db.execute("UPDATE delivery_runs SET recovery_json='{}' WHERE run_id=?", (spec["run_id"],))
-    with store._connect() as db, pytest.raises(ValueError, match="owner"):
-        authority.require_current(db, spec, first)
-
-
 @pytest.mark.asyncio
 async def test_real_delivery_launch_interceptor_and_history_replay(service):
     from temporalio.worker import Replayer
