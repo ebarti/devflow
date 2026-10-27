@@ -112,8 +112,8 @@ def helper_upgrade(compatibility, source, guard, migration):
         raise ValueError(f"Retained helper preserved: {link}: {exc}") from exc
 
 
-def install(skills, home, force, backup=None, *, migration_source=None, lease_fd=None):
-    global MUTATING
+def plan(skills, home, force, *, migration_source=None, predecessor=None):
+    """Read-only complete registration checks shared by preflight and apply."""
     agents = load("install-agents")
     rollback = load("install-rollback")
     rollback.exchange_function()
@@ -123,8 +123,10 @@ def install(skills, home, force, backup=None, *, migration_source=None, lease_fd
             raise ValueError("production registrations require scripts/install.sh adoption")
     agents.check_skills_destination(str(skills))
     migration_helper = load("install-migration")
+    if predecessor is not None and (predecessor != migration_source or predecessor == ROOT):
+        raise ValueError("agent predecessor must be the exact distinct source being migrated")
     migration = migration_helper.plan(migration_source or ROOT, skills, home, guard)
-    _, _, actions, obsolete, _ = agents.plan(ROOT, skills, home, force)
+    _, _, actions, obsolete, _ = agents.plan(ROOT, skills, home, force, predecessor=predecessor)
     service = skills / "devflow-local-delivery"
     source = ROOT / "runtime/desktop/devflow-local-delivery"
     plugin = home / "plugins/cache/devflow-local/devflow"
@@ -195,6 +197,20 @@ def install(skills, home, force, backup=None, *, migration_source=None, lease_fd
                 if hashes(target, guard) != expected:
                     raise ValueError("modified historical helper preserved during production adoption")
                 adopted.append((registered, child))
+    return {"migration": migration, "scripts_upgrade": scripts_upgrade, "adopted": adopted,
+            "plugin": plugin, "service": service, "source": source, "compatibility": compatibility,
+            "children": children, "obsolete": obsolete, "actions": actions}
+
+
+def install(skills, home, force, backup=None, *, migration_source=None, lease_fd=None, predecessor=None):
+    global MUTATING
+    prepared = plan(skills, home, force, migration_source=migration_source, predecessor=predecessor)
+    agents, rollback, migration_helper = (load(name) for name in
+                                         ("install-agents", "install-rollback", "install-migration"))
+    migration, scripts_upgrade, adopted = (prepared[name] for name in ("migration", "scripts_upgrade", "adopted"))
+    plugin, service, source = (prepared[name] for name in ("plugin", "service", "source"))
+    compatibility, children = prepared["compatibility"], prepared["children"]
+    obsolete, actions = prepared["obsolete"], prepared["actions"]
     MUTATING = True
     migration_helper.apply(migration, ROOT, skills, agents, rollback, backup)
     if scripts_upgrade and not adopted:
@@ -223,6 +239,7 @@ def install(skills, home, force, backup=None, *, migration_source=None, lease_fd
                 str(home),
                 str(force).lower(),
                 *([str(backup)] if backup else []),
+                *(["--predecessor", str(predecessor)] if predecessor is not None else []),
             ],
             check=True,
             pass_fds=(() if lease_fd is None else (lease_fd,)),
