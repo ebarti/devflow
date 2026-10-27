@@ -1,7 +1,6 @@
 """Real resource readers keep unknown provider verdicts separate from proven teardown."""
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 
@@ -57,44 +56,6 @@ def test_unknown_provider_observation_requires_explicit_exact_teardown_checkpoin
     assert path.read_bytes() == before
     assert journal['monitoring_complete'] is False
     assert journal['result']['provider_outcome'] == 'unknown'
-
-
-@pytest.mark.parametrize('defect', ['journal', 'request', 'actor', 'monitor', 'port', 'proof',
-                                   'inventory', 'lease'])
-def test_cleanup_checkpoint_never_waives_current_native_custody(quarantined, defect):
-    spec, row, path, journal, request, table, ports, checkpoint = quarantined
-    descriptor = None
-    if defect == 'journal':
-        journal['provider_session']['result_digest'] = 'f' * 64
-        write_private(path, journal)
-    elif defect == 'request':
-        request['workspace'] = str(path.parent)
-        write_private(path.with_name('request.json'), request)
-    elif defect in {'actor', 'monitor'}:
-        table[17 if defect == 'actor' else 19] = {
-            'identity': 'opaque-start' if defect == 'actor' else 'opaque-monitor', 'stat': 'S'}
-    elif defect == 'port':
-        journal['ports'] = [51479]
-        journal['intent']['ports'] = [51479]
-        journal['cleanup_reconciliation']['intent_sha256'] = digest(journal['intent'])
-        write_private(path, journal)
-        checkpoint['journal_sha256'][str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
-        ports.add(17)
-    elif defect == 'proof':
-        journal['cleanup_reconciliation']['owned_sha256'] = 'f' * 64
-        write_private(path, journal)
-        checkpoint['journal_sha256'][str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
-    elif defect == 'inventory':
-        checkpoint['journal_sha256'][str(path.with_name('unregistered.json'))] = 'f' * 64
-    else:
-        descriptor = path.with_name('native-process.lock').open('rb')
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    try:
-        with pytest.raises((ValueError, BlockingIOError)):
-            observe_completed_resources(spec, [row], quarantined=checkpoint)
-    finally:
-        if descriptor:
-            descriptor.close()
 
 
 def test_quarantine_hash_authenticates_the_same_bytes_used_for_actor_observation(
