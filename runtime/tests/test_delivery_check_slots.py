@@ -13,9 +13,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from temporal_test_server import local_temporal
 from temporalio import workflow
 from temporalio.client import WorkflowFailureError
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from test_delivery_resources import spec
 from test_delivery_store import service as service
@@ -380,7 +380,7 @@ async def test_temporal_cancel_or_monitor_timeout_preserves_native_slot_lifecycl
     else:
         request["hours"] = 0.5 / 3600
     broker = owned_checks.brokers["temporal-stopped"]
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "isolated-temporal.sqlite3"),
     ) as environment:
