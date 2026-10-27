@@ -83,6 +83,12 @@ jobs:
       - run: echo "$RUNNER_TEMP/devflow-uv/bin" >> "$GITHUB_PATH"
       - run: uv sync --locked --python python
         working-directory: runtime
+      - name: Prepare exact Python for native location fixtures
+        run: |
+          uv python install --managed-python 3.12.13
+          fixture_python="$(uv python find --managed-python --no-python-downloads 3.12.13)"
+          "$fixture_python" -c 'import sys; assert sys.version_info[:3] == (3, 12, 13)'
+          printf 'DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON=%s\n' "$fixture_python" >> "$GITHUB_ENV"
       - name: Prepare disposable native SDK and official tool fixtures
         env:
           DEVFLOW_TEMPORAL_GITHUB_TOKEN: ${{ github.token }}

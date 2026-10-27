@@ -15,6 +15,43 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RuntimeCITopologyTests(unittest.TestCase):
+    def test_location_fixture_uses_verified_managed_python(self):
+        workflow = (ROOT / '.github/workflows/check.yml').read_text()
+        block = workflow.split('      - name: Prepare exact Python for native location fixtures\n', 1)[1]
+        block = block.split('      - name: Prepare disposable native SDK and official tool fixtures', 1)[0]
+        script = '\n'.join(line[10:] for line in block.split('        run: |\n', 1)[1].splitlines())
+        with tempfile.TemporaryDirectory(prefix='devflow-ci-python-') as directory:
+            root = Path(directory)
+            uv, python, env_file, log = (root / name for name in ('uv', 'fixture-python', 'env', 'log'))
+            uv.write_text("""#!/bin/bash
+printf '%s\\n' \"$*\" >> \"$STUB_LOG\"
+if [ \"$1 $2\" = 'python find' ]; then printf '%s\\n' \"$STUB_PYTHON\"; fi
+""")
+            python.write_text("""#!/bin/bash
+[ \"$1\" = '-c' ] || exit 1
+[ \"$2\" = 'import sys; assert sys.version_info[:3] == (3, 12, 13)' ] || exit 1
+[ \"${STUB_BAD_VERSION:-0}\" = 0 ] || exit 1
+""")
+            uv.chmod(0o755)
+            python.chmod(0o755)
+            env = {**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                   'STUB_LOG': str(log), 'STUB_PYTHON': str(python), 'GITHUB_ENV': str(env_file)}
+            result = subprocess.run(['/bin/bash', '-e', '-c', script], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(log.read_text().splitlines(), [
+                'python install --managed-python 3.12.13',
+                'python find --managed-python --no-python-downloads 3.12.13',
+            ])
+            self.assertEqual(env_file.read_text(),
+                             f'DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON={python}\n')
+            env_file.unlink()
+            env['STUB_BAD_VERSION'] = '1'
+            result = subprocess.run(['/bin/bash', '-e', '-c', script], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(env_file.exists())
+
     def test_two_parents_cover_all_partitions_and_propagate_failure(self):
         workflow = (ROOT / '.github/workflows/check.yml').read_text()
         block = workflow.split(
