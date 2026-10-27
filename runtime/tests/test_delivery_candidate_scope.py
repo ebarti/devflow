@@ -118,6 +118,49 @@ write_private(Path(request['result_path']),{'status':'pass','summary':'Offline r
 '''
 
 
+def native_completion_diagnostic(state_dir, attempt, result):
+    """Expose completion custody facts without copying provider text or paths."""
+    from devflow_temporal.delivery_resources import read_private
+
+    def choice(value, allowed):
+        return value if isinstance(value, str) and value in allowed else 'other'
+
+    states = {'starting', 'running', 'unknown', 'finished', 'confirmed', 'blocked',
+              'pass', 'recovery_unknown', 'observed-native-confirmed'}
+    reasons = {'native monitoring/provider outcome ambiguous', 'native prelaunch identity gap',
+               'role child did not report a startup identity',
+               'role child exited without a final receipt'}
+    journal, journal_state = {}, 'unavailable'
+    key = attempt.get('job_key')
+    if isinstance(key, str) and len(key) == 64 and all(c in '0123456789abcdef' for c in key):
+        try:
+            journal = read_private(state_dir / 'attempts' / key / 'native-process.json')
+            if isinstance(journal, dict):
+                journal_state = 'available'
+            else:
+                journal = {}
+        except (OSError, ValueError):
+            pass
+    native = journal.get('result')
+    native = native if isinstance(native, dict) else {}
+    return {
+        'attempt_state': choice(attempt.get('state'), states),
+        'attempt_cleanup': choice(attempt.get('cleanup'), states),
+        'result_present': attempt.get('result_json') is not None,
+        'activity_status': choice(result.get('status'), states),
+        'activity_cleanup': choice(result.get('cleanup'), states),
+        'activity_reason': choice(result.get('summary'), reasons),
+        'native_journal': journal_state,
+        'native_phase': choice(journal.get('phase'), {'allocated', 'running', 'finished'}),
+        'monitoring_complete': journal.get('monitoring_complete') is True,
+        'native_cleanup': choice(native.get('cleanup'), states),
+        'native_provider_outcome': choice(native.get('provider_outcome'),
+                                         {'not_started', 'unknown'}),
+        'observed_owned_stopped': native.get('observed_owned_stopped') is True,
+        'owned_ports_clear': native.get('owned_ports_clear') is True,
+    }
+
+
 @pytest.mark.parametrize('scenario', ['outside', 'legacy-signed'])
 def test_native_role_admission_enforces_scope_and_controller_commit_ownership(
         api_fixture, tmp_path, monkeypatch, scenario):
@@ -160,8 +203,11 @@ def test_native_role_admission_enforces_scope_and_controller_commit_ownership(
         result = read_private(broker.state_dir / 'activity-result.json')
         with store._connect() as db:
             attempt = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
+        assert (attempt['state'] == 'finished' and attempt['cleanup'] == 'confirmed'
+                and isinstance(attempt['result_json'], str) and attempt['result_json']), (
+            native_completion_diagnostic(broker.state_dir, attempt, result)
+        )
         raw_result = json.loads(attempt['result_json'])
-        assert attempt['state'] == 'finished' and attempt['cleanup'] == 'confirmed'
         # The real provider's stdout proves git commit --signoff was executable.
         log = Path(raw_result['native_process']['log']).read_text()
         assert 'provider commit ' in log
