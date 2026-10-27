@@ -5,9 +5,9 @@ import shutil
 from pathlib import Path
 
 from historical_replay import replay_designated_history
+from temporal_test_server import local_temporal
 from temporalio import activity
 from temporalio.client import WorkflowHistory
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -53,9 +53,10 @@ async def test_real_workflow_schedules_heartbeat_checks_and_replays_current_hist
         "policy": {"max_repairs": 0, "browser_qa": {"id": "browser"},
                    "prepublish_checks": [{"id": "fixture"}]},
     }
-    async with await WorkflowEnvironment.start_local(
+    async with local_temporal(
         dev_server_existing_path=shutil.which("temporal"),
         dev_server_database_filename=str(tmp_path / "owned-temporal.sqlite3"),
+        startup_timeout=5,
     ) as environment:
         async with Worker(
             environment.client, task_queue="check-slots-history", workflows=[DeliveryWorkflow],
