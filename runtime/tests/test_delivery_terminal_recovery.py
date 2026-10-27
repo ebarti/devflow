@@ -492,13 +492,26 @@ async def test_closed_cancelled_recovery_preserves_cleanup_source_contract(
                 # deadline; host contention is not a product latency assertion.
                 stopped = await asyncio.wait_for(handle.result(), 30)
                 assert stopped['outcome'] is None and stopped['phase'] == 'waiting_tracker'
-                assert broker.checkout.exists() == dirty
                 resources = RunResources(spec)
                 cleanup = (resources.root / 'finalization.json').read_bytes()
                 manifest = resources.manifest.read_bytes()
                 receipt = json.loads(cleanup)
                 entry = next(r for r in receipt['roots'] if r['kind'] == 'checkout')
-                assert entry['state'] == ('retained' if dirty else 'removed')
+                cleanup_diagnostic = json.dumps({
+                    'expected_checkout_retained': dirty,
+                    'workflow_cleanup': stopped.get('cleanup'),
+                    'finalization': {key: receipt.get(key) for key in (
+                        'state', 'outcome', 'process_cleanup', 'resource_cleanup', 'retryable',
+                    )},
+                    'checkout': {
+                        'kind': entry.get('kind'), 'state': entry.get('state'),
+                        'reason': str(entry.get('reason', ''))[:300],
+                        'retryable': entry.get('retryable'),
+                        'has_clean_base_removal': bool(entry.get('clean_base_removal')),
+                    },
+                }, sort_keys=True)
+                assert broker.checkout.exists() == dirty, cleanup_diagnostic
+                assert entry['state'] == ('retained' if dirty else 'removed'), cleanup_diagnostic
                 if not dirty:
                     assert entry['clean_base_removal']['candidate'] == {
                         k: candidate[k] for k in ('head', 'id', 'content_sha256')}
@@ -522,7 +535,7 @@ async def test_closed_cancelled_recovery_preserves_cleanup_source_contract(
                 final = await asyncio.wait_for(successor.result(), 10)
                 assert final['outcome'] == 'cancelled' and final['candidate'] == candidate
                 assert final['roles'] == [] and len(calls) == 4
-                assert broker.checkout.exists() == dirty
+                assert broker.checkout.exists() == dirty, cleanup_diagnostic
                 assert (resources.root / 'finalization.json').read_bytes() == cleanup
                 assert resources.manifest.read_bytes() == manifest
                 assert (await browser.post(endpoint + '/reconcile-tracker',
