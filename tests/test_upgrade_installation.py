@@ -608,8 +608,8 @@ if len(arguments) > 1 and pathlib.Path(arguments[0]).name == "install-rollback.p
         def __enter__(self): return self
         def __exit__(self, *args): return self.stream.__exit__(*args)
         def fileno(self): return self.stream.fileno()
-        def read(self):
-            raw = self.stream.read()
+        def read(self, size=-1):
+            raw = self.stream.read(size)
             if not injected and os.fstat(self.fileno()).st_ino == inode:
                 hooks = json.loads(raw)
                 hooks["foreign_capture_note"] = "ordinary update during public old-updater capture"
