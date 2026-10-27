@@ -160,7 +160,7 @@ async def test_generated_stdio_command_raw_goal_question_auto_plan_and_evidence(
                                                  "request_json": json.dumps(answer)})
                     result = await asyncio.wait_for(handle.result(), 20)
                     assert result["phase"] == "blocked"  # Deliberate role stub; no publication.
-                detail = await call("get_run_detail", {"run_id": "run-1"})
+                detail = await call("get_run", {"run_id": "run-1"})
                 assert detail["run"]["decisions"] == []
                 assert detail["run"]["intake"]["accepted_plan"]["authorization"]
                 assert len(calls) == 1 and calls[0]["role"] == "implement"
