@@ -57,8 +57,8 @@ jobs:
   temporal-runtime-tests:
     name: runtime shard ${{ matrix.shard }}
     runs-on: macos-latest
-    # Hosted Mac throughput varies; a passing shard reached 99% at the 20-minute limit.
-    timeout-minutes: 30
+    # Hosted Mac throughput varies; a progressing partition timed out at 82% after 30 minutes.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       # Two Mac hosts each run two partitions; host 0 also qualifies source tests.
