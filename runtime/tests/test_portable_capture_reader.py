@@ -29,6 +29,9 @@ def portable_case(tmp_path, monkeypatch):
            'member': 'temporal', 'binary_sha256': digest(executable),
            'binary_size': len(executable)}
     monkeypatch.setattr(fixture, 'TOOLS', {'cli': pin})
+    # Unit-only version seams; do not change the interpreter's global sys module.
+    monkeypatch.setattr(fixture, 'sys', SimpleNamespace(version_info=(3, 12, 13)))
+    monkeypatch.setattr(fixture, 'version', lambda name: '1.33.0' if name == 'temporalio' else '')
     archive = stage / pin['archive']
     archive.write_bytes(archive_bytes)
     url = f"https://github.com/{pin['repository']}/releases/download/{pin['tag']}/{pin['archive']}"
@@ -97,4 +100,18 @@ def test_fixture_reader_refuses_changed_bound_authority(portable_case, changed):
         binary.rename(moved)
         binary.symlink_to(moved)
     with pytest.raises(ValueError):
+        fixture.reader(config, declared)
+
+
+@pytest.mark.parametrize(('python_version', 'sdk'), [
+    ((3, 12, 12), '1.33.0'),
+    ((3, 12, 13), '1.32.0'),
+])
+def test_fixture_reader_refuses_wrong_runtime_or_sdk(
+    portable_case, monkeypatch, python_version, sdk,
+):
+    _binary, config, declared = portable_case
+    monkeypatch.setattr(fixture, 'sys', SimpleNamespace(version_info=python_version))
+    monkeypatch.setattr(fixture, 'version', lambda _name: sdk)
+    with pytest.raises(ValueError, match='original Python and SDK versions'):
         fixture.reader(config, declared)
