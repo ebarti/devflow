@@ -678,14 +678,25 @@ def install(root):
     if (root / "volume.json").exists():
         last = Path(read_private(root / "volume.json")["last_journal"])
         original = last.read_bytes()
+        original_owner = config.path.read_bytes()
         try:
             changed = json.loads(original)
             changed["result"]["cleanup"] = "unknown"
             write_private(last, changed)
             refused = fixture.control(config, "adopt-runtime-location", request, success=False)
-            assert "preflight authority changed" in refused
+            rejection = json.loads(refused.splitlines()[-1])
+            assert rejection["state"] == "refused", rejection
+            assessment = rejection["assessment"]
+            assert assessment["operation"] == "adopt_runtime_location", assessment
+            assert assessment["eligible"] is False, assessment
+            assert [
+                (item["code"], item["owner"], item["missing_or_unknown_fact"])
+                for item in assessment["blockers"]
+            ] == [("custody_changed", "runtime_installation", "evidence_sha256")], assessment
             assert fixture.original_rows(config) == rows
+            assert config.path.read_bytes() == original_owner
             assert not (config.state_root / "runtime-installations/current.json").exists()
+            assert not (config.state_root / "runtime-installations/pending.json").exists()
         finally:
             last.write_bytes(original)
     result = fixture.control(config, "adopt-runtime-location", request)
