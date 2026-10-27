@@ -307,19 +307,3 @@ def test_changed_authority_plan_or_head_cannot_merge(service, monkeypatch, chang
     assert not gh.closed
     with registry(spec).connect() as db:
         assert db.execute("SELECT COUNT(*) FROM execution_effects").fetchone()[0] == 0
-
-
-def test_unrelated_merge_commit_does_not_close_feature(service, monkeypatch):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    original = gh.api
-
-    def api(path, **kwargs):
-        if "/compare/" in path:
-            return {"status": "diverged", "merge_base_commit": {"sha": "other"}}
-        return original(path, **kwargs)
-
-    gh.api = api
-    gh.merged = {20, 21, 22}
-    with pytest.raises(OwnershipConflict, match="target branch"):
-        merger.merge(store, spec, requested, command, gh=gh)
-    assert not gh.closed

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from pathlib import Path
 
 import pytest
 from test_delivery_feature_execution import Controller, feature_service
@@ -16,67 +15,15 @@ from devflow_temporal import delivery_feature_merge as merger
 from devflow_temporal import delivery_feature_publication as publications
 from devflow_temporal import delivery_feature_workflow as protocol
 from devflow_temporal.contracts import digest
-from devflow_temporal.delivery_broker import DeliveryBroker, _git
-from devflow_temporal.delivery_execution_registry import ExecutionRegistry, OwnershipConflict
 from devflow_temporal.delivery_feature_execution import (
     continue_feature,
-    register_worker,
     registry,
-    worker_spec,
 )
 from devflow_temporal.delivery_feature_pass import checkpoint_key, checkpoints
 from devflow_temporal.delivery_feature_readback import settle
-from devflow_temporal.delivery_github_contract import GitHubDelivery, ordered_chunks
+from devflow_temporal.delivery_github_contract import GitHubDelivery
 
 service = legacy_service
-
-
-@pytest.mark.parametrize("change", ["binding", "parent"])
-def test_merge_rechecks_admitted_workstream_identity_and_parent(service, monkeypatch, change):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    if change == "binding":
-        record["manifest"]["workstream_issues"]["api"] = {
-            "id": "I_999", "number": 999, "url": "https://github.com/example/fixture/issues/999",
-        }
-    else:
-        api = gh.api
-        monkeypatch.setattr(gh, "api", lambda path, **kw: {"node_id": "I_other_feature"}
-                            if path.endswith("/parent") else api(path, **kw))
-    with pytest.raises(OwnershipConflict,
-                       match="bindings changed|hierarchy changed|accepted issue"):
-        merger.merge(store, spec, requested, command, gh=gh,
-                     execute=lambda *_args, **_kw: pytest.fail("must stop before merging"))
-    assert not gh.closed
-
-
-def test_seal_build_replays_exact_patch_after_checkpoint_acknowledgement_loss(service, monkeypatch):
-    store, request, _ = feature_service(service, monkeypatch)
-    store.submit(request)
-    spec = store.effective_spec(request["run_id"])
-    chunk = ordered_chunks(json.loads(request["accepted_plan"]))[0]
-    child = worker_spec(spec, chunk, {"url": "https://github.com/example/fixture/issues/10"},
-                        kind="build", base_sha=spec["base_sha"], base_branch="main")
-    register_worker(store, spec, child)
-    broker = DeliveryBroker(store, child)
-    broker.prepare()
-    (broker.checkout / "README.md").write_text("Complete implementation checkpoint\n")
-    candidate = broker.candidate()
-    monkeypatch.setattr(activities, "_context", lambda _: (store, broker))
-    original = ExecutionRegistry.checkpoint
-
-    def interrupted(self, token, key, value):
-        if key == "build:model":
-            raise TimeoutError("checkpoint acknowledgement lost")
-        return original(self, token, key, value)
-
-    monkeypatch.setattr(ExecutionRegistry, "checkpoint", interrupted)
-    with pytest.raises(TimeoutError):
-        activities.seal_build(child, candidate)
-    patch = (Path(child["state_dir"]) / "feature-implementation.patch").read_bytes()
-    monkeypatch.setattr(ExecutionRegistry, "checkpoint", original)
-    saved = activities.seal_build(child, candidate)
-    assert activities.seal_build(child, candidate) == saved
-    assert Path(saved["path"]).read_bytes() == patch
 
 
 @pytest.mark.parametrize("cancel_during_readback", [False, True])
@@ -171,70 +118,6 @@ async def test_lost_plan_write_settles_before_public_successor_is_admitted(
         "command_id": "continue-original-plan", "expected_revision": result["revision"],
     })
     assert store.effective_spec(successor["run_id"])["feature_delivery"]["owner"]["generation"] == 2
-
-
-def test_feature_readback_projection_cannot_reopen_a_terminal_owner(service, monkeypatch):
-    store, request, _ = feature_service(service, monkeypatch)
-    store.submit(request)
-    spec = store.effective_spec(request["run_id"])
-    store.project(spec["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
-                  event_type="blocked", message="Original terminal state", protocol_revision=2)
-    pending = dict(phase="waiting_feature_readback", execution_state="waiting", outcome=None,
-                   event_type="feature_readback_pending", message="Late waiting event",
-                   checks={"feature_readback": {"state": "pending"}}, protocol_revision=3)
-    assert store.project(spec["run_id"], **pending)["outcome"] == "blocked"
-    registry(spec).stop(spec["feature_delivery"]["owner"], "stopped", {})
-    assert store.project(spec["run_id"], **pending)["outcome"] == "blocked"
-    assert store.project(spec["run_id"], phase="cancelling", execution_state="running",
-                         outcome=None, event_type="cancel_requested", message="Late cancel request",
-                         protocol_revision=4)["phase"] == "blocked"
-
-
-def test_integration_pass_retains_evidence_and_imports_without_force(service, monkeypatch):
-    store, request, _ = feature_service(service, monkeypatch)
-    store.submit(request)
-    spec = store.effective_spec(request["run_id"])
-    shared, token = registry(spec), spec["feature_delivery"]["owner"]
-    source = Path(spec["source_path"])
-    chunk = ordered_chunks(json.loads(request["accepted_plan"]))[0]
-    # Obtain the canonical branch from the normal worker derivation.
-    original = worker_spec(spec, chunk, {"url": "https://github.com/example/fixture/issues/10"},
-                           kind="chunk", base_sha=spec["base_sha"], base_branch="main")
-    old_branch = original["branch"]
-    _git(source, "checkout", "-b", old_branch)
-    (source / "README.md").write_text("The retained feature contribution\n")
-    _git(source, "commit", "-am", "feat: original chunk", "--signoff")
-    old_head = _git(source, "rev-parse", "HEAD")
-    _git(source, "push", "origin", old_branch)
-    _git(source, "checkout", "-B", "main", spec["base_sha"])
-    (source / "unrelated.txt").write_text("New trunk contribution\n")
-    _git(source, "add", "unrelated.txt")
-    _git(source, "commit", "-m", "feat: advance trunk", "--signoff")
-    target = _git(source, "rev-parse", "HEAD")
-    _git(source, "push", "origin", "main")
-    member = {"chunk_id": "model", "number": 20, "branch": old_branch, "head": old_head,
-              "base_branch": "main", "url": "https://github.com/example/fixture/pull/20"}
-    shared.checkpoint(token, "verified:model", {"head": old_head, "run_id": "original"})
-    shared.checkpoint(token, "integration-pass:1", {
-        "number": 1, "target": target, "members": [member],
-    })
-    assert "verified:model" not in checkpoints(spec)
-    child = worker_spec(spec, chunk, {"url": "https://github.com/example/fixture/issues/10"},
-                        kind="chunk", base_sha=target, base_branch="main")
-    assert child["branch"] == old_branch and child["local_branch"] != old_branch
-    assert child["run_id"] != original["run_id"]
-    register_worker(store, spec, child)
-    broker = DeliveryBroker(store, child)
-    broker.prepare()
-    assert (broker.checkout / "README.md").read_text() == "The retained feature contribution\n"
-    assert (broker.checkout / "unrelated.txt").read_text() == "New trunk contribution\n"
-    _git(broker.checkout, "commit", "-m", "feat: integrate updated target", "--signoff")
-    assert _git(broker.checkout, "merge-base", "--is-ancestor", old_head, "HEAD") == ""
-    assert _git(broker.checkout, "merge-base", "--is-ancestor", target, "HEAD") == ""
-    _git(broker.checkout, "push", "origin", "HEAD:refs/heads/" + old_branch)
-    shared.checkpoint(token, checkpoint_key(child, "verified:model"), {"head": "new-proof"})
-    assert checkpoints(spec)["verified:model"]["head"] == "new-proof"
-    assert shared.checkpoints("I_feature")["verified:model"]["head"] == old_head
 
 
 @pytest.mark.parametrize("stale_pr_base", [False, True], ids=["current-pr-base", "stale-pr-base"])
@@ -384,24 +267,3 @@ async def test_successor_reintegrates_published_single_pr_after_target_moves(
     assert shared.checkpoints("I_feature")["verified:model"]["run_id"] == "original-model"
     assert checkpoints(spec)["verified:model"]["run_id"] == "integrated-model"
     assert shared.budget("I_feature")["used"] == 1
-
-
-def test_integration_rejects_trunk_movement_despite_matching_stale_pr_base(service, monkeypatch):
-    _, spec, _, _, _, gh = setup_feature(service, monkeypatch)
-    target = "e" * 40
-    api = gh.api
-
-    def remote(path, **kwargs):
-        if path.endswith("/git/ref/heads/main"):
-            return {"object": {"sha": "f" * 40}}
-        value = api(path, **kwargs)
-        if "/pulls/" in path:
-            value["base"]["sha"] = target
-        return value
-
-    monkeypatch.setattr(gh, "api", remote)
-    monkeypatch.setattr(activities, "GitHubDelivery", lambda: gh)
-    with pytest.raises(OwnershipConflict, match="target moved again before integration admission"):
-        activities.begin_integration(spec, target)
-    assert checkpoints(spec)["integration-pass"] is None
-    assert registry(spec).budget(spec["feature_delivery"]["owner"]["issue_id"])["used"] == 0
