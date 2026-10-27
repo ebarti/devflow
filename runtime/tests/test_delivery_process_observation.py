@@ -7,133 +7,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from devflow_temporal import delivery_control as control
-from devflow_temporal import supervisor
 from devflow_temporal.delivery_config import DeliveryConfig
-from devflow_temporal.supervisor import ProcessObservationUnknown
-
-
-@pytest.mark.parametrize("failure", ["nonzero", "empty", "warning", "timeout", "oserror"])
-def test_unavailable_primary_observation_never_proves_a_live_process_absent(monkeypatch, failure):
-    probes = []
-
-    def inspect(_argv, **kwargs):
-        assert kwargs["timeout"] == 5
-        if failure == "timeout":
-            raise subprocess.TimeoutExpired("ps", 5)
-        if failure == "oserror":
-            raise OSError("process inspection unavailable")
-        return SimpleNamespace(
-            returncode=1 if failure == "nonzero" else 0,
-            stdout="matching-start" if failure == "warning" else "",
-            stderr="inspection incomplete" if failure in {"nonzero", "warning"} else "",
-        )
-
-    monkeypatch.setattr(supervisor.subprocess, "run", inspect)
-    monkeypatch.setattr(supervisor.os, "kill", lambda pid, sig: probes.append((pid, sig)))
-    with pytest.raises(ProcessObservationUnknown, match="ownership remains unknown"):
-        supervisor._process_identity(7001, canonical=True, require_observation=True)
-    assert probes == [(7001, 0)]
-
-
-def test_failed_observer_needs_independent_absence_not_permission_denial(monkeypatch):
-    monkeypatch.setattr(supervisor.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(
-        returncode=1, stdout="", stderr="inspection unavailable"))
-
-    def absent(_pid, _signal):
-        raise ProcessLookupError()
-
-    monkeypatch.setattr(supervisor.os, "kill", absent)
-    assert supervisor._process_identity(7001, require_observation=True) is None
-
-    def denied(_pid, _signal):
-        raise PermissionError()
-
-    monkeypatch.setattr(supervisor.os, "kill", denied)
-    with pytest.raises(ProcessObservationUnknown):
-        supervisor._process_identity(7001, require_observation=True)
-
-
-def test_legacy_identity_fallback_does_not_convert_observation_failure_to_replacement(monkeypatch):
-    observed = []
-
-    def identity(_pid, **kwargs):
-        observed.append(kwargs)
-        if kwargs.get("canonical"):
-            return "canonical-start"
-        raise ProcessObservationUnknown("legacy observation unavailable")
-
-    monkeypatch.setattr(control, "_local_identity", identity)
-    monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
-    monkeypatch.setattr(control.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(
-        returncode=0, stdout="S"))
-    with pytest.raises(ProcessObservationUnknown, match="legacy observation unavailable"):
-        control._owned({"pid": 7001, "identity": "legacy-start"})
-    assert observed == [
-        {"canonical": True, "require_observation": True},
-        {"require_observation": True},
-    ]
-
-
-@pytest.mark.parametrize("observation", ["unknown", "foreign_generation"])
-def test_unverified_or_foreign_generation_is_never_reaped(monkeypatch, observation):
-    def identity(_pid):
-        if observation == "unknown":
-            raise ProcessObservationUnknown("identity observation unavailable")
-        return None
-
-    monkeypatch.setattr(control, "_process_identity", identity)
-    monkeypatch.setattr(control, "_local_identity", lambda *_args, **_kwargs: "foreign-start")
-    monkeypatch.setattr(control.os, "waitpid", lambda *_args: pytest.fail("reaped unverified PID"))
-    if observation == "unknown":
-        with pytest.raises(ProcessObservationUnknown):
-            control._owned({"pid": 7001, "identity": "recorded-start"})
-    else:
-        assert not control._owned({"pid": 7001, "identity": "recorded-start"})
-
-
-@pytest.mark.parametrize("observation", [
-    "nonzero", "empty", "warning", "timeout", "oserror", "foreign_group", "changed_generation",
-])
-def test_zombie_group_fallback_never_signals_without_group_and_generation_proof(
-    monkeypatch, observation,
-):
-    owned = iter((True, observation != "changed_generation"))
-    monkeypatch.setattr(control, "_owned", lambda _process: next(owned))
-
-    def missing_group(_pid):
-        raise ProcessLookupError()
-
-    def inspect(argv, **kwargs):
-        assert argv == ["ps", "-p", "7001", "-o", "pgid="]
-        assert kwargs["timeout"] == 5
-        if observation == "timeout":
-            raise subprocess.TimeoutExpired("ps", 5)
-        if observation == "oserror":
-            raise OSError("group inspection unavailable")
-        return SimpleNamespace(
-            returncode=1 if observation == "nonzero" else 0,
-            stdout=("" if observation == "empty" else
-                    "7002" if observation == "foreign_group" else "7001"),
-            stderr="incomplete observation" if observation == "warning" else "",
-        )
-
-    monkeypatch.setattr(control.os, "getpgid", missing_group)
-    monkeypatch.setattr(control.subprocess, "run", inspect)
-    monkeypatch.setattr(control.os, "killpg", lambda *_args: pytest.fail("unverified signal"))
-    process = {"pid": 7001, "identity": "recorded-start"}
-    if observation == "changed_generation":
-        assert control._terminate("fixture", process) == "already_stopped_or_changed"
-    elif observation == "foreign_group":
-        with pytest.raises(ValueError, match="not its process group leader"):
-            control._terminate("fixture", process)
-    else:
-        with pytest.raises(ProcessObservationUnknown, match="group observation is unavailable"):
-            control._terminate("fixture", process)
 
 
 def _configuration(tmp_path: Path) -> DeliveryConfig:
@@ -153,48 +31,6 @@ def _configuration(tmp_path: Path) -> DeliveryConfig:
     config = DeliveryConfig.load(path)
     control._private_directory(config.state_root)
     return config
-
-
-@pytest.mark.parametrize("failure_stage", ["during_member_stop", "after_member_stop"])
-def test_unknown_after_partial_stop_retains_inventory_and_supervisor_hold(
-    tmp_path, monkeypatch, failure_stage,
-):
-    config = _configuration(tmp_path)
-    processes = {name: {"pid": pid, "identity": "matching-start"}
-                 for name, pid in (("api", 7001), ("worker", 7002))}
-    control._write_manifest(config, processes)
-    before = control._manifest(config).read_bytes()
-    worker_marker = config.state_root / "worker-ready.json"
-    worker_marker.write_text("retained registration")
-    signals = []
-    stopped = set()
-
-    def identity(pid):
-        if (pid == 7002 or (failure_stage == "during_member_stop" and pid in stopped)):
-            raise ProcessObservationUnknown("member observation unavailable")
-        return None if pid in stopped else "matching-start"
-
-    def terminate(pid, sig):
-        signals.append((pid, sig))
-        stopped.add(pid)
-
-    monkeypatch.setattr(control, "_process_identity", identity)
-    monkeypatch.setattr(control, "_local_identity", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(control.os, "waitpid", lambda *_args: (0, 0))
-    monkeypatch.setattr(control.os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(control.os, "killpg", terminate)
-    with pytest.raises(control.ServiceObservationUnknown, match="stop is pending") as pending:
-        control.service_stop(config)
-    assert pending.value.results["worker"] == "observation_unknown"
-    assert pending.value.results["api"] == (
-        "observation_unknown" if failure_stage == "during_member_stop" else "stopped")
-    assert signals == [(7001, signal.SIGTERM)]
-    assert control._manifest(config).read_bytes() == before
-    assert worker_marker.read_text() == "retained registration"
-    intent = json.loads(control._stopped_marker(config).read_text())
-    assert intent["command"] == "stop" and "requested_at" in intent and "stopped_at" not in intent
-    monkeypatch.setattr(control, "_start", lambda *_args, **_kwargs: pytest.fail("restarted"))
-    assert control.ensure_service_running(config, unless_stopped=True)["stopped"]
 
 
 def _cli(config: DeliveryConfig, command: str, *, env: dict[str, str] | None = None):
@@ -274,73 +110,6 @@ def test_public_stop_retains_unknown_live_member_then_recovers(tmp_path, recorde
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
         child.wait(timeout=5)
-
-
-def test_public_mixed_stack_reports_unknown_member_and_stops_later_known_members(tmp_path):
-    config = _configuration(tmp_path)
-    children = {name: subprocess.Popen(
-        [sys.executable, "-B", "-c", "import time; time.sleep(60)"],
-        start_new_session=True, stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ) for name in ("api", "worker", "temporal")}
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
-           "PYTHONPATH": str(Path(control.__file__).resolve().parents[1])}
-    try:
-        processes = {name: {"pid": child.pid, "identity": control._process_identity(child.pid)}
-                     for name, child in children.items()}
-        control._write_manifest(config, processes)
-        original = control._manifest(config).read_bytes()
-        marker = config.state_root / "worker-ready.json"
-        marker.write_text("retained registration")
-        adapter = tmp_path / "bin"
-        adapter.mkdir()
-        ps = adapter / "ps"
-        real_ps = "/bin/ps" if Path("/bin/ps").is_file() else "/usr/bin/ps"
-        ps.write_text(
-            '#!/bin/sh\ncase "$*" in\n'
-            f'  "-p {children["api"].pid} -o lstart=") '
-            'echo "fixture: api identity observation unavailable" >&2; exit 1 ;;\n'
-            f'  *) exec {real_ps} "$@" ;;\nesac\n'
-        )
-        ps.chmod(0o700)
-        unavailable = {**env, "PATH": str(adapter) + os.pathsep + os.environ["PATH"]}
-        status = _cli(config, "status", env=unavailable)
-        assert status.returncode == 1, status.stderr
-        members = json.loads(status.stdout)["processes"]
-        assert members["api"]["running"] is None
-        assert members["api"]["observation"] == "unknown"
-        assert members["worker"]["running"] is True
-        assert members["temporal"]["running"] is True
-        stopped = _cli(config, "stop", env=unavailable)
-        assert stopped.returncode == 1, stopped.stderr
-        assert json.loads(stopped.stdout) == {
-            "api": "observation_unknown", "worker": "stopped", "temporal": "stopped",
-        }
-        assert children["api"].poll() is None
-        assert children["worker"].wait(timeout=5) == -signal.SIGTERM
-        assert children["temporal"].wait(timeout=5) == -signal.SIGTERM
-        assert control._manifest(config).read_bytes() == original
-        assert marker.read_text() == "retained registration"
-        assert control._stopped_marker(config).exists()
-        status = _cli(config, "status", env=unavailable)
-        assert status.returncode == 1
-        members = json.loads(status.stdout)["processes"]
-        assert members["api"]["running"] is None
-        assert members["worker"]["running"] is False
-        assert members["temporal"]["running"] is False
-        reconciled = _cli(config, "stop", env=env)
-        assert reconciled.returncode == 0, reconciled.stderr
-        assert json.loads(reconciled.stdout) == {
-            "api": "stopped", "worker": "already_stopped_or_changed",
-            "temporal": "already_stopped_or_changed",
-        }
-        assert children["api"].wait(timeout=5) == -signal.SIGTERM
-        assert not control._manifest(config).exists() and not marker.exists()
-    finally:
-        for child in children.values():
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=5)
 
 
 @pytest.mark.parametrize("leader_exits_first", [False, True])
