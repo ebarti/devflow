@@ -606,7 +606,13 @@ p.write_text(json.dumps(s))
         if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", baseline + "^{commit}"],
                           capture_output=True).returncode:
             self.skipTest("historical installed checkout is absent from this shallow clone")
-        fixture = self.root.resolve()
+        parent = os.environ.get("DEVFLOW_PRODUCTION_FIXTURE_PARENT")
+        if not parent:
+            raise RuntimeError("set an owned durable DEVFLOW_PRODUCTION_FIXTURE_PARENT "
+                               "for historical production updater replay")
+        temporary_fixture = tempfile.TemporaryDirectory(prefix="reconcile-upgrade-", dir=parent)
+        self.addCleanup(temporary_fixture.cleanup)
+        fixture = Path(temporary_fixture.name).resolve()
         origin, checkout = fixture / "origin", fixture / "checkout"
         # Preserve the historical Git objects and ancestry used by migration.
         subprocess.run(["git", "clone", "--quiet", "--shared", str(ROOT), str(origin)], check=True)
