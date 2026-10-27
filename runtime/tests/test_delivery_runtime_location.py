@@ -160,3 +160,91 @@ async def test_public_permanent_location_owner_and_continuation(installed_pair, 
     assert result["finite_maximum"] == 4
     assert result["native_preparation"] == "actual"
     assert result["capacity"] == 2 and result["frozen_capacity"] == 6
+
+
+def test_worker_failure_diagnostic_retains_verdict_without_untrusted_text(tmp_path):
+    from runtime_location_scenario import worker_failure_diagnostic
+
+    sentinel = "Bearer synthetic-secret-do-not-log"
+    result = {"outcome": "blocked", "error": sentinel, "findings": [sentinel],
+              "roles": [{"role": sentinel, "status": sentinel, "findings": [sentinel]}]}
+    checks = [{"state": "failed", "source_unchanged": True, "diagnostic": sentinel,
+               "results": [{"id": "worker-regressions", "passed": False, "exit_code": 1,
+                            "test_count": 2, "cleanup": "confirmed",
+                            "evidence_failure": sentinel, "rejection_causes": [sentinel],
+                            "diagnostic": sentinel},
+                           {"id": sentinel, "passed": sentinel, "exit_code": sentinel}]}]
+    diagnostic = worker_failure_diagnostic(result, ["checks", sentinel], checks)
+    assert sentinel not in json.dumps(diagnostic)
+    assert diagnostic["error_category"] == "other" and diagnostic["finding_count"] == 1
+    assert diagnostic["calls"] == ["checks", "other"]
+    assert diagnostic["checks"][0]["state"] == "failed"
+    item, unknown = diagnostic["checks"][0]["results"]
+    assert item == {"id": "worker-regressions", "passed": False, "exit_code": 1,
+                    "test_count": 2, "cleanup": "confirmed", "evidence_failure_present": True,
+                    "rejection_count": 1, "diagnostic_present": True}
+    assert unknown["id"] == "other" and unknown["exit_code"] is None
+
+    import xml.etree.ElementTree as ET
+
+    from devflow_temporal.delivery_check_evidence import retain_artifacts
+
+    candidate = {"id": "a" * 64}
+    folder = tmp_path / "checks/4/worker-regressions"
+    raw = folder / "pytest-artifacts"
+    raw.mkdir(parents=True)
+    suite = ET.Element("testsuite")
+    case = ET.SubElement(suite, "testcase", name="test_real_local_activity")
+    ET.SubElement(case, "failure", type="RuntimeError", message=(
+        "Failed starting Temporal dev server: timed out " + sentinel
+    )).text = sentinel
+    case = ET.SubElement(suite, "testcase", name=sentinel)
+    ET.SubElement(case, "error", type=sentinel, message=sentinel)
+    (raw / "junit.xml").write_bytes(ET.tostring(suite))
+    reference = retain_artifacts(folder, candidate)
+    owned = {"state": "failed", "results": [
+        {"id": "worker-regressions", "passed": False, "artifacts": reference},
+    ]}
+    diagnostic = worker_failure_diagnostic(
+        {**result, "candidate": candidate}, ["checks"], [owned], state_dir=tmp_path,
+    )
+    assert sentinel not in json.dumps(diagnostic)
+    inner = diagnostic["checks"][0]["results"][0]["inner_junit"]
+    assert inner["state"] == "available" and inner["unknown_failed_case_count"] == 1
+    assert inner["failed_cases"] == [{"probe": "test_real_local_activity", "outcome": "failure",
+                                      "exception_type": "RuntimeError",
+                                      "known_startup_timeout": True}]
+    (folder / "artifacts/junit.xml").write_text(sentinel)
+    diagnostic = worker_failure_diagnostic(
+        {**result, "candidate": candidate}, ["checks"], [owned], state_dir=tmp_path,
+    )
+    assert sentinel not in json.dumps(diagnostic) and diagnostic["outcome"] == "blocked"
+    assert diagnostic["checks"][0]["results"][0]["inner_junit"] == {
+        "state": "unavailable", "exception_type": "ValueError",
+    }
+
+def test_native_check_assertion_omits_untrusted_failure_output():
+    from runtime_location_scenario import assert_native_checks_passed
+
+    sentinel = "Bearer synthetic-secret-do-not-log"
+    with pytest.raises(AssertionError) as failure:
+        assert_native_checks_passed(
+            {"outcome": "delivered", "error": sentinel, "findings": [sentinel]},
+            ["checks"],
+            [{"state": "failed", "diagnostic": sentinel, "results": [
+                {"id": "worker-regressions", "passed": False, "diagnostic": sentinel}
+            ]}],
+        )
+    assert sentinel not in str(failure.value)
+    assert json.loads(str(failure.value))["checks"][0]["results"][0]["passed"] is False
+
+def test_native_check_assertion_reports_first_failed_check_after_retry():
+    from runtime_location_scenario import assert_native_checks_passed
+
+    checks = [{"state": "failed", "results": [{"id": "worker-regressions", "passed": False}]},
+              {"state": "passed", "results": [{"id": "worker-regressions", "passed": True}]}]
+    with pytest.raises(AssertionError) as failure:
+        assert_native_checks_passed({"outcome": "delivered"}, ["checks", "checks"], checks)
+    verdicts = json.loads(str(failure.value))["checks"]
+    assert [item["state"] for item in verdicts] == ["failed", "passed"]
+    assert verdicts[0]["results"][0]["passed"] is False
