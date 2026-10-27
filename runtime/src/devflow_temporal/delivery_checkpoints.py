@@ -70,12 +70,23 @@ def _require_index_baseline(value):
         raise ValueError("checkpoint index semantics are unverified; a fresh seal is required")
 
 
+def _legacy_index_format(value):
+    return "index_semantics" not in value.get("source", {})
+
+
 def _verify_index_baseline(checkout, value):
     from .delivery_checkpoint_index import observe_index
 
+    observed = observe_index(checkout, _git)
+    if _legacy_index_format(value):
+        # v1 recorded a tree and binary patches, not index flags. Observe a
+        # normal reconstructed index without pretending it was the old index.
+        return {"schema": "devflow-legacy-index-reconstruction-v1",
+                "original_index_flags": "not_recorded", "restored_index_semantics": observed}
     _require_index_baseline(value)
-    if observe_index(checkout, _git) != value["source"]["index_semantics"]:
+    if observed != value["source"]["index_semantics"]:
         raise ValueError("checkpoint Git index semantics changed")
+    return None
 
 
 class AttemptSettlementObservation(Protocol):
@@ -1122,7 +1133,8 @@ def create_checkpoint(
             prior = _read_acknowledged(db, spec, checkpoint_id)[0] if saved is not None else None
             if prior is not None:
                 _require_supported_native_custody(prior.get("closed_journals"))
-                _require_index_baseline(prior)
+                if not _legacy_index_format(prior):
+                    _require_index_baseline(prior)
             db.execute("BEGIN")
             if _command(db, key, run_id, request) != saved:
                 raise ValueError("checkpoint command changed during observation")
@@ -1474,6 +1486,8 @@ def read_checkpoint(store, run_id, checkpoint_id):
         ],
         "artifact_count": len(value["artifacts"]),
         "retention": "pinned-until-explicit-terminal-prune",
+        **({"legacy_index_recovery": "restore-recorded-v1-source-then-fresh-seal"}
+           if _legacy_index_format(value) else {}),
     }
 
 
@@ -1622,7 +1636,17 @@ def _finish_restore(
     ):
         raise ValueError("checkpoint restore allocation has an unknown or changed outcome")
     _openers(current)
-    _verify_index_baseline(current, value)
+    index_reconstruction = _verify_index_baseline(current, value)
+    if index_reconstruction is not None:
+        root = _root(spec) / value["checkpoint_id"]
+        for name, args in (
+            ("staged.patch", ("diff", "--cached", "--binary", "--full-index", "HEAD")),
+            ("unstaged.patch", ("diff", "--binary", "--full-index")),
+        ):
+            if _git(current, *args) != read_private(root / name, raw=True):
+                raise CheckpointRestoreUnknown(
+                    "legacy source bytes and recorded patches need index reconciliation; "
+                    "the prepared workspace is retained without inventing old flags")
     observed_ledger = _execution_ledger(
         spec, allow_unfinished_workers=fence is not None and writer is not None,
         facts=registry_observation.facts if registry_observation is not None else None,
@@ -1719,6 +1743,8 @@ def _finish_restore(
             "revision": request["expected_revision"],
             "restored": True,
             "execution_started": False,
+            **({"index_reconstruction": index_reconstruction}
+               if index_reconstruction is not None else {}),
         }
         db.execute(
             "INSERT INTO delivery_commands VALUES (?,?,?,?)",
@@ -1938,7 +1964,8 @@ def restore_checkpoint(
         with store._connect() as db:
             value, checkpoint = _read_acknowledged(db, spec, checkpoint_id)
             _require_supported_native_custody(value.get("closed_journals"))
-            _require_index_baseline(value)
+            if not _legacy_index_format(value):
+                _require_index_baseline(value)
             if value.get("checkpoint_context_sha256") != context_sha256:
                 raise ValueError("checkpoint authenticated controller snapshot changed")
             db.execute("BEGIN")
@@ -2038,9 +2065,13 @@ def restore_checkpoint(
                     or candidate_for(checkout) != checkpoint["candidate"]
                 ):
                     raise ValueError("restored checkpoint workspace changed")
-                from .delivery_retained_checkpoint import verify_retained_source
+                if ("index_reconstruction" in old
+                        and not isinstance(old["index_reconstruction"], dict)):
+                    raise ValueError("legacy restore receipt has an unknown index reconstruction")
+                from .delivery_retained_checkpoint import verify_restored_source
 
-                verify_retained_source(spec, value, _root(spec) / checkpoint_id, resources)
+                verify_restored_source(spec, value, _root(spec) / checkpoint_id, resources,
+                                       old.get("index_reconstruction"))
                 return old
             pending = db.execute(
                 "SELECT * FROM delivery_mutations WHERE command_id=?", (key,)

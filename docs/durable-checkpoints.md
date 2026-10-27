@@ -48,7 +48,17 @@ New source seals include a versioned index semantics baseline. Nonzero Git index
 flags, including assume-unchanged, skip-worktree and intent-to-add, refuse sealing
 without changing the index. Retained verification rechecks the baseline even if
 candidate content is unchanged. Old acknowledgements lacking this proof remain
-inspectable but cannot grant verified recovery; a fresh seal is required.
+inspectable and retain their original v1 restore and command-replay route. That
+format recorded source bytes, branch, index tree and binary staged/unstaged
+patches; it did not record index flags. Restoration reconstructs exactly those
+recorded facts into a new owned workspace with a normal index. Its new atomic
+receipt binds the original manifest and new workspace to the observed reconstructed
+index, explicitly marking original flags `not_recorded`. It never rewrites the
+old acknowledgement or infers an old baseline. Readback points to that recovery
+route while retaining the exact-index uncertainty. Older restore receipts replay
+only after current recorded source and normal index are reverified. An intact
+legacy workspace cannot grant a no-copy exact-index ACK; after reconstruction,
+it can take a fresh source seal. Neither reconstruction nor replay starts work.
 
 New native admissions own a private bare Git database in their durable run state
 before admission is acknowledged or the outbox becomes dispatchable. Local source

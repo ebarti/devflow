@@ -249,6 +249,24 @@ def _query(path, *args):
 
 def verify_retained_source(spec, value, checkpoint_root, resources):
     """Read-only comparison under an already-held concrete custody owner."""
+    if not value["source"].get("index_semantics"):
+        raise ValueError("retained checkpoint requires an index semantics baseline")
+    if observe_index(Path(spec["checkout"]), _query) != value["source"]["index_semantics"]:
+        raise ValueError("retained checkpoint index semantics changed")
+    return _verify_recorded_source(spec, value, checkpoint_root, resources)
+
+
+def verify_restored_source(spec, value, checkpoint_root, resources, reconstruction=None):
+    """Verify v1's recorded contract without inventing its unrecorded flags."""
+    if not checkpoints._legacy_index_format(value):
+        return verify_retained_source(spec, value, checkpoint_root, resources)
+    observed = checkpoints._verify_index_baseline(Path(spec["checkout"]), value)
+    if reconstruction is not None and reconstruction != observed:
+        raise ValueError("legacy reconstructed checkpoint index changed")
+    return _verify_recorded_source(spec, value, checkpoint_root, resources)
+
+
+def _verify_recorded_source(spec, value, checkpoint_root, resources):
     checkout = Path(spec["checkout"])
     entry = resources["roots"].get(str(checkout))
     if (entry is None or entry["kind"] != "checkout"
@@ -275,10 +293,6 @@ def verify_retained_source(spec, value, checkpoint_root, resources):
     if not any(item.rstrip(b"\0") == expected_registration.rstrip(b"\0")
                for item in registrations):
         raise ValueError("retained checkpoint worktree registration changed")
-    if not value["source"].get("index_semantics"):
-        raise ValueError("retained checkpoint requires an index semantics baseline")
-    if observe_index(checkout, _query) != value["source"]["index_semantics"]:
-        raise ValueError("retained checkpoint index semantics changed")
     _query(checkout, "diff", "--cached", "--exit-code", value["source"]["index_tree"], "--")
     for name, args in (
         ("staged.patch", ("diff", "--cached", "--binary", "--full-index", "HEAD")),
