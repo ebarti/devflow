@@ -66,7 +66,7 @@ def closed_unpublished(unpublished, monkeypatch, request):
         path = folder / 'native-process.json'
         q.update(result_path=str(folder / 'result.json'), start_path=str(folder / 'start.json'))
         intent, owned = {'run_id': spec['run_id']}, {'17017': {'identity': 'opaque-provider'}}
-        proof = {'kind': 'interrupted_monitor', 'version': 1,
+        proof = {'kind': 'interrupted_monitor', 'version': 1, 'previous_phase': 'authorized',
                  'intent_sha256': digest(intent), 'owned_sha256': digest(owned)}
         native = {'journal': str(path), 'cleanup': 'observed-native-confirmed',
                   'interrupted_monitor': True, 'monitoring_complete': False,

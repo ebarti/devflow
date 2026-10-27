@@ -22,7 +22,7 @@ from devflow_temporal.delivery_resources import (
 @pytest.fixture
 def quarantined(completed):
     spec, row, path, journal, request, table, ports = completed
-    proof = {'kind': 'interrupted_monitor', 'version': 1,
+    proof = {'kind': 'interrupted_monitor', 'version': 1, 'previous_phase': 'authorized',
              'intent_sha256': digest(journal['intent']), 'owned_sha256': digest(journal['owned'])}
     native = {'journal': str(path), 'cleanup': 'observed-native-confirmed',
               'provider_outcome': 'unknown', 'interrupted_monitor': True,

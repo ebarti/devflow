@@ -55,7 +55,8 @@ def test_retained_stopped_cleanup_observes_without_state_effects(
                        result={'interrupted_monitor': True, 'provider_outcome': 'unknown',
                                'cleanup': 'observed-native-confirmed'})
         journal['cleanup_reconciliation'] = {
-            'kind': 'interrupted_monitor', 'intent_sha256': digest(journal['intent']),
+            'kind': 'interrupted_monitor', 'previous_phase': 'authorized',
+            'intent_sha256': digest(journal['intent']),
             'owned_sha256': digest(journal['owned'])}
         if observation != 'reconciled-provider':
             journal_path = (Path(spec['state_dir']) / 'dependency-preparation'
