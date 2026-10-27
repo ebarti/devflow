@@ -256,6 +256,8 @@ async def test_cancelled_constructor_cannot_launch_after_its_waiter_exits(native
 
     def construct(*args, **kwargs):
         process = original(*args, **kwargs)
+        if process.folder != case.folder:
+            return process
         entered.set()
         assert release.wait(10), 'constructor was not released'
         return process
@@ -288,6 +290,8 @@ async def test_delayed_native_run_cannot_release_capacity_from_cancellation_alon
     original = case.process_type.run
 
     def run(process):
+        if process.folder != case.folder:
+            return original(process)
         entered.set()
         assert release.wait(10), 'monitor entry was not released'
         return original(process)
