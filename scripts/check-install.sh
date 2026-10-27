@@ -9,3 +9,4 @@ python=${DEVFLOW_PYTHON:-python3.12}
 "$python" -B -m unittest discover -s tests -p 'test_upgrade_installation.py' -v
 "$python" -B -m unittest discover -s tests -p 'test_delivery*.py' -v
 "$python" -B -m unittest discover -s tests -p 'test_production_installation.py' -v
+"$python" -B -m unittest discover -s tests -p 'test_source_custody_process_owned.py' -v
