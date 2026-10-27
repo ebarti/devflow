@@ -1,5 +1,55 @@
 # Durable delivery checkpoints
 
+## Retained workspaces
+
+An intact checkout is never deleted to make restoration proceed. The internal
+`RetainedCheckpointCustody` context verifies the original acknowledged manifest,
+all artifacts, independent Git ownership, worktree registration, branch and HEAD,
+index tree, staged and unstaged patches, complete selected source paths and
+bytes, executable bits, and exact retained state evidence and absences. It also
+refuses newly selected evidence or unclassified ignored source. Source modes and
+mtimes are not part of the existing source manifest; this operation makes no
+stronger claim for them.
+
+`POST /api/runs/{run_id}/checkpoints/{checkpoint_id}/verify-retained` accepts
+`command_id` and `expected_revision` through the existing CSRF boundary. It records
+a distinct `delivery_checkpoint_retained_verified` source-only receipt, without
+restoring or activating anything. Replaying a command reacquires physical custody.
+The context binds its original PID and thread; an inherited descriptor after a
+fork is not the same owner.
+
+The scope retains concrete checkpoint, resource and writer leases while preparing
+its read-only comparison outside admission locks. A bounded raw tracking snapshot
+is captured before full payload reads. The same live SQLite observer connection's
+data version, schema and canonical pin are rechecked in the short ACK writer;
+another connection's commit, including an ABA update, requires a fresh observation.
+No full state materialization, JSON parsing or receipt hashing is needed there.
+
+Pause readiness additionally requires the exact concrete `RetainedPauseCapability`
+from the pause owner. Caller-provided fences, contexts and transition callbacks
+are not accepted. The immutable transition ticket is part of both command and
+receipt; a saved command never reapplies readiness. The capability prepares receipt
+bytes before admission, verifies original and authorized post-state in the ACK
+transaction, and can insert only its immutable readiness row. Source and budget
+writes are denied by the ACK's SQL authorizer. Readiness is not activation, and
+runtime work must stay gated until the context releases its physical leases. The
+current pause custody producer still refuses unproven closure; that integration
+remains unmounted.
+
+The source-only route supports settled ordinary non-feature work
+with no opaque native journals. Unproven native closure, queued attempt settlement
+without its own concrete custody integration, feature projection, or a checkpoint
+with unresolved effects remains unsupported. Local source equality cannot promote
+an unobserved effect to a resumable result. No-copy acknowledgement preserves
+the original source and budgets; it does not allocate or move a worktree, rewrite
+authorization, run checks, publish, or start execution.
+
+New source seals include a versioned index semantics baseline. Nonzero Git index
+flags, including assume-unchanged, skip-worktree and intent-to-add, refuse sealing
+without changing the index. Retained verification rechecks the baseline even if
+candidate content is unchanged. Old acknowledgements lacking this proof remain
+inspectable but cannot grant verified recovery; a fresh seal is required.
+
 New native admissions own a private bare Git database in their durable run state
 before admission is acknowledged or the outbox becomes dispatchable. Local source
 copying happens before the short claim transaction; partial ownership publication
