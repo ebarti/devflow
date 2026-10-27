@@ -174,8 +174,12 @@ def census(descriptor, proof):
         raise ValueError("installation service-lock FD census cannot see its exact own descriptor")
     foreign = [item for item in records if item not in owned]
     if foreign:
+        holders = ",".join(
+            f"{str(item['pid'])[:12]}:{str(int(item['fd']))[:12]}" for item in foreign[:8]
+        )
         raise ValueError(
-            "unfinished installation: foreign service-lock FDs remain; no further "
+            "unfinished installation: foreign service-lock FDs remain "
+            f"(count={len(foreign)}, holders={holders}); no further "
             "relocation effect is authorized and prevalidated legacy lifecycle may still act"
         )
 
