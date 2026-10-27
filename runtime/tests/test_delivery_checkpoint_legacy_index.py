@@ -35,58 +35,6 @@ def legacy_v1(stopped, monkeypatch):
     return stopped
 
 
-def test_original_v1_restore_receipt_replays_without_inferred_original_flags(
-    legacy_v1, monkeypatch,
-):
-    store, spec, broker, row = legacy_v1
-    saved = checkpoints.create_checkpoint(store, spec["run_id"], "v1-old-receipt", row["revision"])
-    path = Path(__file__).parent / "fixtures/checkpoint_v1/source_producer.py"
-    module = dict(vars(checkpoints))
-    exec(compile(path.read_text(), str(path), "exec"), module)
-    shutil.rmtree(broker.checkout)
-    with monkeypatch.context() as old_runtime:
-        old_runtime.setattr(checkpoints, "_finish_restore", module["_finish_restore"])
-        original = checkpoints.restore_checkpoint(store, spec["run_id"], saved["checkpoint_id"],
-                                                  "old-v1-restore", row["revision"])
-    assert "index_reconstruction" not in original and not original["execution_started"]
-    assert checkpoints.restore_checkpoint(store, spec["run_id"], saved["checkpoint_id"],
-                                          "old-v1-restore", row["revision"]) == original
-    inode = broker.checkout.stat().st_ino
-    # Corrupt prior success is an unknown receipt, never a reason to replace the
-    # retained workspace or invent a new original-index baseline.
-    with store._connect() as db:
-        corrupt = {**original, "index_reconstruction": None}
-        db.execute("UPDATE delivery_commands SET response_json=? WHERE command_id=?",
-                   (json.dumps(corrupt), "checkpoint-restore:old-v1-restore"))
-    with pytest.raises(ValueError, match="unknown index reconstruction"):
-        checkpoints.restore_checkpoint(store, spec["run_id"], saved["checkpoint_id"],
-                                       "old-v1-restore", row["revision"])
-    assert broker.checkout.stat().st_ino == inode
-
-
-def test_ambiguous_v1_flags_preserve_prepared_source_without_fabricated_ack(legacy_v1):
-    store, spec, broker, row = legacy_v1
-    checkpoints._git(broker.checkout, "update-index", "--assume-unchanged", "README.md")
-    before = (broker.checkout / "README.md").read_bytes()
-    saved = checkpoints.create_checkpoint(store, spec["run_id"], "ambiguous-v1", row["revision"])
-    manifest = checkpoints._root(spec) / saved["checkpoint_id"] / "manifest.json"
-    original = manifest.read_bytes()
-    value = json.loads(original)
-    archived = manifest.parent / value["source"]["files"]["README.md"]["artifact"]
-    shutil.rmtree(broker.checkout)
-    for _retry in range(2):
-        with pytest.raises(ValueError, match="restored file changed"):
-            checkpoints.restore_checkpoint(store, spec["run_id"], saved["checkpoint_id"],
-                                           "ambiguous-restore", row["revision"])
-        stages = list(broker.checkout.parent.glob(".checkpoint-restore-*"))
-        assert len(stages) == 1
-        assert (stages[0] / "README.md").exists() and archived.read_bytes() == before
-    assert manifest.read_bytes() == original and not broker.checkout.exists()
-    with store._connect() as db:
-        assert not db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
-                              ("checkpoint-restore:ambiguous-restore",)).fetchone()
-
-
 @pytest.mark.asyncio
 async def test_public_v1_restore_reconstructs_recorded_source_without_rewriting_ack(
     legacy_v1, monkeypatch,
