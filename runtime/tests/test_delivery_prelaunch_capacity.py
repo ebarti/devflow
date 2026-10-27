@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from temporalio import activity
+from temporalio.testing import ActivityEnvironment
 from test_delivery_api import api_fixture as api_fixture
 
 from devflow_temporal import (
@@ -224,11 +225,10 @@ async def test_cancelled_preparation_joins_before_releasing_capacity(
 
     monkeypatch.setattr(supervisor, 'prepare_native_role', prepare)
     if source == 'heartbeat_timeout':
-        monkeypatch.setattr(activity, 'in_activity', lambda: True)
-        monkeypatch.setattr(activity, 'heartbeat', lambda *args: None)
         monkeypatch.setattr(activity, 'cancellation_details', lambda: SimpleNamespace(
             cancel_requested=False, timed_out=True, not_found=False, worker_shutdown=False))
-    task = asyncio.create_task(delivery_role(case.request))
+    environment = ActivityEnvironment()
+    task = asyncio.create_task(environment.run(delivery_role, case.request))
     try:
         await _wait(entered)
         task.cancel()
@@ -325,11 +325,10 @@ async def test_heartbeat_replacement_preserves_an_already_launched_provider(
         native_role, monkeypatch):
     case = native_role
     (case.state / 'hold-provider').touch()
-    monkeypatch.setattr(activity, 'in_activity', lambda: True)
-    monkeypatch.setattr(activity, 'heartbeat', lambda *args: None)
     monkeypatch.setattr(activity, 'cancellation_details', lambda: SimpleNamespace(
         cancel_requested=False, timed_out=True, not_found=False, worker_shutdown=False))
-    task = asyncio.create_task(delivery_role(case.request))
+    environment = ActivityEnvironment()
+    task = asyncio.create_task(environment.run(delivery_role, case.request))
     replacement = None
     try:
         deadline = time.monotonic() + 10
@@ -344,7 +343,7 @@ async def test_heartbeat_replacement_preserves_an_already_launched_provider(
         table = delivery_native_process.process_table()
         assert any(table.get(int(pid), {}).get('identity') == entry['identity']
                    for pid, entry in journal['owned'].items())
-        replacement = asyncio.create_task(delivery_role(case.request))
+        replacement = asyncio.create_task(environment.run(delivery_role, case.request))
         await asyncio.sleep(0.1)
         assert _attempt(case)[1] == 1
         assert (case.state / 'invocations').read_text().splitlines() == ['one']
@@ -603,11 +602,10 @@ async def test_queued_replacement_while_admission_transaction_waits(
 
     monkeypatch.setattr(case.store, '_connect', controlled)
     monkeypatch.setattr(case.owner, '_enter_capacity', enter)
-    monkeypatch.setattr(activity, 'in_activity', lambda: True)
-    monkeypatch.setattr(activity, 'heartbeat', lambda *args: None)
     monkeypatch.setattr(activity, 'cancellation_details', lambda: SimpleNamespace(
         cancel_requested=False, timed_out=True, not_found=False, worker_shutdown=False))
-    task = asyncio.create_task(delivery_role(case.request))
+    environment = ActivityEnvironment()
+    task = asyncio.create_task(environment.run(delivery_role, case.request))
     try:
         await _wait(entered)
         with sqlite3.connect(f'file:{case.store.config.tracking_db}?mode=ro', uri=True) as db:
@@ -628,7 +626,7 @@ async def test_queued_replacement_while_admission_transaction_waits(
             {'before': before, 'after': after}, indent=2))
         assert after == before, after
         assert not (case.state / 'invocations').exists()
-        retry = await delivery_role(case.request)
+        retry = await environment.run(delivery_role, case.request)
         assert retry['finish_reason'] == 'fixture'
         assert (case.state / 'invocations').read_text().splitlines() == ['one']
     finally:
