@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 from importlib.metadata import distribution
 from pathlib import Path
+from subprocess import CompletedProcess
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +29,7 @@ from devflow_temporal import delivery_ci_inventory as inventory
 from devflow_temporal import delivery_ci_teardown as teardown
 from devflow_temporal import delivery_gate_retry as gates
 from devflow_temporal import delivery_policy_recovery as policy
+from devflow_temporal import delivery_resources as resources
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_activities import delivery_gates_readback, delivery_repair_preflight
@@ -67,7 +70,41 @@ def historical_ci(service, monkeypatch):
     # owner so the pre-ACK refusal and the purpose-specific bridge are tested.
     monkeypatch.setattr(gates, "_stopped_cleanup", policy._stopped_cleanup)
     monkeypatch.setattr(resume, "prepare_runtime", lambda value, *_args: prepared_spec(value))
-    response, current, previous = admitted(historical)
+    try:
+        response, current, previous = admitted(historical)
+    except ValueError as exc:
+        if str(exc) != 'predecessor has a live root user or unreadable lease':
+            raise
+        facts = {'root_kind': None, 'inspection_returncode': None, 'holder_pids': None,
+                 'holder_count_capped': None, 'self_pid_reported': None, 'stderr_present': None}
+        trace = exc.__traceback__
+        while trace is not None:
+            if trace.tb_frame.f_code is resources._observe_locked_resources.__code__:
+                observed = trace.tb_frame.f_locals.get('observed')
+                entry = trace.tb_frame.f_locals.get('entry')
+                kind = entry.get('kind') if isinstance(entry, dict) else None
+                if isinstance(kind, str):
+                    facts['root_kind'] = kind if kind in {'checkout', 'gate'} else 'other'
+                if isinstance(observed, CompletedProcess):
+                    code = observed.returncode
+                    if type(code) is int and -255 <= code <= 255:
+                        facts['inspection_returncode'] = code
+                    if isinstance(observed.stderr, str):
+                        facts['stderr_present'] = bool(observed.stderr)
+                    text = observed.stdout
+                    if isinstance(text, str) and len(text) <= 4096:
+                        lines = text.splitlines()
+                        if all(line.startswith('p') and line[1:].isascii()
+                               and line[1:].isdigit() and len(line[1:]) <= 10
+                               and 0 < int(line[1:]) <= 2**31 - 1 for line in lines):
+                            pids = [int(line[1:]) for line in lines]
+                            facts.update(holder_pids=pids[:8],
+                                         holder_count_capped=min(8, len(pids)),
+                                         self_pid_reported=os.getpid() in pids)
+                break
+            trace = trace.tb_next
+        exc.add_note('historical root-user observation: ' + json.dumps(facts, sort_keys=True))
+        raise
     assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": previous})) == {
         "state": "confirmed"
     }
