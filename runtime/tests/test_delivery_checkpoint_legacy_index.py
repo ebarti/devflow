@@ -101,8 +101,8 @@ async def test_public_v1_restore_reconstructs_recorded_source_without_rewriting_
                                          row["revision"]) == saved
     with pytest.raises(ValueError, match="baseline"):
         with RetainedCheckpointCustody(store, spec["run_id"], saved["checkpoint_id"],
-                                      row["revision"]):
-            pytest.fail("old format became exact retained-index authority")
+                                      row["revision"]) as owner:
+            owner.acknowledge("legacy-no-copy")
     shutil.rmtree(Path(spec["source_path"]))
     shutil.rmtree(broker.checkout)
     url = store.config.dashboard_url.rstrip("/")

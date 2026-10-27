@@ -88,10 +88,7 @@ def test_source_only_ack_is_idempotent_and_never_grants_transition_authority(sto
     with RetainedCheckpointCustody(store, spec["run_id"], checkpoint["checkpoint_id"],
                                   row["revision"]) as owner:
         receipt = owner.acknowledge("retained-bind")
-        assert receipt["transition_sha256"] is None
         assert receipt["copied"] is False and receipt["execution_started"] is False
-        with pytest.raises(ValueError, match="same-transaction"):
-            owner.require_ack_prepared(owner.db, "{}")
         with pytest.raises(ValueError, match="fresh custody scope"):
             owner.acknowledge("retained-bind")
     with pytest.raises(ValueError, match="live custody owner"):
@@ -108,7 +105,7 @@ def test_source_only_ack_is_idempotent_and_never_grants_transition_authority(sto
     assert not list(broker.checkout.parent.glob(".checkpoint-restore-*"))
 
 
-def test_ready_sql_policy_cannot_modify_preserved_budget(stopped):
+def test_ack_sql_policy_cannot_modify_preserved_budget(stopped):
     import sqlite3
 
     from devflow_temporal.delivery_retained_tracking import RetainedSQLPolicy
@@ -117,7 +114,7 @@ def test_ready_sql_policy_cannot_modify_preserved_budget(stopped):
     policy = RetainedSQLPolicy()
     with store._connect(write_authorizer=policy) as db:
         db.execute("BEGIN IMMEDIATE")
-        with policy.allow("ready"):
+        with policy.allow("record"):
             with pytest.raises(sqlite3.DatabaseError, match="authorized"):
                 db.execute("UPDATE delivery_runs SET usage_json='{}' WHERE run_id=?",
                            (spec["run_id"],))
@@ -127,12 +124,8 @@ def test_ready_sql_policy_cannot_modify_preserved_budget(stopped):
                           (spec["run_id"],)).fetchone()[0] == row["usage_json"]
 
 
-@pytest.mark.parametrize("first_phase,next_phase,table", [
-    ("record", "ready", "delivery_commands"),
-    ("ready", "read", "delivery_pause_retained_ready"),
-])
 def test_reused_sql_is_reauthorized_after_policy_phase_change(
-    stopped, monkeypatch, first_phase, next_phase, table,
+    stopped, monkeypatch,
 ):
     import sqlite3
 
@@ -145,21 +138,15 @@ def test_reused_sql_is_reauthorized_after_policy_phase_change(
         return original_connect(path)
 
     monkeypatch.setattr(store.state, "connect", legacy_connect)
-    with store._connect() as db:
-        db.execute("CREATE TABLE delivery_pause_retained_ready (value TEXT PRIMARY KEY)")
     policy = RetainedSQLPolicy()
     with store._connect(write_authorizer=policy) as db:
         db.execute("BEGIN IMMEDIATE")
-        if table == "delivery_commands":
-            sql = "INSERT INTO delivery_commands VALUES (?,?,?,?)"
-            first = ("retained-policy-first", spec["run_id"], "request", "{}")
-            second = ("retained-policy-second", spec["run_id"], "request", "{}")
-        else:
-            sql = "INSERT INTO delivery_pause_retained_ready VALUES (?)"
-            first, second = ("first",), ("second",)
-        with policy.allow(first_phase):
+        sql = "INSERT INTO delivery_commands VALUES (?,?,?,?)"
+        first = ("retained-policy-first", spec["run_id"], "request", "{}")
+        second = ("retained-policy-second", spec["run_id"], "request", "{}")
+        with policy.allow("record"):
             db.execute(sql, first)
-        with policy.allow(next_phase):
+        with policy.allow("read"):
             with pytest.raises(sqlite3.DatabaseError, match="authorized"):
                 db.execute(sql, second)
         db.rollback()
@@ -179,8 +166,8 @@ def test_retained_replay_rechecks_index_even_with_unchanged_candidate(stopped):
     assert candidate_for(broker.checkout) == checkpoint["candidate"]
     with pytest.raises(ValueError):
         with RetainedCheckpointCustody(store, spec["run_id"], checkpoint["checkpoint_id"],
-                                      row["revision"]):
-            pytest.fail("replay admitted a different index")
+                                      row["revision"]) as owner:
+            owner.acknowledge("same-retained-command")
 
 
 @pytest.mark.parametrize("change", ["extra_evidence", "evidence_mtime", "native_registration"])
@@ -207,8 +194,8 @@ def test_retained_scope_refuses_changed_evidence_or_unknown_native_without_sourc
         write_private(manifest, data)
     with pytest.raises(ValueError):
         with RetainedCheckpointCustody(store, spec["run_id"], checkpoint["checkpoint_id"],
-                                      row["revision"]):
-            pytest.fail("changed or unknown custody was accepted")
+                                      row["revision"]) as owner:
+            owner.acknowledge("changed-retained-evidence")
     assert broker.checkout.stat().st_ino == original
     with store._connect() as db:
         assert not db.execute("SELECT 1 FROM delivery_events WHERE run_id=? AND type=?",
@@ -247,14 +234,14 @@ def test_retained_custody_does_not_promote_unobserved_effect_archive(stopped):
             pytest.fail("local equality promoted an unobserved outcome")
 
 
-def test_fence_bound_checkpoint_requires_concrete_pause_capability(stopped):
+def test_fence_bound_checkpoint_refuses_retained_verification(stopped):
     from test_delivery_checkpoints import durable_fence
 
     store, spec, _broker, row = stopped
     first = durable_fence(store, spec, epoch=1)
     checkpoint = create_checkpoint(store, spec["run_id"], "retained-epoch", row["revision"],
                                    fence=first)
-    with pytest.raises(ValueError, match="concrete live capability"):
+    with pytest.raises(ValueError, match="pause/control verification is unsupported"):
         with RetainedCheckpointCustody(store, spec["run_id"], checkpoint["checkpoint_id"],
                                       row["revision"]):
             pytest.fail("copied pause data became live authority")
@@ -300,8 +287,34 @@ def test_retained_index_flags_cannot_change_behind_same_candidate(stopped, flag)
     assert candidate_for(broker.checkout) == checkpoint["candidate"]
     with pytest.raises(ValueError, match="semantic"):
         with RetainedCheckpointCustody(store, spec["run_id"], checkpoint["checkpoint_id"],
-                                      row["revision"]):
-            pytest.fail("modified index semantics were accepted")
+                                      row["revision"]) as owner:
+            owner.acknowledge("changed-index-flags")
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_one_final_physical_scan_catches_source_changes_during_scope(stopped, monkeypatch, changed):
+    from devflow_temporal import delivery_checkpoints as checkpoints
+
+    store, spec, broker, row = stopped
+    checkpoint = create_checkpoint(store, spec["run_id"], "single-scan", row["revision"])
+    scans = []
+    original = checkpoints._read_acknowledged
+
+    def observed(*args, **kwargs):
+        scans.append(kwargs.get("verify_artifacts", True))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, "_read_acknowledged", observed)
+    with RetainedCheckpointCustody(store, spec["run_id"], checkpoint["checkpoint_id"],
+                                  row["revision"]) as owner:
+        assert scans == [False]  # Entry owns leases; it grants no verified receipt.
+        if changed:
+            (broker.checkout / "README.md").write_text("changed while custody was held\n")
+            with pytest.raises(ValueError):
+                owner.acknowledge("final-scan")
+        else:
+            assert owner.acknowledge("final-scan")["retained_verified"]
+    assert scans == [False, True]
 
 
 def test_tracking_aba_refuses_without_fresh_payload_read_under_ack(stopped, monkeypatch):

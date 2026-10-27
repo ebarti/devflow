@@ -1374,7 +1374,7 @@ def create_checkpoint(
                     shutil.rmtree(stage)
 
 
-def _read_acknowledged(db, spec, checkpoint_id):
+def _read_acknowledged(db, spec, checkpoint_id, *, verify_artifacts=True):
     if not isinstance(checkpoint_id, str) or not _ID.fullmatch(checkpoint_id):
         raise ValueError("checkpoint ID is invalid")
     root = _root(spec) / checkpoint_id
@@ -1409,7 +1409,7 @@ def _read_acknowledged(db, spec, checkpoint_id):
     from .delivery_writer_custody import verify_closed
 
     verify_closed(db, value["authority"], value.get("controller"))
-    for relative, item in value["artifacts"].items():
+    for relative, item in (value["artifacts"].items() if verify_artifacts else ()):
         try:
             content = read_private(_path(root, relative), raw=True)
         except FileNotFoundError as exc:

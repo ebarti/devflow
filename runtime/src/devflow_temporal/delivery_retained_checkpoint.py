@@ -40,24 +40,12 @@ REVALIDATED = "delivery_checkpoint_retained_verified"
 class RetainedCheckpointCustody:
     """An exact live process/thread owner; receipts never grant activation."""
 
-    def __init__(self, store, run_id, checkpoint_id, expected_revision, *,
-                 pause_capability=None, writer_context=None):
+    def __init__(self, store, run_id, checkpoint_id, expected_revision):
         if type(expected_revision) is not int or expected_revision < 0:
             raise ValueError("retained checkpoint revision must be a nonnegative integer")
-        if pause_capability is not None:
-            try:
-                from .delivery_pause_retained_capability import RetainedPauseCapability
-            except ImportError as exc:
-                raise ValueError("typed retained pause capability is unavailable") from exc
-            if type(pause_capability) is not RetainedPauseCapability:
-                raise ValueError("retained pause requires its exact concrete owner")
         self.store, self.run_id = store, run_id
         self.checkpoint_id, self.expected_revision = checkpoint_id, expected_revision
-        self.capability, self.writer_context = pause_capability, writer_context
-        self.context = (pause_capability.checkpoint_context
-                        if pause_capability is not None else None)
-        self.context_sha256 = digest(self.context) if self.context is not None else None
-        self._stack, self._owner, self._active_db, self._acknowledged = None, None, None, None
+        self._stack, self._owner = None, None
         self._committed = False
 
     def __enter__(self):
@@ -77,16 +65,15 @@ class RetainedCheckpointCustody:
                 read_only=True, exclusive=True))
             with self.store._connect() as db:
                 self.value, self.checkpoint = checkpoints._read_acknowledged(
-                    db, self.spec, self.checkpoint_id)
+                    db, self.spec, self.checkpoint_id, verify_artifacts=False)
             checkpoints._require_supported_native_custody(self.value.get("closed_journals"))
             if not self.checkpoint["resumable"] or self.value.get("resume_blockers"):
                 raise ValueError("retained checkpoint requires reconciled effects and a fresh seal")
-            if self.value.get("control") is not None and self.capability is None:
-                raise ValueError("retained pause requires its concrete live capability")
+            if (self.value.get("control") is not None
+                    or self.value.get("checkpoint_context_sha256") is not None):
+                raise ValueError("retained pause/control verification is unsupported")
             if digest(self.spec) != self.value["spec_sha256"]:
                 raise ValueError("retained checkpoint execution authority changed")
-            if self.context_sha256 != self.value.get("checkpoint_context_sha256"):
-                raise ValueError("retained checkpoint authenticated context changed")
             self.policy = RetainedSQLPolicy()
             self.db = stack.enter_context(self.store._connect(write_authorizer=self.policy))
             self.observation = RetainedTrackingObservation(self.store, self.run_id)
@@ -98,19 +85,17 @@ class RetainedCheckpointCustody:
                 raise ValueError("retained checkpoint state, effects, owner or budget changed")
             self.journals = checkpoints._closed(
                 self.registry, self.resources, self.frozen["delivery_attempts"], stack)
-            writer = (self.writer_context if self.writer_context is not None
-                      else self.store._checkpoint_writer_context(self.spec))
+            writer = self.store._checkpoint_writer_context(self.spec)
             if (type(writer) is not CheckpointWriters or writer.store is not self.store
                     or digest(writer.spec) != digest(self.spec) or writer.stack is not None):
                 raise ValueError("retained checkpoint requires its concrete writer owner")
             self.writer = stack.enter_context(writer)
             self.writer.verify(self.db)
-            controller = (None if self.capability is not None else checkpoints._controller_binding(
-                self.store, self.spec, self.expected_revision, None))
+            controller = checkpoints._controller_binding(
+                self.store, self.spec, self.expected_revision, None)
             if not checkpoints._same_controller(controller, self.value.get("controller")):
                 raise ValueError("retained checkpoint controller lineage changed")
             self.observation._unchanged()
-            self._verify_physical()
             return self
         except BaseException:
             self._owner = None
@@ -152,92 +137,61 @@ class RetainedCheckpointCustody:
         row = self.observation.row
         if row["revision"] != self.expected_revision:
             raise ValueError("retained checkpoint run revision changed")
-        if self.capability is None:
-            checkpoints._stopped(self.db, row, None)
-        elif self.capability.validate_pre(self.db, row, self) != self.value.get("control"):
-            raise ValueError("retained pause capability changed its original binding")
+        checkpoints._stopped(self.db, row, None)
         return row
 
     def acknowledge(self, command_id):
-        """Record once; a concrete pause capability may bind immutable readiness."""
+        """Verify once under held leases and record a source-only receipt."""
         self._live()
         if self._committed:
             raise ValueError("retained ACK replay requires a fresh custody scope")
         if not isinstance(command_id, str) or not command_id or len(command_id) > 200:
             raise ValueError("retained checkpoint command is invalid")
         self._verify_physical()
-        transition = self.capability.ticket_sha256 if self.capability is not None else None
-        if transition is not None and not checkpoints._ID.fullmatch(transition):
-            raise ValueError("retained pause transition ticket is invalid")
         request = {"kind": REVALIDATED, "run_id": self.run_id,
                    "checkpoint_id": self.checkpoint_id, "command_id": command_id,
-                   "expected_revision": self.expected_revision, "transition_sha256": transition}
+                   "expected_revision": self.expected_revision}
         key, request_sha256 = "checkpoint-retained:" + command_id, digest(request)
         response = {**request, "manifest_sha256": self.checkpoint["manifest_sha256"],
-                    "physical": self.physical, "control": self.value.get("control"),
-                    "checkpoint_context_sha256": self.context_sha256,
+                    "physical": self.physical,
                     "retained_verified": True, "copied": False, "execution_started": False}
         response_json = canonical_json(response)
         saved = self.observation.saved_command(key, self.run_id, request_sha256)
         if saved is not None and saved != response:
-            raise ValueError("retained checkpoint replay lost its original ticket")
-        if self.capability is not None:
-            self.capability.prepare(self, json.loads(response_json))
-        admission = self.capability.admission_context if self.capability is not None else None
+            raise ValueError("retained checkpoint replay changed its recorded receipt")
         try:
-            with checkpoints._checkpoint_admission(admission, None, None):
-                self.db.execute("BEGIN IMMEDIATE")
-                with self.policy.allow("read"):
-                    row = self._verify_token()
-                if saved is None:
-                    with self.policy.allow("record"):
-                        self.db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)",
-                                        (key, self.run_id, request_sha256, response_json))
-                        stamp = _now()
-                        event = self.db.execute(
-                            "INSERT INTO delivery_events "
-                            "(run_id,timestamp,type,message,run_revision,payload_json) "
-                            "VALUES (?,?,?,?,?,?)", (self.run_id, stamp, REVALIDATED,
-                            "Retained delivery workspace verified", self.expected_revision,
-                            response_json))
-                        self.db.execute("INSERT INTO delivery_phase_events "
-                            "(event_sequence,run_id,workflow_id,phase,execution_state,"
-                            "iteration,timestamp) "
-                            "VALUES (?,?,?,?,?,?,?)", (event.lastrowid, self.run_id,
-                            row["workflow_id"] or "delivery-" + self.run_id, row["phase"],
-                            row["execution_state"], row["iteration"], stamp))
-                if self.capability is not None:
-                    self._active_db, self._acknowledged = self.db, response_json
-                    try:
-                        if saved is None:
-                            with self.policy.allow("ready"):
-                                self.capability.apply(self.db, row, self)
-                        with self.policy.allow("read"):
-                            post = self.capability.verify_post(self.db, row, self)
-                            if post != self.value.get("control"):
-                                raise ValueError(
-                                    "retained transition changed its original pause epoch")
-                    finally:
-                        self._active_db, self._acknowledged = None, None
-                with self.policy.allow("read"):
-                    self.writer.verify_token(self.db)
-                    self.observation.verify_token(self.db)
-                self.db.commit()
+            self.db.execute("BEGIN IMMEDIATE")
+            with self.policy.allow("read"):
+                row = self._verify_token()
+            if saved is None:
+                with self.policy.allow("record"):
+                    self.db.execute("INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                                    (key, self.run_id, request_sha256, response_json))
+                    stamp = _now()
+                    event = self.db.execute(
+                        "INSERT INTO delivery_events "
+                        "(run_id,timestamp,type,message,run_revision,payload_json) "
+                        "VALUES (?,?,?,?,?,?)", (self.run_id, stamp, REVALIDATED,
+                        "Retained delivery workspace verified", self.expected_revision,
+                        response_json))
+                    self.db.execute("INSERT INTO delivery_phase_events "
+                        "(event_sequence,run_id,workflow_id,phase,execution_state,"
+                        "iteration,timestamp) "
+                        "VALUES (?,?,?,?,?,?,?)", (event.lastrowid, self.run_id,
+                        row["workflow_id"] or "delivery-" + self.run_id, row["phase"],
+                        row["execution_state"], row["iteration"], stamp))
+            with self.policy.allow("read"):
+                self.writer.verify_token(self.db)
+                self.observation.verify_token(self.db)
+            self.db.commit()
         except BaseException:
             self.db.rollback()
             raise
         self._committed = True
         return json.loads(response_json)
 
-    def require_ack_prepared(self, db, prepared_receipt_json):
-        self._live()
-        if (self._active_db is not db or not db.in_transaction or self._acknowledged is None
-                or type(prepared_receipt_json) is not str
-                or prepared_receipt_json != self._acknowledged):
-            raise ValueError("retained receipt lacks this same-transaction custody owner")
-
     def __exit__(self, *args):
-        self._owner, self._active_db, self._acknowledged = None, None, None
+        self._owner = None
         return self._stack.__exit__(*args)
 
 

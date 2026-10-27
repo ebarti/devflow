@@ -25,16 +25,13 @@ data version, schema and canonical pin are rechecked in the short ACK writer;
 another connection's commit, including an ABA update, requires a fresh observation.
 No full state materialization, JSON parsing or receipt hashing is needed there.
 
-Pause readiness additionally requires the exact concrete `RetainedPauseCapability`
-from the pause owner. Caller-provided fences, contexts and transition callbacks
-are not accepted. The immutable transition ticket is part of both command and
-receipt; a saved command never reapplies readiness. The capability prepares receipt
-bytes before admission, verifies original and authorized post-state in the ACK
-transaction, and can insert only its immutable readiness row. Source and budget
-writes are denied by the ACK's SQL authorizer. Readiness is not activation, and
-runtime work must stay gated until the context releases its physical leases. The
-current pause custody producer still refuses unproven closure; that integration
-remains unmounted.
+Scope entry acquires custody and authenticates the acknowledged manifest; it
+does not grant a verified receipt. One final source/evidence comparison precedes
+ACK while the leases remain held, so changes after entry are still refused.
+The fixed ACK SQL authorizer permits only verification command/event inserts;
+source and budget writes are denied. Paused/control checkpoints, caller-provided
+fences and transition callbacks are unsupported. Pause integration requires its
+own concrete custody producer and is not included in this source-only endpoint.
 
 The source-only route supports settled ordinary non-feature work
 with no opaque native journals. Unproven native closure, queued attempt settlement

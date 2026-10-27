@@ -15,7 +15,6 @@ _TABLES = (
     "delivery_runs", "delivery_attempts", "delivery_effects", "delivery_preparations",
     "delivery_merge_requests", "delivery_native_renewal_anchors", "delivery_execution_authority",
     "delivery_merge_executions", "delivery_publication_executors", "claims",
-    "delivery_pause_retained_ready",
 )
 
 
@@ -52,8 +51,6 @@ class RetainedTrackingObservation:
                     continue
                 if table == "claims":
                     where, args = "work_id=?", (work[0],)
-                elif table == "delivery_pause_retained_ready":
-                    where, args = "root_id=?", (run_id,)
                 elif table == "delivery_publication_executors":
                     prefix = "publish:" + run_id + ":"
                     where, args = "effect_key>=? AND effect_key<?", (prefix, prefix[:-1] + ";")
@@ -116,7 +113,7 @@ class RetainedTrackingObservation:
 
 
 class RetainedSQLPolicy:
-    """Restrict this ACK's writes instead of rereading large post-hook state."""
+    """Allow only the fixed source-verification ACK writes."""
 
     def __init__(self):
         self.phase = "idle"
@@ -135,8 +132,7 @@ class RetainedSQLPolicy:
             permitted = (
                 self.phase == "record" and action == sqlite3.SQLITE_INSERT
                 and table in {"delivery_commands", "delivery_events", "delivery_phase_events"}
-            ) or (self.phase == "ready" and action == sqlite3.SQLITE_INSERT
-                  and table == "delivery_pause_retained_ready")
+            )
             return sqlite3.SQLITE_OK if permitted else sqlite3.SQLITE_DENY
         forbidden = {
             sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_ALTER_TABLE,
