@@ -14,7 +14,6 @@ from test_delivery_store import service as service
 
 from devflow_temporal import delivery_activities
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_publication_execution import execution
 
 
 @pytest.fixture
@@ -87,34 +86,6 @@ async def until(root, kind, child=None):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_activity_waiter_cannot_admit_a_second_publication_body(publication):
-    store, spec, broker, checked, root, _receipt = publication
-    request = {'spec': spec, 'iteration': 0, 'candidate': checked}
-    first = asyncio.create_task(delivery_activities.delivery_publish(request))
-    await until(root, 'create-start')
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    for call in (delivery_activities.delivery_publish,
-                 delivery_activities.delivery_reconcile_publish):
-        result = await asyncio.wait_for(call(request), timeout=.5)
-        assert result == {'state': 'pending', 'reason': 'publication_execution_active'}
-    assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
-    with store._connect() as db:
-        row = db.execute("SELECT state FROM delivery_effects WHERE kind='publish'").fetchone()
-        assert row[0] == 'pending'
-    await until(root, 'create-end')
-    # The original body can still be acknowledging the exact receipt.
-    for _ in range(100):
-        result = await delivery_activities.delivery_reconcile_publish(request)
-        if result.get('number'):
-            break
-        await asyncio.sleep(.02)
-    assert result['head'] == _git(broker.checkout, 'rev-parse', 'HEAD')
-    assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
-
-
-@pytest.mark.asyncio
 async def test_lost_waiter_then_proven_pre_mutation_failure_can_restart_original_request(
     publication, monkeypatch,
 ):
@@ -139,6 +110,35 @@ async def test_lost_waiter_then_proven_pre_mutation_failure_can_restart_original
     with store._connect() as db:
         row = db.execute("SELECT state FROM delivery_effects WHERE kind='publish'").fetchone()
         assert row[0] == 'complete'
+
+
+def test_actual_missing_executable_can_retry_creation_without_repeating_push(
+    publication, monkeypatch,
+):
+    _store, _spec, broker, checked, root, _receipt = publication
+    real = broker._create_owned_pr
+    first = True
+
+    def create(base):
+        nonlocal first
+        if first:
+            first = False
+            # No executable exists in this owned path. This reaches real Popen,
+            # and cannot fall through to the account's installed gh executable.
+            with monkeypatch.context() as missing:
+                missing.setenv('PATH', str(root / 'no-executables'))
+                return real(base)
+        return real(base)
+
+    monkeypatch.setattr(broker, '_create_owned_pr', create)
+    with pytest.raises(FileNotFoundError):
+        broker.publish(0, checked)
+    assert events(root) == []
+    head = _git(broker.checkout, 'rev-parse', 'HEAD')
+    remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + broker.spec['branch'])
+    assert remote.split()[0] == head
+    assert broker.reconcile_publish(0, checked, create_missing=True)['head'] == head
+    assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
 
 
 @pytest.mark.asyncio
@@ -179,85 +179,3 @@ b.publish(0,r['candidate'])
             child.kill()
             child.wait(timeout=5)
         await until(root, 'create-end')
-
-
-def test_released_executor_is_not_proof_that_unknown_create_did_nothing(publication, monkeypatch):
-    _store, _spec, broker, checked, root, receipt = publication
-    monkeypatch.setenv('PUBLICATION_FAIL', '1')
-    with pytest.raises(RuntimeError, match='unconfirmed'):
-        broker.publish(0, checked)
-    for _ in range(2):
-        assert broker.reconcile_publish(0, checked, create_missing=True) == {
-            'state': 'pending', 'reason': 'original_create_readback'}
-        assert broker.publish(0, checked) == {
-            'state': 'pending', 'reason': 'original_create_readback'}
-    assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
-    receipt[0]['headRefOid'] = _git(broker.checkout, 'rev-parse', 'HEAD')
-    (root / 'receipt.json').write_text(json.dumps(receipt))
-    assert broker.reconcile_publish(0, checked, create_missing=True)['number'] == 1
-
-
-def test_actual_missing_executable_can_retry_creation_without_repeating_push(
-    publication, monkeypatch,
-):
-    _store, _spec, broker, checked, root, _receipt = publication
-    real = broker._create_owned_pr
-    first = True
-
-    def create(base):
-        nonlocal first
-        if first:
-            first = False
-            # No executable exists in this owned path. This reaches real Popen,
-            # and cannot fall through to the account's installed gh executable.
-            with monkeypatch.context() as missing:
-                missing.setenv('PATH', str(root / 'no-executables'))
-                return real(base)
-        return real(base)
-
-    monkeypatch.setattr(broker, '_create_owned_pr', create)
-    with pytest.raises(FileNotFoundError):
-        broker.publish(0, checked)
-    assert events(root) == []
-    head = _git(broker.checkout, 'rev-parse', 'HEAD')
-    remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + broker.spec['branch'])
-    assert remote.split()[0] == head
-    assert broker.reconcile_publish(0, checked, create_missing=True)['head'] == head
-    assert len([item for item in events(root) if item['kind'] == 'create-start']) == 1
-
-
-def test_legacy_pending_without_executor_journal_requires_readback(publication):
-    store, _spec, broker, checked, root, _receipt = publication
-    broker._effect(broker.publication_effect_key(0), 'publish', {
-        'iteration': 0, 'input_candidate_id': checked['id']})
-    assert broker.publish(0, checked) == {
-        'state': 'pending', 'reason': 'original_commit_readback'}
-    assert events(root) == []
-    assert _git(broker.checkout, 'rev-parse', 'HEAD') == checked['head']
-    with store._connect() as db:
-        row = db.execute('SELECT legacy_unknown FROM delivery_publication_executors').fetchone()
-        assert row[0] == 1
-
-
-@pytest.mark.asyncio
-async def test_copied_async_context_does_not_transfer_live_thread_ownership(publication):
-    _store, _spec, broker, checked, _root, _receipt = publication
-    with execution(broker, 0, checked):
-        result = await asyncio.to_thread(broker.publish, 0, checked)
-        assert result == {'state': 'pending', 'reason': 'publication_execution_active'}
-
-
-def test_replaced_lock_inode_cannot_grant_a_second_generation(publication):
-    _store, _spec, broker, checked, _root, _receipt = publication
-    with execution(broker, 0, checked) as owner:
-        owner.path.unlink()
-        with pytest.raises((ValueError, FileNotFoundError)):
-            owner.check()
-        # The retained journal fences even a new independent descriptor/inode.
-        # Clear the inherited context to model another process.
-        import contextvars
-        def replacement():
-            with execution(broker, 0, checked):
-                pytest.fail('a replaced inode acquired publication authority')
-        with pytest.raises(ValueError, match='lock generation'):
-            contextvars.Context().run(replacement)

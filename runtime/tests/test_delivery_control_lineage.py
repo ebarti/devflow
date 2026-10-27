@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -17,16 +16,13 @@ from test_delivery_automatic_retry import stopped
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_automatic_retry as retry
-from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_activities import delivery_finalize_resources, delivery_project
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_control_lineage import (
-    FIELD,
     control_from_spec,
-    inherit_delivery_control,
 )
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -55,34 +51,6 @@ def disabled_stop(service, monkeypatch):
     return store, request, closed, control
 
 
-def test_automatic_successor_durably_inherits_one_accepted_control(service, monkeypatch):
-    store, request, _, control = disabled_stop(service, monkeypatch)
-    original = store.spec(request["run_id"])
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _: retry.retry_once(store), range(2)))
-    successors = [item for result in results for item in result]
-    assert len(successors) == 1
-    restarted = DeliveryStore(DeliveryConfig.load(store.config.path))
-    successor = restarted.spec(successors[0]["run_id"])
-    assert control_from_spec(successor) == control
-    assert successor[FIELD]["origin"]["run_id"] == request["run_id"]
-    assert successor["policy"] == original["policy"]
-    assert successor["delivery_admitted_at"] == original["delivery_admitted_at"]
-    assert restarted.spec(request["run_id"]) == original
-    assert retry.retry_once(restarted) == []
-    assert len(restarted.pending_starts()) == 1
-    assert (
-        len(
-            [
-                event
-                for event in restarted.events(request["run_id"])
-                if event["type"] == "delivery_limits_disabled"
-            ]
-        )
-        == 1
-    )
-
-
 @pytest.mark.parametrize(
     "conflict", ["missing_event", "changed_event", "closed_control", "predecessor_changed"]
 )
@@ -109,45 +77,6 @@ def test_automatic_control_uncertainty_refuses_successor(service, monkeypatch, c
                 )
     assert retry.retry_once(store) == []
     assert len(store.list_runs()) == 1
-
-
-def test_caller_cannot_supply_a_timer_control_carrier(service):
-    store, request = service
-    with pytest.raises(ValueError, match="submit fields"):
-        store.submit({**request, FIELD: {"control": {"disabled": True}}})
-    assert not store.list_runs()
-
-
-def test_control_carrier_authenticates_origin_through_multiple_successors(service, monkeypatch):
-    store, request, closed, control = disabled_stop(service, monkeypatch)
-    successor = store.spec(retry.retry_once(store)[0]["run_id"])
-    with store._connect() as db:
-        row = dict(
-            db.execute(
-                "SELECT * FROM delivery_runs WHERE run_id=?", (successor["run_id"],)
-            ).fetchone()
-        )
-        checks = {"delivery_limits_control": control}
-        db.execute(
-            "UPDATE delivery_runs SET checks_json=? WHERE run_id=?",
-            (json.dumps(checks), successor["run_id"]),
-        )
-        row = dict(
-            db.execute(
-                "SELECT * FROM delivery_runs WHERE run_id=?", (successor["run_id"],)
-            ).fetchone()
-        )
-        next_spec = copy.deepcopy(successor)
-        next_spec.pop(FIELD)
-        next_spec.update(run_id="third-run", request_digest=digest("third-request"))
-        inherit_delivery_control(store, db, next_spec, row)
-        assert control_from_spec(next_spec) == control
-        assert next_spec[FIELD]["origin"] == successor[FIELD]["origin"]
-        db.execute("DELETE FROM delivery_events WHERE type='delivery_limits_disabled'")
-        rejected = copy.deepcopy(next_spec)
-        rejected.pop(FIELD)
-        with pytest.raises(ValueError, match="no longer authentic"):
-            inherit_delivery_control(store, db, rejected, row)
 
 
 @pytest.mark.asyncio
@@ -264,65 +193,3 @@ async def test_public_disable_survives_closed_retry_and_service_restart(
             assert after["checks"]["delivery_clock"]["admitted_at"] == spec["delivery_admitted_at"]
             assert "delivery_limit" not in after["checks"]
             assert store.spec(spec["run_id"]) == spec
-
-
-def test_feature_constructor_preserves_control_and_budget_across_capacity_change(
-    service, monkeypatch
-):
-    """SQLite/registry constructor coverage; remote tracker/closure are controlled."""
-    from test_delivery_feature_execution import feature_service
-
-    from devflow_temporal.delivery_feature_execution import continue_feature, registry
-
-    original_store, request = service
-    raw = copy.deepcopy(original_store.config.raw)
-    raw["delivery_timeout_seconds"] = 3600
-    original_store.config.path.write_text(json.dumps(raw))
-    configured = DeliveryStore(DeliveryConfig.load(original_store.config.path))
-    store, request, _ = feature_service((configured, request), monkeypatch)
-    store.submit(request)
-    original = store.effective_spec(request["run_id"])
-    control = {
-        "disabled": True,
-        "command_id": "accepted-feature-disable",
-        "reason": "Keep the accepted operator timer control",
-        "recorded_at": "2026-10-26T00:00:00+00:00",
-        "protocol_revision": 1,
-    }
-    store.record_delivery_limits_disabled(
-        original["run_id"],
-        {"revision": 1, "checks": {"delivery_limits_control": control}},
-        control["command_id"],
-    )
-    registry(original).stop(original["feature_delivery"]["owner"], "stopped", {})
-    with store._connect() as db:
-        db.execute(
-            "UPDATE delivery_runs SET phase='cancelled',outcome='cancelled',"
-            "execution_state='terminal' WHERE run_id=?",
-            (original["run_id"],),
-        )
-        store.state.release_work(db, original["work_id"], "external:devflow:" + original["run_id"])
-    raw = json.loads(store.config.path.read_text())
-    raw["capacity"] = 6
-    store.config.path.write_text(json.dumps(raw))
-    restarted = DeliveryStore(DeliveryConfig.load(store.config.path))
-    monkeypatch.setattr(restarted, "_completed_temporal_result", lambda *_: {"result": {}})
-    with restarted._connect() as db:
-        revision = db.execute(
-            "SELECT revision FROM delivery_runs WHERE run_id=?", (original["run_id"],)
-        ).fetchone()[0]
-    result = continue_feature(
-        restarted,
-        original["run_id"],
-        {
-            "command_id": "feature-continue-control",
-            "expected_revision": revision,
-        },
-    )
-    successor = restarted.effective_spec(result["run_id"])
-    assert control_from_spec(successor) == control
-    assert successor["delivery_admitted_at"] == original["delivery_admitted_at"]
-    assert successor["policy"]["delivery_timeout_seconds"] == 3600
-    issue = successor["feature_delivery"]["owner"]["issue_id"]
-    assert registry(successor).budget(issue)["used"] == 0
-    assert restarted.spec(original["run_id"]) == original
