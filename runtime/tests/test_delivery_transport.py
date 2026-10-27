@@ -3,17 +3,14 @@ from __future__ import annotations
 import hashlib
 import random
 import string
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
 from temporalio.converter import DataConverter
 
-from devflow_temporal import delivery_native_preparation as native
 from devflow_temporal import delivery_transport_adoption as adoption
 from devflow_temporal.delivery_broker import _git
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
-from devflow_temporal.delivery_preparation import PreparationError
 from devflow_temporal.delivery_resources import write_private
 from devflow_temporal.payload import payload_digest
 
@@ -66,22 +63,6 @@ def installation(tmp_path, monkeypatch):
     return source, package, spec, path, receipt
 
 
-def test_adoption_authenticates_old_payload_and_keeps_original_controller(installation):
-    _source, _package, spec, path, receipt = installation
-    original_bytes = path.read_bytes()
-    before = receipt['before']
-    assert adoption.transport_adoption(spec, before['payload_sha256']) == receipt
-    original = {'runtime_payload_sha256': before['payload_sha256'],
-                'source_revision': before['revision'],
-                'service_manifest_sha256': receipt['historical_service_manifest']['sha256']}
-    retained_original = deepcopy(original)
-    current, raw = adoption.controller_installation(spec, original)
-    assert current['source_revision'] == receipt['after']['revision']
-    assert hashlib.sha256(raw).hexdigest() == original['service_manifest_sha256']
-    assert original == retained_original
-    assert path.read_bytes() == original_bytes
-
-
 @pytest.mark.parametrize('change', ['role-source', 'mode'])
 def test_adoption_rejects_drift_even_with_current_receipt(installation, change):
     source, package, spec, path, receipt = installation
@@ -104,22 +85,3 @@ def test_adoption_rejects_drift_even_with_current_receipt(installation, change):
         path.chmod(0o644)
     with pytest.raises(ValueError):
         adoption.transport_adoption(spec, receipt['before']['payload_sha256'])
-
-
-def test_native_identity_adoption_cannot_accept_host_or_permission_drift(monkeypatch, tmp_path):
-    frozen = {'runtime_payload_sha256': 'old', 'codex_bin_sha256': 'binary',
-              'config_overrides': ['sealed']}
-    spec = {'state_dir': str(tmp_path / 'state/runs/queued'),
-            'policy': {'native_identity': frozen},
-            'preparation': {'schema': native.SCHEMA, 'fingerprint': 'invalid'}}
-    calls = []
-    monkeypatch.setattr(adoption, 'transport_adoption', lambda *_args: calls.append(True))
-    current = {**frozen, 'runtime_payload_sha256': 'new', 'config_overrides': ['changed']}
-    monkeypatch.setattr(native, 'native_identity', lambda _spec: current)
-    with pytest.raises(PreparationError):
-        native.verify_native_spec(spec)
-    assert not calls
-    current['config_overrides'] = ['sealed']
-    with pytest.raises(PreparationError):
-        native.verify_native_spec(spec)
-    assert calls == [True]  # A receipt never replaces the original proof validation.

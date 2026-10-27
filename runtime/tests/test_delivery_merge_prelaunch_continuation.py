@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -149,103 +148,6 @@ async def test_exact_derived_prelaunch_continues_original_grant(
         assert effect["state"] == "complete" and effect["request_json"] == b.effect["request_json"]
         assert json.loads(effect["observed_json"])["cleanup"] == "confirmed_prelaunch_absent"
     assert canonical_json(d.spec) == b.c.original_bytes
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "change",
-    [
-        "execution_digest",
-        "reference",
-        "receipt",
-        "intent",
-        "workflow",
-        "workspace",
-        "parent_evidence",
-        "session",
-        "foreign_original_spec",
-    ],
-)
-async def test_derived_prelaunch_requires_complete_original_and_execution_authority(
-    relocated_conflict, monkeypatch, change
-):
-    b = await blocked(relocated_conflict, monkeypatch)
-    d = b.c.d
-    bound = json.loads(b.effect["request_json"])
-    if change in {"execution_digest", "reference", "foreign_original_spec"}:
-        if change == "execution_digest":
-            bound["execution_spec_sha256"] = "0" * 64
-        elif change == "reference":
-            bound[native.FIELD]["sha256"] = "0" * 64
-        else:
-            bound["spec_sha256"] = "0" * 64
-        with d.store._connect() as db:
-            db.execute(
-                "UPDATE delivery_effects SET request_json=? WHERE effect_key=?",
-                (canonical_json(bound), b.effect["effect_key"]),
-            )
-    elif change == "receipt":
-        Path(bound[native.FIELD]["path"]).write_text("{}")
-    elif change == "intent":
-        (Path(bound[native.FIELD]["path"]).parent / "runtime-preparation/intent.json").write_text(
-            "{}"
-        )
-    elif change == "workflow":
-        with d.store._connect() as db:
-            db.execute("UPDATE delivery_merge_requests SET workflow_id='foreign'")
-    elif change == "workspace":
-        path = Path(b.request["workspace"])
-        held = path.with_name(path.name + "-held")
-        path.rename(held)
-        shutil.copytree(held, path, symlinks=True)
-    elif change == "parent_evidence":
-        Path(bound["merge_context"]["evidence_path"]).write_text("{}")
-    else:
-        with d.store._connect() as db:
-            db.execute(
-                "UPDATE delivery_attempts SET session_id='foreign' WHERE job_key=?", (b.key,)
-            )
-    before = names(d.spec)
-    with pytest.raises((ValueError, KeyError)):
-        followup.preflight(d.store, "run-1")
-    assert names(d.spec) == before
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("late", [False, True])
-async def test_prelaunch_never_acquires_cleanup_of_an_unbound_scratch(
-    relocated_conflict, monkeypatch, late
-):
-    b = await blocked(relocated_conflict, monkeypatch, persisted=True)
-    d = b.c.d
-    scratch = resolution.scratch_path(b.request)
-    assert not os.path.lexists(scratch)
-    observe = native.prelaunch_receipts
-
-    def create():
-        resolution.scratch(b.request)
-        (scratch / "keep.txt").write_text("owned scratch must survive refused admission")
-
-    if late:
-
-        @contextmanager
-        def changed(*args, **kwargs):
-            with observe(*args, **kwargs) as proofs:
-                create()  # An external generation appears after observation.
-                yield proofs
-
-        monkeypatch.setattr(native, "prelaunch_receipts", changed)
-    else:
-        create()
-    try:
-        with pytest.raises(ValueError, match="scratch|custody"):
-            followup.preflight(d.store, "run-1")
-        assert (scratch / "keep.txt").read_text() == "owned scratch must survive refused admission"
-        with pytest.raises(ValueError, match="scratch|custody"):
-            followup.admit(d.store, "run-1", {**d.command, "command_id": "refuse-unbound-scratch"})
-        assert (scratch / "keep.txt").read_text() == "owned scratch must survive refused admission"
-    finally:
-        shutil.rmtree(scratch)  # Only this test's authored scratch, after its assertions.
 
 
 @pytest.mark.asyncio

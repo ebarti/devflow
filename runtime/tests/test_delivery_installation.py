@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import sys
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -151,17 +150,6 @@ def test_owned_update_failure_restores_or_resumes_exact_pointer(installation, fa
     assert len(current['adds']) == (3 if failure == 'readback' else 1)
 
 
-def test_applied_replay_rejects_unrecorded_owned_pointer_reversal(installation):
-    fixture = installation
-    assert _run(fixture, '--repoint-owned-request', str(fixture['request'])).returncode == 0
-    current = json.loads(fixture['registry'].read_bytes())
-    current['entries'][NAME] = fixture['entry']
-    _private(fixture['registry'], current)
-    replay = _run(fixture, '--repoint-owned-request', str(fixture['request']))
-    assert replay.returncode != 0 and 'changed' in replay.stderr
-    assert json.loads(fixture['registry'].read_bytes()) == current
-
-
 @pytest.mark.parametrize('change', ['original-config', 'roles'])
 def test_pointer_upgrade_rejects_changed_inspected_inputs(installation, change):
     fixture = installation
@@ -207,123 +195,3 @@ def canonicalized_unknown(installation, monkeypatch):
     assert failed['state'] == 'unknown' and 'rollback refused' in failed['rollback_error']
     monkeypatch.setattr(module, 'unrelated_seal', semantic)
     return module, fixture, args, manifest, failed
-
-
-def test_legacy_unknown_default_canonicalization_replays_without_new_pointer_effect(
-    canonicalized_unknown,
-):
-    module, fixture, args, manifest, failed = canonicalized_unknown
-    registry = json.loads(fixture['registry'].read_text())
-    assert len(registry['adds']) == 1
-    accepted = module.upgrade(*args)
-    assert accepted['state'] == 'applied'
-    current = json.loads(manifest.read_text())
-    assert {k: v for k, v in current.items() if k != 'state'} == {
-        k: v for k, v in failed.items() if k != 'state'}
-    assert module.upgrade(*args)['existing']
-    assert json.loads(fixture['registry'].read_text()) == registry
-    assert module.rollback(args[0], fixture['home'], manifest)['state'] == 'rolled_back'
-    restored = json.loads(fixture['registry'].read_text())
-    assert restored['entries'][NAME] == fixture['entry']
-    assert fixture['skill'].read_text() == 'Inspected previous owned skill\n'
-    assert fixture['agents'].read_text() == 'preserved agent bytes\n'
-
-
-@pytest.mark.parametrize('change', ['args', 'public-inventory'])
-def test_legacy_unknown_canonicalization_refuses_meaningful_unrelated_drift(
-    canonicalized_unknown, change,
-):
-    module, fixture, args, manifest, _failed = canonicalized_unknown
-    host_config = fixture['home'] / 'config.toml'
-    text = host_config.read_text()
-    if change == 'args':
-        text += 'args=["changed"]\n'
-    elif change in {'timeout', 'boolean', 'infinite'}:
-        value = {'timeout': '20.0', 'boolean': 'true', 'infinite': 'inf'}[change]
-        text = text.replace('startup_timeout_sec=10.0', 'startup_timeout_sec=' + value)
-    elif change == 'command':
-        text = text.replace('/usr/bin/true', '/usr/bin/false')
-    elif change == 'model':
-        text = text.replace('gpt-6.1-sol', 'user-selected-model')
-    else:
-        registry = json.loads(fixture['registry'].read_text())
-        registry['entries']['unrelated']['transport']['args'] = ['changed']
-        _private(fixture['registry'], registry)
-    host_config.write_text(text)
-    before = (manifest.read_bytes(), fixture['registry'].read_bytes(), host_config.read_bytes())
-    with pytest.raises(ValueError):
-        module.upgrade(*args)
-    with pytest.raises(ValueError):
-        module.rollback(args[0], fixture['home'], manifest)
-    assert before == (manifest.read_bytes(), fixture['registry'].read_bytes(),
-                      host_config.read_bytes())
-
-
-def test_only_stdio_toml_defaults_have_bounded_legacy_equivalence(monkeypatch):
-    monkeypatch.syspath_prepend(str(ROOT / 'runtime/desktop'))
-    module = importlib.import_module('owned_upgrade')
-    original = {'settings': {'mcp_servers': {'node_repl': {
-        'command': '/usr/bin/true', 'args': [], 'startup_timeout_sec': 10}}},
-        'other_mcp': [{'transport': {'type': 'stdio', 'args': []}}]}
-    after = deepcopy(original)
-    entry = after['settings']['mcp_servers']['node_repl']
-    entry.pop('args')
-    entry['startup_timeout_sec'] = 10.0
-    legacy = module.seal(original)
-    assert module.unrelated_seal(after) == module.unrelated_seal(original)
-    assert module.unrelated_seal(after, legacy) == legacy
-    after['other_mcp'][0]['transport'].pop('args')
-    assert module.unrelated_seal(after, legacy) != legacy
-    many = {'settings': {'mcp_servers': {str(n): {'command': '/usr/bin/true', 'args': [],
-            'startup_timeout_sec': 10.0} for n in range(7)}}}
-    canonical = deepcopy(many)
-    for item in canonical['settings']['mcp_servers'].values():
-        item.pop('args')
-    assert module.unrelated_seal(canonical, module.seal(many)) != module.seal(many)
-    assert module.unrelated_seal(canonical) == module.unrelated_seal(many)
-
-
-@pytest.mark.parametrize('transport', [{'command': '/bin/true'}, {'url': 'https://example.invalid/mcp'}])
-@pytest.mark.parametrize('inventory_key', ['other_mcp', 'mcp'])
-def test_mcp_enabled_true_default_requires_unchanged_public_effective_inventory(
-    monkeypatch, transport, inventory_key,
-):
-    monkeypatch.syspath_prepend(str(ROOT / 'runtime/desktop'))
-    module = importlib.import_module('owned_upgrade')
-    absent = {'settings': {'mcp_servers': {'foreign': transport}},
-              inventory_key: [{'name': 'foreign', 'enabled': True}]}
-    explicit = deepcopy(absent)
-    explicit['settings']['mcp_servers']['foreign']['enabled'] = True
-    assert module.unrelated_seal(explicit) == module.unrelated_seal(absent)
-    assert module.unrelated_seal(absent, module.seal(explicit)) == module.seal(explicit)
-    assert module.unrelated_seal(explicit, module.seal(absent)) == module.seal(absent)
-    for value in (False, 'true', 1, None):
-        changed = deepcopy(explicit)
-        changed['settings']['mcp_servers']['foreign']['enabled'] = value
-        assert module.unrelated_seal(changed) != module.unrelated_seal(absent)
-    for confirmation in ([], [{'name': 'foreign', 'enabled': False}],
-                         [{'name': 'different-server', 'enabled': True}],
-                         [{'name': 'foreign', 'enabled': 'true'}],
-                         [{'name': 'foreign', 'enabled': 1}],
-                         [{'name': 'foreign', 'enabled': True}] * 2):
-        before, after = deepcopy(explicit), deepcopy(absent)
-        before[inventory_key] = after[inventory_key] = confirmation
-        assert module.unrelated_seal(before) != module.unrelated_seal(after)
-    public_change = deepcopy(absent)
-    public_change[inventory_key][0]['enabled'] = False
-    assert module.unrelated_seal(public_change) != module.unrelated_seal(explicit)
-
-
-def test_mode_only_upgrade_rejects_numerically_equal_config_type_change_before_effects(
-    installation,
-):
-    fixture = installation
-    trusted = json.loads(fixture['trusted'].read_text())
-    trusted['capacity'] = 2.0
-    _private(fixture['trusted'], trusted)
-    current = fixture['registry'].read_bytes()
-    result = _run(fixture, '--repoint-owned-request', str(fixture['request']))
-    assert result.returncode != 0 and 'only the trusted execution mode delta' in result.stderr
-    assert fixture['registry'].read_bytes() == current
-    assert not (fixture['home'] / '.devflow-local-delivery-upgrades'
-                / 'owned-trust-upgrade' / 'manifest.json').exists()

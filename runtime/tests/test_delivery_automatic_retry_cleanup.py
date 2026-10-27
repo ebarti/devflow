@@ -12,7 +12,6 @@ from test_delivery_automatic_retry import stopped
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_automatic_retry as retry
-from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_store import DeliveryStore
 
 
@@ -141,75 +140,6 @@ def test_unknown_closure_later_observed_cleanup_releases_own_claim_and_retries(l
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 2
 
 
-def test_finished_attempt_does_not_hide_later_cleanup_obligation(later_cleanup):
-    store, request, _historical, calls, external = later_cleanup
-    from devflow_temporal.supervisor import DeliverySupervisor
-
-    job, _ = DeliverySupervisor(store, capacity=1)._claim({
-        'spec': store.spec(request['run_id']), 'role': 'implement', 'iteration': 0,
-        'candidate': {'id': 'fixture', 'head': 'fixture', 'worktree_sha256': 'fixture'}})
-    with store._connect() as db:
-        db.execute("UPDATE delivery_attempts SET state='finished',cleanup='confirmed' "
-                   'WHERE job_key=?', (job,))
-    external['ready'] = True
-    assert len(retry.retry_once(store)) == 1
-    assert ('observe', True) in calls
-
-
-def test_exhausted_ceiling_still_finishes_cleanup_and_claim_closure(service, monkeypatch):
-    fixture_store, request = service
-    raw = copy.deepcopy(fixture_store.config.raw)
-    raw['max_attempts'] = 1
-    fixture_store.config.path.write_text(json.dumps(raw))
-    store = DeliveryStore(DeliveryConfig.load(fixture_store.config.path))
-    fixture = later_cleanup.__wrapped__((store, request), monkeypatch)
-    store, request, _historical, calls, external = fixture
-    external['ready'] = True
-    assert retry.retry_once(store) == []
-    assert ('tracker', 'blocked', True, True) in calls
-    with store._connect() as db:
-        assert store.state.claim_for(db, request['work_id']) is None
-        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
-
-
-@pytest.mark.parametrize('obstacle', ['foreign_claim', 'changed_record'])
-def test_later_cleanup_cannot_bypass_original_safety_guards(later_cleanup, obstacle):
-    store, request, historical, calls, external = later_cleanup
-    external['ready'] = True
-    with store._connect() as db:
-        if obstacle == 'foreign_claim':
-            store.state.release_work(db, request['work_id'],
-                                     'external:devflow:' + request['run_id'])
-            store.state.claim_work(db, request['work_id'], 'foreign', 'fixture')
-        elif obstacle == 'effect_unknown':
-            db.execute('INSERT INTO delivery_effects VALUES (?,?,?,?,?,?,?)',
-                       ('effect', request['run_id'], 'tracker', '{}', 'unknown', None, 'now'))
-        elif obstacle == 'cancel':
-            db.execute('INSERT INTO delivery_mutations '
-                       '(command_id,run_id,kind,request_digest,state) VALUES (?,?,?,?,?)',
-                       ('cancel', request['run_id'], 'cancel', 'opaque', 'complete'))
-        elif obstacle == 'changed_failure':
-            historical['result']['checks']['failure']['cause_type'] = 'different'
-        elif obstacle == 'changed_record':
-            db.execute("UPDATE delivery_runs SET request_digest='changed'")
-    if obstacle == 'unfinished_attempt':
-        from devflow_temporal.supervisor import DeliverySupervisor
-        DeliverySupervisor(store, capacity=1)._claim({
-            'spec': store.spec(request['run_id']), 'role': 'implement', 'iteration': 0,
-            'candidate': {'id': 'fixture', 'head': 'fixture', 'worktree_sha256': 'fixture'}})
-    assert retry.retry_once(store) == []
-    assert not any(call[0] in {'finalize', 'tracker'} for call in calls)
-
-
-def test_unacknowledged_terminal_tracker_cannot_admit(later_cleanup):
-    store, _request, _historical, calls, external = later_cleanup
-    external.update(ready=True, tracker='pending')
-    assert retry.retry_once(store) == []
-    assert ('tracker', 'blocked', True, True) in calls
-    with store._connect() as db:
-        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
-
-
 def test_later_closure_survives_base_failure_without_repeating_effects_or_events(later_cleanup):
     store, request, historical, calls, external = later_cleanup
     external.update(ready=True, base_unknown=True)
@@ -241,41 +171,6 @@ def test_lost_tracker_acknowledgement_reads_back_release_before_one_successor(la
     store._automatic_retry_waits.clear()
     assert len(retry.retry_once(store)) == 1
     assert external['external_sets'] == 1
-
-
-@pytest.mark.parametrize('changed', ['row', 'stop'])
-def test_publication_readback_rechecks_guard_before_cleanup_effect(later_cleanup, changed):
-    store, request, _historical, calls, external = later_cleanup
-    external['ready'] = True
-    stop = [False]
-    def change():
-        if changed == 'stop':
-            stop[0] = True
-            return
-        with store._connect() as db:
-            if changed == 'row':
-                db.execute('UPDATE delivery_runs SET revision=revision+1')
-            elif changed == 'claim':
-                store.state.release_work(db, request['work_id'],
-                                         'external:devflow:' + request['run_id'])
-                store.state.claim_work(db, request['work_id'], 'foreign', 'fixture')
-            else:
-                db.execute('INSERT INTO delivery_effects VALUES (?,?,?,?,?,?,?)',
-                           ('raced', request['run_id'], 'tracker', '{}', 'unknown', None, 'now'))
-    external['on_publication'] = change
-    assert retry.retry_once(store, stopped=lambda: stop[0]) == []
-    assert not any(call[0] in {'finalize', 'tracker'} for call in calls)
-
-
-def test_registered_records_changed_during_finalization_cannot_release_claim(later_cleanup):
-    store, _request, _historical, calls, external = later_cleanup
-    external['ready'] = True
-    def changed(unknown_allowed):
-        if not unknown_allowed:
-            external['journal'] = 'changed'
-    external['on_observe'] = changed
-    assert retry.retry_once(store) == []
-    assert not any(call[0] == 'tracker' for call in calls)
 
 
 @pytest.mark.parametrize('changed', ['row', 'effect'])

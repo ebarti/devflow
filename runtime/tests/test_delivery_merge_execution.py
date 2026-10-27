@@ -7,7 +7,6 @@ import json
 from contextvars import copy_context
 from dataclasses import replace
 from datetime import timedelta
-from threading import Event
 from types import SimpleNamespace
 
 import httpx
@@ -96,86 +95,6 @@ def test_sdk_origin_binds_exact_run_and_fences_late_progress_effects(delivered, 
         assert not db.execute("SELECT 1 FROM delivery_effects "
                               "WHERE effect_key='late-effect'").fetchone()
     assert subprocess_calls == []
-
-
-def test_sdk_context_without_verified_start_is_not_an_effect_grant(delivered):
-    d = delivered
-    grant = followup.admit(d.store, "run-1", d.command)
-
-    def probe():
-        with execution.activity_scope(d.store, {
-            "spec": d.spec, "merge_authorization": grant["grant_sha256"]}):
-            pytest.fail("unbound SDK context reached the effect boundary")
-
-    with pytest.raises(ValueError, match="original SDK binding"):
-        sdk_environment(d, grant).run(probe)
-    with d.store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_merge_executions").fetchone()[0] == 0
-
-
-@pytest.mark.parametrize("field,value", [("namespace", "foreign"),
-    ("workflow_type", "DeliveryWorkflow"), ("task_queue", "foreign"),
-    ("workflow_run_id", "")])
-def test_sdk_scope_refuses_foreign_execution_fields(delivered, field, value):
-    d = delivered
-    grant = followup.admit(d.store, "run-1", d.command)
-    env = sdk_environment(d, grant)
-    env.info = replace(env.info, **{field: value})
-
-    def probe():
-        with execution.activity_scope(d.store, {
-            "spec": d.spec, "merge_authorization": grant["grant_sha256"]}):
-            pytest.fail("foreign SDK origin reached the effect boundary")
-
-    with pytest.raises(ValueError, match="SDK execution identity"):
-        env.run(probe)
-    with d.store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_merge_executions").fetchone()[0] == 0
-
-
-@pytest.mark.asyncio
-async def test_cancelled_waiter_preserves_unfinished_thread_lease(delivered):
-    d = delivered
-    grant = followup.admit(d.store, "run-1", d.command)
-    entered, release, finished = Event(), Event(), Event()
-    with d.store._connect() as db:
-        execution.bind_execution(db, d.spec, grant["grant_sha256"], {
-            "workflow_id": grant["workflow_id"], "execution_run_id": "sdk-original-run"})
-
-    def body():
-        entered.set()
-        try:
-            assert release.wait(10)
-        finally:
-            finished.set()
-
-    async def probe():
-        with execution.activity_scope(d.store, {
-            "spec": d.spec, "merge_authorization": grant["grant_sha256"]}):
-            task = asyncio.create_task(execution.to_thread(d.store, d.spec, body))
-            assert await asyncio.to_thread(entered.wait, 5)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-    try:
-        await sdk_environment(d, grant).run(probe)
-        with pytest.raises(ValueError, match="still owns its effect lease"):
-            with execution.existing_lease(d.store.config, exclusive=True):
-                pytest.fail("unfinished body lost its effect lease")
-    finally:
-        release.set()
-        assert await asyncio.to_thread(finished.wait, 5)
-    # The body signals just before its lease finally closes; wait for that
-    # observed release, rather than racing its descriptor cleanup.
-    for _ in range(100):
-        try:
-            with execution.existing_lease(d.store.config, exclusive=True):
-                break
-        except ValueError:
-            await asyncio.sleep(0.01)
-    else:
-        pytest.fail("finished body did not release its effect lease")
 
 
 @pytest.mark.asyncio

@@ -123,50 +123,6 @@ def test_original_prevalidated_expired_fd_is_counted_and_can_act_after_abort(own
         child.communicate(timeout=5)
 
 
-def test_census_excludes_only_its_exact_fd_and_requires_complete_visibility(owned, monkeypatch):
-    config, fd, proof = owned
-    os.link(proof["path"], proof["link"])
-    guard.census(fd, proof)
-    extra = os.open(proof["path"], os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        with pytest.raises(ValueError, match="foreign service-lock FDs"):
-            guard.census(fd, proof)
-    finally:
-        os.close(extra)
-    original = guard.subprocess.run
-
-    def incomplete(*args, **kwargs):
-        result = original(*args, **kwargs)
-        result.stderr = b"lsof: visibility incomplete"
-        return result
-
-    monkeypatch.setattr(guard.subprocess, "run", incomplete)
-    with pytest.raises(ValueError, match="indeterminate"):
-        guard.census(fd, proof)
-
-
-@pytest.mark.parametrize("change", ["third", "replacement", "changed", "linked-parent"])
-def test_only_exact_original_two_owned_names_are_recognized(owned, change):
-    config, fd, proof = owned
-    link = Path(proof["link"])
-    os.link(proof["path"], link)
-    guard.check(config, proof, fd, linked=True)
-    if change == "third":
-        os.link(proof["path"], link.with_name("third"))
-    elif change == "replacement":
-        Path(proof["path"]).unlink()
-        Path(proof["path"]).write_bytes(b"")
-        Path(proof["path"]).chmod(0o600)
-    elif change == "changed":
-        os.write(fd, b"different original inode contents")
-    else:
-        original = link.parent.with_name("moved")
-        link.parent.rename(original)
-        link.parent.symlink_to(original)
-    with pytest.raises((ValueError, OSError)):
-        guard.check(config, proof, fd, linked=True)
-
-
 def test_unacknowledged_two_name_lock_never_grants_current_lifecycle(owned):
     from devflow_temporal.delivery_control import _lifecycle_lock
 

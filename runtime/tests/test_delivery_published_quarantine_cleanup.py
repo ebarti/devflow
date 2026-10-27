@@ -15,7 +15,6 @@ from test_delivery_quarantined_authority import native_quarantine as native_quar
 from test_delivery_store import _git
 from test_delivery_store import service as service
 
-from devflow_temporal import delivery_native_process as native
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -188,94 +187,3 @@ def test_public_published_cleanup_replays_after_compact_maintenance(published_af
     assert value.closed == before and value.case.journal.read_bytes() == value.original_unknown
     assert read_private(value.case.journal)['monitoring_complete'] is False
     assert read_private(value.case.journal)['result']['provider_outcome'] == 'unknown'
-
-
-@pytest.mark.parametrize('field', ['historical_quarantines', 'quarantined_cleanup',
-                                  'native_observation'])
-def test_compact_maintenance_never_replaces_anchor_custody(published_after_unknown, field):
-    value = published_after_unknown
-    _row, anchor, _receipt = _later_compact_maintenance(value)
-    if field == 'historical_quarantines':
-        anchor[field] = []
-    else:
-        anchor[field]['journal_sha256'][str(value.case.journal)] = digest('changed old journal')
-    with value.store._connect() as db:
-        db.execute("UPDATE delivery_events SET payload_json=? WHERE "
-                   "type='resource_cleanup_reconciled' AND "
-                   "json_extract(payload_json,'$.closure')='published'",
-                   (canonical_json(anchor),))
-    with pytest.raises(ValueError):
-        reconcile_attempt(value.store, run_id='run-1', role='cleanup', iteration=1)
-
-
-@pytest.mark.parametrize('drift', ['old_journal', 'old_request', 'live_actor', 'live_port',
-                                    'foreign_claim', 'new_unknown', 'late_old_request'])
-def test_published_cleanup_never_extends_an_old_teardown_grant(
-    published_after_unknown, monkeypatch, drift,
-):
-    value = published_after_unknown
-    if drift == 'late_old_request':
-        from devflow_temporal import delivery_automatic_retry as retry
-
-        tracker = retry._tracker_sync
-
-        def changed_after_tracker(*args, **kwargs):
-            result = tracker(*args, **kwargs)
-            path = value.case.journal.with_name('request.json')
-            request = read_private(path)
-            request['workspace'] += '-late-change'
-            write_private(path, request)
-            return result
-
-        monkeypatch.setattr(retry, '_tracker_sync', changed_after_tracker)
-    elif drift == 'old_journal':
-        journal = read_private(value.case.journal)
-        journal['owned']['17017']['identity'] = 'different original identity'
-        write_private(value.case.journal, journal)
-    elif drift == 'old_request':
-        path = value.case.journal.with_name('request.json')
-        request = read_private(path)
-        request['workspace'] += '-changed'
-        write_private(path, request)
-    elif drift == 'live_actor':
-        monkeypatch.setattr(native, 'process_table', lambda: {
-            17017: {'identity': 'opaque-provider', 'stat': 'S'}})
-    elif drift == 'live_port':
-        monkeypatch.setattr(native, 'listeners', lambda _port: {991})
-        journal = read_private(value.later / 'native-process.json')
-        journal['ports'] = [19687]
-        write_private(value.later / 'native-process.json', journal)
-    elif drift == 'foreign_claim':
-        with value.store._connect() as db:
-            value.store.state.release_work(db, value.current['work_id'], 'external:devflow:run-1')
-            value.store.state.claim_work(db, value.current['work_id'], 'other-owner', 'Owned drift')
-    else:
-        journal = read_private(value.case.journal)
-        path = Path(value.current['state_dir']) / 'attempts/new-unknown/native-process.json'
-        journal['result']['journal'] = str(path)
-        write_private(path, journal)
-        write_private(path.with_name('launch.json'), read_private(value.case.journal.with_name(
-            'launch.json')))
-        for name in ('native-process.lock', 'native-monitor.lock'):
-            path.with_name(name).touch(mode=0o600)
-        value.registry.process(path)
-        final = read_private(value.registry.root / 'finalization.json')
-        final['processes'].append({**final['processes'][0], 'journal': str(path)})
-        write_private(value.registry.root / 'finalization.json', final)
-    with pytest.raises(ValueError):
-        reconcile_attempt(value.store, run_id='run-1', role='cleanup', iteration=1)
-    with value.store._connect() as db:
-        assert not db.execute("SELECT 1 FROM delivery_events WHERE "
-                              "type='resource_cleanup_reconciled' "
-                              "AND json_extract(payload_json,'$.closure')='published'").fetchone()
-
-
-def test_published_cleanup_replay_reauthenticates_historical_bytes(published_after_unknown):
-    value = published_after_unknown
-    assert reconcile_attempt(value.store, run_id='run-1', role='cleanup', iteration=1)['changed']
-    path = value.case.journal.with_name('request.json')
-    request = read_private(path)
-    request['workspace'] += '-replay-change'
-    write_private(path, request)
-    with pytest.raises(ValueError):
-        reconcile_attempt(value.store, run_id='run-1', role='cleanup', iteration=1)

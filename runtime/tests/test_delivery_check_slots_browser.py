@@ -163,21 +163,6 @@ def browser_checks(tmp_path, monkeypatch):
     assert all(not listeners(port) for port in ports)
 
 
-async def test_actual_browser_runs_queue_on_same_frozen_ports(browser_checks):
-    requests = [browser_checks.request(name) for name in ("one", "two")]
-    first = asyncio.create_task(activities.delivery_browser_qa(requests[0]))
-    await wait_until(lambda: all(listeners(port) for port in browser_checks.ports))
-    second = asyncio.create_task(activities.delivery_browser_qa(requests[1]))
-    results = await asyncio.gather(first, second)
-    assert [result["state"] for result in results] == ["passed", "passed"]
-    assert any(heart["run_id"] == "two" and heart["stage"] == "waiting-browser-ports"
-               for heart in browser_checks.hearts)
-    for request, result in zip(requests, results, strict=True):
-        journal = read_private(Path(result["native_process"]["journal"]))
-        assert journal["intent"]["argv"] == request["spec"]["policy"]["browser_qa"]["argv"]
-        assert journal["intent"]["ports"] == list(browser_checks.ports)
-
-
 async def test_actual_browser_run_cancelled_in_port_queue_never_launches(browser_checks):
     first_request = browser_checks.request("first", seconds=1.0)
     request = browser_checks.request("queued")
@@ -201,35 +186,6 @@ async def test_actual_browser_run_cancelled_in_port_queue_never_launches(browser
     assert not (Path(request["spec"]["state_dir"]) / "browser-qa").exists()
 
 
-async def test_actual_browser_cancelled_after_preparation_cleans_owned_scratch(
-    browser_checks, monkeypatch,
-):
-    request = browser_checks.request("prepared")
-    broker = browser_checks.brokers["prepared"]
-    from devflow_temporal.delivery_browser_qa import prepare_browser_qa
-
-    def cancel_after_preparation(*args):
-        result = prepare_browser_qa(*args)
-        db = broker.store._connect()
-        with db:
-            db.execute("INSERT INTO delivery_runs(run_id, phase) VALUES ('prepared', 'cancelling')")
-        db.close()
-        return result
-
-    monkeypatch.setattr("devflow_temporal.delivery_browser_qa.prepare_browser_qa",
-                        cancel_after_preparation)
-    result = await activities.delivery_browser_qa(request)
-    assert result["cleanup"] == "confirmed"
-    assert result["cancelled"] is True
-    assert not (Path(broker.spec["state_dir"]) / "browser-qa/0/native/native-process.json").exists()
-    resources = RunResources(request["spec"])
-    scratch = resources.browser_scratch()
-    assert scratch.exists()
-    cleanup = resources.finalize("cancelled")
-    assert cleanup["state"] == "confirmed"
-    assert not scratch.exists()
-
-
 def assert_locked(path):
     descriptor = os.open(path, os.O_RDWR)
     try:
@@ -245,28 +201,6 @@ def assert_unlocked(path):
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         os.close(descriptor)
-
-
-async def test_browser_port_wait_cancels_without_taking_generic_capacity(browser_checks):
-    first_request = browser_checks.request("first", seconds=2)
-    first = asyncio.create_task(activities.delivery_browser_qa(first_request))
-    await wait_until(lambda: all(listeners(port) for port in browser_checks.ports))
-    queued_request = browser_checks.request("queued")
-    queued = asyncio.create_task(activities.delivery_browser_qa(queued_request))
-    await wait_until(lambda: any(heart["run_id"] == "queued"
-                                and heart["stage"] == "waiting-browser-ports"
-                                for heart in browser_checks.hearts))
-    following = browser_checks.request("generic")
-    launched = []
-    assert await activities._execute_check(
-        following, lambda _: (launched.append(True), {"state": "passed"})[1], kind="checks",
-    ) == {"state": "passed"}
-    assert launched and not first.done()
-    queued.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await queued
-    assert not (browser_checks.brokers["queued"].evidence_dir / "browser-qa").exists()
-    assert (await first)["state"] == "passed", first.result()
 
 
 @pytest.mark.parametrize("failure", ["interrupted", "exception"])

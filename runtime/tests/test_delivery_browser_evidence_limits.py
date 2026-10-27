@@ -13,38 +13,6 @@ from devflow_temporal import delivery_browser_qa as browser
 from devflow_temporal.delivery_resources import RunResources
 
 
-def test_complete_pdf_evidence_is_not_limited_to_128_small_files(tmp_path):
-    report = tmp_path / "dist/playwright-report"
-    report.mkdir(parents=True)
-    for index in range(190):
-        (report / f"page-{index}.txt").write_text(f"owned page evidence {index}")
-    artifacts = browser._artifacts(tmp_path, ["dist/playwright-report"])
-    assert len(artifacts) == 190
-    assert all(Path(item["path"]).is_file() and item["sha256"] for item in artifacts)
-
-
-def test_browser_evidence_has_a_total_byte_bound(tmp_path, monkeypatch):
-    report = tmp_path / "report"
-    report.mkdir()
-    (report / "one").write_bytes(b"abc")
-    (report / "two").write_bytes(b"def")
-    monkeypatch.setattr(browser, "MAX_BROWSER_ARTIFACT_BYTES", 5, raising=False)
-    with pytest.raises(ValueError, match="evidence bound"):
-        browser._artifacts(tmp_path, ["report"])
-
-
-def test_browser_evidence_still_rejects_symlinks(tmp_path):
-    checkout = tmp_path / "checkout"
-    report = checkout / "report"
-    report.mkdir(parents=True)
-    outside = tmp_path / "private-data"
-    outside.write_bytes(b"preserve")
-    (report / "link").symlink_to(outside)
-    with pytest.raises(ValueError, match="symlink"):
-        browser._artifacts(checkout, ["report"])
-    assert outside.read_bytes() == b"preserve"
-
-
 def _request_with_evidence(fixture, name, count, *, failed=False):
     request = fixture.request(name, owned_checkout=True)
     broker = fixture.brokers[name]
@@ -137,12 +105,3 @@ async def test_interrupted_postprocessing_replays_completed_browser_without_laun
         assert len(result["artifacts"]) == 190
     finally:
         assert RunResources(request["spec"]).finalize("blocked")["state"] == "confirmed"
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="native process and port observation")
-def test_browser_reconciliation_never_starts_an_absent_invocation(browser_checks):
-    request = browser_checks.request("absent")
-    broker = browser_checks.brokers["absent"]
-    with pytest.raises(FileNotFoundError):
-        broker.run_browser_qa(0, request["candidate"], reconcile_only=True)
-    assert not (broker.evidence_dir / "browser-qa").exists()

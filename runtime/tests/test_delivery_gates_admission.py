@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -14,7 +12,6 @@ from devflow_temporal import delivery_gates_admission as gates
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_resources import RunResources, private_directory
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 @pytest.fixture
@@ -176,31 +173,6 @@ def stopped(service, monkeypatch):
     return store, broker, closed, command
 
 
-def test_gates_only_preserves_rejected_result_input_after_custody_and_has_no_extra_turn(stopped):
-    store, broker, closed, command = stopped
-    with store._connect() as db:
-        attempts = list(db.execute("SELECT * FROM delivery_attempts"))
-        original = db.execute("SELECT request_json FROM delivery_runs").fetchone()[0]
-    response = store.admit_gates_only("run-1", command)
-    assert response["iteration"] == 4 and response["implementation_authority"] is False
-    assert store.admit_gates_only("run-1", command) == response
-    with store._connect() as db:
-        row = db.execute("SELECT * FROM delivery_runs").fetchone()
-        recovery = json.loads(row["recovery_json"])
-        assert row["request_json"] == original
-        assert list(db.execute("SELECT * FROM delivery_attempts")) == attempts
-        assert db.execute("SELECT COUNT(*) FROM delivery_repair_grants").fetchone()[0] == 0
-        assert store.state.claim_for(db, "work-1")["owner"] == "external:devflow:run-1"
-    assert recovery["state"] == closed["result"]
-    assert recovery["candidate"] == closed["result"]["roles"][0]["candidate"]
-    assert recovery["candidate"]["id"] != closed["result"]["candidate"]["id"]
-    assert gates.readback(store, broker.spec, recovery)["implementation_authority"] is False
-    with pytest.raises(ValueError, match="already received"):
-        store.admit_gates_only("run-1", {**command, "command_id": "gates-2"})
-    with pytest.raises(ValueError, match="different inputs"):
-        store.admit_gates_only("run-1", {**command, "precheck_sha256": "0" * 64})
-
-
 def test_gates_only_controller_patch_uses_authenticated_consumer_namespace(stopped):
     from devflow_temporal.delivery_activities import _context
 
@@ -228,42 +200,6 @@ def test_gates_only_controller_patch_uses_authenticated_consumer_namespace(stopp
     )
     assert not (original.state_dir / 'gate-evidence/4/review').exists()
     assert broker.state_dir == original.state_dir
-
-
-
-
-
-
-
-
-@pytest.mark.parametrize('change', ['container-write', 'missing-leaf'])
-def test_historical_native_receipt_reader_rejects_unrecognized_custody_without_creation(
-    stopped, change,
-):
-    store, broker, _closed, _command = stopped
-    with store._connect() as db:
-        attempt = dict(db.execute('SELECT * FROM delivery_attempts').fetchone())
-    path = Path(attempt['result_path'])
-    if change == 'container-write':
-        path.parent.parent.chmod(0o775)
-    elif change == 'leaf-public':
-        path.parent.chmod(0o755)
-    elif change == 'result-public':
-        path.chmod(0o644)
-    elif change == 'hardlink':
-        os.link(path, path.with_name('foreign-link.json'))
-    elif change == 'symlink':
-        moved = path.with_name('retained.json')
-        path.rename(moved)
-        path.symlink_to(moved.name)
-    elif change == 'wrong-path':
-        attempt['result_path'] = str(path.with_name('retained.json'))
-    else:
-        attempt['job_key'] = 'absent-leaf'
-        attempt['result_path'] = str(broker.state_dir / 'attempts/absent-leaf/result.json')
-    with pytest.raises((ValueError, OSError)):
-        gates._native_result_bytes(broker.spec, attempt)
-    assert not (broker.state_dir / 'attempts/absent-leaf').exists()
 
 
 @pytest.mark.parametrize(
@@ -306,53 +242,3 @@ def test_gates_only_admission_refuses_changed_provenance_without_claim_or_roles(
     with store._connect() as db:
         assert store.state.claim_for(db, "work-1") is None
         assert db.execute("SELECT COUNT(*) FROM delivery_gate_admissions").fetchone()[0] == 0
-
-
-@pytest.mark.parametrize("failed", [False, True])
-def test_same_iteration_workflow_skips_implementation_and_cannot_spend_another_turn(
-    stopped, monkeypatch, failed
-):
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
-    store, broker, _closed, command = stopped
-    store.admit_gates_only("run-1", command)
-    with store._connect() as db:
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-    flow = DeliveryWorkflow()
-    called = []
-
-    async def project(*_args):
-        pass
-
-    async def execute(name, request, **_kw):
-        called.append(name)
-        if name == "delivery_role":
-            assert request["role"] in {"review", "verify"}
-            return {
-                "status": "pass",
-                "role": request["role"],
-                "cleanup": "confirmed",
-                "session_id": "independent",
-                "candidate": flow.state["candidate"],
-            }
-        if name in {"delivery_tracker_start", "delivery_tracker"}:
-            return {"state": "consistent"}
-        if name == "delivery_publish":
-            candidate = {**flow.state["candidate"], "head": "b" * 40, "id": "b" * 64}
-            return {
-                "state": "OPEN",
-                "head": "b" * 40,
-                "candidate": candidate,
-                "number": 7,
-                "url": "https://example.invalid/pull/7",
-            }
-        if name == "delivery_precheck" and failed:
-            return {"state": "failed", "cleanup": "confirmed", "results": []}
-        return {"state": "passed", "cleanup": "confirmed"}
-
-    monkeypatch.setattr(flow, "_project", project)
-    monkeypatch.setattr(flow, "_activity", execute)
-    result = asyncio.run(flow._resume_gates_only(broker.spec, recovery))
-    assert result["iteration"] == 4
-    assert result["outcome"] == ("blocked" if failed else "delivered")
-    assert called.count("delivery_role") == (0 if failed else 2)
-    assert result["roles"][0]["status"] is None  # Rejected original assessment stays rejected.

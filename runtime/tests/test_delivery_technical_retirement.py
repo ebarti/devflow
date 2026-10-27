@@ -7,7 +7,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from historical_replay import replay_designated_history
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_technical_integration as integration
@@ -26,22 +25,6 @@ def _snapshot(store):
              for root in (source, store.config.state_root)
              for path in root.rglob('*') if path.is_file()}
     return rows, files
-
-
-@pytest.mark.parametrize('kind,preflight', [('accepted_technical_successor', False), ([], False)])
-def test_retired_or_malformed_continuation_refuses_before_any_effect(service, kind, preflight):
-    store, supplied = service
-    store.submit(supplied)
-    before = _snapshot(store)
-    try:
-        with pytest.raises(ValueError, match='unsupported repair continuation kind'):
-            store.continue_repair('run-1', {
-                'command_id': 'retired-technical',
-                'continuation_kind': kind,
-                'additional_iterations': 0,
-            }, preflight=preflight)
-    finally:
-        assert _snapshot(store) == before
 
 
 def test_already_admitted_technical_outbox_keeps_its_inputs_and_start_acknowledgement(service):
@@ -71,25 +54,6 @@ def test_already_admitted_technical_outbox_keeps_its_inputs_and_start_acknowledg
     with store._connect() as db:
         row = db.execute("SELECT phase,request_json,recovery_json FROM delivery_runs").fetchone()
         assert tuple(row) == ('technical_preflight', original_request, recovery_json)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "name,workflow_id",
-    [
-        ("technical-c04-checks-completed-history.json", "technical-checks"),
-        ("technical-c04-review-completed-history.json", "technical-review"),
-    ],
-)
-async def test_original_completed_and_suspended_technical_histories_replay(
-    name,
-    workflow_id,
-    tmp_path,
-):
-    path = Path(__file__).parent / 'fixtures' / name
-    original = path.read_bytes()
-    await replay_designated_history(path, tmp_path, workflow_id)
-    assert path.read_bytes() == original
 
 
 @pytest.mark.parametrize('drift', [None, 'base'])

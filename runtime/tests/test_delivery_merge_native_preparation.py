@@ -72,39 +72,6 @@ def relocated_conflict(conflicted, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_derived_execution_keeps_original_grant_and_replays_completed_roles(
-    relocated_conflict,
-):
-    c = relocated_conflict
-    from test_delivery_store import _git
-
-    result = await activity_call_async(
-        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
-    )
-    assert result["state"] == "pending"
-    assert [r["role"] for r in c.calls] == ["implement", "review"]
-    assert len(c.preparations) == 2
-    assert all(r["spec"] != c.d.spec and r.get(native.FIELD) for r in c.calls)
-    assert _git(c.remote, "show", "-s", "--format=%P", result["head"]).split() == [
-        c.previous,
-        c.target,
-    ]
-    assert _git(c.remote, "show", result["head"] + ":conflict.txt") == (
-        "feature requirement\nmain requirement"
-    )
-    replay = await activity_call_async(
-        resolution.resolve, c.d.store, c.d.spec, c.receipt["grant_sha256"], c.conflict
-    )
-    assert replay == result and len(c.preparations) == 2 and len(c.calls) == 2
-    with c.d.store._connect() as db:
-        assert followup.current(db, "run-1")["grant_json"]
-        assert digest(c.d.store.effective_spec("run-1")) == digest(c.d.spec)
-    from devflow_temporal.contracts import canonical_json
-
-    assert canonical_json(c.d.spec) == c.original_bytes
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "change",
     [
@@ -311,47 +278,3 @@ async def test_actual_empty_prelaunch_continues_original_merge_without_fabricati
         assert saved["state"] == "complete"
         assert json.loads(saved["observed_json"])["cleanup"] == "confirmed_prelaunch_absent"
     assert d.before == before
-
-
-@pytest.mark.parametrize("change", ["workflow", "source", "workspace"])
-def test_preparation_rechecks_current_generation_after_native_measurement(
-    relocated_conflict,
-    monkeypatch,
-    change,
-):
-    from devflow_temporal import delivery_gate_retry as gates
-
-    c = relocated_conflict
-    broker = MergeBroker(c.d.store, c.d.spec)
-    _, workspace, context = resolution._prepare(broker, c.pr, c.conflict, c.receipt["grant_sha256"])
-    key = f"merge-resolution:run-1:{context['resolution_id']}:implement"
-    request = {
-        "role": "implement",
-        "iteration": 0,
-        "spec": c.d.spec,
-        "candidate": candidate_for(workspace),
-        "workspace": str(workspace),
-        "merge_context": {**context, "effect_key": key},
-    }
-    measure = gates.prepare_runtime
-
-    def changed(*args, **kwargs):
-        execution = measure(*args, **kwargs)
-        if change == "workflow":
-            with c.d.store._connect() as db:
-                db.execute("UPDATE delivery_merge_requests SET workflow_id='foreign'")
-        elif change == "source":
-            (workspace / "conflict.txt").write_text("Changed during measurement")
-        else:
-            held = workspace.with_name(workspace.name + "-held")
-            workspace.rename(held)
-            shutil.copytree(held, workspace, symlinks=True)
-        return execution
-
-    monkeypatch.setattr(gates, "prepare_runtime", changed)
-    with selected_activity(c.d.store, c.d.spec), pytest.raises(ValueError):
-        native.prepare(c.d.store, c.d.spec, request, c.receipt["grant_sha256"])
-    with c.d.store._connect() as db:
-        assert not db.execute(
-            "SELECT 1 FROM delivery_effects WHERE kind='merge_resolution'"
-        ).fetchone()

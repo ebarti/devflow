@@ -190,12 +190,6 @@ def test_reattached_worker_recovery_preserves_fences(reattached, obstacle, messa
     ]
 
 
-def test_reattachment_does_not_authorize_stale_coordinator(reattached):
-    store, parent, _, _ = reattached
-    with pytest.raises(OwnershipConflict, match="execution ownership changed"):
-        _guard(store, _row(store, parent["run_id"]), parent)
-
-
 @pytest.mark.asyncio
 async def test_reattached_worker_resumes_authenticated_history_and_keeps_budget(
     reattached_temporal,

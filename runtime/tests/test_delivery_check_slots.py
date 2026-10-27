@@ -207,10 +207,6 @@ async def test_activity_stop_joins_real_native_tree_before_slot_reuse(owned_chec
     assert owned_checks.maximum() == 1
 
 
-
-
-
-
 def project_cancel(broker):
     db = broker.connect()
     with db:
@@ -283,14 +279,6 @@ async def test_run_cancel_after_admission_does_not_launch_and_releases_slot(
     os.close(descriptor)
 
 
-
-
-
-
-
-
-
-
 async def test_slot_lock_is_shared_with_another_worker_process(owned_checks, tmp_path):
     root = tmp_path / "check-execution"
     root.mkdir()
@@ -313,8 +301,6 @@ async def test_slot_lock_is_shared_with_another_worker_process(owned_checks, tmp
         assert owned_checks.maximum() == 1
     finally:
         worker.communicate(timeout=5)
-
-
 
 
 async def test_unknown_cleanup_retains_slot_until_recorded_processes_are_gone(
@@ -366,8 +352,6 @@ async def test_unknown_cleanup_retains_slot_until_recorded_processes_are_gone(
         del activities._UNCLEAN_CHECK_SLOTS[retained:]
 
 
-
-
 async def test_native_timeout_confirms_tree_cleanup_and_releases_slot(owned_checks):
     owned_checks.config.raw["check_concurrency"] = 1
     first = asyncio.create_task(
@@ -380,10 +364,6 @@ async def test_native_timeout_confirms_tree_cleanup_and_releases_slot(owned_chec
     assert broker.result["timed_out"] is True
     assert_stopped(broker)
     assert owned_checks.maximum() == 1
-
-
-
-
 
 
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
@@ -492,10 +472,6 @@ async def test_replaced_check_attempt_keeps_native_gate_running_for_the_retry(
     assert not (folder / "cancel").exists()
     assert read_private(journal)["phase"] == "finished"
     assert_stopped(broker)
-
-
-
-
 
 
 @pytest.mark.parametrize('queued_finished', [True, False])

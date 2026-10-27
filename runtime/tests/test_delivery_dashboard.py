@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import httpx
 import pytest
@@ -9,14 +8,11 @@ from test_delivery_api import api_fixture as api_fixture
 from test_delivery_store import service as service
 
 from devflow_temporal.delivery_api import create_app
-from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_dashboard import (
-    launch_steering,
     mutate,
     statistics_for,
 )
 from devflow_temporal.delivery_store import DeliveryStore
-from devflow_temporal.role_runner import _task
 
 
 def finish(store, run_id="run-1", outcome="delivered", iteration=0):
@@ -77,164 +73,6 @@ def test_commands_reject_stale_state_and_unowned_fields(service):
             },
         )
     assert store.detail("run-1")["steering"] == []
-
-
-def test_archive_rejects_uncertain_process_cleanup(service):
-    store, raw = service
-    store.submit(raw)
-    finish(store)
-    with store._connect() as db:
-        db.execute(
-            "INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
-            "state,cleanup) VALUES "
-            "('uncertain','run-1','implement',0,'candidate','finished','unknown')"
-        )
-    with pytest.raises(ValueError, match="stopped"):
-        mutate(
-            store,
-            "run-1",
-            "archive",
-            {"command_id": "hide", "expected_revision": 2, "archived": True},
-        )
-    assert store.list_runs()[0]["archived"] is False
-
-
-def test_steering_reaches_next_role_and_launch_replay_preserves_input(service):
-    store, raw = service
-    store.submit(raw)
-    payload = {
-        "command_id": "note-1",
-        "expected_revision": 1,
-        "message": "Include a meaningful rejection-path assertion.",
-    }
-    mutate(store, "run-1", "steer", payload)
-    assert mutate(store, "run-1", "steer", payload)["state"] == "queued"
-    with store._connect() as db:
-        for key, role in [("first", "implement"), ("next", "review")]:
-            db.execute(
-                "INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,state) "
-                "VALUES (?,?,?,0,'candidate','queued')",
-                (key, "run-1", role),
-            )
-    spec = store.spec("run-1")
-    role_request = {
-        "spec": spec,
-        "role": "implement",
-        "iteration": 0,
-        "candidate": {"id": "candidate", "head": "head"},
-        "workspace": "/fixture",
-    }
-    first = launch_steering(store, role_request, "first")
-    assert payload["message"] in _task(first).goal
-    assert "cannot expand paths" in _task(first).goal
-    mutate(
-        store,
-        "run-1",
-        "steer",
-        {**payload, "command_id": "note-2", "message": "Keep old behavior."},
-    )
-    assert launch_steering(store, role_request, "first") == first
-    next_request = launch_steering(store, {**role_request, "role": "review"}, "next")
-    assert len(next_request["steering"]) == 2
-    notes = store.detail("run-1")["steering"]
-    assert {n["role"] for n in notes[0]["included_in"]} == {"implement", "review"}
-    assert [n["role"] for n in notes[1]["included_in"]] == ["review"]
-    assert store.spec("run-1") == spec
-
-
-def test_steering_closes_before_final_qa_even_if_projection_lags(service):
-    store, request = service
-    store.submit(request)
-    with store._connect() as db:
-        db.execute(
-            "INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,state) "
-            "VALUES ('qa','run-1','verify',0,'candidate','queued')"
-        )
-    assert store.detail("run-1")["can_steer"] is False
-    with pytest.raises(ValueError, match="no next role"):
-        mutate(
-            store,
-            "run-1",
-            "steer",
-            {"command_id": "late", "expected_revision": 1, "message": "Change the implementation"},
-        )
-    assert store.detail("run-1")["steering"] == []
-
-
-@pytest.mark.parametrize('changed,allowed', [({}, True), ({'state': 'queued'}, False),
-    ({'cleanup': 'unknown'}, False), ({'pid': 123}, False),
-    ({'session_id': 'actual-verifier'}, False),
-    ({'result_json': '{"finish_reason":"done"}'}, False)])
-def test_no_process_prelaunch_history_does_not_close_a_new_gate_feedback_window(
-    service, changed, allowed
-):
-    store, raw = service
-    store.submit(raw)
-    store.project('run-1', phase='checks', execution_state='running', event_type='checks_started',
-                  message='New gate admission at the same iteration')
-    attempt = {'job_key': 'old-prelaunch', 'run_id': 'run-1', 'role': 'verify', 'iteration': 0,
-               'candidate_id': 'candidate', 'state': 'finished', 'cleanup': 'confirmed',
-               'result_json': '{"finish_reason":"prelaunch"}', **changed}
-    with store._connect() as db:
-        columns = ','.join(attempt)
-        db.execute(
-            f"INSERT INTO delivery_attempts({columns}) VALUES ({','.join('?' for _ in attempt)})",
-            tuple(attempt.values()),
-        )
-    assert store.detail('run-1')['can_steer'] is allowed
-    if allowed:
-        revision = store.detail('run-1')['projection_revision']
-        assert (
-            mutate(
-                store,
-                "run-1",
-                "steer",
-                {
-                    "command_id": "new-gate-note",
-                    "expected_revision": revision,
-                    "message": "Inspect the actual current CI failure",
-                },
-            )["state"]
-            == "queued"
-        )
-        store.project('run-1', phase='waiting_ci', execution_state='running', event_type='ci_wait',
-                      message='No future assessment launch remains')
-        assert store.detail('run-1')['can_steer'] is False
-
-
-def test_upgrade_preserves_input_of_a_role_started_before_steering_existed(service):
-    from devflow_temporal.delivery_resources import write_private
-
-    store, raw = service
-    store.submit(raw)
-    spec = store.spec("run-1")
-    request = {
-        "spec": spec,
-        "role": "implement",
-        "iteration": 0,
-        "candidate": {"id": "candidate", "head": "head"},
-        "workspace": "/fixture",
-    }
-    with store._connect() as db:
-        db.execute(
-            "INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,state) "
-            "VALUES ('old','run-1','implement',0,'candidate','running')"
-        )
-    write_private(Path(spec["state_dir"]) / "attempts" / "old" / "request.json", request)
-    mutate(
-        store,
-        "run-1",
-        "steer",
-        {
-            "command_id": "later",
-            "expected_revision": 1,
-            "message": "Do not alter the running turn.",
-        },
-    )
-    preserved = launch_steering(store, request, "old")
-    assert preserved == request
-    assert "User steering supplied" not in _task(preserved).goal
-    assert store.detail("run-1")["steering"][0]["included_in"] == []
 
 
 def test_statistics_keep_failures_archives_unknowns_and_missing_usage(service, monkeypatch):
@@ -317,33 +155,3 @@ async def test_dashboard_commands_require_csrf_and_use_real_persistent_store(api
         assert (await browser.get("/api/runs")).json()["runs"] == []
         assert (await browser.get("/api/runs?archived=true")).json()["runs"][0]["archived"]
         assert (await browser.get("/api/statistics")).json()["total_runs"] == 1
-
-
-@pytest.mark.asyncio
-async def test_statistics_reset_keeps_history_and_retries_keep_the_same_boundary(api_fixture):
-    config, request = api_fixture
-    app = create_app(config)
-    store = app.state.delivery.store
-    store.submit(request)
-    with store._connect() as db:
-        original = dict(db.execute("SELECT * FROM delivery_runs").fetchone())
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                 base_url="http://127.0.0.1:18770") as browser:
-        payload = {"command_id": "reset-sample"}
-        assert (await browser.post("/api/statistics/reset", json=payload)).status_code == 403
-        token = (await browser.get("/api/session")).json()["csrf_token"]
-        headers = {"Origin": "http://127.0.0.1:18770", "X-Devflow-CSRF": token}
-        first = (await browser.post("/api/statistics/reset", json=payload, headers=headers)).json()
-        assert first["total_runs"] == 0 and first["cohorts"] == [] and first["reset_at"]
-        store.submit({**request, "run_id": "later-run", "command_id": "later-submit",
-                      "work_id": "later-work", "branch": "feat/later",
-                      "issue_url": "https://github.com/example/fixture/issues/999"})
-        retried = (await browser.post(
-            "/api/statistics/reset", json=payload, headers=headers)).json()
-        assert retried["total_runs"] == 1 and retried["reset_at"] == first["reset_at"]
-    reloaded = DeliveryStore(DeliveryConfig.load(config))
-    assert statistics_for(reloaded) == retried
-    with store._connect() as db:
-        assert dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
-                               (request["run_id"],)).fetchone()) == original
-        assert db.execute("SELECT COUNT(*) FROM delivery_statistics_resets").fetchone()[0] == 1

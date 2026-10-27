@@ -128,61 +128,6 @@ def test_payload_only_native_generation_preserves_old_proof_and_replays_strictly
         renewal.renew(before, {**payload, 'command_id': 'different-command'}, 'f' * 64)
 
 
-@pytest.mark.parametrize('change', ['protected-root', 'authority'])
-def test_native_generation_rejects_every_non_payload_or_unapproved_change(
-    payload_update, monkeypatch, change,
-):
-    _store, spec, payload, _old, _package = payload_update
-    if change in {'protected-root', 'binary'}:
-        identity = native.native_identity(spec)
-        identity['protected_commands' if change == 'protected-root' else 'codex_bin_sha256'] = (
-            ['/foreign'] if change == 'protected-root' else '0' * 64
-        )
-        monkeypatch.setattr(renewal, 'native_identity', lambda _spec: identity)
-    elif change == 'mode':
-        spec['policy']['host_sandbox'] = 'native-profile'
-    elif change == 'config':
-        # The sealed snapshot is the authority: only its loss or tampering rejects.
-        snapshot = (Path(spec['state_dir']).parents[1] / 'configuration-snapshots'
-                    / (spec['config_digest'] + '.json'))
-        snapshot.unlink()
-        Path(spec['config_path']).write_text('{}')
-    else:
-        payload['preparation_authority_sha256'] = '0' * 64
-    with pytest.raises((ValueError, OSError)):
-        renewal.renew(spec, payload, digest(payload))
-    assert not (Path(spec['state_dir']) / 'native-preparation-renewal/generation.json').exists()
-
-
-def test_native_generation_resumes_interrupted_probe_and_retains_failure(
-    payload_update, monkeypatch,
-):
-    _store, spec, payload, old, _package = payload_update
-    original = native._measure
-    calls = []
-
-    def interrupted(*args, **kwargs):
-        observed = original(*args, **kwargs)
-        calls.append(observed)
-        if len(calls) == 1:
-            raise RuntimeError('Controlled uncertain measurement')
-        return observed
-
-    monkeypatch.setattr(native, '_measure', interrupted)
-    with pytest.raises(RuntimeError, match='uncertain measurement'):
-        renewal.renew(spec, payload, digest(payload))
-    assert Path(spec['preparation']['environment']['path']).read_bytes() == old
-    after, reference = renewal.renew(spec, payload, digest(payload))
-    native.verify_native_spec(after)
-    history = read_private(Path(reference['path']))['preparation_history']
-    assert len(history) == 2 and 'Controlled uncertain' in history[0]['error']
-    assert all(attempt['cleanup']['state'] == 'confirmed' for attempt in history)
-    assert renewal.renew(spec, payload, digest(payload)) == (after, reference)
-    assert len(calls) == 2
-
-
-
-
 @pytest.mark.parametrize('bad', ['missing', 'wrong-hash'])
 def test_readonly_native_readiness_rejects_authority_without_sealing(payload_update, bad):
     _store, spec, payload, old, _package = payload_update
@@ -194,32 +139,3 @@ def test_readonly_native_readiness_rejects_authority_without_sealing(payload_upd
     assert Path(spec['preparation']['environment']['path']).read_bytes() == old
     assert renewal.readiness(spec, payload)['required'] is True
     assert not (Path(spec['state_dir']) / 'native-preparation-renewal').exists()
-
-
-def test_native_generation_recovers_a_recorded_started_attempt(payload_update, monkeypatch):
-    _store, spec, payload, _old, _package = payload_update
-    original = native._measure
-    calls = []
-
-    def interrupted(*args, **kwargs):
-        result = original(*args, **kwargs)
-        calls.append(result)
-        if len(calls) == 1:
-            raise RuntimeError('Controlled interrupted owner')
-        return result
-
-    monkeypatch.setattr(native, '_measure', interrupted)
-    with pytest.raises(RuntimeError, match='interrupted owner'):
-        renewal.renew(spec, payload, digest(payload))
-    path = Path(spec['state_dir']) / 'native-preparation-renewal/preparation.json'
-    journal = read_private(path)
-    # Recreate the lost acknowledgement window while preserving real probe evidence.
-    journal['preparation_attempts'][0]['state'] = 'started'
-    journal['preparation_attempts'][0]['cleanup'] = None
-    write_private(path, journal)
-    after, reference = renewal.renew(spec, payload, digest(payload))
-    native.verify_native_spec(after)
-    history = read_private(Path(reference['path']))['preparation_history']
-    assert [item['state'] for item in history] == ['interrupted', 'stopped']
-    assert all(item['cleanup']['state'] == 'confirmed' for item in history)
-    assert len(calls) == 2

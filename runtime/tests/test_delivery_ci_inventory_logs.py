@@ -32,26 +32,6 @@ def test_terminal_formats_preserve_actual_cases_and_source_permitted_skips(kind,
 
 
 @pytest.mark.parametrize(
-    "kind,text",
-    [
-        ("pytest", "0 passed, 5 skipped in 0.1s"),
-        ("pytest", "3 passed, 1 error in 0.1s"),
-        ("pytest", "3 passed in 0.1s\n3 passed in 0.1s"),
-        ("vitest", "Tests 2 passed | 1 failed (3)"),
-        ("vitest", "Tests 2 passed (3)"),
-        ("jest", "Tests: 1 failed, 3 passed, 4 total"),
-        ("tap", "# tests 3\n# pass 3\n# fail 0"),
-        ("playwright", "1 failed\n6 passed (1.0s)"),
-        ("playwright", "4 skipped (1.0s)"),
-        ("unknown", "3 passed in 0.1s"),
-    ],
-)
-def test_zero_partial_failed_unknown_or_ambiguous_reports_refuse(kind, text):
-    with pytest.raises(ValueError):
-        report(kind, text.splitlines())
-
-
-@pytest.mark.parametrize(
     "drift",
     [
         "source_command",

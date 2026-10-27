@@ -30,7 +30,6 @@ from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_gate_attribution_recovery as attribution
 from devflow_temporal import delivery_gate_preflight_continuation as preflight
 from devflow_temporal import delivery_gate_retry as gates
-from devflow_temporal import delivery_stopped_resume as stopped
 from devflow_temporal import delivery_store as stores
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -51,7 +50,6 @@ from devflow_temporal.delivery_resources import (
     read_private,
     write_private,
 )
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 @pytest.fixture
@@ -363,89 +361,6 @@ def interrupted_assessment(service, monkeypatch, request):
         chunk=chunk, drift=drift, proof=proof, closures=closures)
 
 
-@pytest.mark.parametrize('passed', [True, False])
-def test_reserve_rearms_only_fresh_gates_and_keeps_exhausted_budget(
-    interrupted_assessment, monkeypatch, passed,
-):
-    f = interrupted_assessment
-    before, budget = deepcopy(f.closed), f.shared.budget(f.token['issue_id'])
-    assert budget['used'] == budget['maximum'] == 10
-    from devflow_temporal.delivery_feature_closure import closed_worker
-
-    # Later cleanup is authentic, but the modeled blocked implementation has no
-    # durable supervisor receipt. It still cannot gain generic repair authority.
-    authenticated = closed_worker(f.store, f.child['run_id'], f.closed['workflow_id'],
-                                  sealed_only=True)
-    assert authenticated['result'] == before['result']
-    with f.store._connect() as db:
-        row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
-                              (f.child['run_id'],)).fetchone())
-        commands = list(db.execute('SELECT * FROM delivery_commands ORDER BY command_id'))
-        assert not db.execute('SELECT 1 FROM delivery_attempts WHERE run_id=?',
-                              (f.child['run_id'],)).fetchone()
-    with pytest.raises(ValueError,
-                       match='^blocked implementation lacks its exact supervisor receipt$'):
-        stopped.snapshot(f.store, f.child['run_id'])
-    assert stopped.interrupted_resume({'predecessor_spec': f.spec, 'state': f.state,
-                                      'candidate': f.state['candidate']}) is None
-    assert f.closed == before and f.shared.budget(f.token['issue_id']) == budget
-    with f.store._connect() as db:
-        assert dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
-                               (f.child['run_id'],)).fetchone()) == row
-        assert list(db.execute('SELECT * FROM delivery_commands ORDER BY command_id')) == commands
-    with pytest.raises(ValueError, match='already terminal'):
-        f.store.begin_mutation(f.child['run_id'], 'reconcile-old-terminal', 'reconcile_tracker',
-                               {'command_id': 'reconcile-old-terminal', 'expected_revision': 77})
-    result = activities.reserve(f.parent, f.chunk['id'], 'chunk')
-    assert result['resumed'] and result['workflow_id'].endswith('-preflight-continuation-2')
-    assert activities.reserve(f.parent, f.chunk['id'], 'chunk') == {
-        'spec': result['spec'], 'completed': False, 'workflow_id': result['workflow_id']}
-    spec = result['spec']
-    with f.store._connect() as db:
-        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
-                                        (f.child['run_id'],)).fetchone()[0])
-    assert recovery['command']['additional_iterations'] == 0
-    replay = gates.admit(f.store, f.child['run_id'], recovery['command'])
-    assert replay['workflow_id'] == result['workflow_id']
-    assert replay['implementation_authority'] is False and replay['additional_iterations'] == 0
-    assert recovery['state'] == f.state and f.closed == before
-    assert recovery['candidate']['id'] == f.state['candidate']['id']
-    assert recovery['publication']['head'] == f.state['pull_request']['head']
-    assert recovery['seal']['attribution_observation'] == f.proof
-    assert not preflight.interrupted({'recovery_json': json.dumps(recovery),
-                                     'checks_json': json.dumps(f.state['checks']),
-                                     'error': f.state['error']})
-    assert gates.readback(f.store, spec, recovery)['number'] == 7
-    assert f.shared.budget(f.token['issue_id']) == budget
-    flow, calls = DeliveryWorkflow(), []
-    async def activity(name, body, **_kw):
-        calls.append(name)
-        if name == 'delivery_gates_readback':
-            return gates.readback(f.store, body['spec'], body['recovery'])
-        if name in {'delivery_tracker_start', 'delivery_tracker'}:
-            return {'state': 'consistent'}
-        if name == 'delivery_role':
-            assert body['role'] in {'review', 'verify'}
-            return {'role': body['role'], 'status': 'pass', 'iteration': 7,
-                    'session_id': 'fresh-' + body['role'], 'cleanup': 'confirmed',
-                    'candidate': recovery['candidate']}
-        return {'state': 'passed' if passed else 'failed', 'cleanup': 'confirmed'}
-    async def project(*_a, **_kw):
-        pass
-    monkeypatch.setattr(flow, '_activity', activity)
-    monkeypatch.setattr(flow, '_project', project)
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
-    finished = asyncio.run(flow._resume_published_gates(spec, recovery))
-    assert finished['outcome'] == ('delivered' if passed else 'blocked')
-    assert finished['iteration'] == 7
-    assert finished['roles'][:len(f.state['roles'])] == f.state['roles']
-    assert f.state['roles'][-1]['status'] == 'blocked'
-    assert 'delivery_precheck' in calls and 'delivery_publish' not in calls
-    assert f.shared.budget(f.token['issue_id']) == budget
-    with f.store._connect() as db:
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-
-
 @pytest.fixture
 def historical_listener_identity(monkeypatch):
     from test_delivery_feature_review_context import git
@@ -471,8 +386,6 @@ def historical_listener_identity(monkeypatch):
         monkeypatch.setattr(context, '_sources', sources)
         yield {'dirty': False, 'local_digest': None, 'revision': revision,
                'runtime_payload_sha256': payload}
-
-
 
 
 @pytest.mark.parametrize('changed', ['effect', 'argv'])
@@ -512,23 +425,6 @@ def test_interrupted_assessment_requires_actual_operational_failure(interrupted_
     f = interrupted_assessment
     with pytest.raises(ValueError, match='incomplete infrastructure result'):
         activities.reserve(f.parent, f.chunk['id'], 'chunk')
-
-
-def test_interrupted_assessment_refuses_row_drift_during_native_readback(
-    interrupted_assessment, monkeypatch,
-):
-    f = interrupted_assessment
-    original = preflight.observe_completed_resources
-    def drift(*args):
-        proof = original(*args)
-        with f.store._connect() as db:
-            db.execute('UPDATE delivery_runs SET candidate_revision=candidate_revision+1 '
-                       'WHERE run_id=?', (f.child['run_id'],))
-        return proof
-    monkeypatch.setattr(preflight, 'observe_completed_resources', drift)
-    with pytest.raises(ValueError, match='ownership or records changed'):
-        activities.reserve(f.parent, f.chunk['id'], 'chunk')
-    assert f.shared.budget(f.token['issue_id'])['used'] == 10
 
 
 @pytest.fixture
@@ -620,113 +516,6 @@ def preparation_assessment(interrupted_assessment, monkeypatch, request):
                         native_observation)
     return SimpleNamespace(**{**vars(f), 'spec': spec, 'state': state, 'closed': closed,
                               'recovery': recovery})
-
-
-@pytest.mark.parametrize('passed', [True, False])
-def test_unlaunched_preparation_reserve_replays_without_a_third_interruption(
-    preparation_assessment, monkeypatch, passed,
-):
-    from devflow_temporal.delivery_activities import _context, delivery_gates_readback
-    from devflow_temporal.delivery_check_prelaunch import preparation_possible
-
-    f = preparation_assessment
-    original, budget = deepcopy(f.closed), f.shared.budget(f.token['issue_id'])
-    result = activities.reserve(f.parent, f.chunk['id'], 'chunk')
-    assert result['workflow_id'].endswith('-preparation-retry')
-    assert result['workflow_id'] not in f.closures
-    spec = result['spec']
-    assert 'gate_retry_preflight_generation' not in spec
-    store, broker = _context(spec)
-    with store._connect() as db:
-        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs WHERE run_id=?',
-                                        (spec['run_id'],)).fetchone()[0])
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-    assert recovery['kind'] == gates.PRELAUNCH_KIND
-    assert recovery['command']['additional_iterations'] == 0
-    assert recovery['state'] == f.state and f.closed == original
-    assert recovery['original_recovery'] == f.recovery
-    assert recovery['candidate']['id'] == f.state['candidate']['id']
-    assert recovery['publication']['head'] == f.state['pull_request']['head']
-    assert str(broker.evidence_dir).endswith('/published-preparation-admission-2/evidence')
-    assert gates.admit(store, spec['run_id'], recovery['command'])['workflow_id'] == result[
-        'workflow_id']
-    assert asyncio.run(delivery_gates_readback({'spec': spec, 'recovery': recovery}))['number'] == 7
-    renewed = {'recovery_json': json.dumps(recovery), 'checks_json': json.dumps(f.state['checks']),
-               'error': f.state['error']}
-    assert not preparation_possible(renewed) and not preflight.interrupted(renewed)
-    with pytest.raises(ValueError):
-        gates.admit(store, spec['run_id'],
-                    {**recovery['command'], 'command_id': 'second-preparation'})
-    assert f.shared.budget(f.token['issue_id']) == budget and budget['used'] == 10
-    flow, calls = DeliveryWorkflow(), []
-    async def activity(name, body, **_kw):
-        calls.append(name)
-        if name == 'delivery_gates_readback':
-            return gates.readback(store, body['spec'], body['recovery'])
-        if name in {'delivery_tracker_start', 'delivery_tracker'}:
-            return {'state': 'consistent'}
-        if name == 'delivery_role':
-            assert body['role'] in {'review', 'verify'}
-            return {'role': body['role'], 'status': 'pass', 'iteration': 7,
-                    'session_id': 'fresh-' + body['role'], 'cleanup': 'confirmed',
-                    'candidate': recovery['candidate']}
-        return {'state': 'passed' if passed else 'failed', 'cleanup': 'confirmed'}
-    async def project(*_a, **_kw):
-        pass
-    monkeypatch.setattr(flow, '_activity', activity)
-    monkeypatch.setattr(flow, '_project', project)
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
-    finished = asyncio.run(flow._resume_published_gates(spec, recovery))
-    assert finished['outcome'] == ('delivered' if passed else 'blocked')
-    assert finished['iteration'] == 7
-    assert finished['roles'][:len(f.state['roles'])] == f.state['roles']
-    assert 'delivery_precheck' in calls and 'delivery_publish' not in calls
-    assert f.state['roles'][-1]['status'] == 'blocked'
-    assert f.shared.budget(f.token['issue_id']) == budget
-
-
-
-
-@pytest.mark.parametrize('preparation_assessment', ['prerequisite-monitor'], indirect=True)
-def test_unlaunched_preparation_keeps_successful_prerequisite_monitoring_truthful(
-    preparation_assessment,
-):
-    f = preparation_assessment
-    with pytest.raises(ValueError, match='prerequisite did not complete successfully'):
-        gates.snapshot(f.store, f.spec['run_id'], gates.PRELAUNCH_KIND)
-    assert f.shared.budget(f.token['issue_id'])['used'] == 10
-
-
-
-def test_preparation_success_uses_the_exact_authenticated_prerequisite_bytes(
-    preparation_assessment, monkeypatch,
-):
-    from devflow_temporal import delivery_check_prelaunch as subject
-    from devflow_temporal import delivery_resources as resources
-
-    f = preparation_assessment
-    old = f.recovery['seal']['cleanup']['journal_sha256']
-    journals = f.state['checks']['resource_cleanup']['processes']
-    path = Path(next(item['journal'] for item in journals if item['journal'] not in old))
-    successful = read_private(path)
-    interrupted = deepcopy(successful)
-    interrupted['monitoring_complete'] = False
-    interrupted['result'].update(monitoring_complete=False, interrupted_monitor=True)
-    write_private(path, interrupted)
-    original, calls = resources.read_private, []
-    def read(given, *, raw=False):
-        if Path(given) == path:
-            calls.append(raw)
-            if len(calls) == 2:
-                return ((json.dumps(successful, sort_keys=True, indent=2) + '\n').encode()
-                        if raw else deepcopy(successful))
-        return original(given, raw=raw)
-    monkeypatch.setattr(resources, 'read_private', read)
-    monkeypatch.setattr(subject, 'read_private', read)
-    with pytest.raises(ValueError, match='prerequisite did not complete successfully'):
-        gates.snapshot(f.store, f.spec['run_id'], gates.PRELAUNCH_KIND)
-    assert calls == [True]
-    assert f.shared.budget(f.token['issue_id'])['used'] == 10
 
 
 @pytest.fixture

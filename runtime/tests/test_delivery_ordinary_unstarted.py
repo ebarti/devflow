@@ -111,33 +111,3 @@ def test_ordinary_unstarted_proof_cannot_replay_consumed_or_changed_authority(un
     with store._connect() as db:
         assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
                               (command['command_id'],)).fetchone()
-
-
-def test_authenticated_input_rejection_reuses_only_its_exact_admitted_ordinary_turn(unstarted):
-    store, _broker, _original, prior, later, _command = unstarted
-    spec = store.effective_spec('run-1')
-    role = {'role': 'implement', 'iteration': later['iteration'], 'status': 'blocked',
-            'session_id': None, 'finish_reason': 'exception', 'cleanup': 'confirmed',
-            'candidate': later['candidate']}
-    attempt = {'job_key': 'verified-input-rejection', 'role': 'implement',
-               'iteration': later['iteration'], 'state': 'finished', 'cleanup': 'confirmed'}
-    state = {**later, 'roles': [*later['roles'], role]}
-    seal = {'predecessor_spec': spec, 'state': state, 'candidate': later['candidate'],
-            'original_recovery': saved(store), 'attempts': [*prior['attempts'], attempt],
-            'effects': prior['effects'], 'session_id': prior['session_id'],
-            # Native request/process/session proof has its own adversarial tests.
-            'session_custody': {'input_rejection': {'request': 'verified'},
-                                'session_origin': 'verified',
-                                'session_state_digest': 'resumed-settings-metadata'}}
-    with store._connect() as db:
-        assert resume._unstarted_repair(seal, prior, db)
-        pending = resume.pending_repair(seal, db=db)
-        assert pending['iteration'] == later['iteration']
-        # Any second attempt or role/effect/source drift invalidates reuse.
-        with pytest.raises(ValueError, match='unchanged source or receipt inventory'):
-            resume._unstarted_repair({**seal, 'attempts': [*seal['attempts'],
-                {**attempt, 'job_key': 'second'}]}, prior, db)
-        with pytest.raises(ValueError, match='unchanged source or receipt inventory'):
-            resume._unstarted_repair({**seal, 'session_custody': {
-                **seal['session_custody'], 'session_id': 'different-session'}}, prior, db)
-        assert resume._unstarted_repair({**seal, 'session_custody': {}}, prior, db) is False

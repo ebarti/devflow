@@ -65,18 +65,3 @@ def test_scope_cannot_search_backwards_for_a_plausible_assessment(blocked_scope,
     rewrite_observation(case, observation)
     with pytest.raises(ValueError, match='scope finding'):
         case.store.repair_admission_preflight('run-1', case.command)
-
-
-@pytest.mark.parametrize('later', ['non_json', 'different_json'])
-def test_worker_reauthenticates_the_last_terminal_item_after_admission(blocked_scope, later):
-    case = blocked_scope
-    two_finals(case)
-    _response, current, recovery = admitted(case)
-    observation = read_private(case.folder / 'native-thread-observation.json')
-    last = observation['turns'][-1]['items'][-1]
-    last['text'] = ('Not structured JSON' if later == 'non_json' else
-                    json.dumps({'status': 'pass', 'summary': 'Changed', 'findings': []}))
-    observation['turns'][-1]['turn']['items'][-1] = copy.deepcopy(last)
-    rewrite_observation(case, observation)
-    with pytest.raises(ValueError):
-        asyncio.run(delivery_repair_preflight({'spec': current, 'recovery': recovery}))

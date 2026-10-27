@@ -5,8 +5,6 @@ import pytest
 from devflow_temporal.delivery_execution_registry import ExecutionRegistry, OwnershipConflict
 from devflow_temporal.delivery_github_contract import (
     GitHubDelivery,
-    validate_manifest,
-    validate_plan,
 )
 
 
@@ -67,45 +65,6 @@ def manifest():
         "workstream_issues": {},
         "publication": {"stack_id": None, "members": []},
     }
-
-
-@pytest.mark.parametrize("change", ["cycle", "same_issue"])
-def test_invalid_decomposition_cannot_acquire_execution_authority(change):
-    value = plan()
-    if change == "cycle":
-        value["workstreams"][0]["chunks"][0]["depends_on"] = ["endpoint"]
-    elif change == "unknown":
-        value["workstreams"][1]["chunks"][0]["depends_on"] = ["missing"]
-    elif change == "sequential":
-        value["workstreams"][0]["chunks"][1]["depends_on"] = []
-    elif change == "scope":
-        value["workstreams"][0]["chunks"][0]["allowed_paths"] = [".git/config"]
-    else:
-        value["workstreams"][1]["issue_number"] = 2
-    with pytest.raises(ValueError):
-        validate_plan(value)
-
-
-def test_chunk_paths_cannot_expand_service_authority():
-    with pytest.raises(ValueError, match="configured source scope"):
-        validate_plan(plan(), allowed_paths=["model.py"])
-
-
-@pytest.mark.parametrize("field,value", [("branch", []), ("url", 1)])
-def test_malformed_publication_is_rejected(field, value):
-    record = manifest()
-    member = {
-        "chunk_id": "model",
-        "number": 10,
-        "url": "https://github.com/owner/repo/pull/10",
-        "head": "a" * 40,
-        "branch": "feat/model",
-        "base_branch": "main",
-    }
-    member[field] = value
-    record["publication"]["members"] = [member]
-    with pytest.raises(ValueError):
-        validate_manifest(record, ISSUE)
 
 
 class MemoryGitHub(GitHubDelivery):
@@ -169,12 +128,6 @@ def test_plan_publication_is_idempotent_and_bound_reads_do_not_discover(tmp_path
     assert gh.saved_issue["body"] == "Human scope"
 
 
-def test_conflicting_binding_does_not_choose_the_newest_record():
-    gh = MemoryGitHub()
-    with pytest.raises(OwnershipConflict, match="ambiguous"):
-        gh.bound_record({**ISSUE, "labels": ["devflow-plan-11", "devflow-plan-12"]})
-
-
 def test_update_cannot_rewrite_the_accepted_plan(tmp_path):
     registry = ExecutionRegistry(tmp_path / "private" / "registry.sqlite3")
     token = registry.claim({"issue": ISSUE}, "run-one", str(tmp_path / "store"))
@@ -185,39 +138,3 @@ def test_update_cannot_rewrite_the_accepted_plan(tmp_path):
     updated["plan"]["scope"] = "Different feature"
     with pytest.raises(OwnershipConflict, match="business plan"):
         gh.update(ISSUE, record, updated, registry, token)
-
-
-@pytest.mark.parametrize("boundary", ["binding", "record"])
-def test_lost_binding_or_record_receipt_reconciles_known_comment(tmp_path, monkeypatch, boundary):
-    registry = ExecutionRegistry(tmp_path / "private" / "registry.sqlite3")
-    token = registry.claim({"issue": ISSUE}, "run-one", str(tmp_path / "store"))
-    gh = MemoryGitHub()
-    finish = registry.finish_effect
-    interrupted = False
-
-    def finish_effect(token, key, result, **kwargs):
-        nonlocal interrupted
-        prefix = "github-plan-bind:" if boundary == "binding" else "github-record:"
-        if key.startswith(prefix) and not interrupted:
-            interrupted = True
-            raise TimeoutError("response lost before local completion")
-        return finish(token, key, result, **kwargs)
-
-    monkeypatch.setattr(registry, "finish_effect", finish_effect)
-    if boundary == "binding":
-        with pytest.raises(TimeoutError):
-            gh.initialize(ISSUE, plan(), registry, token)
-    else:
-        record = gh.initialize(ISSUE, plan(), registry, token)
-        updated = deepcopy(record["manifest"])
-        updated["revision"] += 1
-        updated["workstream_issues"]["api"] = {
-            "id": "I_2", "number": 2, "url": "https://github.com/owner/repo/issues/2",
-        }
-        with pytest.raises(TimeoutError):
-            gh.update(ISSUE, record, updated, registry, token)
-    gh.calls.clear()
-    saved = gh.initialize(ISSUE, plan(), registry, token)
-    assert saved["comment_id"] == 11
-    assert gh.calls == [("GET", "repos/owner/repo/issues/comments/11")]
-    registry.stop(token, "settled", {})

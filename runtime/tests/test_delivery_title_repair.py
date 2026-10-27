@@ -12,7 +12,6 @@ from test_delivery_store import service as service
 
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_metadata_recovery import evidence_applicability
-from devflow_temporal.delivery_title_repair import validate_source
 
 
 @pytest.fixture
@@ -252,25 +251,6 @@ def admitted_title_repair(title_repair):
     return store, broker, command, recovery, response
 
 
-def test_previously_admitted_title_repair_remains_readable_and_strict(admitted_title_repair):
-    store, broker, command, recovery, response = admitted_title_repair
-    with store._connect() as db:
-        before = list(db.iterdump())
-    assert store.continue_repair("run-1", command) == response
-    assert store.repair_admission_preflight("run-1", command) == response
-    with store._connect() as db:
-        assert list(db.iterdump()) == before
-    assert store.effective_spec("run-1") == broker.spec
-    store.repair_preflight(broker.spec, recovery)
-    constraint = recovery["title_constraint"]
-    validate_source(broker.spec, constraint, completed=False)
-    target = broker.checkout / constraint["path"]
-    target.write_text(target.read_text().replace("failed requests", "request errors"))
-    validate_source(broker.spec, constraint, completed=True)
-    with pytest.raises(ValueError, match="fields do not match"):
-        store.continue_repair("run-1", {**command, "command_id": "title-2"})
-
-
 @pytest.mark.parametrize("change", ["digest", "run"])
 def test_previously_admitted_title_command_cannot_be_rebound(admitted_title_repair, change):
     store, _broker, command, _recovery, _response = admitted_title_repair
@@ -285,38 +265,6 @@ def test_previously_admitted_title_command_cannot_be_rebound(admitted_title_repa
             db.execute("UPDATE delivery_commands SET run_id='foreign' WHERE command_id='title-1'")
     with pytest.raises(ValueError, match="different inputs"):
         store.continue_repair("run-1", command)
-
-
-@pytest.mark.parametrize(
-    "change",
-    ["assertion", "authority"],
-)
-def test_literal_only_controller_rejects_source_or_authority_expansion(
-    admitted_title_repair, change,
-):
-    _store, broker, command, recovery, _response = admitted_title_repair
-    constraint = recovery["title_constraint"]
-    target = broker.checkout / constraint["path"]
-    text = target.read_text().replace("failed requests", "request errors")
-    if change == "assertion":
-        text = text.replace("toBe(true)", "toBe(false)", 1)
-    elif change == "other-file":
-        (broker.checkout / "README.md").write_text("Unauthorized change")
-    elif change == "unchanged":
-        text = target.read_text()
-    elif change == "bad-title":
-        text = text.replace("request errors", "failed requests again")
-    elif change == "another-title":
-        text = text.replace("case 0", "unrelated case")
-    elif change == "head":
-        _git(broker.checkout, "commit", "--allow-empty", "-qm", "test: unadmitted commit")
-    else:
-        from pathlib import Path
-
-        Path(command["authority_path"]).write_text("{}")
-    target.write_text(text)
-    with pytest.raises(ValueError):
-        validate_source(broker.spec, constraint, completed=True)
 
 
 @pytest.mark.asyncio

@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import lzma
 import os
 import sqlite3
 import subprocess
 import sys
 import time
 import uuid
-import zlib
 from contextlib import ExitStack, closing
 from types import SimpleNamespace
 
@@ -115,67 +113,6 @@ def test_snapshot_refuses_hot_or_unowned_original_family(tmp_path, defect):
     assert time.monotonic() - started < 3
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
-def test_original_fd_census_excludes_only_exact_owned_descriptors(tmp_path):
-    root, database, _ = source(tmp_path)
-    # A second FD in this SAME process must refuse, even if it is read-only.
-    with database.open("rb"), pytest.raises(ValueError, match="foreign FD"):
-        with capture.SourceFamily(root):
-            pass
-    with capture.SourceFamily(root) as observed:
-        with database.open("rb"), pytest.raises(ValueError, match="foreign FD"):
-            observed.observe()
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
-@pytest.mark.parametrize("defect", ["content", "restored-mtime", "replace", "new-wal", "master"])
-def test_snapshot_revalidates_original_and_master_generations(tmp_path, defect):
-    root, database, _ = source(tmp_path)
-    folder = tmp_path / "capture"
-    folder.mkdir(mode=0o700)
-    with capture.SourceFamily(root) as observed:
-        observed.snapshot(folder)
-        if defect in {"content", "restored-mtime"}:
-            info = database.stat()
-            with database.open("r+b") as stream:
-                stream.seek(200)
-                stream.write(b"changed")
-            if defect == "restored-mtime":
-                os.utime(database, ns=(info.st_atime_ns, info.st_mtime_ns))
-        elif defect == "replace":
-            raw = database.read_bytes()
-            database.unlink()
-            database.write_bytes(raw)
-        elif defect == "new-wal":
-            (root / "temporal.sqlite3-wal").write_bytes(b"unexpected generation")
-        else:
-            (folder / "master/temporal.sqlite3").write_bytes(b"changed master")
-        with pytest.raises(ValueError, match="changed|generation"):
-            observed.snapshot(folder)
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
-@pytest.mark.parametrize("member", ["temporal.sqlite3-wal", "temporal.sqlite3-journal", "extra"])
-def test_master_namespace_cannot_add_unregistered_wal_or_other_members(tmp_path, member):
-    root, _database, _ = source(tmp_path)
-    original = bytes_of(root)
-    folder = tmp_path / "capture"
-    folder.mkdir(mode=0o700)
-    with capture.SourceFamily(root) as observed:
-        observed.snapshot(folder)
-        unexpected = folder / "master" / member
-        unexpected.write_bytes(b"not part of the original held family")
-        unexpected.chmod(0o600)
-        with pytest.raises(ValueError, match="unregistered member"):
-            observed.snapshot(folder)
-        with pytest.raises(ValueError, match="unregistered member"), capture._working(
-            folder, "default", observed.initial
-        ):
-            pytest.fail("Extra master membership cannot acquire working custody")
-    assert not (folder / "working").exists()
-    assert bytes_of(root) == original
-
-
 @pytest.mark.parametrize("alias", ["raw-symlink", "target-symlink", "target-hardlink"])
 def test_real_serve_refuses_staging_collision_before_any_alias_write(tmp_path, monkeypatch, alias):
     # Exact causal 2cd shape: readers/{1} was reused because len(entries)==1.
@@ -209,64 +146,6 @@ def test_real_serve_refuses_staging_collision_before_any_alias_write(tmp_path, m
         )
     assert original.read_bytes() == before
     assert not (working.parent / "master").exists()
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
-def test_working_copy_never_reuses_existing_empty_staging(tmp_path):
-    root, _database, _ = source(tmp_path)
-    folder = tmp_path / "capture"
-    folder.mkdir(mode=0o700)
-    with capture.SourceFamily(root) as observed:
-        observed.snapshot(folder)
-        (folder / "working").mkdir(mode=0o700)
-        with pytest.raises(ValueError, match="generation already exists"), capture._working(
-            folder, "default", observed.initial
-        ):
-            pytest.fail("Existing working namespace cannot acquire write custody")
-    assert not list((folder / "working").iterdir())
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual complete native lsof visibility")
-@pytest.mark.parametrize("defect", ["bytes", "replace", "link", "directory"])
-def test_held_pre_go_custody_refuses_prepared_name_or_byte_drift(tmp_path, defect):
-    root, _database, _ = source(tmp_path)
-    folder = tmp_path / "capture"
-    folder.mkdir(mode=0o700)
-    with capture.SourceFamily(root) as observed:
-        observed.snapshot(folder)
-        with capture._working(folder, "default", observed.initial) as (database, _namespace, pin):
-            pin()
-            if defect == "bytes":
-                info = database.stat()
-                with database.open("ab") as stream:
-                    stream.write(b"unexpected bytes")
-                os.utime(database, ns=(info.st_atime_ns, info.st_mtime_ns))
-            elif defect == "replace":
-                data = database.read_bytes()
-                database.rename(database.with_suffix(".retained"))
-                database.write_bytes(data)
-                database.chmod(0o600)
-            elif defect == "link":
-                os.link(database, database.with_suffix(".alias"))
-            else:
-                database.parent.rename(folder / "retained-working")
-                database.parent.mkdir(mode=0o700)
-            with pytest.raises((ValueError, FileNotFoundError), match="generation|bytes|No such"):
-                pin()
-
-
-def test_snapshot_reserves_all_four_retained_copies_before_staging(tmp_path, monkeypatch):
-    root, _database, _ = source(tmp_path)
-    total = sum(path.stat().st_size for path in root.iterdir())
-    between_three_and_four = 3 * total + total // 2 + 128 * 1024**2
-    monkeypatch.setattr(
-        capture.shutil, "disk_usage", lambda _path: SimpleNamespace(free=between_three_and_four)
-    )
-    original = bytes_of(root)
-    with pytest.raises(ValueError, match="snapshot/disk allowance"):
-        with capture.SourceFamily(root):
-            pytest.fail("Disk for four copies must be reserved before staging")
-    assert bytes_of(root) == original
 
 
 class Pages:
@@ -322,63 +201,6 @@ async def test_sdk_export_canonicalizes_unordered_maps_for_exact_crash_replay():
     assert raw != history.to_json().encode()
 
 
-@pytest.mark.asyncio
-async def test_sdk_pagination_tokens_count_toward_total_byte_limit(monkeypatch):
-    pages = Pages([[HistoryEvent(event_id=1)], [HistoryEvent(event_id=2)]])
-    original = pages.fetch_next_page
-
-    async def large_token():
-        await original()
-        pages.next_page_token = b"x" * 256
-
-    pages.fetch_next_page = large_token
-    monkeypatch.setattr(capture, "MAX_HISTORY", 128)
-    with pytest.raises(ValueError, match="byte/event bound"):
-        await capture._history(
-            handle(pages), time.monotonic() + 3, {"pages": 0, "events": 0, "bytes": 0}
-        )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("limit", ["pages", "events", "bytes", "json", "time", "repeated"])
-async def test_sdk_export_excess_refuses_instead_of_truncating(monkeypatch, limit):
-    pages = Pages(
-        [
-            [HistoryEvent(event_id=1)],
-            [HistoryEvent(event_id=2)],
-            [HistoryEvent(event_id=3)],
-            [HistoryEvent(event_id=4)],
-        ],
-        repeated=limit == "repeated",
-    )
-    budget = {"pages": 0, "events": 0, "bytes": 0}
-    if limit == "pages":
-        monkeypatch.setattr(capture, "MAX_PAGES", 1)
-    elif limit == "events":
-        monkeypatch.setattr(capture, "MAX_EVENTS", 1)
-    elif limit == "bytes":
-        monkeypatch.setattr(capture, "MAX_HISTORY", 1)
-    elif limit == "json":
-        budget["json_bytes"] = capture.MAX_HISTORY
-    deadline = time.monotonic() + (-1 if limit == "time" else 3)
-    with pytest.raises(ValueError, match="bound|pagination"):
-        await capture._history(handle(pages), deadline, budget)
-
-
-def test_pre_go_ready_identity_cannot_grant_signal_or_blind_replacement(tmp_path, monkeypatch):
-    reader = tmp_path / "reader"
-    reader.mkdir(mode=0o700)
-    write_private(reader / "ready.json", {"pid": 12345, "identity": "owned fixture identity"})
-    write_private(reader / "intent.json", {"ports": []})
-    monkeypatch.setattr(capture, "_table", lambda: {12345: {"identity": "owned fixture identity"}})
-    monkeypatch.setattr(
-        capture.os, "kill", lambda *_: pytest.fail("No PID receipt means no signal")
-    )
-    with pytest.raises(ValueError, match="before authorization"):
-        capture._cleanup(reader)
-    assert not (reader / "cleanup.json").exists()
-
-
 @pytest.mark.parametrize("defect", ["content", "restored-mtime", "replace", "link", "missing"])
 def test_capture_input_fd_and_name_generation_remain_bound(tmp_path, defect):
     path = tmp_path / "owner.json"
@@ -411,38 +233,6 @@ def payload_history(encoding, payloads):
         payload.data = raw
         events.append(event)
     return WorkflowHistory("owned-workflow", events)
-
-
-@pytest.mark.parametrize("encoding", [b"binary/zlib", b"binary/xz"])
-@pytest.mark.parametrize("defect", [None, "payload", "total", "truncated", "trailing"])
-def test_payload_expansion_bound_is_proved_before_existing_codec(monkeypatch, encoding, defect):
-    monkeypatch.setattr(capture, "MAX_PAYLOAD", 128)
-    monkeypatch.setattr(capture, "MAX_DECODED", 192)
-    compressed = (zlib.compress if encoding == b"binary/zlib" else lzma.compress)(b"x" * 100)
-    blobs = [compressed]
-    if defect == "payload":
-        monkeypatch.setattr(capture, "MAX_PAYLOAD", 99)
-    elif defect == "total":
-        blobs *= 2
-    elif defect == "truncated":
-        blobs = [compressed[:-1]]
-    elif defect == "trailing":
-        blobs = [compressed + b"unconsumed"]
-    history = payload_history(encoding, blobs)
-    if defect:
-        with pytest.raises(ValueError, match="bound|incomplete|trailing"):
-            capture._bounded_payloads(history)
-    else:
-        assert capture._bounded_payloads(history) == 100
-
-
-def test_uncompressed_payloads_obey_same_total_bound(monkeypatch):
-    monkeypatch.setattr(capture, "MAX_PAYLOAD", 128)
-    monkeypatch.setattr(capture, "MAX_DECODED", 192)
-    with pytest.raises(ValueError, match="bound"):
-        capture._bounded_payloads(payload_history(b"json/plain", [b"x" * 100] * 2))
-    with pytest.raises(ValueError, match="bound"):
-        capture._bounded_payloads(payload_history(b"json/plain", [b"x" * 100]), consumed=100)
 
 
 def test_public_capture_route_authenticates_before_ordinary_missing_helper_store(

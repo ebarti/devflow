@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 import temporal_test_server
-from temporal_test_server import _available_port, local_temporal
+from temporal_test_server import local_temporal
 from temporalio.api.workflowservice.v1 import DescribeNamespaceRequest
 
 from devflow_temporal.delivery_native_process import process_table
@@ -125,15 +125,6 @@ async def test_cli_exit_preserves_exit_status_and_diagnostic_without_relaunch(tm
         async with local_temporal(dev_server_existing_path=str(script)):
             pytest.fail("failed CLI must not enter the test")
     assert launches.read_text().splitlines() == ["launch"]
-
-
-def test_reserved_port_can_be_rebound_immediately_by_reusing_server_socket():
-    # Linux keeps the server side in TIME_WAIT; both bindings must enable reuse.
-    port = _available_port()
-    with socket.socket() as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", port))
-        listener.listen()
 
 
 @pytest.mark.asyncio

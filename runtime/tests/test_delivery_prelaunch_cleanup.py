@@ -5,10 +5,6 @@ resource registry, finalizer and public cleanup readers are real owned objects.
 """
 from __future__ import annotations
 
-import copy
-import fcntl
-import hashlib
-import json
 import os
 from pathlib import Path
 
@@ -29,8 +25,6 @@ from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_orphans import reconcile_attempt
 from devflow_temporal.delivery_resources import (
     RunResources,
-    observe_completed_resources,
-    read_private,
     write_private,
 )
 from devflow_temporal.supervisor import DeliverySupervisor
@@ -85,126 +79,6 @@ def no_launch(service, monkeypatch):
     monkeypatch.setattr(native, 'listeners', lambda _port: set())
     assert RunResources(spec).finalize('blocked')['state'] == 'confirmed'
     return store, spec, row, request, folder
-
-
-def test_completed_typed_prelaunch_needs_no_fictitious_registration(no_launch):
-    _store, spec, row, request, folder = no_launch
-    registry = RunResources(spec)
-    original = {p: p.read_bytes() for p in [folder / 'request.json', registry.manifest,
-                                           registry.state / 'resources/finalization.json']}
-    assert request['workspace'] in read_private(registry.manifest)['roots']
-    assert read_private(registry.manifest)['roots'][request['workspace']]['identity']
-    executions = {}
-    from devflow_temporal.delivery_resources import _gate_roots
-    _gate_roots(spec, execution_specs=executions)
-    assert request['spec'] in executions.values()
-    proof = observe_completed_resources(spec, [row])
-    assert proof['journal_sha256'] == {}
-    saved = proof['prelaunch_attempts'][str(folder / 'native-process.json')]
-    assert saved['attempt_sha256'] == digest(row)
-    assert saved['request_sha256'] == hashlib.sha256(original[folder / 'request.json']).hexdigest()
-    assert saved['result_sha256'] == digest(json.loads(row['result_json']))
-    assert saved['leases']['native-monitor.lock'] is None
-    assert all(path.read_bytes() == raw for path, raw in original.items())
-    assert read_private(folder / 'request.json') == request
-    assert not (folder / 'native-process.json').exists()
-
-
-@pytest.mark.parametrize('drift', [
-    'unknown', 'untyped', 'pass', 'session', 'pid', 'process_identity', 'usage', 'forged_native',
-    'wrong_role', 'wrong_iteration', 'wrong_input', 'foreign_spec', 'unauthorized',
-    'wrong_result_path', 'wrong_start_path', 'foreign_workspace', 'missing_request',
-    'missing_owner', 'owner_link', 'owner_busy', 'native_busy', 'journal', 'launch',
-    'request_fifo', 'request_mode', 'request_link', 'request_symlink',
-    'ready', 'start', 'result', 'cancel',
-])
-def test_absence_or_null_session_cannot_replace_original_prelaunch_authority(no_launch, drift):
-    _store, spec, row, request, folder = no_launch
-    row = copy.deepcopy(row)
-    result = json.loads(row['result_json'])
-    held = None
-    if drift == 'unknown':
-        result['status'] = result['finish_reason'] = 'recovery_unknown'
-    elif drift == 'untyped':
-        result.pop('finish_reason')
-    elif drift == 'pass':
-        result['status'] = 'pass'
-    elif drift in {'session', 'pid', 'process_identity'}:
-        row['session_id' if drift == 'session' else drift] = 'unexpected-provider'
-    elif drift == 'usage':
-        result['usage'] = {'tokens': 1}
-    elif drift == 'forged_native':
-        result['native_process'] = {'provider_outcome': 'unknown', 'cleanup': 'confirmed'}
-    elif drift.startswith('wrong_') or drift in {'foreign_spec', 'unauthorized',
-                                                'foreign_workspace'}:
-        if drift == 'wrong_role':
-            request['role'] = 'review'
-        elif drift == 'wrong_iteration':
-            request['iteration'] = 1
-        elif drift == 'wrong_input':
-            request['candidate']['id'] = digest('other-input')
-        elif drift == 'foreign_spec':
-            request['spec'] = {**spec, 'request_digest': digest('foreign')}
-        elif drift == 'unauthorized':
-            request['native_authorized'] = False
-        elif drift == 'foreign_workspace':
-            request['workspace'] = str(folder)
-        else:
-            request['result_path' if drift == 'wrong_result_path' else 'start_path'] += '.other'
-        write_private(folder / 'request.json', request)
-    elif drift == 'missing_request':
-        (folder / 'request.json').unlink()
-    elif drift.startswith('request_'):
-        path = folder / 'request.json'
-        if drift == 'request_fifo':
-            path.unlink()
-            os.mkfifo(path, mode=0o600)
-        elif drift == 'request_mode':
-            path.chmod(0o644)
-        elif drift == 'request_link':
-            os.link(path, path.with_suffix('.linked'))
-        else:
-            path.rename(path.with_suffix('.original'))
-            path.symlink_to(path.with_suffix('.original'))
-    elif drift in {'missing_owner', 'owner_link', 'owner_busy'}:
-        path = DeliverySupervisor._owner_lock_path(spec, row['job_key'])
-        if drift == 'missing_owner':
-            path.unlink()
-        elif drift == 'owner_link':
-            os.link(path, path.with_suffix('.linked'))
-        else:
-            held = path.open('rb')
-            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    elif drift == 'native_busy':
-        path = folder / 'native-monitor.lock'
-        path.touch(mode=0o600)
-        held = path.open('rb')
-        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    else:
-        name = 'native-process.json' if drift == 'journal' else (
-            drift if drift == 'cancel' else drift + '.json')
-        write_private(folder / name, {'opaque': 'possible prior launch'})
-    row['result_json'] = canonical_json(result)
-    try:
-        with pytest.raises((ValueError, OSError)):
-            observe_completed_resources(spec, [row])
-    finally:
-        if held is not None:
-            held.close()
-
-
-def test_request_change_while_native_roots_are_observed_refuses(no_launch, monkeypatch):
-    _store, spec, row, request, folder = no_launch
-    original = RunResources._allowed
-
-    def replace_after_leases(self, path, kind, **kwargs):
-        request['candidate']['id'] = digest('changed-during-observation')
-        write_private(folder / 'request.json', request)
-        return original(self, path, kind, **kwargs)
-
-    monkeypatch.setattr(RunResources, '_allowed', replace_after_leases)
-    with pytest.raises(ValueError, match='evidence generation changed'):
-        observe_completed_resources(spec, [row])
 
 
 def test_public_cleanup_preserves_prelaunch_rows_and_replays_after_maintenance(

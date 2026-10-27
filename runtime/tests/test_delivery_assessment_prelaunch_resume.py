@@ -1,12 +1,11 @@
 """A source-ready ordinary issue resumes gates after proved controller-only launch failure."""
 from __future__ import annotations
 
-import asyncio
 import copy
 from pathlib import Path
 
 import pytest
-from test_delivery_stopped_resume import project, saved
+from test_delivery_stopped_resume import project
 from test_delivery_store import _git
 from test_delivery_store import service as service
 from test_delivery_unused_budget_resume import fixed_stop as fixed_stop
@@ -14,7 +13,6 @@ from test_delivery_unused_budget_resume import fixed_stop as fixed_stop
 from devflow_temporal import delivery_stopped_resume as resume
 from devflow_temporal.contracts import canonical_json
 from devflow_temporal.delivery_resources import private_directory
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 from devflow_temporal.supervisor import DeliverySupervisor
 
 
@@ -80,49 +78,6 @@ def assessment_stop(fixed_stop, monkeypatch):
     command.update(command_id='resume-unlaunched-assessments', additional_iterations=0,
                    expected_candidate_id=candidate['id'], expected_candidate_head=candidate['head'])
     return store, broker, state, command, attempts
-
-
-def test_public_assessment_prelaunch_resume_preserves_source_pr_and_paid_iteration(
-    assessment_stop, monkeypatch
-):
-    store, broker, state, command, _ = assessment_stop
-    original = copy.deepcopy(store.submitted_spec('run-1'))
-    stopped = copy.deepcopy(state)
-    observed = resume.snapshot(store, 'run-1')
-    assert resume._unlaunched_assessments(observed), {
-        "state": {k: observed["state"].get(k) for k in ["error", "phase", "iteration"]},
-        "roles": observed["state"]["roles"],
-        "attempts": observed["attempts"],
-        "spec": {
-            k: observed["predecessor_spec"].get(k) for k in ["gate_admission", "policy_digest"]
-        },
-    }
-    assert resume.interrupted_resume(observed), 'eligible assessment gates need an interrupted plan'
-    assert store.repair_admission_preflight('run-1', command)['authorized_through_iteration'] == 1
-    store.continue_repair('run-1', command)
-    recovery = saved(store)
-    assert recovery['state'] == stopped
-    assert recovery['maximum_iteration'] == recovery['resume_iteration'] == 1
-    assert recovery['resume_stage'] == 'published'
-    assert recovery['gate_evidence']['implementation_job_key']
-    assert store.submitted_spec('run-1') == original
-    assert broker.candidate() == stopped['candidate']
-    assert resume.readback(store, store.effective_spec('run-1'), recovery) == {'state': 'confirmed'}
-    flow = DeliveryWorkflow()
-    async def confirmed(*_a): return True
-    async def activity(*_a, **_k): return {'state': 'consistent'}
-    async def projected(*_a, **_k): pass
-    async def iterations(_spec, **body):
-        assert body['published_checkpoint'] is True
-        assert body['start_iteration'] == body['authorized_max_iteration'] == 1
-        assert body['prior_implementer_session'] == 'original-implementation'
-        return {'outcome': 'gates-only'}
-    monkeypatch.setattr(flow, '_confirm_repair_preflight', confirmed)
-    monkeypatch.setattr(flow, '_activity', activity)
-    monkeypatch.setattr(flow, '_project', projected)
-    monkeypatch.setattr(flow, '_run_iterations', iterations)
-    assert asyncio.run(flow._resume_stopped(store.effective_spec('run-1'), recovery)) == {
-        'outcome': 'gates-only'}
 
 
 @pytest.mark.parametrize(

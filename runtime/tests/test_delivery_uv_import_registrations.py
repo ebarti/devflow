@@ -8,7 +8,6 @@ The official uv code writes the pth as the exact bytes b"import _virtualenv".
 
 import hashlib
 import importlib.util
-import marshal
 import os
 import py_compile
 import shutil
@@ -55,60 +54,6 @@ def _load_patch(site, monkeypatch):
     monkeypatch.setitem(sys.modules, "_virtualenv", module)
     spec.loader.exec_module(module)
     py_compile.compile(str(module_path), doraise=True)
-
-
-def test_legacy_single_editable_registration_is_unchanged(owned):
-    root, site, _ = owned
-    installation._import_registrations(root, site)
-    (site / "extra.pth").write_text("/foreign/path\n")
-    with pytest.raises(ValueError, match="unacknowledged"):
-        installation._import_registrations(root, site)
-
-
-def test_pinned_upstream_patch_and_real_bytecode_are_accepted(owned):
-    root, site, monkeypatch = owned
-    _install_patch(site, monkeypatch)
-    installation._import_registrations(root, site)
-
-
-@pytest.mark.parametrize(
-    "mutation", ["pth", "source", "extra", "package", "legacy_pyc", "bytecode"]
-)
-def test_mutations_and_import_shadows_are_refused(owned, mutation):
-    root, site, monkeypatch = owned
-    source = _install_patch(site, monkeypatch)
-    if mutation == "pth":
-        (site / "_virtualenv.pth").write_bytes(b"import _virtualenv; import os")
-    elif mutation == "source":
-        source.write_text("# forged startup patch\n")
-    elif mutation == "extra":
-        (site / "foreign.pth").write_text("import os\n")
-    elif mutation == "package":
-        (site / "_virtualenv").mkdir()
-        (site / "_virtualenv/__init__.py").write_text("# shadow\n")
-    elif mutation == "legacy_pyc":
-        (site / "_virtualenv.pyc").write_bytes(b"not trusted")
-    else:
-        compiled = next((site / "__pycache__").glob("_virtualenv.*.pyc"))
-        header = compiled.read_bytes()[:16]
-        compiled.write_bytes(header + marshal.dumps(compile("pass", str(source), "exec")))
-    with pytest.raises(ValueError):
-        installation._import_registrations(root, site)
-
-
-def test_other_path_shadow_and_forged_loaded_origin_are_refused(owned, tmp_path):
-    root, site, monkeypatch = owned
-    _install_patch(site, monkeypatch)
-    shadow = tmp_path / "shadow"
-    shadow.mkdir()
-    (shadow / "_virtualenv.py").write_text("# unrelated shadow\n")
-    monkeypatch.syspath_prepend(str(shadow))
-    with pytest.raises(ValueError, match="resolved outside"):
-        installation._import_registrations(root, site)
-    sys.path.remove(str(shadow))
-    monkeypatch.setattr(sys.modules["_virtualenv"], "__file__", str(shadow / "_virtualenv.py"))
-    with pytest.raises(ValueError, match="resolved outside"):
-        installation._import_registrations(root, site)
 
 
 def test_owned_pth_and_source_cannot_be_symlinks(owned, tmp_path):

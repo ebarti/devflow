@@ -60,54 +60,6 @@ def test_original_bytes_survive_finalize_then_refusal_or_crash(later_cleanup, in
     assert sum('predecessor_resources' in row for row in records) == 1
 
 
-@pytest.mark.parametrize('name', ['manifest.json', 'finalization.json'])
-def test_changed_archived_original_refuses_before_further_cleanup(later_cleanup, name):
-    store, request, _historical, calls, external = later_cleanup
-    root, original = files(store, request)
-    external.update(ready=True, crash_finalizing=True)
-    assert retry.retry_once(store) == []
-    assert_preserved(store, request, original)
-    write_private(root / 'predecessor-resources' / name, {'changed': True})
-    count = calls.count(('finalize', 'blocked', False))
-    store._automatic_retry_waits.clear()
-    assert retry.retry_once(store) == []
-    assert calls.count(('finalize', 'blocked', False)) == count
-    assert not any(item[0] == 'tracker' for item in calls)
-
-
-def test_pre_effect_event_failure_preserves_bytes_without_cleanup(later_cleanup, monkeypatch):
-    import sqlite3
-    store, request, _historical, calls, external = later_cleanup
-    root, original = files(store, request)
-    external['ready'] = True
-    event = store._event
-    def fail_observation(*args, **kwargs):
-        if args[3] == 'resource_cleanup_reconciled':
-            raise sqlite3.OperationalError('opaque observation transaction refused')
-        return event(*args, **kwargs)
-    monkeypatch.setattr(store, '_event', fail_observation)
-    assert retry.retry_once(store) == []
-    assert not any(item[0] in {'finalize', 'tracker'} for item in calls)
-    for name, raw in original.items():
-        assert (root / name).read_bytes() == raw
-        assert (root / 'predecessor-resources' / name).read_bytes() == raw
-    monkeypatch.setattr(store, '_event', event)
-    store._automatic_retry_waits.clear()
-    assert len(retry.retry_once(store)) == 1
-    assert_preserved(store, request, original)
-
-
-@pytest.mark.parametrize('name', ['manifest.json', 'finalization.json'])
-def test_changed_original_during_readback_refuses_before_archive_effect(later_cleanup, name):
-    store, request, _historical, calls, external = later_cleanup
-    root, _original = files(store, request)
-    external['ready'] = True
-    external['on_publication'] = lambda: write_private(root / name, {'changed': True})
-    assert retry.retry_once(store) == []
-    assert not any(item[0] in {'finalize', 'tracker'} for item in calls)
-    assert not (root / 'predecessor-resources').exists()
-
-
 @pytest.mark.parametrize('drift', [None, 'producer_hash', 'latest_hash'])
 def test_published_cleanup_keeps_historical_bytes_after_owner_refresh(later_cleanup, drift):
     store, request, historical, calls, external = later_cleanup

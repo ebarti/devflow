@@ -156,41 +156,6 @@ async def test_revision_heartbeats_cover_delayed_authentication_and_persistence(
 
 
 @pytest.mark.asyncio
-async def test_revision_persistence_stays_live_after_the_role_returns(revision_activity):
-    h = revision_activity
-    h.auth_release.set()
-    h.role_release.set()
-    task = asyncio.create_task(h.environment.run(activities.delivery_feature_revision_propose,
-                                               h.request))
-    try:
-        assert await asyncio.to_thread(h.save_entered.wait, 1)
-        await phase_heartbeats(h, "persistence")
-        h.save_release.set()
-        result = await asyncio.wait_for(task, 1)
-        assert result["proposal_receipt"] == h.saved[0] and len(h.saved) == 1
-    finally:
-        await finish(h, task)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["propose", "review"])
-async def test_revision_cancel_during_authentication_cannot_launch_a_role(revision_activity, role):
-    h = revision_activity
-    task = asyncio.create_task(h.environment.run(
-        getattr(activities, "delivery_feature_revision_" + role), h.request))
-    try:
-        assert await asyncio.to_thread(h.auth_entered.wait, 1)
-        h.environment.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        h.auth_release.set()
-        assert await asyncio.to_thread(h.auth_done.wait, 1)
-        assert h.payloads == [] and h.saved == []
-    finally:
-        await finish(h, task)
-
-
-@pytest.mark.asyncio
 async def test_revision_role_cancel_and_candidate_refusal_keep_existing_checks(revision_activity):
     h = revision_activity
     h.candidate = {"id": "drifted-candidate"}

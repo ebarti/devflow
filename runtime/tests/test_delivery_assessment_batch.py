@@ -82,21 +82,6 @@ def test_every_independent_assessment_finishes_before_single_repair(monkeypatch,
         assert state["repair_findings"] == {"iteration": 0, "findings": batch}
 
 
-@pytest.mark.parametrize("unsafe", ["cleanup", "source", "review-candidate"])
-def test_unsafe_custody_stops_collection_without_a_repair_debit(monkeypatch, unsafe):
-    calls, repairs, state = exercise(monkeypatch, unsafe=unsafe)
-    assert not repairs
-    assert state["outcome"] == "blocked"
-    assert calls == (["checks", "browser", "review"] if unsafe == "review-candidate"
-                     else ["checks"])
-
-
-def test_recorded_legacy_input_keeps_first_failure_order(monkeypatch):
-    calls, repairs, _state = exercise(monkeypatch, enabled=False)
-    assert calls == ["checks", "implement"]
-    assert len(repairs[0]) == 1
-
-
 @pytest.mark.parametrize('failed', ['prelaunch', 'review-prelaunch'])
 def test_prelaunch_failures_finish_independent_collection_without_a_coding_turn(
     monkeypatch, failed

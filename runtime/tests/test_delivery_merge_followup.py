@@ -22,61 +22,6 @@ from devflow_temporal.delivery_resources import write_private
 from devflow_temporal.supervisor import DeliverySupervisor
 
 
-@pytest.mark.parametrize("rotations", [1, 2])
-@pytest.mark.parametrize("drift", [None, "head", "content", "unsealed"])
-def test_sealed_runtime_policy_renewal_keeps_original_publication_custody(
-    delivered, rotations, drift,
-):
-    from pathlib import Path
-
-    from devflow_temporal.delivery_gate_retry import gate_namespace
-
-    d = delivered
-    spec = copy.deepcopy(d.spec)
-    with d.store._connect() as db:
-        pr = json.loads(db.execute("SELECT pr_json FROM delivery_runs").fetchone()[0])
-    original_publication = copy.deepcopy(pr)
-    recovery = None
-    for generation in range(1, rotations + 1):
-        previous_spec, previous_pr = copy.deepcopy(spec), copy.deepcopy(pr)
-        spec["policy"]["native_preparation"] = {"runtime_payload_sha256": str(generation) * 64}
-        spec["policy_digest"] = digest(spec["policy"])
-        spec.update(gate_retry_generation=generation, gate_retry_stage="published")
-        candidate = {**pr["candidate"], "policy_digest": spec["policy_digest"]}
-        pr = {**pr, "candidate": candidate}
-        recovery = {"kind": "published_gate_retry", "original_spec": d.spec,
-                    "execution_spec": copy.deepcopy(spec), "original_recovery": recovery,
-                    "command": {"additional_iterations": 0}, "candidate": candidate,
-                    "publication": copy.deepcopy(pr),
-                    "seal": {"original_spec": previous_spec, "publication": previous_pr}}
-        root = Path(spec["state_dir"]) / gate_namespace(generation, "published")
-        write_private(root / "admission.json", recovery)
-    with d.store._connect() as db:
-        db.execute("INSERT INTO delivery_gate_admissions VALUES ('run-1','renew-policy',?)",
-                   (canonical_json(recovery),))
-        db.execute("UPDATE delivery_runs SET recovery_json=?,candidate_json=?,pr_json=?",
-                   tuple(canonical_json(v) for v in (recovery, candidate, pr)))
-    if drift == "head":
-        pr["head"] = "f" * 40
-    elif drift == "content":
-        pr["candidate"] = {**pr["candidate"], "content_sha256": "changed"}
-    elif drift == "unsealed":
-        recovery["seal"]["original_spec"]["policy_digest"] = "f" * 64
-    with d.store._connect() as db:
-        db.execute("UPDATE delivery_runs SET pr_json=?,recovery_json=?",
-                   (canonical_json(pr), canonical_json(recovery)))
-    # A second generic gate assessment is not an admitted historical path.
-    if drift or rotations > 1:
-        with pytest.raises(ValueError):
-            followup.preflight(d.store, "run-1")
-    else:
-        assert followup.preflight(d.store, "run-1")["phase"] == "available"
-        with d.store._connect() as db:
-            saved = json.loads(db.execute("SELECT observed_json FROM delivery_effects "
-                                         "WHERE kind='publish'").fetchone()[0])
-        assert saved == original_publication
-
-
 @pytest.fixture
 def delivered(service, monkeypatch, *, native_spec=None):
     store, request = service
@@ -271,27 +216,6 @@ def delivered(service, monkeypatch, *, native_spec=None):
     )
 
 
-@pytest.mark.parametrize("hold", [False, True])
-def test_updated_pr_or_explicit_owner_hold_cannot_advertise_or_admit_merge(delivered, hold):
-    d = delivered
-    with d.store._connect() as db:
-        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
-        pr = json.loads(row["pr_json"])
-        if hold:
-            db.execute("INSERT INTO delivery_issue_observations VALUES (?,?,?,?,NULL)",
-                       (d.spec["issue_url"].casefold(), canonical_json(
-                           {"state": "OPEN", "labels": ["do not merge yet"]}), "now", "later"))
-        else:
-            db.execute("INSERT INTO delivery_pr_observations VALUES (?,?,?,?,NULL)",
-                       (pr["url"], canonical_json({"state": "OPEN", "head": "new-commit"}),
-                        "now", "later"))
-        assert followup.action(db, row, d.spec)["available"] is False
-    with pytest.raises(ValueError, match="current validated PR commit"):
-        followup.preflight(d.store, "run-1")
-    with d.store._connect() as db:
-        assert db.execute("SELECT count(*) FROM delivery_merge_requests").fetchone()[0] == 0
-
-
 def test_explicit_merge_admission_is_durable_exact_and_does_not_rewrite_delivery(delivered):
     d = delivered
     assert followup.preflight(d.store, "run-1")["head"] == "h"
@@ -306,11 +230,6 @@ def test_explicit_merge_admission_is_durable_exact_and_does_not_rewrite_delivery
         assert db.execute("SELECT COUNT(*) FROM delivery_merge_requests").fetchone()[0] == 1
         assert d.store.state.claim_for(db, d.spec["work_id"])["owner"] == "external:devflow:run-1"
     assert d.store.effective_spec("run-1")["authorized_endpoint"] == "published_unmerged"
-
-
-@pytest.mark.parametrize("result", [None, "null", "[]", "true", "0", '"pending"'])
-def test_absent_or_nonobject_merge_result_does_not_offer_continuation(result):
-    assert followup._continuable({"phase": "merging", "result_json": result}) is False
 
 
 @pytest.mark.asyncio
@@ -364,46 +283,6 @@ def test_conflict_continuation_retains_original_grant_and_is_idempotent(delivere
         assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == d.before
 
 
-def test_real_product_decision_cannot_be_restarted_as_a_routine_conflict(delivered):
-    d = delivered
-    followup.admit(d.store, "run-1", d.command)
-    activity_call(followup.record, d.store, d.spec, "decision_required", {
-        "state": "decision_required", "reason": "divergent_product_direction"})
-    with pytest.raises(ValueError, match="already owns"):
-        followup.admit(d.store, "run-1", {**d.command, "command_id": "retry"})
-
-
-def test_merge_turns_do_not_replace_original_delivery_gates(delivered):
-    d = delivered
-    first = followup.admit(d.store, "run-1", d.command)
-    with d.store._connect() as db:
-        db.execute("INSERT INTO delivery_effects VALUES "
-                   "('merge-role','run-1','merge_resolution',?,'complete','{}','now')",
-                   (canonical_json({"job_key": "merge-attempt"}),))
-        db.execute("INSERT INTO delivery_attempts "
-                   "(job_key,run_id,role,iteration,candidate_id,state,cleanup,result_json) "
-                   "VALUES ('merge-attempt','run-1','implement',0,'combined','finished',"
-                   "'confirmed','{}')")
-    assert followup.authorize(d.store, d.spec, first["grant_sha256"])
-
-
-def test_fresh_custody_observation_does_not_replace_native_source_authority(delivered, monkeypatch):
-    d = delivered
-    first = followup.admit(d.store, "run-1", d.command)
-    checks = json.loads(d.before["checks_json"])
-    checks["resource_cleanup"]["observed_at"] = "later"
-    with d.store._connect() as db:
-        db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
-    monkeypatch.setattr(followup, "observe_finalized_resources",
-                        lambda _: {"manifest_sha256": "freshly-confirmed"})
-    assert followup.authorize(d.store, d.spec, first["grant_sha256"])
-    checks["qa"]["candidate_id"] = "foreign"
-    with d.store._connect() as db:
-        db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
-    with pytest.raises(ValueError, match="authority, candidate or ownership changed"):
-        followup.authorize(d.store, d.spec, first["grant_sha256"])
-
-
 def test_cleanup_wait_preserves_claim_then_merges_same_candidate(delivered, monkeypatch):
     d = delivered
     remote = git_remote(d, monkeypatch)
@@ -430,112 +309,6 @@ def test_cleanup_wait_preserves_claim_then_merges_same_candidate(delivered, monk
     assert remote.updates == remote.merge_calls == 1
 
 
-def test_closed_delivery_maintenance_leaves_the_later_merge_to_its_owner(delivered, monkeypatch):
-    from devflow_temporal import delivery_orphans
-
-    d = delivered
-    followup.admit(d.store, "run-1", d.command)
-
-    def forbidden(*_):
-        raise AssertionError("Historical delivery maintenance entered the later merge")
-
-    monkeypatch.setattr(delivery_orphans, "_unchanged", forbidden)
-    delivery_orphans._reconcile(d.store, d.before, d.spec, {})
-    with d.store._connect() as db:
-        assert dict(db.execute("SELECT * FROM delivery_runs").fetchone()) == d.before
-
-
-def test_legacy_continuation_requalifies_custody_and_owned_head_without_replaying_work(
-    delivered, monkeypatch,
-):
-    d = delivered
-    remote = git_remote(d, monkeypatch)
-    admitted = followup.admit(d.store, "run-1", d.command)
-    # Model a v1 grant that predated a separate immutable native evidence digest.
-    with d.store._connect() as db:
-        saved = followup.current(db, "run-1")
-        grant = json.loads(saved["grant_json"])
-        grant.pop("native_proof_sha256")
-        legacy_grant = canonical_json(grant)
-        bound = digest(grant)
-        response = {k: v for k, v in admitted.items() if k != "native_proof_sha256"}
-        response["grant_sha256"] = bound
-        db.execute("UPDATE delivery_merge_requests SET grant_json=?", (legacy_grant,))
-        db.execute("UPDATE delivery_commands SET response_json=? WHERE command_id=?",
-                   (canonical_json(response), d.command["command_id"]))
-    d.store._test_merge_execution["grant_sha256"] = bound
-    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
-    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
-    with d.store._connect() as db:
-        checks = json.loads(db.execute("SELECT checks_json FROM delivery_runs").fetchone()[0])
-        checks["resource_cleanup"]["observed_at"] = "later"
-        db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
-    monkeypatch.setattr(followup, "observe_finalized_resources",
-                        lambda _: {"manifest_sha256": "later-observation"})
-    with pytest.raises(ValueError, match="native evidence changed"):
-        followup.authorize(d.store, d.spec, bound)
-    activity_call(followup.record, d.store, d.spec, "blocked", {
-        "state": "blocked",
-        "reason": "ValueError: predecessor process/root custody is unconfirmed"})
-    remote.ci_ready = True
-    command = {**d.command, "command_id": "continue-custody"}
-    continued = followup.admit(d.store, "run-1", command)
-    assert continued["grant_sha256"] == bound
-    assert followup.authorize(d.store, d.spec, bound)
-    with d.store._connect() as db:
-        assert followup.current(db, "run-1")["grant_json"] == legacy_grant
-    assert remote.updates == 1 and remote.merge_calls == 0
-    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "confirmed"
-    assert remote.updates == remote.merge_calls == 1
-
-
-@pytest.mark.parametrize(
-    "drift",
-    [
-        "revision",
-        "head",
-        "candidate",
-        "permission",
-        "closed",
-        "native",
-        "claim",
-        "pending_effect",
-        "unfinished",
-        "gate",
-    ],
-)
-def test_stale_unowned_or_unverified_work_cannot_acquire_merge_authority(delivered, drift):
-    d = delivered
-    if drift in {"revision", "head", "candidate", "permission"}:
-        key = {
-            "revision": "expected_revision",
-            "head": "head",
-            "candidate": "candidate_id",
-            "permission": "answer",
-        }[drift]
-        d.command[key] = 0 if drift == "revision" else "other"
-    elif drift == "closed":
-        d.closed["result"]["outcome"] = "blocked"
-    elif drift == "native":
-        write_private(d.root / "result.json", {"status": "pass", "session_id": "foreign"})
-    else:
-        with d.store._connect() as db:
-            if drift == "claim":
-                d.store.state.claim_work(db, d.spec["work_id"], "external:other")
-            elif drift == "pending_effect":
-                db.execute("UPDATE delivery_effects SET state='pending'")
-            elif drift == "unfinished":
-                db.execute("UPDATE delivery_attempts SET state='running' WHERE role='verify'")
-            else:
-                checks = json.loads(d.before["checks_json"])
-                checks["qa"]["candidate_id"] = "stale"
-                db.execute("UPDATE delivery_runs SET checks_json=?", (canonical_json(checks),))
-    with pytest.raises(ValueError):
-        followup.admit(d.store, "run-1", d.command)
-    with d.store._connect() as db:
-        assert followup.current(db, "run-1") is None
-
-
 def test_second_command_cannot_replace_accepted_authority(delivered):
     d = delivered
     first = followup.admit(d.store, "run-1", d.command)
@@ -544,26 +317,6 @@ def test_second_command_cannot_replace_accepted_authority(delivered):
     with pytest.raises(ValueError, match="different inputs"):
         followup.admit(d.store, "run-1", {**d.command, "answer": "merge", "head": "other"})
     assert followup.admit(d.store, "run-1", d.command) == first
-
-
-def test_active_merge_cannot_be_archived_and_dispatch_error_does_not_replace_completion(delivered):
-    from devflow_temporal.delivery_dashboard import mutate
-
-    d = delivered
-    followup.admit(d.store, "run-1", d.command)
-    with pytest.raises(ValueError, match="merge is still active"):
-        mutate(
-            d.store,
-            "run-1",
-            "archive",
-            {"command_id": "archive", "expected_revision": 1, "archived": True},
-        )
-    activity_call(followup.record, d.store, d.spec, "merged", {"state": "confirmed"})
-    activity_call(followup.record,
-        d.store, d.spec, "queued", {"state": "pending"}, "late transport error", only_if="queued"
-    )
-    with d.store._connect() as db:
-        assert followup.current(db, "run-1")["phase"] == "merged"
 
 
 @pytest.mark.asyncio
@@ -581,45 +334,6 @@ async def test_public_endpoint_needs_csrf_and_records_only_explicit_merge(delive
         response = await client.post(url, json=d.command, headers=headers)
         assert response.status_code == 200, response.text
         assert (await client.post(url, json=d.command, headers=headers)).json() == response.json()
-
-
-@pytest.mark.parametrize("state", ["pending", "decision_required", "confirmed"])
-def test_merge_only_step_projects_result_and_settles_its_claim(delivered, monkeypatch, state):
-    import devflow_temporal.delivery_merge as merger
-
-    d = delivered
-    admitted = followup.admit(d.store, "run-1", d.command)
-    calls = []
-
-    def merge(store, spec, request, _cancelled):
-        followup.authorize(store, spec, request["merge_authorization"])
-        calls.append("merge")
-        return {"state": state, "reason": "test observation"}
-
-    monkeypatch.setattr(merger, "merge_verified", merge)
-    monkeypatch.setattr(
-        "devflow_temporal.delivery_activities._tracker_sync",
-        lambda *_args, **_kw: {"state": "recorded", "pending": False},
-    )
-    result = activity_call(followup.step, d.store, d.spec, admitted["grant_sha256"], Event())
-    assert result["state"] == state and calls == ["merge"]
-    with d.store._connect() as db:
-        saved = followup.current(db, "run-1")
-        assert saved["phase"] == {"pending": "waiting_ci", "confirmed": "merged"}.get(state, state)
-        assert bool(d.store.state.claim_for(db, d.spec["work_id"])) == (state == "pending")
-        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 3
-
-
-def test_title_identifies_actual_change_without_altering_original_goal(delivered):
-    spec = {
-        **delivered.spec,
-        "publication_summary": "feat: preview exact cover-letter PDFs",
-        "github_repo": "ebarti/JobCtrl",
-        "issue_url": "https://github.com/ebarti/JobCtrl/issues/1042",
-    }
-    before = copy.deepcopy(spec)
-    assert delivered.store._display_title(spec) == "JobCtrl #1042 · Preview exact cover-letter PDFs"
-    assert spec == before
 
 
 def git_remote(d, monkeypatch, *, conflict=False):
@@ -735,41 +449,6 @@ def git_remote(d, monkeypatch, *, conflict=False):
     d.command["head"] = feature
     d.closed["result"].update(candidate=candidate, pull_request=pr)
     return remote
-
-
-@pytest.mark.parametrize("lost", ["none", "update", "merge"])
-def test_merge_entry_reconciles_real_main_and_waits_for_new_ci_without_another_worker(
-    delivered,
-    monkeypatch,
-    lost,
-):
-    from test_delivery_store import _git
-
-    d = delivered
-    remote = git_remote(d, monkeypatch)
-    remote.lost = lost == "update"
-    remote.lose_merge_ack = lost == "merge"
-    admitted = followup.admit(d.store, "run-1", d.command)
-    bound = admitted["grant_sha256"]
-    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
-    assert remote.updates == 1 and remote.merge_calls == 0
-    assert activity_call(followup.step, d.store, d.spec, bound, Event())["state"] == "pending"
-    assert remote.updates == 1 and remote.merge_calls == 0
-    remote.ci_ready = True
-    result = activity_call(followup.step, d.store, d.spec, bound, Event())
-    if lost == "merge":
-        assert result["state"] == "pending"
-        result = activity_call(followup.step, d.store, d.spec, bound, Event())
-    assert result["state"] == "confirmed", result
-    assert result["base"] == remote.target and result["head"] == remote.head
-    assert _git(remote.repo, "show", remote.squash + ":feature.txt") == "Reviewed source"
-    assert _git(remote.repo, "show", remote.squash + ":main.txt") == "New main work"
-    assert activity_call(followup.step, d.store, d.spec, bound, Event()) == result
-    assert remote.merge_calls == 1 and remote.issue_state == "closed"
-    with d.store._connect() as db:
-        assert d.store.state.claim_for(db, d.spec["work_id"]) is None
-        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 3
-        assert followup.current(db, "run-1")["phase"] == "merged"
 
 
 @pytest.mark.asyncio

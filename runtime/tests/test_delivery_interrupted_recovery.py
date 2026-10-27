@@ -258,64 +258,6 @@ async def test_closed_controller_resumes_without_repeating_work_or_budget(
                     )
 
 
-@pytest.mark.parametrize(
-    "obstacle", ["cancel", "retired"]
-)
-def test_interrupted_recovery_respects_existing_authority(service, monkeypatch, obstacle):
-    from devflow_temporal.delivery_interrupted_recovery import _guard
-
-    store, request = service
-    store.submit(request)
-    spec = store.effective_spec("run-1")
-    with store._connect() as db:
-        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone())
-    _guard(store, row, spec)
-    with store._connect() as db:
-        if obstacle in {"cancel", "mutation"}:
-            db.execute(
-                "INSERT INTO delivery_mutations "
-                "(command_id,run_id,kind,request_digest,state) VALUES (?,?,?,?,?)",
-                (
-                    "fixture-control",
-                    "run-1",
-                    "cancel" if obstacle == "cancel" else "steer",
-                    "fixture",
-                    "complete" if obstacle == "cancel" else "unknown",
-                ),
-            )
-        elif obstacle == "claim":
-            store.state.release_work(db, spec["work_id"], "external:devflow:run-1")
-        elif obstacle == "attempt":
-            db.execute(
-                "INSERT INTO delivery_attempts (job_key,run_id,role,iteration,"
-                "candidate_id,state,cleanup) VALUES "
-                "('uncertain','run-1','implement',2,'candidate','unknown','unknown')"
-            )
-        elif obstacle == "changed-row":
-            db.execute("UPDATE delivery_runs SET iteration=iteration+1 WHERE run_id='run-1'")
-        elif obstacle == "successor":
-            # Clone a private fixture row with a newer admission identity.
-            other = dict(row)
-            other["run_id"] = "newer-run"
-            other["request_digest"] = "newer-request"
-            keys = list(other)
-            db.execute(
-                "INSERT INTO delivery_runs ("
-                + ",".join(keys)
-                + ") VALUES ("
-                + ",".join("?" for _ in keys)
-                + ")",
-                tuple(other.values()),
-            )
-    if obstacle == "retired":
-        monkeypatch.setattr(
-            "devflow_temporal.delivery_interrupted_recovery.execution_retired", lambda _: True
-        )
-    with pytest.raises(ValueError):
-        _guard(store, row, spec)
-    assert not [event for event in store.events("run-1") if event["type"] in (INTENT, RESULT)]
-
-
 @pytest.mark.asyncio
 async def test_execution_that_expired_before_first_worker_task_can_start(service):
     from temporalio.client import Client

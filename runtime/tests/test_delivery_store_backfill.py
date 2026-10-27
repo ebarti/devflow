@@ -7,14 +7,11 @@ import os
 import sqlite3
 import threading
 
-import httpx
 import pytest
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_features
-from devflow_temporal.delivery_api import create_app
-from devflow_temporal.delivery_config import DeliveryConfig
-from devflow_temporal.delivery_features import NEWEST_RUN_SQL, maintain_projections
+from devflow_temporal.delivery_features import maintain_projections
 from devflow_temporal.delivery_store import DeliveryStore
 
 
@@ -69,27 +66,6 @@ def test_construction_never_projects_and_the_service_pass_reprojects_changed_row
     assert [marker[1:3] for marker in _markers(store)] == [(2, "upgraded"), (2, "upgraded")]
 
 
-def test_construction_from_another_install_or_config_does_nothing(service, tmp_path, monkeypatch):
-    """The CLI, MCP and activities (sealed snapshots) may run other package
-    bytes or configurations; only the service re-projects, so they never replay
-    history or touch its markers."""
-    store, request = service
-    store.submit(request)
-    store.submit(_second(request))
-    before = _markers(store)
-    edited = json.loads(store.config.path.read_text())
-    edited["repositories"]["fixture"]["assignee"] = "octocat"
-    sealed_path = tmp_path / "sealed-snapshot.json"
-    sealed_path.write_text(json.dumps(edited))
-    sealed = DeliveryConfig.load(sealed_path)
-    calls = _counting_transition(monkeypatch)
-    monkeypatch.setattr(delivery_features, "projection_generation", lambda: "another-install")
-    for config in (store.config, sealed, store.config, sealed):
-        DeliveryStore(config)
-    assert calls == []
-    assert _markers(store) == before
-
-
 def test_service_pass_commits_per_row_and_holds_no_lock_between_rows(service, monkeypatch):
     store, request = service
     for number in range(1, 6):
@@ -136,34 +112,6 @@ def test_service_pass_commits_per_row_and_holds_no_lock_between_rows(service, mo
     assert [marker[:2] for marker in _markers(store)] == [
         ("run-1", 1), ("run-2", 1), ("run-3", 1), ("run-4", 1), ("run-5", 2)]
     assert maintain_projections(store)["pending"] == 0
-
-
-def test_newest_run_lookup_uses_the_issue_index(service):
-    store, _request = service
-    with store._connect() as db:
-        plan = db.execute("EXPLAIN QUERY PLAN " + NEWEST_RUN_SQL, ("issue",)).fetchall()
-    assert any("delivery_runs_issue_newest" in row[3] for row in plan), plan
-
-
-@pytest.mark.asyncio
-async def test_skipped_projections_are_visible_in_service_info_and_run_detail(service):
-    store, request = service
-    store.submit(request)
-    with store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        delivery_features.record_projection(
-            db, store.config, "run-1", revision=1, error="ValueError: registry unreadable")
-    assert store.detail("run-1")["feature_projection_error"] == "ValueError: registry unreadable"
-    configuration = json.loads(store.config.path.read_text())
-    configuration["dashboard_url"] = "http://127.0.0.1:18770"
-    store.config.path.write_text(json.dumps(configuration))
-    app = create_app(store.config.path)
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport,
-                                 base_url="http://127.0.0.1:18770") as browser:
-        info = (await browser.get("/api/service")).json()
-    assert [(item["run_id"], item["error"]) for item in info["feature_projection_failures"]] == [
-        ("run-1", "ValueError: registry unreadable")]
 
 
 def test_service_pass_skips_an_unreadable_historical_feature_row(

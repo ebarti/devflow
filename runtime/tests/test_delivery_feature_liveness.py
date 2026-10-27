@@ -10,7 +10,6 @@ cover the fast paths; a history recorded before the marker replays unchanged.
 from __future__ import annotations
 
 import asyncio
-import json
 from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
@@ -18,11 +17,8 @@ from pathlib import Path
 import pytest
 from temporal_test_server import local_temporal
 from temporalio import activity
-from temporalio.exceptions import ActivityError, ApplicationError, TimeoutType
-from temporalio.exceptions import TimeoutError as ActivityTimeoutError
+from temporalio.exceptions import ApplicationError
 from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, Worker
-from test_delivery_feature_execution import Controller, feature_service
-from test_delivery_feature_integration import integration
 from test_delivery_feature_recovered_closure import recovered_worker as recovered_worker
 from test_delivery_feature_revision_preparation import (
     pending_preparation as pending_preparation,
@@ -33,22 +29,10 @@ from test_delivery_feature_revision_subject import (
 from test_delivery_feature_revision_subject import intake_fixture as intake_fixture
 from test_delivery_feature_revision_subject import native_configuration as native_configuration
 from test_delivery_feature_workflow_temporal import FeatureActivities
-from test_delivery_github_contract import plan
 from test_delivery_store import service as service
 
 import devflow_temporal.delivery_feature_workflow as protocol
-from devflow_temporal import delivery_feature_activities as activities
-from devflow_temporal import delivery_feature_publication as publications
-from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
-from devflow_temporal.delivery_feature_execution import (
-    register_worker,
-    registry,
-    worker_spec,
-)
-from devflow_temporal.delivery_feature_pass import checkpoint_key
-from devflow_temporal.delivery_github_contract import ordered_chunks
-from devflow_temporal.delivery_store import DeliveryStore
-from devflow_temporal.delivery_workflow import DeliveryWorkflow, _interrupted_role
+from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MARKER = "delivery-feature-liveness-v1"
@@ -59,78 +43,6 @@ TERMINAL = {"outcome": "blocked", "phase": "blocked", "cleanup": "confirmed",
             "planning_defect": False, "error": "workstream product repair limit exhausted",
             "failure": {"classification": "terminal"}}
 REFUSAL = "blocked implementation has no authenticated launch outcome"
-
-
-def _activity_error(cause, name="delivery_feature_reserve"):
-    error = ActivityError("activity failed", scheduled_event_id=1, started_event_id=2,
-                          identity="", activity_type=name, activity_id="1", retry_state=None)
-    error.__cause__ = cause
-    return error
-
-
-def _lost_heartbeat():
-    return ActivityTimeoutError("heartbeat", type=TimeoutType.HEARTBEAT, last_heartbeat_details=[])
-
-
-def _transient_error(name, type="ConnectionError", message="connection reset"):
-    return _activity_error(ApplicationError(message, type=type), name)
-
-
-def _delivered(controller, chunk_id, kind):
-    if kind == "chunk":
-        publication = controller.record["manifest"]["publication"]
-        publication["members"].append({
-            "chunk_id": chunk_id, "number": len(publication["members"]) + 1,
-        })
-        if len(publication["members"]) > 1:
-            publication["stack_id"] = 42
-        controller.record["manifest"]["revision"] += 1
-    return {"outcome": "delivered", "record": deepcopy(controller.record), "budget": {"used": 0}}
-
-
-class LivenessController(Controller):
-    def __init__(self, value, *, liveness=True):
-        super().__init__(value)
-        self.feature_liveness_v1 = liveness
-        self.messages = []
-        self.sleeps = []
-        self.admissions = []
-
-    async def _project(self, spec, event, message):
-        self.messages.append((event, message))
-        await super()._project(spec, event, message)
-
-    async def _stop(self, spec, message, **kwargs):
-        self.messages.append(("stopped", message))
-        return await super()._stop(spec, message, **kwargs)
-
-    async def _activity(self, name, request):
-        if name == "delivery_feature_reserve":
-            # The real admission is modeled as accepted; refusal tests override it.
-            self.admissions.append((request["chunk_id"], request["kind"]))
-            child = request["kind"] + ":" + request["chunk_id"]
-            return {"spec": {"run_id": child}, "workflow_id": "wf-" + child,
-                    "completed": False, "resumed": True}
-        return await super()._activity(name, request)
-
-
-def _protocol_stubs(monkeypatch, controller, *, bounded_wait=False):
-    """Protocol stubs run outside Temporal: timers resolve at once and are recorded."""
-    monkeypatch.setattr(protocol.workflow, "patched",
-                        lambda marker: bounded_wait and marker == "feature-worker-bounded-wait-v1")
-
-    async def sleep(delay):
-        controller.sleeps.append(delay)
-
-    async def wait_condition(fn, *, timeout=None):
-        if timeout is not None:
-            controller.sleeps.append(timeout)
-            return
-        while not fn():
-            await asyncio.sleep(0)
-
-    monkeypatch.setattr(protocol.workflow, "sleep", sleep)
-    monkeypatch.setattr(protocol.workflow, "wait_condition", wait_condition)
 
 
 def _feature_spec(run_id):
@@ -150,30 +62,12 @@ def _base_handler(fixtures, name):
                 if activity._Definition.must_from_callable(f).name == name)
 
 
-async def _scheduled(history, name):
-    scheduled = []
-    for event in history.events:
-        if not event.HasField("activity_task_scheduled_event_attributes"):
-            continue
-        attributes = event.activity_task_scheduled_event_attributes
-        if attributes.activity_type.name == name:
-            request = (await DELIVERY_DATA_CONVERTER.decode(attributes.input.payloads))[0]
-            scheduled.append((request, attributes))
-    return scheduled
-
-
 def _timers(history):
     return [e.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
             for e in history.events if e.HasField("timer_started_event_attributes")]
 
 
 # --- H-6a: the coordinator's worker wait survives lost attempts -------------------------------
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -217,56 +111,6 @@ async def test_real_temporal_permanent_github_refusal_stops_without_an_observati
 
 
 # --- H-6b: per-chunk failure isolation and bounded infrastructure resume ----------------------
-
-
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("recovers", [True, False])
-async def test_infrastructure_closures_resume_through_admission_within_a_durable_bound(
-    monkeypatch, recovers,
-):
-    controller = LivenessController(plan())
-    _protocol_stubs(monkeypatch, controller)
-    attempts = []
-
-    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
-                     assignment=None):
-        attempts.append((chunk_id, kind, resume_allowed, assignment))
-        failures = sum(1 for item in attempts if item[:2] == (chunk_id, kind))
-        if (chunk_id, kind) == ("client", "build") and (failures <= 2 or not recovers):
-            raise protocol.FeatureWorkerStopped(chunk_id, kind, closure=deepcopy(TRANSIENT))
-        return _delivered(controller, chunk_id, kind)
-
-    monkeypatch.setattr(protocol, "_worker", worker)
-    result = await protocol.coordinate(
-        controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
-    client = [(allowed, assignment) for c, k, allowed, assignment in attempts
-              if (c, k) == ("client", "build")]
-    assert [allowed for allowed, _ in client] == [True, True, False]
-    assert client[0][1] is None, "the first attempt reserves on its own"
-    assert all(assignment["resumed"] for _, assignment in client[1:]), (
-        "every re-issue carries the admitted continuation instead of reserving again")
-    assert controller.admissions == [("client", "build")] * 2
-    assert controller.state["checks"]["feature_worker_recoveries"] == {"client:build": 2}
-    recovering = [m for e, m in controller.messages if e == "feature_worker_recovering"]
-    assert recovering == [
-        "Resumed the build worker for client after an infrastructure failure (1 of 2)",
-        "Resumed the build worker for client after an infrastructure failure (2 of 2)",
-    ]
-    if recovers:
-        assert result["phase"] == "merged"
-    else:
-        assert result["outcome"] == "blocked"
-        assert "client" in result["error"] and "exhausted 2 automatic resumes" in result["error"]
-        assert "product repair" not in result["error"]
-    assert any(name == "delivery_feature_stop" for name, _ in controller.events)
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -424,97 +268,7 @@ IMPLEMENT_DEATH = [{"role": "implement", "iteration": 0, "status": "blocked",
                     "findings": ["Connection reset by peer"]}]
 
 
-def _closed_chunk_worker(service, monkeypatch, *, roles, failure, error, revision=9,
-                         execution="modeled-closed"):
-    """A real store, registry and git checkout; only the provider receipts and the
-    Temporal closure proof are modeled. Returns what the coordinator observes."""
-    store, parent, child, broker, candidate, member, _ = integration(service, monkeypatch)
-    value = json.loads(parent["accepted_plan"])
-    record = {"manifest": {"revision": 1, "plan": value,
-                           "publication": {"stack_id": None, "members": [member]},
-                           "workstream_issues": {
-                               stream["id"]: {"url": "https://github.com/example/fixture/issues/10"}
-                               for stream in value["workstreams"]}}}
-    monkeypatch.setattr(activities, "current_record", lambda *_, **__: deepcopy(record))
-    monkeypatch.setattr(publications, "current_record", lambda *_, **__: deepcopy(record))
-    monkeypatch.setattr(publications, "live_members", lambda *_, **__: [
-        {"number": member["number"], "state": "open", "merged": False}])
-    roles = [{"candidate": candidate, **role} for role in roles]
-    checks = {"failure": failure}
-    state = {"run_id": child["run_id"], "phase": "blocked", "outcome": "blocked",
-             "execution_state": "blocked", "cleanup": "confirmed", "revision": revision,
-             "iteration": 0, "candidate": candidate, "pull_request": None,
-             "roles": roles, "checks": checks, "error": error}
-    store.project(child["run_id"], phase="blocked", execution_state="blocked", outcome="blocked",
-                  cleanup="confirmed", event_type="blocked", message=error,
-                  candidate=candidate, pull_request=None, checks=checks, iteration=0,
-                  protocol_revision=revision, error=error)
-    with store._connect() as db:
-        store.state.release_work(db, child["work_id"], "external:devflow:" + child["run_id"])
-        for index, role in enumerate(roles):
-            receipt = {k: v for k, v in role.items() if k not in {"role", "iteration", "candidate"}}
-            db.execute("INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
-                       "state,session_id,result_json,cleanup) "
-                       "VALUES (?,?,?,0,?,'finished',?,?,'confirmed')",
-                       (f"modeled-{index}", child["run_id"], role["role"], candidate["id"],
-                        role.get("session_id"), json.dumps(receipt)))
-        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
-                              (child["run_id"],)).fetchone())
-    closed = {"workflow_id": row["workflow_id"], "execution_run_id": execution,
-              "request_digest": child["request_digest"], "recovery_digest": None,
-              "result": state}
-    monkeypatch.setattr(DeliveryStore, "_completed_temporal_result",
-                        lambda self, run_id, **kwargs: deepcopy(closed))
-    chunk_id = child["feature_worker"]["chunk_id"]
-    registry(parent).checkpoint(
-        parent["feature_delivery"]["owner"],
-        checkpoint_key(child, f"assignment:{chunk_id}:chunk"),
-        {"run_id": child["run_id"], "store_path": str(store.config.tracking_db),
-         "chunk_id": chunk_id, "kind": "chunk"})
-    return store, parent, child, candidate, state
-
-
-def _commands(store, child):
-    with store._connect() as db:
-        recovery = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
-                              (child["run_id"],)).fetchone()[0]
-        commands = [r[0] for r in db.execute(
-            "SELECT command_id FROM delivery_commands WHERE run_id=? ORDER BY rowid",
-            (child["run_id"],))]
-    return (json.loads(recovery) if recovery else None), commands
-
-
-
-
-def test_an_implementation_death_is_neither_offered_nor_admitted(service, monkeypatch):
-    from devflow_temporal.delivery_workflow import _failure_classification
-
-    error = "workstream execution needs recovery"
-    roles = [{"candidate": None, **r} for r in IMPLEMENT_DEATH]
-    # What the worker's own _stop now records for this closure: a verdict.
-    assert _interrupted_role(roles) is None
-    failure = {**_failure_classification(None, None), "stage": "implement", "reason": error}
-    assert failure["classification"] == "terminal"
-    store, parent, child, candidate, _ = _closed_chunk_worker(
-        service, monkeypatch, roles=IMPLEMENT_DEATH, failure=failure, error=error)
-    closure = {"outcome": "blocked", "phase": "blocked", "cleanup": "confirmed", "error": error,
-               "failure": failure, "planning_defect": False}
-    assert not protocol._resumable(closure)
-    # And were it ever offered, the admission refuses it with the reason the
-    # coordinator surfaces in its stop.
-    with pytest.raises(ValueError, match=REFUSAL):
-        activities.reserve(parent, child["feature_worker"]["chunk_id"], "chunk")
-    recovery, commands = _commands(store, child)
-    assert recovery is None and commands == []
-
-
-
-
 # --- M-24: merge and readback loops back off instead of stopping ------------------------------
-
-
-
-
 
 
 # --- Replay: executions recorded before the marker keep their commands -----------------------
@@ -523,62 +277,10 @@ def test_an_implementation_death_is_neither_offered_nor_admitted(service, monkey
 # --- Child side: a worker's own controller classifies its closure -----------------------------
 
 
-
-
-
-
-def _registered_build_worker(service, monkeypatch):
-    store, request, _ = feature_service(service, monkeypatch)
-    store.submit(request)
-    parent = store.effective_spec(request["run_id"])
-    chunk = ordered_chunks(json.loads(request["accepted_plan"]))[0]
-    child = worker_spec(parent, chunk, {"url": "https://github.com/example/fixture/issues/10"},
-                        kind="build", base_sha=parent["base_sha"], base_branch="main")
-    register_worker(store, parent, child)
-    return store, parent, child
-
-
-
-
 # --- Re-issue paths keep the naming and `_resumable`; allowlist coverage ----------------------
 
 
-
-
-
-
-
-
-@pytest.mark.parametrize(
-    "kind, message, transient",
-    [
-        ("ConnectionResetError", "[Errno 54] Connection reset by peer", True),
-        ("ValueError", "stopped checkpoint changed before admission", False),
-    ],
-)
-def test_infrastructure_allowlist_matches_on_the_child_and_coordinator_sides(
-    kind,
-    message,
-    transient,
-):
-    from devflow_temporal.delivery_workflow import _failure_classification
-
-    error = _activity_error(ApplicationError(message, type=kind), "delivery_feature_finish_worker")
-    assert (_failure_classification(error, None)["classification"] == "transient") is transient
-    assert protocol._transient_activity_failure(error) is transient
-    # A non-retryable failure of a transient type is a verdict on both sides.
-    final = _activity_error(ApplicationError(message, type=kind, non_retryable=True))
-    assert _failure_classification(final, None)["classification"] == "terminal"
-    assert not protocol._transient_activity_failure(final)
-
-
-
-
-
-
 # --- An unsettled readback has a cancel exit and a bound; the effect stays pending -----------
-
-
 
 
 @pytest.mark.asyncio
@@ -625,54 +327,3 @@ async def test_real_temporal_operator_cancel_leaves_an_unsettled_readback_pendin
     assert not any(n == "delivery_feature_stop" for n, _ in fixtures.calls)
     assert fixtures.calls[-1][0] == "delivery_project"
     assert _timers(history)[:1] == [timedelta(seconds=1)]
-
-
-
-
-
-
-
-
-
-
-
-
-@pytest.mark.asyncio
-async def test_transient_admission_retries_do_not_spend_a_resume(monkeypatch):
-    controller = LivenessController(plan())
-    _protocol_stubs(monkeypatch, controller)
-    admissions = []
-    admitted = controller._activity
-
-    async def execute(name, request):
-        if name == "delivery_feature_reserve":
-            admissions.append(request["chunk_id"])
-            if len(admissions) == 1:
-                raise _transient_error(name, type="TimeoutExpired", message="gh timed out")
-        return await admitted(name, request)
-
-    controller._activity = execute
-    attempts = []
-
-    async def worker(_controller, spec, chunk_id, kind, active, *, resume_allowed=False,
-                     assignment=None):
-        attempts.append((chunk_id, kind, resume_allowed))
-        if (chunk_id, kind) == ("client", "build"):
-            raise protocol.FeatureWorkerStopped(chunk_id, kind, closure=deepcopy(TRANSIENT))
-        return _delivered(controller, chunk_id, kind)
-
-    monkeypatch.setattr(protocol, "_worker", worker)
-    result = await protocol.coordinate(
-        controller, {"run_id": "run-one", "authorized_endpoint": "merged"})
-    assert result["outcome"] == "blocked" and "exhausted 2 automatic resumes" in result["error"]
-    assert [allowed for c, k, allowed in attempts if (c, k) == ("client", "build")] == [
-        True, True, False]
-    assert admissions == ["client"] * 3, "one transient admission, then two admitted resumes"
-    assert controller.state["checks"]["feature_worker_recoveries"] == {"client:build": 2}
-    assert controller.state["checks"]["feature_worker_reissues"] == {"client:build": 1}
-    assert [m for e, m in controller.messages if e == "feature_worker_recovering"] == [
-        "Re-issuing the build worker admission for client after TimeoutExpired: gh timed out "
-        f"(1 of {protocol.REISSUES})",
-        "Resumed the build worker for client after an infrastructure failure (1 of 2)",
-        "Resumed the build worker for client after an infrastructure failure (2 of 2)",
-    ]

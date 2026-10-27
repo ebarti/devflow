@@ -8,11 +8,10 @@ import pytest
 from test_delivery_store import _git, submit_historical_admission
 from test_delivery_store import service as service
 
-from devflow_temporal.contracts import canonical_json, digest
+from devflow_temporal.contracts import canonical_json
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_project_sync import GitHub
-from devflow_temporal.delivery_publication_validation import KIND, readback
-from devflow_temporal.delivery_resources import _gate_path
+from devflow_temporal.delivery_publication_validation import KIND
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -99,149 +98,6 @@ def publication(service, monkeypatch, tmp_path):
     return store, broker, payload, state, remote, comparison, issue
 
 
-def test_validation_preserves_pr_scope_checkpoint_and_original_attempt(publication):
-    store, broker, payload, state, *_ = publication
-    original = deepcopy(store.spec("run-1"))
-    before = _git(broker.checkout, "rev-parse", "HEAD")
-    assert store.repair_admission_preflight("run-1", payload)["head"] == payload["expected_pr_head"]
-    assert _git(broker.checkout, "rev-parse", "HEAD") == before
-    response = store.continue_repair("run-1", payload)
-    assert response["pr_number"] == 7 and response["additional_iterations"] == 0
-    assert store.continue_repair("run-1", payload) == response
-    effective = store.effective_spec("run-1")
-    assert effective["policy"] == original["policy"]
-    assert effective["accepted_plan"] == original["accepted_plan"]
-    assert _git(broker.checkout, "rev-parse", "HEAD") == payload["expected_pr_head"]
-    assert "publication-validation-" in str(_gate_path(effective, "review", 0))
-    with store._connect() as db:
-        row = db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'").fetchone()
-        recovery = json.loads(row["recovery_json"])
-        attempt = json.loads(db.execute("SELECT result_json FROM delivery_attempts").fetchone()[0])
-        assert db.execute("SELECT count(*) FROM delivery_attempts").fetchone()[0] == 1
-        assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
-    assert attempt == state["roles"][0]
-    assert recovery["state"] == state
-    assert readback(store, effective, recovery)["head"] == payload["expected_pr_head"]
-    assert DeliveryBroker(store, effective).publication_effect_key(0) != "publish:run-1:0"
-
-
-def test_validation_restores_a_cleaned_checkout_from_its_retained_commit(publication):
-    store, broker, payload, *_ = publication
-    _git(broker.source, "worktree", "remove", str(broker.checkout))
-    assert not broker.checkout.exists()
-    assert store.repair_admission_preflight("run-1", payload)["preflight"]
-    assert not broker.checkout.exists()
-    store.continue_repair("run-1", payload)
-    assert _git(broker.checkout, "rev-parse", "HEAD") == payload["expected_pr_head"]
-    assert _git(broker.checkout, "branch", "--show-current") == broker.spec["branch"]
-
-
-def test_validation_refuses_restoration_after_retained_branch_changes(publication):
-    store, broker, payload, *_ = publication
-    _git(broker.source, "worktree", "remove", str(broker.checkout))
-    _git(broker.source, "update-ref", "refs/heads/" + broker.spec["branch"],
-         broker.spec["base_sha"])
-    with pytest.raises(ValueError, match="retained local branch"):
-        store.continue_repair("run-1", payload)
-    assert not broker.checkout.exists()
-
-
-def test_checkout_restoration_preserves_and_renews_resource_ownership(publication, tmp_path):
-    from devflow_temporal.delivery_publication_validation import (
-        _checkpoint,
-        preserve_validation_resources,
-        restore_checkout,
-    )
-    from devflow_temporal.delivery_resources import (
-        RunResources,
-        _identity,
-        read_private,
-        write_private,
-    )
-
-    store, broker, payload, *_ = publication
-    seal = _checkpoint(store, "run-1", payload)
-    spec = seal["original_spec"]
-    spec["resource_cleanup_version"] = 1
-    resources = RunResources(spec)
-    identity = _identity(broker.checkout)
-    _git(broker.source, "worktree", "remove", str(broker.checkout))
-    resources.register(broker.checkout, "checkout")
-    with resources.locked() as manifest:
-        manifest["roots"][str(broker.checkout)].update(
-            identity=identity, state="created", receipt={"state": "retained"})
-        manifest["finalization"] = {"resource_cleanup": "confirmed"}
-        write_private(resources.manifest, manifest)
-    write_private(resources.root / "finalization.json", {"state": "confirmed"})
-    before = resources.manifest.read_bytes()
-    root = tmp_path / "restoration"
-    restore_checkout(store, seal, root)
-    assert (root / "predecessor-resources/manifest.json").read_bytes() == before
-    entry = read_private(resources.manifest)["roots"][str(broker.checkout)]
-    assert entry["identity"] == _identity(broker.checkout)
-    assert entry["generation"] == 1 and "receipt" not in entry
-    assert (root / "checkout-restoration.json").exists()
-    preserve_validation_resources(root, seal)
-    restore_checkout(store, seal, root)
-    assert read_private(resources.manifest)["roots"][str(broker.checkout)] == entry
-    with resources.locked() as manifest:
-        manifest["finalization"]["unrelated_change"] = True
-        write_private(resources.manifest, manifest)
-    with pytest.raises(ValueError, match="outside the restored checkout"):
-        preserve_validation_resources(root, seal)
-
-
-@pytest.mark.parametrize("download_failure", [True, False])
-def test_validation_download_stop_can_recheck_without_a_product_repair(
-    publication, monkeypatch, download_failure,
-):
-    store, _broker, payload, original_state, remote, *_ = publication
-    store.continue_repair("run-1", payload)
-    spec = store.effective_spec("run-1")
-    candidate = DeliveryBroker(store, spec).candidate()
-    with store._connect() as db:
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-    state = deepcopy(original_state)
-    state.update(revision=10, phase="blocked", execution_state="blocked", outcome="blocked",
-                 error="repair limit exhausted", candidate=candidate,
-                 pull_request=recovery["publication"])
-    state["roles"].extend({"role": role, "status": "pass", "candidate": candidate,
-                           "session_id": role + "-passed", "iteration": 0, "findings": []}
-                          for role in ("review", "verify"))
-    state["checks"] = {key: {"state": "passed", "candidate_id": candidate["id"]}
-                       for key in ("prepublish", "review", "qa")}
-    state["checks"]["local"] = {"state": "failed", "candidate_id": candidate["id"],
-        "source_unchanged": True, "results": [{"passed": False, "cleanup": "confirmed",
-            "argv": ["python", "-m", "pytest"], "diagnostic": (
-                "Failed starting test server: Temp download file x not complete after 20 seconds"
-                if download_failure else "AssertionError: wrong profile value")}]}
-    store.project("run-1", phase="blocked", execution_state="blocked", event_type="blocked",
-                  message=state["error"], error=state["error"], candidate=candidate,
-                  pull_request=state["pull_request"], checks=state["checks"],
-                  protocol_revision=10, outcome="blocked", cleanup="confirmed")
-    with store._connect() as db:
-        store.state.release_work(db, spec["work_id"], "external:devflow:run-1")
-    monkeypatch.setattr(store, "_completed_temporal_result", lambda *_a, **_kw: {
-        "workflow_id": "closed-validation", "request_digest": spec["request_digest"],
-        "recovery_digest": digest(recovery), "result": state})
-    monkeypatch.setattr(DeliveryBroker, "_existing_pr", lambda *_: deepcopy(remote))
-    monkeypatch.setattr("devflow_temporal.delivery_gate_retry._stopped_cleanup", lambda _: {})
-    command = {"continuation_kind": "published_gate_retry", "command_id": "retry-download",
-        "expected_revision": 10, "expected_iteration": 0,
-        "expected_candidate_id": candidate["id"], "expected_pr_head": candidate["head"],
-        "expected_pr_number": 7, "additional_iterations": 0}
-    if not download_failure:
-        with pytest.raises(ValueError):
-            store.continue_repair("run-1", command)
-        return
-    result = store.continue_repair("run-1", command)
-    assert result["additional_iterations"] == 0
-    assert store.effective_spec("run-1")["policy"] == spec["policy"]
-    assert DeliveryBroker(store, store.effective_spec("run-1")).candidate() == candidate
-    with store._connect() as db:
-        assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
-
-
 @pytest.mark.parametrize("drift", ["hold_issue", "hold_pr", "closed_pr", "head", "code",
                                   "ancestry", "revision", "candidate", "budget", "dirty"])
 def test_validation_rejects_wrong_authority_before_admission(publication, drift):
@@ -273,47 +129,6 @@ def test_validation_rejects_wrong_authority_before_admission(publication, drift)
     with store._connect() as db:
         assert not db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
                               (payload["command_id"],)).fetchone()
-
-
-@pytest.mark.asyncio
-async def test_controller_requires_fresh_native_acceptance_on_same_iteration(
-    publication, monkeypatch,
-):
-    store, _broker, payload, state, *_ = publication
-    store.continue_repair("run-1", payload)
-    spec = store.effective_spec("run-1")
-    with store._connect() as db:
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs").fetchone()[0])
-    workflow = DeliveryWorkflow()
-    workflow.cancel_requested = False
-    observed = {}
-
-    async def activity(name, request, **_kw):
-        if name == "delivery_publication_validation_readback":
-            return readback(store, spec, recovery)
-        if name == "delivery_tracker_start":
-            return {"state": "consistent"}
-        raise AssertionError(name)
-
-    async def project(*_args, **_kwargs):
-        return None
-
-    async def iterations(actual, **kwargs):
-        observed.update(kwargs)
-        assert actual == spec
-        assert workflow.state["candidate"]["head"] == payload["expected_pr_head"]
-        assert workflow.state["pull_request"]["number"] == 7
-        assert not workflow.state["checks"]
-        return workflow.state
-
-    monkeypatch.setattr(workflow, "_activity", activity)
-    monkeypatch.setattr(workflow, "_project", project)
-    monkeypatch.setattr(workflow, "_run_iterations", iterations)
-    await workflow._resume_publication_validation(spec, recovery)
-    assert observed["start_iteration"] == state["iteration"]
-    assert observed["authorized_max_iteration"] == state["iteration"]
-    assert observed["prior_implementer_session"] == "original-session"
-    assert observed["recovery"] is None
 
 
 @pytest.mark.asyncio

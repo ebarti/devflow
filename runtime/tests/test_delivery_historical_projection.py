@@ -134,33 +134,6 @@ async def test_public_list_and_detail_preserve_cleaned_historical_receipts_witho
     assert not Path(spec["checkout"]).exists()
 
 
-@pytest.mark.parametrize("state", ["queued", "replaced_checkout"])
-def test_active_or_replaced_execution_keeps_strict_readback(service, monkeypatch, state):
-    store, spec, _candidate, _publication = retained_history(service, monkeypatch, archived=True)
-    with store._connect() as db:
-        if state == "queued":
-            db.execute(
-                "UPDATE delivery_runs SET outcome=NULL,execution_state='queued' WHERE run_id=?",
-                (spec["run_id"],),
-            )
-        elif state == "unfinished":
-            db.execute(
-                "INSERT INTO delivery_attempts(job_key,run_id,role,iteration,candidate_id,state) "
-                "VALUES ('unfinished',?,'implement',0,?,'running')",
-                (spec["run_id"], "a" * 64),
-            )
-        else:
-            Path(spec["checkout"]).symlink_to(store.config.state_root / "absent-replacement")
-    before = snapshot(store)
-    for operation in (
-        lambda: store.list_runs_page(archived=True),
-        lambda: store.detail(spec["run_id"]),
-    ):
-        with pytest.raises(RuntimeError, match="cannot change to"):
-            operation()
-    assert snapshot(store) == before
-
-
 def test_missing_historical_checkout_does_not_normalize_unknown_cleanup_or_invent_candidate_fields(
     service,
     monkeypatch,

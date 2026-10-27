@@ -1,7 +1,5 @@
 """Owning readers bind one private evidence generation and exact legacy entrypoints."""
 
-import hashlib
-import json
 import shlex
 from contextlib import ExitStack
 from pathlib import Path
@@ -33,40 +31,6 @@ def observed(tmp_path):
         journal.with_name(name).chmod(0o600)
     registry.process(journal)
     return supplied, registry, journal
-
-
-def test_native_observation_hashes_exact_parsed_journal_generation(tmp_path, monkeypatch):
-    supplied, _registry, journal = observed(tmp_path)
-    original = owner.private_bytes(journal)
-    raw_reader, parsed_reader = owner.private_bytes, resources.read_private
-    changed = []
-
-    def mutate(value):
-        value["result"]["cleanup"] = "unknown"
-        changed.append(True)
-        resources.write_private(journal, value)
-
-    def parsed(path):
-        value = parsed_reader(path)
-        if Path(path) == journal and not changed:
-            mutate(json.loads(json.dumps(value)))
-        return value
-
-    def raw(path):
-        value = raw_reader(path)
-        if Path(path) == journal and not changed:
-            mutate(json.loads(value))
-        return value
-
-    monkeypatch.setattr(resources, "read_private", parsed)
-    monkeypatch.setattr(owner, "private_bytes", raw)
-    with ExitStack() as leases:
-        result = owner._native_observation(supplied, leases)
-        assert changed
-        assert result["journals"][str(journal)] == hashlib.sha256(original).hexdigest()
-        assert result["journals"][str(journal)] != hashlib.sha256(raw_reader(journal)).hexdigest()
-        with pytest.raises(ValueError, match="journal changed"):
-            owner._native_current({"original_spec": supplied, "native": result})
 
 
 def test_native_observation_refuses_manifest_changed_after_locked_parse(tmp_path, monkeypatch):

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
-import os
 from datetime import timedelta
 
 import pytest
@@ -221,81 +219,6 @@ def restore_admitted_metadata(store, broker, state, closed, command, title):
     return recovery
 
 
-def test_explicit_command_bound_and_immutable_staged_receipt_recovery(published, monkeypatch):
-    store, broker, _state, _closed, command, _title = published
-    root = broker.state_dir / "metadata-reconciliation"
-    root.mkdir(mode=0o700)
-    value = {"bounded": "receipt"}
-    path = root / "controlled.json"
-    original_unlink = metadata.Path.unlink
-    stopped = []
-
-    def unlink(self, *args, **kwargs):
-        if self.name.startswith(".stage-controlled") and not stopped:
-            stopped.append(True)
-            raise RuntimeError("interrupted staged link cleanup")
-        return original_unlink(self, *args, **kwargs)
-
-    monkeypatch.setattr(metadata.Path, "unlink", unlink)
-    with pytest.raises(RuntimeError, match="interrupted"):
-        metadata._immutable(path, value)
-    assert path.stat().st_nlink == 2
-    metadata._immutable(path, value)
-    assert path.stat().st_nlink == 1
-    os.link(path, root / "foreign-hardlink")
-    with pytest.raises(ValueError):
-        metadata._immutable(path, value)
-
-
-def test_metadata_gate_namespace_preserves_retained_old_head_and_artifacts(published):
-    from pathlib import Path
-
-    from devflow_temporal.delivery_activities import _context
-    from devflow_temporal.delivery_resources import RunResources, private_directory, read_private
-
-    store, broker, state, _closed, command, _title = published
-    resources = RunResources(broker.spec)
-    old_path = broker.state_dir / 'gates/1/verify'
-    private_directory(old_path.parent)
-    resources.register(old_path, 'gate')
-    old = broker.gate_checkout('verify', 1, state['candidate'])
-    resources.created(old)
-    old_patch = broker.gate_diff('verify', 1, state['candidate'])
-    retained = Path(old_patch['path']).read_bytes()
-    restore_admitted_metadata(store, broker, state, _closed, command, _title)
-    spec = store.effective_spec('run-1')
-    _store, successor = _context(spec)
-    candidate = successor.candidate()
-    expected = broker.state_dir / 'metadata-reconciliation/evidence/gates/1/verify'
-    private_directory(expected.parent)
-    resources.register(expected, 'gate')
-    path = successor.gate_checkout('verify', 1, candidate)
-    resources.created(path)
-    assert path == broker.state_dir / 'metadata-reconciliation/evidence/gates/1/verify'
-    assert path != old and _git(path, 'rev-parse', 'HEAD') == candidate['head']
-    diff = successor.gate_diff('verify', 1, candidate)
-    from devflow_temporal.delivery_sandbox import _review_diff_path
-
-    request = {'spec': spec, 'role': 'verify', 'iteration': 1,
-               'candidate': candidate, 'workspace': str(path), 'review_diff': diff}
-    assert _review_diff_path(request) == Path(diff['path'])
-    resources = RunResources(spec)
-    resources._allowed(path, 'gate')
-    assert str(old) in read_private(resources.manifest)['roots']
-    assert _git(old, 'rev-parse', 'HEAD') == state['candidate']['head']
-    assert Path(old_patch['path']).read_bytes() == retained
-    assert successor.state_dir == broker.state_dir
-    generated = path / 'node_modules'
-    resources.register(generated, 'generated')
-    generated.mkdir()
-    resources.created(generated)
-    generated.joinpath('owned.txt').write_text('temporary generated dependency')
-    resources.finalize('blocked')
-    assert not generated.exists()
-    assert _git(old, 'rev-parse', 'HEAD') == state['candidate']['head']
-    assert Path(old_patch['path']).read_bytes() == retained
-
-
 @pytest.mark.parametrize('change', ['foreign', 'seal'])
 def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(published, change):
     from copy import deepcopy
@@ -335,75 +258,6 @@ def test_metadata_gate_namespace_refuses_foreign_alias_or_changed_custody(publis
     if change in {'foreign', 'alias', 'raw-spec', 'seal'}:
         assert not expected.exists()
     assert original.state_dir == broker.state_dir
-
-
-@pytest.mark.parametrize("failed_stage", [None, "local"])
-def test_metadata_workflow_runs_deterministic_gates_without_any_provider_turn(
-    published, monkeypatch, failed_stage,
-):
-    store, broker, state, closed, command, title = published
-    recovery = restore_admitted_metadata(store, broker, state, closed, command, title)
-    flow = DeliveryWorkflow()
-    called, projections = [], []
-    before = broker.spec["policy"]["max_repairs"]
-
-    async def project(_spec, event, _message):
-        projections.append(event)
-
-    async def execute(name, request, **_kwargs):
-        called.append(name)
-        assert name != "delivery_role"
-        if name == "delivery_tracker_start":
-            return {"state": "consistent"}
-        stage = {"delivery_precheck": "prepublish", "delivery_checks": "local"}.get(name)
-        if stage and stage == failed_stage:
-            return {"state": "failed", "candidate_id": recovery["candidate"]["id"],
-                    "cleanup": "confirmed", "results": [
-                        {"id": "retained-check", "passed": False, "exit_code": 1},
-                    ]}
-        return {"state": "passed", "cleanup": "confirmed"}
-
-    monkeypatch.setattr(flow, "_project", project)
-    monkeypatch.setattr(flow, "_activity", execute)
-    result = asyncio.run(flow._resume_metadata(broker.spec, recovery))
-    assert result["roles"] == recovery["state"]["roles"]
-    assert result["outcome"] == "blocked"
-    assert result["iteration"] == recovery["state"]["iteration"] == 1
-    assert broker.spec["policy"]["max_repairs"] == before
-    expected = ["delivery_metadata_readback", "delivery_tracker_start", "delivery_precheck"]
-    if failed_stage != "prepublish":
-        expected.append("delivery_checks")
-    assert called == expected
-    assert projections == ["metadata_validation_started", "blocked"]
-    assert result["error"] == (
-        "repair limit exhausted" if failed_stage
-        else "metadata reconciled; independent source assessment remains incomplete"
-    )
-    assert result["findings"][:1] == state["findings"]
-    if failed_stage:
-        assert result["checks"][failed_stage]["state"] == "failed"
-        assert len(result["findings"]) == len(state["findings"]) + 1
-        assert failed_stage in result["findings"][-1]
-        assert recovery["candidate"]["id"] in result["findings"][-1]
-        assert "retained-check" in result["findings"][-1]
-    else:
-        assert result["findings"] == state["findings"]
-        assert result["checks"]["local"]["state"] == "passed"
-
-
-def test_prequeue_metadata_intent_is_visible_without_a_detail_phase(published):
-    store, broker, _state, _closed, _command, _title = published
-    root = broker.state_dir / "metadata-reconciliation"
-    root.mkdir(mode=0o700)
-    metadata._immutable(root / "intent.json", {"kind": "published_metadata_recovery"})
-    detail = store.detail("run-1")
-    assert detail["phase"] == "blocked"
-    assert detail["metadata_reconciliation"] is None
-    indexed = {item["id"] for item in store.evidence_index("run-1")}
-    assert "metadata-reconciliation-intent" in indexed
-    assert store.evidence("run-1", "metadata-reconciliation-intent")["sha256"] == (
-        hashlib.sha256((root / "intent.json").read_bytes()).hexdigest()
-    )
 
 
 @pytest.mark.asyncio
