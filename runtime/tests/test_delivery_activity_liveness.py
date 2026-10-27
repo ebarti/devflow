@@ -361,6 +361,7 @@ async def _wait_for_fixture_native_start(worker, log_path, state, handle):
 async def test_real_temporal_worker_loss_reuses_original_native_command(
     api_fixture,
     tmp_path,
+    monkeypatch,
     stage,
     interruption,
 ):
@@ -386,6 +387,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
     check = {'id': 'fixture-check', 'kind': 'test', 'argv': [sys.executable,
         'liveness.py', str(state)], 'test_count_regex': r'(\d+) passed', 'min_tests': 1}
     repository.update(prepublish_checks=[check], checks=[check], baseline_check_ids=[check['id']],
+        readiness={'version': 1, 'generation': 0, 'browser_engines': [], 'temporal_checks': []},
         required_ci=['test'], project_url='https://github.com/users/example/projects/1',
         assignee='example')
     if stage == 'browser_qa':
@@ -401,7 +403,9 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             'env': {'JOBCTRL_E2E_ISOLATED': '1'}}
     path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(path))
-    store.submit(submission)
+    from test_delivery_store import submit_before_readiness
+
+    submit_before_readiness(store, submission, monkeypatch)
     spec = store.spec(submission['run_id'])
     broker = DeliveryBroker(store, spec)
     broker.prepare()

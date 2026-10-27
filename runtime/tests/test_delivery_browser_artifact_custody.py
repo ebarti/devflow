@@ -297,6 +297,8 @@ def test_real_native_check_output_is_reused_by_fixture_gate(api_fixture, tmp_pat
     recipe = {'id': 'regression', 'kind': 'check', 'cwd': '.',
               'argv': [sys.executable, 'fixture.py'], 'timeout_seconds': 30}
     repository.update(prepublish_checks=[recipe], checks=[recipe],
+        readiness={'version': 1, 'generation': 0, 'browser_engines': ['chromium'],
+                   'temporal_checks': []},
                       required_ci=['test'], project_url='https://github.com/users/example/projects/1',
                       assignee='example', browser_qa={
                           'id': 'fixture', 'argv': recipe['argv'], 'cwd': '.',

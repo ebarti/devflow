@@ -141,15 +141,24 @@ def test_submit_claim_and_temporal_outbox_are_atomic_and_idempotent(service):
         store.submit({**request, "command_id": "command-3", "goal": "A different change"})
 
 
+def submit_before_readiness(store, request, monkeypatch):
+    """Retain the original contract of a native command admitted before readiness."""
+    spec = store.config.admit(request, _readiness_base={})
+    with monkeypatch.context() as historical:
+        historical.setattr(DeliveryConfig, "admit", lambda *_a, **_kw: copy.deepcopy(spec))
+        return store.submit(request)
+
+
 def submit_historical_admission(store, request, monkeypatch):
     """Set up a pre-budget admission for tests of retained legacy continuations."""
-    spec = store.config.admit(request)
+    spec = store.config.admit(request, _readiness_base={})
     spec.pop("automatic_retry_version", None)
     spec.pop("retry_budget_version", None)
     spec.pop("assessment_batch_version", None)
     spec.pop("validation_schedule_version", None)
     spec.pop("merge_reconciliation_version", None)
     spec.pop("readiness_version", None)
+    spec.pop("workspace_custody_version", None)
     spec["policy"].pop("readiness", None)
     spec["policy"].pop("max_attempts", None)
     spec["policy_digest"] = digest(spec["policy"])

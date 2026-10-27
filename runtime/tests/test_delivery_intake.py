@@ -171,6 +171,8 @@ async def test_public_real_submit_is_durable_without_attestation_or_docker_readb
     repository = config["repositories"]["fixture"]
     repository.update({
         "prepublish_checks": [{"id": "precheck", "argv": ["/usr/bin/true"]}],
+        "readiness": {"version": 1, "generation": 0, "browser_engines": [],
+                      "temporal_checks": []},
         "checks": [{"id": "test", "argv": ["/usr/bin/true"]}],
         "required_ci": ["test"],
         "project_url": "https://github.com/orgs/example/projects/1",

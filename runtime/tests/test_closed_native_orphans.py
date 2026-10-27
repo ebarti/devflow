@@ -19,6 +19,7 @@ from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 from test_delivery_policy_recovery import preserved as preserved
 from test_delivery_role_reattach import FIXED_NATIVE_PROVIDER
+from test_delivery_store import submit_before_readiness
 
 from devflow_temporal.delivery_api import DeliveryService
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -30,7 +31,7 @@ from devflow_temporal.delivery_store import DeliveryStore
 
 @pytest.mark.asyncio
 async def test_closed_native_role_is_reconciled_after_worker_sigkill_without_replacement(
-    api_fixture, tmp_path,
+    api_fixture, tmp_path, monkeypatch,
 ):
     path, submission = api_fixture
     async with await WorkflowEnvironment.start_local(
@@ -54,11 +55,12 @@ async def test_closed_native_role_is_reconciled_after_worker_sigkill_without_rep
         check = {'id': 'fixture-check', 'kind': 'test', 'argv': [sys.executable,
             'liveness.py', str(state)], 'test_count_regex': r'(\d+) passed', 'min_tests': 1}
         repository.update(required_ci=['test'], assignee='example', checks=[check],
+            readiness={'version': 1, 'generation': 0, 'browser_engines': [], 'temporal_checks': []},
             prepublish_checks=[check], baseline_check_ids=[check['id']],
             project_url='https://github.com/users/example/projects/1')
         path.write_text(json.dumps(raw))
         store = DeliveryStore(DeliveryConfig.load(path))
-        store.submit(submission)
+        submit_before_readiness(store, submission, monkeypatch)
         spec = store.spec(submission['run_id'])
         broker = DeliveryBroker(store, spec)
         broker.prepare()

@@ -125,12 +125,13 @@ def test_configured_environment_does_not_adopt_foreign_or_unlocked_paths(tmp_pat
 @pytest.mark.parametrize("fails", [False, True])
 @pytest.mark.parametrize("stage", ["baseline", "implementation"])
 def test_real_native_preparation_owns_locked_python_before_consumers(
-    api_fixture, tmp_path, fails, stage,
+    api_fixture, tmp_path, fails, stage, monkeypatch,
 ):
     from devflow_temporal.delivery_baseline import run_baseline_checks
     from devflow_temporal.delivery_config import DeliveryConfig
     from devflow_temporal.delivery_preparation import prepare_authority
     from devflow_temporal.delivery_store import DeliveryStore
+    from test_delivery_store import submit_before_readiness
 
     config_path, request = api_fixture
     raw = json.loads(config_path.read_text())
@@ -182,7 +183,7 @@ def test_real_native_preparation_owns_locked_python_before_consumers(
         # Cross-language probes need the worker even without a named pytest file.
         request["accepted_plan"] = json.dumps({"verification": ["Run API acceptance checks"]})
     store = DeliveryStore(DeliveryConfig.load(config_path))
-    store.submit(request)
+    submit_before_readiness(store, request, monkeypatch)
     owned = prepare_authority(store, store.submitted_spec(request["run_id"]))
     if stage == "baseline":
         assert owned["accepted_plan"] == "" and owned["baseline_checks_version"] == 2

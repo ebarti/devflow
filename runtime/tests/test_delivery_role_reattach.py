@@ -243,14 +243,18 @@ delivery_preparation.verify_prepared_spec=lambda spec: None
 supervisor.prepare_native_role=lambda req,folder: ('fixture', {'PATH':'/usr/bin:/bin'})
 original=delivery_native_process.NativeProcess
 def native(spec,folder,**options):
+    if folder.parent != state/'attempts':
+        return original(spec,folder,**options)
     options['argv']=[sys.executable,'-I',str(provider),str(folder/'request.json')]
     options['timeout']=20
     return original(spec,folder,**options)
 delivery_native_process.NativeProcess=native
-def prerequisites(self,iteration,candidate):
+def prerequisites(self,iteration,candidate,**kwargs):
     assert self.candidate()==candidate, 'preparation repeated after implementation'
-    with (state/'preparation-calls').open('a') as stream: stream.write('one\\n')
-    return {'state':'passed','cleanup':'confirmed','results':[]}
+    if kwargs.get('readiness_attempt') is None:
+        with (state/'preparation-calls').open('a') as stream: stream.write('one\\n')
+    return {'state':'passed','cleanup':'confirmed','results':[],
+            'candidate_id':candidate['id'],'source_unchanged':self.candidate()==candidate}
 delivery_broker.DeliveryBroker.run_implementation_preparation=prerequisites
 async def execute():
     result=await delivery_role(request)

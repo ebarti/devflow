@@ -346,6 +346,8 @@ def test_fresh_configuration_still_refuses_mode0(stopped_browser):
     case = stopped_browser
     path = Path(case.command[mode.FIELD]["amended_config_path"])
     config = DeliveryConfig.load(path)
+    config.raw["repositories"]["fixture"]["readiness"] = {
+        "version": 1, "generation": 0, "browser_engines": ["chromium"], "temporal_checks": []}
     with pytest.raises(ValueError, match="fixture isolation must be enabled"):
         config.admit(
             {

@@ -137,7 +137,14 @@ def scope_case(
         repository["browser_qa"] = browser_qa
     owner.config.path.write_text(json.dumps(config))
     store = DeliveryStore(DeliveryConfig.load(owner.config.path))
-    store.submit(submitted)
+    # The sealed stopped execution predates the readiness contract. Preserve
+    # that historical absence instead of admitting new backend requirements.
+    historical_spec = store.config.admit(submitted, _readiness_base={})
+    historical_spec.pop("workspace_custody_version", None)
+    with monkeypatch.context() as historical:
+        historical.setattr(DeliveryConfig, "admit",
+                           lambda *_a, **_kw: copy.deepcopy(historical_spec))
+        store.submit(submitted)
     store.mark_start("run-1", accepted=True)
     spec = store.effective_spec("run-1")
     DeliveryBroker(store, spec).prepare()

@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from importlib.metadata import distribution
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +19,6 @@ from test_delivery_api import api_fixture as api_fixture
 from devflow_temporal import (
     delivery_activities,
     delivery_native_process,
-    delivery_preparation,
     delivery_role_evidence,
     supervisor,
 )
@@ -51,19 +50,35 @@ def native_role(api_fixture, tmp_path, monkeypatch):
     raw = json.loads(path.read_text())
     raw.update(provider='codex', execution_mode='trusted-local', codex_bin=str(
         distribution('openai-codex-cli-bin').locate_file('codex_cli_bin/bin/codex')))
+    raw['execution_registry'] = str(tmp_path / 'execution-registry.sqlite3')
     raw['roles'] = {role: {'model': 'gpt-6.1-sol', 'effort': 'high'} for role in raw['roles']}
-    check = {'id': 'fixture-check', 'argv': [str(Path(sys.executable).resolve()), '-c',
-             "print('1 passed')"], 'test_count_regex': r'(\d+) passed', 'min_tests': 1}
+    check = {'id': 'fixture-check', 'argv': ['git', 'diff', '--check']}
     raw['repositories']['fixture'].update(prepublish_checks=[check], checks=[check],
         required_ci=['test'], project_url='https://github.com/users/example/projects/1',
-        assignee='example')
+        assignee='example', readiness={'version': 1, 'generation': 0,
+            'browser_engines': [], 'temporal_checks': []})
     path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(path))
     store.submit(submission)
-    spec = store.spec(submission['run_id'])
+    from devflow_temporal.delivery_native_preparation import prepare_native_authority
+    spec = prepare_native_authority(store, store.spec(submission['run_id']))
     broker = DeliveryBroker(store, spec)
     request = {'spec': spec, 'role': 'implement', 'iteration': 0,
                'candidate': broker.prepare()['candidate']}
+    from devflow_temporal.delivery_readiness import describe_requirements, prepare_and_probe
+
+    # Complete actual readiness before timing or injecting faults into the
+    # product launch. Preparation probes keep their own native process owner.
+    requirements = describe_requirements(spec, broker.checkout,
+                                         accepted_plan=spec['accepted_plan'])
+    custody = nullcontext()
+    if spec.get('workspace_custody_version') == 1:
+        from devflow_temporal.delivery_writer_custody import shared
+
+        custody = shared(spec)
+    with custody:
+        readiness = prepare_and_probe(store, spec, request['candidate'], requirements, 'plan')
+    assert readiness['state'] == 'passed', readiness
     owner = get_supervisor(store)
     key = owner._job_key(request)
     state = Path(spec['state_dir'])
@@ -74,6 +89,8 @@ def native_role(api_fixture, tmp_path, monkeypatch):
     created = []
 
     def native(spec, folder, **options):
+        if folder.parent != state / 'attempts':
+            return original(spec, folder, **options)
         options.update(argv=[sys.executable, '-I', str(provider), str(folder / 'request.json')],
                        timeout=10)
         process = original(spec, folder, **options)
@@ -81,12 +98,8 @@ def native_role(api_fixture, tmp_path, monkeypatch):
         return process
 
     monkeypatch.setattr(delivery_native_process, 'NativeProcess', native)
-    monkeypatch.setattr(delivery_preparation, 'verify_prepared_spec', lambda spec: None)
     monkeypatch.setattr(supervisor, 'prepare_native_role',
                         lambda request, folder: ('fixture', {'PATH': '/usr/bin:/bin'}))
-    monkeypatch.setattr(DeliveryBroker, 'run_implementation_preparation',
-                        lambda self, iteration, candidate:
-                        {'state': 'passed', 'cleanup': 'confirmed', 'results': []})
     case = SimpleNamespace(store=store, broker=broker, request=request, owner=owner, key=key,
                            state=state, folder=folder, created=created, process_type=original)
     yield case
@@ -101,7 +114,7 @@ def native_role(api_fixture, tmp_path, monkeypatch):
     receipt = RunResources(spec).finalize('blocked')
     (tmp_path / 'finalization.json').write_text(json.dumps(receipt, indent=2))
     if broker.checkout.exists():
-        subprocess.run(['git', '-C', spec['source_path'], 'worktree', 'remove', '--force',
+        subprocess.run(['git', '-C', str(broker.source), 'worktree', 'remove', '--force',
                         str(broker.checkout)], check=True, capture_output=True)
 
 

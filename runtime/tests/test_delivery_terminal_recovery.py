@@ -38,8 +38,9 @@ def legacy_tracker_admission(monkeypatch):
     """These recovery cases represent specs admitted before automatic retries."""
     original = DeliveryConfig.admit
 
-    def admit(self, request):
-        spec = original(self, request)
+    def admit(self, request, **kwargs):
+        spec = original(self, request, **{**kwargs, '_readiness_base': {}})
+        spec.pop('workspace_custody_version', None)
         spec.pop('tracker_retry_version', None)
         spec['policy'].pop('tracker_retry_seconds', None)
         spec['policy_digest'] = digest(spec['policy'])

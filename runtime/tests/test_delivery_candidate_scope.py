@@ -195,10 +195,13 @@ def test_native_role_admission_enforces_scope_and_controller_commit_ownership(
     check = {'id': 'fixture-check', 'argv': [str(Path(sys.executable).resolve()),
              '-c', "print('1 passed')"], 'test_count_regex': r'(\d+) passed', 'min_tests': 1}
     repository.update(prepublish_checks=[check], checks=[check], required_ci=['test'],
+        readiness={'version': 1, 'generation': 0, 'browser_engines': [], 'temporal_checks': []},
         project_url='https://github.com/users/example/projects/1', assignee='example')
     path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(path))
-    store.submit(submission)
+    from test_delivery_store import submit_before_readiness
+
+    submit_before_readiness(store, submission, monkeypatch)
     broker = DeliveryBroker(store, store.spec(submission['run_id']))
     initial = broker.prepare()['candidate']
     request = {'spec': broker.spec, 'role': 'implement', 'iteration': 0,
