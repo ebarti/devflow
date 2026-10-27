@@ -375,8 +375,8 @@ m.effect(backup,target,stage)
             def fileno(self):
                 return self.stream.fileno()
 
-            def read(self):
-                raw = self.stream.read()
+            def read(self, size=-1):
+                raw = self.stream.read(size)
                 return update_after_read(raw) if os.fstat(self.fileno()).st_ino == inode else raw
 
         def opened(descriptor, *args, **kwargs):
@@ -493,8 +493,8 @@ m.effect(backup,target,stage)
             def fileno(self):
                 return self.stream.fileno()
 
-            def read(self):
-                raw = self.stream.read()
+            def read(self, size=-1):
+                raw = self.stream.read(size)
                 if foreign_inode and os.fstat(self.fileno()).st_ino == foreign_inode[0] and not changed:
                     next(backup.glob("forward-*")).write_bytes(updated)
                     changed.append(True)
