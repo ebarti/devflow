@@ -248,6 +248,16 @@ def _tracker_closed(spec, tracker):
 
 def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
                    closure=None, quarantined=None, closure_checkpoint=None):
+    """Retain actual-body writer custody through cleanup and tracker settlement."""
+    from .delivery_writer_custody import shared
+
+    with shared(spec):
+        return _close_cleanup_owned(store, row, spec, closed, stopped, published=published,
+            closure=closure, quarantined=quarantined, closure_checkpoint=closure_checkpoint)
+
+
+def _close_cleanup_owned(store, row, spec, closed, stopped, *, published=False,
+                         closure=None, quarantined=None, closure_checkpoint=None):
     """Keep historical failure immutable; record separately authenticated later cleanup.
 
     A published run keeps its branch and PR; only its native cleanup and claim
