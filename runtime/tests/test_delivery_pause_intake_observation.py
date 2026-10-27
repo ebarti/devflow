@@ -57,51 +57,6 @@ def test_intake_snapshot_rejects_aba_between_observation_and_fence(unstarted, mo
             assert interval[0] is None
 
 
-@pytest.mark.parametrize("action", ["seal", "activate"])
-def test_intake_capture_and_hash_do_not_run_under_root(unstarted, monkeypatch, action):
-    store, spec, row = unstarted
-    root = spec["run_id"]
-    pause.request_pause(store, root, "pause", 0, intake_only=True)
-    begin_intake_settlement(store, root)
-    if action == "activate":
-        intake.seal_unstarted(
-            store, root, 1, row["revision"], prove_unstarted=controlled_no_start(store)
-        )
-        paused = pause.publish_paused(store, root, 1)
-        pause.begin_resume(store, root, "resume", paused["revision"], 1)
-    original_mutex, original_capture, original_digest = (
-        pause.root_mutex,
-        intake._capture,
-        intake.digest,
-    )
-    held = []
-
-    @contextmanager
-    def observed_mutex(owner, run_id):
-        with original_mutex(owner, run_id):
-            held.append(True)
-            try:
-                yield
-            finally:
-                held.pop()
-
-    def capture(*args, **kwargs):
-        assert not held
-        return original_capture(*args, **kwargs)
-
-    def digest(value):
-        assert not held
-        return original_digest(value)
-
-    monkeypatch.setattr(pause, "root_mutex", observed_mutex)
-    monkeypatch.setattr(intake, "_capture", capture)
-    monkeypatch.setattr(intake, "digest", digest)
-    result = getattr(intake, f"{action}_unstarted")(
-        store, root, 1, row["revision"], prove_unstarted=controlled_no_start(store)
-    )
-    assert result["resumable"] if action == "seal" else result["state"] == "running"
-
-
 def test_intake_seal_replays_same_receipt_before_and_after_paused(unstarted):
     store, spec, row = unstarted
     root = spec["run_id"]

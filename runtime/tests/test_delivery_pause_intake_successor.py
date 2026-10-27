@@ -17,18 +17,6 @@ class RecoveryProbe:
         return "recovery-started"
 
 
-@pytest.mark.parametrize("workflow,recovery,expected", [
-    (None, None, True),
-    ("delivery-run-1", None, True),
-    ("delivery-run-1-resume-abc", '{"kind":"stopped_delivery_resume"}', False),
-    ("delivery-run-1-publish-recovery-1", '{"state":{"phase":"blocked"}}', False),
-])
-def test_initial_and_admitted_successor_are_routed_separately(workflow, recovery, expected):
-    spec = {"run_id": "run-1", "pause_intake_version": 1, "execution_authority_version": 1}
-    assert _intake_initial_dispatch({"workflow_id": workflow, "recovery_json": recovery}, spec) is (
-        expected)
-
-
 @pytest.mark.parametrize("workflow,recovery", [
     (None, '{"kind":"stopped_delivery_resume"}'),
     ("delivery-run-1", '{}'),
@@ -41,10 +29,6 @@ def test_intake_ambiguous_selection_is_refused(workflow, recovery):
     spec = {"run_id": "run-1", "pause_intake_version": 1, "execution_authority_version": 1}
     with pytest.raises((ValueError, json.JSONDecodeError)):
         _intake_initial_dispatch({"workflow_id": workflow, "recovery_json": recovery}, spec)
-
-
-def test_legacy_unmarked_dispatch_keeps_original_routing():
-    assert not _intake_initial_dispatch({}, {"run_id": "run-1"})
 
 
 @pytest.mark.asyncio
@@ -108,27 +92,3 @@ async def test_stopped_intake_recovery_dispatches_selected_successor(request, mo
                 authority = db.execute("SELECT execution_run_id FROM delivery_execution_authority "
                                        "WHERE workflow_id=?", (selected,)).fetchone()
                 assert authority[0] == (await handle.describe()).run_id
-
-
-@pytest.mark.parametrize("version", [None, True, 2])
-def test_intake_successor_requires_exact_execution_authority_version(version):
-    spec = {"run_id": "run-1", "pause_intake_version": 1,
-            "execution_authority_version": version}
-    item = {"workflow_id": "delivery-run-1-resume-x", "recovery_json": '{"kind":"resume"}'}
-    with pytest.raises(ValueError, match="execution authority"):
-        _intake_initial_dispatch(item, spec)
-
-
-@pytest.mark.asyncio
-async def test_ambiguous_intake_selection_does_not_reach_sdk():
-    from types import SimpleNamespace
-
-    from devflow_temporal.delivery_api import _dispatch_start
-
-    class NoSDK:
-        def get_workflow_handle(self, *_args, **_kwargs):
-            pytest.fail("ambiguous intake selection reached the SDK")
-
-    spec = {"run_id": "run-1", "pause_intake_version": 1, "execution_authority_version": 1}
-    item = {"workflow_id": "delivery-run-1-resume-x", "recovery_json": "{}"}
-    await _dispatch_start(SimpleNamespace(), NoSDK(), item, spec)

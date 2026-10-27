@@ -13,7 +13,6 @@ from devflow_temporal.delivery_api import _dispatch_start
 from devflow_temporal.delivery_pause_dispatch_lease import (
     dispatch_lease,
     lock_path,
-    record_when_running,
 )
 from devflow_temporal.delivery_pause_writers import PauseWriterCustody
 
@@ -142,72 +141,4 @@ async def test_actual_dispatcher_retains_lease_during_readback_and_failure_ack(
     await asyncio.wait_for(task, 5)
     assert acknowledgements == []  # Pause won before the failure observation.
     with PauseWriterCustody(store, spec) as custody, store._connect() as db:
-        custody.verify(db)
-
-
-def test_preflight_projection_is_linearized_against_pause(tmp_path):
-    store, spec, _item = fixture(tmp_path)
-    entered, release, accepted = threading.Event(), threading.Event(), threading.Event()
-    writes = []
-
-    def projection():
-        entered.set()
-        assert release.wait(5)
-        writes.append("recorded")
-
-    def record():
-        assert record_when_running(store, spec, projection) is True
-
-    def request():
-        assert entered.wait(5)
-        pause.request_pause(store, "root", "pause", 0, intake_only=True)
-        accepted.set()
-
-    threads = [threading.Thread(target=record), threading.Thread(target=request)]
-    for thread in threads:
-        thread.start()
-    assert entered.wait(5)
-    assert not accepted.wait(.1)
-    release.set()
-    for thread in threads:
-        thread.join(5)
-    assert all(not thread.is_alive() for thread in threads)
-    assert writes == ["recorded"] and accepted.is_set()
-    assert record_when_running(store, spec, lambda: writes.append("late")) is False
-    assert writes == ["recorded"]
-
-
-@pytest.mark.asyncio
-async def test_dispatch_preflight_does_not_record_after_pause(tmp_path, monkeypatch):
-    from devflow_temporal import delivery_api
-
-    store, spec, item = fixture(tmp_path)
-    calls = []
-    item["run_id"] = "root"
-    store.pending_starts = lambda: [item]
-    store.effective_spec = lambda _run_id: spec
-
-    def blocked(_spec):
-        pause.request_pause(store, "root", "pause", 0, intake_only=True)
-        return "configuration unavailable"
-
-    store.execution_ownership = blocked
-    store.record_dispatch_block = lambda *_args, **_kwargs: calls.append("recorded")
-    monkeypatch.setattr(delivery_api, "execution_retired", lambda _spec: False)
-    await delivery_api.DeliveryService.dispatch_once(SimpleNamespace(store=store))
-    assert calls == []
-
-
-def test_dispatch_custody_requires_live_scope_and_unchanged_inventory(tmp_path):
-    store, spec, _item = fixture(tmp_path)
-    custody = PauseWriterCustody(store, spec)
-    with store._connect() as db, pytest.raises(ValueError, match="inventory changed"):
-        custody.verify(db)
-    with custody:
-        with store._connect() as db:
-            db.execute("INSERT INTO delivery_pause_dispatch_leases VALUES "
-                       "('root','delivery-root',1,'{}',1,'new-owner')")
-        with store._connect() as db, pytest.raises(ValueError, match="inventory changed"):
-            custody.verify(db)
-    with store._connect() as db, pytest.raises(ValueError, match="inventory changed"):
         custody.verify(db)

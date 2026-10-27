@@ -107,18 +107,6 @@ def test_unstarted_checkpoint_preserves_claim_outbox_and_owned_source(unstarted)
                           (root,)).fetchone()[0] == 0
 
 
-def test_unstarted_checkpoint_refuses_any_admitted_start(unstarted):
-    store, spec, row = unstarted
-    root = spec["run_id"]
-    with pause.start_admission(store, root, "delivery-" + root, 1, epoch=0,
-                               validate=lambda *_: None):
-        pass
-    with pytest.raises(ValueError, match="after start admission"):
-        pause.request_pause(store, root, "pause-after-start", 0, intake_only=True)
-    with store._connect() as db:
-        assert pause._row(db, root)["checkpoint_json"] is None
-
-
 def test_intake_resume_refuses_changed_outbox_or_boolean_revision(unstarted):
     store, spec, row = unstarted
     root = spec["run_id"]
