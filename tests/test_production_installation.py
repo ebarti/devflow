@@ -285,6 +285,9 @@ print(json.dumps({"spec": s.submitted_spec("owned-run"), "events": s.events("own
         shutil.rmtree(cls.setup.name)
         cls.env["DEVFLOW_PYTHON"] = str(cls.target / "runtime/.venv/bin/python")
 
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ, HOME=str(self.home)))
+
     def test_cli_imports_and_api_restart_after_setup_checkout_removed(self):
         target = self.target
         self.assertFalse(self.origin.exists())
