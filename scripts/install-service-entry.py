@@ -129,7 +129,11 @@ def plan(skills, home, force, *, migration_source=None, predecessor=None):
     if (predecessor is None and migration is not None and migration_source is not None
             and migration_source != ROOT):
         predecessor = migration_source
-    _, _, actions, obsolete, _ = agents.plan(ROOT, skills, home, force, predecessor=predecessor)
+    predecessor_revision = (migration["revision"] if migration is not None
+                            and migration_source is not None and migration_source != ROOT else None)
+    _, _, actions, obsolete, _ = agents.plan(
+        ROOT, skills, home, force, predecessor=predecessor,
+        predecessor_revision=predecessor_revision)
     service = skills / "devflow-local-delivery"
     source = ROOT / "runtime/desktop/devflow-local-delivery"
     plugin = home / "plugins/cache/devflow-local/devflow"
@@ -203,7 +207,7 @@ def plan(skills, home, force, *, migration_source=None, predecessor=None):
     return {"migration": migration, "scripts_upgrade": scripts_upgrade, "adopted": adopted,
             "plugin": plugin, "service": service, "source": source, "compatibility": compatibility,
             "children": children, "obsolete": obsolete, "actions": actions,
-            "predecessor": predecessor}
+            "predecessor": predecessor, "predecessor_revision": predecessor_revision}
 
 
 def install(skills, home, force, backup=None, *, migration_source=None, lease_fd=None, predecessor=None):
@@ -216,6 +220,7 @@ def install(skills, home, force, backup=None, *, migration_source=None, lease_fd
     compatibility, children = prepared["compatibility"], prepared["children"]
     obsolete, actions = prepared["obsolete"], prepared["actions"]
     predecessor = prepared["predecessor"]
+    predecessor_revision = prepared["predecessor_revision"]
     MUTATING = True
     migration_helper.apply(migration, ROOT, skills, agents, rollback, backup)
     if scripts_upgrade and not adopted:
@@ -245,6 +250,8 @@ def install(skills, home, force, backup=None, *, migration_source=None, lease_fd
                 str(force).lower(),
                 *([str(backup)] if backup else []),
                 *(["--predecessor", str(predecessor)] if predecessor is not None else []),
+                *(["--predecessor-revision", predecessor_revision]
+                  if predecessor_revision is not None else []),
             ],
             check=True,
             pass_fds=(() if lease_fd is None else (lease_fd,)),
