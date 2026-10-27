@@ -62,15 +62,16 @@ async def test_stopped_mcp_handoff_starts_explicitly_before_required_reads(
 
         monkeypatch.setattr(store, "submit", submit)
         monkeypatch.setattr(store, "begin_mutation", begin)
-        monkeypatch.setattr(store, "detail", lambda run_id: {
-            "id": run_id, "protocol_revision": 7, "events": [],
-            "pending_decision": {"id": "question-1", "revision": 2, "candidate_revision": 3},
-        })
-        def evidence_index(run_id, *, details):
-            assert details["id"] == run_id
-            return []
+        def persisted_status(run_id):
+            assert run_id == "run-1"
+            return {"run_id": run_id, "protocol_revision": 7}
 
-        monkeypatch.setattr(store, "evidence_index", evidence_index)
+        def unexpected_detail(*_args, **_kwargs):
+            raise AssertionError("bounded status must not reconstruct run detail")
+
+        monkeypatch.setattr(store, "persisted_status", persisted_status)
+        monkeypatch.setattr(store, "detail", unexpected_detail)
+        monkeypatch.setattr(store, "evidence_index", unexpected_detail)
         # Real API authentication/forwarding; no Temporal or background dispatch.
         api = uvicorn.Server(uvicorn.Config(
             app, host="127.0.0.1", port=port, lifespan="off", log_level="error"))
@@ -119,7 +120,10 @@ async def test_stopped_mcp_handoff_starts_explicitly_before_required_reads(
                 arguments = {"request_json": json.dumps(payload)}
                 expected = [("submit_run", payload)]
             else:
+                assert current["version"] == 1
+                assert current["source"] == "persisted_projection"
                 run = current["run"]
+                assert run["run_id"] == "run-1"
                 payload = {"command_id": "continue-1",
                            "expected_revision": run["protocol_revision"]}
                 if mutation == "answer_decision":
