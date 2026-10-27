@@ -46,6 +46,7 @@ from test_delivery_store import service as service
 
 from devflow_temporal import (
     delivery_activities,
+    delivery_feature_activities,
 )
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_api import create_app
@@ -504,6 +505,105 @@ async def test_closed_tracker_deadline_records_are_reconciled_and_forgeries_refu
     assert events[-1]["type"] == EVENT and events[-1]["run_revision"] == final["revision"]
     assert (await reconcile_projection(store, client, _row(store)))["state"] == "observed"
     assert store.events("run-1") == events
+
+
+async def _failed_feature_stop(unpublished, monkeypatch, *, terminal_failed):
+    """A bounded stop whose feature stop failed, with a recorded `stop_feature` double."""
+    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
+    store, _, original, _ = unpublished
+    owner = {"issue_id": "private-feature", "generation": 1}
+    spec = {**store.effective_spec("run-1"), "feature_delivery": {"owner": owner}}
+    _bind_store(store, monkeypatch, spec)
+    _reset_preterminal(store, original)
+    controller = DeliveryWorkflow()
+    controller.controller_failure_boundary = controller.liveness_v2 = True
+    controller.state = copy.deepcopy(original)
+    calls = []
+
+    async def execute(name, request, **_kwargs):
+        event_id = 10 + 3 * len(calls)
+        if name == "delivery_project":
+            if terminal_failed:
+                calls.append((name, copy.deepcopy(request), None))
+                raise _activity_failure(name, event_id)
+            store.project("run-1", **{k: v for k, v in request.items() if k != "spec"})
+            calls.append((name, copy.deepcopy(request), {}))
+            return {}
+        assert name == "delivery_feature_stop"
+        calls.append((name, copy.deepcopy(request), None))
+        raise _activity_failure(name, event_id)
+
+    controller._activity = execute
+    await controller._project(spec, "blocked", original["error"])
+    state = controller.state
+    record = state["checks"]["feature_stop_failure"]
+    stop_request = calls[1][1]
+    assert record["scheduled_event_id"] == 13 and record["request_sha256"] == digest(stop_request)
+    assert stop_request["checkpoint"]["completed_chunks"] == []
+    assert stop_request["checkpoint"]["state"]["checks"] == {
+        key: value for key, value in state["checks"].items() if key != "feature_stop_failure"}
+    assert ("terminal_projection_failure" in state["checks"]) is terminal_failed
+    history = await _history(spec, calls)
+    client, _ = _closed_client(spec, state, history)
+    stops = []
+    results = [{"owner": owner, "state": "stopped"}]
+
+    def stop_feature(actual_spec, checkpoint):
+        stops.append((actual_spec, checkpoint))
+        return results[-1]
+
+    monkeypatch.setattr(delivery_feature_activities, "stop_feature", stop_feature)
+    return store, spec, state, stop_request, history, client, stops, results
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_failed", [False, True])
+async def test_failed_feature_stop_is_replayed_from_its_scheduled_request(
+    unpublished, monkeypatch, terminal_failed,
+):
+    store, spec, state, stop_request, history, client, stops, results = (
+        await _failed_feature_stop(unpublished, monkeypatch, terminal_failed=terminal_failed))
+    before, before_events = _row(store), store.events("run-1")
+    exact = copy.deepcopy(history.events)
+    forged = copy.deepcopy(stop_request)
+    forged["checkpoint"]["state"]["candidate"] = {"id": "foreign"}
+    scheduled_event_id = state["checks"]["feature_stop_failure"]["scheduled_event_id"]
+    scheduled_event = next(event for event in history.events
+                           if event.event_id == scheduled_event_id)
+    assert scheduled_event.HasField("activity_task_scheduled_event_attributes")
+    scheduled = scheduled_event.activity_task_scheduled_event_attributes
+    assert scheduled.activity_type.name == "delivery_feature_stop"
+    scheduled.input.CopyFrom(
+        Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([forged])))
+    with pytest.raises(ValueError, match="failed feature stop request"):
+        await reconcile_projection(store, client, _row(store))
+    history.events = exact
+    results.append({"owner": "foreign", "state": "stopped"})
+    with pytest.raises(ValueError, match="did not settle the recorded owner"):
+        await reconcile_projection(store, client, _row(store))
+    assert stops == [(spec, stop_request["checkpoint"])]
+    assert _row(store) == before or terminal_failed
+    assert not any(event["type"] == FEATURE_STOP_EVENT for event in store.events("run-1"))
+    results.append({"owner": spec["feature_delivery"]["owner"], "state": "stopped"})
+    observed = await reconcile_projection(store, client, _row(store))
+    assert observed["state"] == "reconciled"
+    assert observed["feature_stop_key"].startswith("closed-feature-stop:isolated-closed-execution:")
+    assert len(stops) == 2 and stops[-1] == (spec, stop_request["checkpoint"])
+    events = store.events("run-1")
+    assert events[-1]["type"] == FEATURE_STOP_EVENT
+    assert events[-1]["payload"]["scheduled_event_id"] == 13
+    final = _row(store)
+    if terminal_failed:
+        assert [event["type"] for event in events[len(before_events):]] == [
+            EVENT, FEATURE_STOP_EVENT]
+        assert final["phase"] == "blocked" and json.loads(final["checks_json"]) == state["checks"]
+    else:
+        assert len(events) == len(before_events) + 1
+        assert {k: v for k, v in final.items() if k != "updated_at"} == {
+            k: v for k, v in before.items() if k != "updated_at"}
+    assert events[-1]["run_revision"] == final["revision"]
+    assert (await reconcile_projection(store, client, _row(store)))["state"] == "observed"
+    assert len(stops) == 2 and store.events("run-1") == events
 
 
 @pytest.mark.asyncio
