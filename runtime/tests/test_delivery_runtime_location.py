@@ -30,8 +30,7 @@ def command(argv, *, cwd=None, env=None, timeout=180):
     return result.stdout
 
 
-@pytest.fixture(scope="module")
-def installed_pair(tmp_path_factory):
+def installed_pair_fixture(tmp_path_factory, *, historical_venv=False):
     assert not command(["git", "-C", ROOT, "status", "--porcelain"]).strip(), (
         "Commit the isolated candidate before testing actual installed-source authority"
     )
@@ -58,12 +57,49 @@ def installed_pair(tmp_path_factory):
         target.parent.mkdir(parents=True, exist_ok=True)
         command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", ROOT, target])
         command(["git", "-C", target, "checkout", "--quiet", "--detach", revision])
-        command(
-            ["uv", "sync", "--frozen", "--offline", "--python", python],
-            cwd=target / "runtime",
-            env=environment,
-        )
+        sync_fixture_runtime(target, python, environment, historical_venv=historical_venv)
     return root, old, new, environment, python
+
+
+def sync_fixture_runtime(target, python, environment, *, historical_venv=False):
+    runtime = target / "runtime"
+    if historical_venv:
+        # Historical validators accepted only the editable controller's .pth.
+        # Precreate a standard Python environment so uv 0.12.17 installs the
+        # same locked dependencies without adding its own virtualenv hook.
+        command([python, "-m", "venv", "--without-pip", runtime / ".venv"], env=environment)
+    command(["uv", "sync", "--frozen", "--offline", "--python", python],
+            cwd=runtime, env=environment)
+    if historical_venv:
+        registrations = list((runtime / ".venv/lib").glob("python*/site-packages/*.pth"))
+        assert len(registrations) == 1
+        assert registrations[0].name == "_editable_impl_devflow_temporal.pth"
+        assert registrations[0].read_text().strip() == str(runtime / "src")
+
+
+@pytest.fixture(scope="module")
+def installed_pair(tmp_path_factory):
+    return installed_pair_fixture(tmp_path_factory)
+
+
+def test_historical_fixture_sync_retains_only_its_editable_registration(tmp_path):
+    runtime = tmp_path / "candidate" / "runtime"
+    package = runtime / "src/devflow_temporal"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 'fixture'\n")
+    (runtime / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n'
+        '[project]\nname = "devflow-temporal"\nversion = "0.1.0"\n'
+        'requires-python = ">=3.12"\n'
+        '[tool.hatch.build.targets.wheel]\npackages = ["src/devflow_temporal"]\n'
+    )
+    env = {**os.environ, "UV_EXCLUDE_NEWER": "false"}
+    python = Path(sys._base_executable)
+    command(["uv", "lock", "--offline"], cwd=runtime, env=env)
+    sync_fixture_runtime(runtime.parent, python, env, historical_venv=True)
+    assert command([runtime / ".venv/bin/python", "-I", "-c",
+                    "import devflow_temporal; print(devflow_temporal.VALUE)"],
+                   env=env).strip() == "fixture"
 
 
 @pytest.mark.asyncio
