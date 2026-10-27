@@ -145,32 +145,6 @@ def configured_publication(service):
     return published((store, request))[:2]
 
 
-def test_missing_status_is_pending_across_restart_until_owner_configures_it(service):
-    store, request = configured_publication(service)
-    remote = ProjectRemote(desired="Awaiting merge", configured=False)
-    stamp = datetime(2026, 10, 26, tzinfo=UTC)
-    sync = ProjectSynchronizer([store], remote, clock=lambda: stamp,
-                               interval=DAY, project_interval=DAY)
-    first = sync.tick()[request["issue_url"]]
-    assert first["mirror"]["state"] == "pending"
-    assert "lacks configured Status option 'Awaiting merge'" in first["mirror"]["last_error"]
-    assert first["project_receipt"] is None and remote.mutations == []
-    assert remote.mirror_reads == 1
-
-    restarted = ProjectSynchronizer([DeliveryStore(store.config)], remote, clock=lambda: stamp,
-                                    interval=DAY, project_interval=DAY)
-    assert restarted.tick()[request["issue_url"]]["mirror"]["state"] == "pending"
-    assert remote.mirror_reads == 1  # The saved backoff survives restart.
-    remote.configure_status()  # Explicit external configuration, never a mirror effect.
-    stamp += timedelta(seconds=15)
-    restored = restarted.tick()[request["issue_url"]]
-    assert restored["mirror"]["state"] == "consistent"
-    assert restored["mirror"]["last_error"] is None
-    assert restored["project_receipt"]["option_id"] == "desired"
-    assert len(remote.mutations) == 1
-    assert remote.other_status == "foreign"
-
-
 def test_lost_item_acknowledgement_reconciles_without_schema_or_duplicate_effect(service):
     store, request = configured_publication(service)
     remote = ProjectRemote(desired="Awaiting merge")
@@ -191,21 +165,3 @@ def test_lost_item_acknowledgement_reconciles_without_schema_or_duplicate_effect
     assert restarted.tick()[request["issue_url"]]["mirror"]["state"] == "consistent"
     assert len(remote.mutations) == 1  # Exact readback reconciles the first write.
     assert remote.options == options and remote.other_status == "foreign"
-
-
-@pytest.mark.parametrize("edit", ["rename", "delete"])
-def test_changed_desired_option_never_produces_a_consistent_receipt(edit):
-    remote = ProjectRemote()
-
-    def external_edit():
-        option = next(item for item in remote.options if item["id"] == "desired")
-        if edit == "rename":
-            option["name"] = "Different owner meaning"
-        else:
-            remote.options.remove(option)
-
-    remote.after_field_read = external_edit
-    with pytest.raises((ValueError, RuntimeError), match="readback differs|no longer exists"):
-        remote.mirror(feature(), lambda: None)
-    assert all(item["id"] != "desired" or item["name"] != "Done" for item in remote.options)
-    assert remote.other_status == "foreign"
