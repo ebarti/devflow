@@ -604,9 +604,15 @@ def _native_fetch_allowed(spec, requirements):
     """Do not add registry access that no frozen prerequisite admitted."""
     if spec.get("policy", {}).get("host_sandbox") == "trusted-local":
         return True
-    return all("/store" not in check.get("argv", [])
-               or "registry.npmjs.org" in check.get("network_domains", [])
-               for check in requirements["configured"])
+    for check in requirements["configured"]:
+        if "/store" not in check.get("argv", []):
+            continue
+        domains = check.get("network_domains", [])
+        if not isinstance(domains, list) or not any(
+            domain == "registry.npmjs.org" for domain in domains
+        ):
+            return False
+    return True
 
 def probe_configured(broker, requirements, candidate, *, attempt):
     """Execute frozen prerequisite recipes before scheduling expensive roles.

@@ -800,3 +800,34 @@ async def test_feature_repair_requires_paid_key_or_accounting_capability(
         else ['require', 'run'] if case == 'delegated' else [])
     if case == 'delegated':
         assert calls[0][1]['readiness_worker_assignment']['repair_key'] == 'worker-1:1'
+
+
+@pytest.mark.parametrize(('domains', 'allowed'), [
+    (['registry.npmjs.org'], True),
+    (['example.org', 'registry.npmjs.org'], True),
+    ([], False),
+    (['registry.npmjs.org.attacker.example'], False),
+    (['attacker.example/registry.npmjs.org'], False),
+    ('https://registry.npmjs.org.attacker.example', False),
+    ('registry.npmjs.org', False),
+    ({'registry.npmjs.org': True}, False),
+    (None, False),
+])
+def test_native_fetch_requires_exact_domain_list(domains, allowed):
+    from devflow_temporal.delivery_readiness import _native_fetch_allowed
+
+    spec = {'policy': {'host_sandbox': 'native-profile'}}
+    check = {'argv': ['corepack', 'pnpm', 'install', '/store'], 'network_domains': domains}
+    assert _native_fetch_allowed(spec, {'configured': [check]}) is allowed
+    assert _native_fetch_allowed(spec, {'configured': [{'argv': ['git', 'status']}]})
+    assert _native_fetch_allowed({'policy': {'host_sandbox': 'trusted-local'}},
+                                 {'configured': [check]})
+
+
+def test_native_fetch_requires_every_store_prerequisite_to_admit_registry():
+    from devflow_temporal.delivery_readiness import _native_fetch_allowed
+
+    spec = {'policy': {'host_sandbox': 'native-profile'}}
+    checks = [{'argv': ['pnpm', '/store'], 'network_domains': ['registry.npmjs.org']},
+              {'argv': ['pnpm', '/store'], 'network_domains': ['example.org']}]
+    assert not _native_fetch_allowed(spec, {'configured': checks})
