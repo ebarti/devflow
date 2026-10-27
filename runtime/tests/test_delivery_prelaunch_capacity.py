@@ -509,7 +509,11 @@ async def test_cancelled_executor_waiter_joins_actual_native_worker_without_spin
 
         def run_in_executor(executor, function, *args):
             values = (function, *args, *getattr(function, 'args', ()))
-            if any(getattr(value, '__name__', None) == 'monitor' for value in values):
+            # Actual-body custody may wrap the monitor before executor entry.
+            # Inspect that bound callable too, without changing the executor.
+            targets = (*values, *(cell.cell_contents for value in values
+                        for cell in (getattr(value, '__closure__', None) or ())))
+            if any(getattr(value, '__name__', None) == 'monitor' for value in targets):
                 def delayed():
                     preparing.set()
                     assert release.wait(10), 'actual queued executor work was not released'
