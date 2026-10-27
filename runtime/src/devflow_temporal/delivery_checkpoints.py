@@ -2151,7 +2151,8 @@ def restore_checkpoint(
 
 def restored_identity(spec, path, current, expected):
     """Authenticate only an acknowledged canonical candidate replacement."""
-    if Path(path) != Path(spec.get("checkout", "")) or spec.get("workspace_custody_version") != 1:
+    if (spec is None or Path(path) != Path(spec.get("checkout", ""))
+            or spec.get("workspace_custody_version") != 1):
         return current
     from .delivery_execution_config import load_execution_config
 
