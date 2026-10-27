@@ -4,6 +4,7 @@ import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, IntakePlan, PhaseGate, RoleState, RunDetail } from './model'
 import { RunControls } from './RunControls'
+import { PauseControls } from './PauseControls'
 import { DurableOperations } from './DurableOperations'
 import { loadIntent, saveIntent } from './operationIntent'
 import { FeatureDelivery } from './FeatureDelivery'
@@ -431,6 +432,7 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     {run.error ? <p className="inline-alert" role="alert">{run.error}</p> : null}
     <BlockingFindings run={run} />
     {!run.feature_delivery ? <PhaseStrip gates={run.phase_gates} /> : null}
+    {run.pause_intake_version === 1 ? <PauseControls key={run.id} runId={run.id} /> : null}
     <MergeRun key={`merge-${run.id}`} run={run} onRefresh={onRefresh} />
     {decisions.map(decision => <DecisionCard key={`${decision.id}:${decision.revision}`} run={run} decision={decision} onRefresh={onRefresh} />)}
     <IntakeHistory run={run} />

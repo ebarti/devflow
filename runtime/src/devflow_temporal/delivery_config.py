@@ -275,10 +275,24 @@ class DeliveryConfig:
         }
         optional = {
             "accepted_plan", "recovery_key", "supersedes_run_id",
-            "plan_approval", "origin_thread_id", "publication_summary", "feature_predecessor"
+            "plan_approval", "origin_thread_id", "publication_summary", "feature_predecessor",
+            "start_paused"
         }
         if set(supplied) - (required | optional) or required - set(supplied):
             raise ValueError("submit fields do not match the delivery contract")
+        if "start_paused" in supplied:
+            if supplied["start_paused"] is not True:
+                raise ValueError("start_paused must be true when supplied")
+            from .delivery_pause_context import require_intake_dispatcher_cutover
+
+            require_intake_dispatcher_cutover(self)
+            from .delivery_limits import policy as pause_limit_policy
+
+            if (self.raw.get("feature_delivery_version") == 1
+                    or any(key in supplied for key in ("supersedes_run_id", "recovery_key",
+                                                       "feature_predecessor"))
+                    or pause_limit_policy(self.raw)):
+                raise ValueError("start_paused supports only untimed fresh ordinary deliveries")
         if "feature_predecessor" in supplied and self.raw.get("feature_delivery_version") != 1:
             raise ValueError("feature continuation requires the feature delivery protocol")
         if not all(isinstance(supplied[key], str) and supplied[key].strip() for key in required):
@@ -702,9 +716,11 @@ class DeliveryConfig:
             "accepted_plan": accepted_plan or "",
             "intake_required": accepted_plan is None,
             "version": 1,
+            **({"pause_intake_version": 1} if supplied.get("start_paused") is True else {}),
             **({"workspace_custody_version": 1}
                if (self.raw.get("provider", "codex") == "codex"
-                   or self.raw.get("workspace_custody_version") == 1) else {}),
+                   or self.raw.get("workspace_custody_version") == 1
+                   or supplied.get("start_paused") is True) else {}),
             "automatic_retry_version": 1,
             **({"retry_budget_version": 1} if "max_attempts" in policy else {}),
             "tracker_retry_version": 1,

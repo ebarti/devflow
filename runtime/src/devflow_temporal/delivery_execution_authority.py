@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import secrets
 from contextvars import ContextVar
@@ -169,6 +170,8 @@ async def authenticate_original_start(
     inputs = await DELIVERY_DATA_CONVERTER.decode(list(start.input.payloads))
     if inputs != [json.loads(reservation["start_spec_json"]), recovery]:
         raise ValueError("delivery start inputs differ from its reservation")
+    return {"event1_sha256": hashlib.sha256(
+        page[0].SerializeToString(deterministic=True)).hexdigest()}
 
 
 def bind(store, reservation, execution_run_id):

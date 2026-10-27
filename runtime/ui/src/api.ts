@@ -105,7 +105,31 @@ export interface DurableOperation {
   authority: string | null
 }
 
+export interface PauseControl {
+  root_id: string
+  desired: string
+  observed: 'running' | 'pause_requested' | 'pausing' | 'paused' | 'resuming' | 'complete'
+  revision: number
+  epoch: number
+  blockers: string[]
+  notification_pending: boolean
+  resume_authorization: string
+  pause_eligible?: boolean
+}
+
+export interface PauseIntent {
+  action: 'pause' | 'resume'
+  command_id: string
+  expected_revision: number
+  epoch?: number
+}
+
 export const api = {
+  pauseControl: (id: string): Promise<PauseControl> => request(`/api/runs/${encodeURIComponent(id)}/pause-control`),
+  pauseCommand: (id: string, intent: PauseIntent): Promise<{ state: string }> => {
+    const { action, ...body } = intent
+    return command(`/api/runs/${encodeURIComponent(id)}/${action}`, body)
+  },
   createOperation: (body: { operation_id: string; run_id: string | null; kind: string; request: object }): Promise<DurableOperation> => command('/api/operations', body),
   getOperation: (id: string): Promise<DurableOperation> => request(`/api/operations/${encodeURIComponent(id)}`),
   runOperations: (runId: string): Promise<{ operations: DurableOperation[] }> => request(`/api/runs/${encodeURIComponent(runId)}/operations`),

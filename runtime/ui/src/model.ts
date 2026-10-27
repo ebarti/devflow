@@ -182,6 +182,7 @@ export interface FeaturePlanState {
 }
 
 export interface RunDetail extends RunSummary {
+  pause_intake_version?: number
   feature_plan?: FeaturePlanState | null
   can_steer?: boolean
   steering?: Array<{ id: number; message: string; created_at: string; included_in: Array<{ role: string; job_key: string }> }>
