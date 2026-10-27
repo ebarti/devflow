@@ -64,6 +64,8 @@ def test_real_admission_selects_merge_explicitly_without_a_second_repo_permissio
         base_ref="origin/main", assignee="owner", project_url="https://github.com/users/owner/projects/1",
         required_ci=["test"], prepublish_checks=[{"id": "readme", "argv": ["true"]}],
         checks=[{"id": "readme", "argv": ["true"]}],
+        readiness={"version": 1, "generation": 0, "browser_engines": [],
+                   "temporal_checks": []},
     )
     request["base_ref"] = "origin/main"
     # Tests only construct immutable authority. No service, role or native check starts.

@@ -5,10 +5,9 @@ from __future__ import annotations
 import json
 import os
 import stat
-from types import SimpleNamespace
 
 import pytest
-from temporalio import activity
+from temporalio.testing import ActivityEnvironment
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_prelaunch_capacity import native_role as native_role
 
@@ -196,18 +195,14 @@ async def test_refreshed_credential_does_not_block_the_next_implement_iteration(
     _auth(auth, "A")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(supervisor, "prepare_native_role", delivery_sandbox.prepare_native_role)
-    monkeypatch.setattr(activity, "in_activity", lambda: True)
-    monkeypatch.setattr(activity, "heartbeat", lambda *args: None)
-    monkeypatch.setattr(activity, "cancellation_details", lambda: SimpleNamespace(
-        cancel_requested=False, timed_out=False, not_found=False, worker_shutdown=False))
-
-    first = await delivery_role(case.request)
+    environment = ActivityEnvironment()
+    first = await environment.run(delivery_role, case.request)
     assert first["finish_reason"] == "fixture", first
     copied = case.state / "role-homes" / "implement" / "codex" / "auth.json"
     assert copied.read_bytes() == auth.read_bytes()
 
     _auth(auth, "B", "2026-10-11T10:00:00Z")  # `codex login` or a token refresh
-    second = await delivery_role({**case.request, "iteration": 1,
-                                  "resume_session": first["session_id"]})
+    second = await environment.run(delivery_role, {**case.request, "iteration": 1,
+                                                  "resume_session": first["session_id"]})
     assert second["finish_reason"] == "fixture", second
     assert copied.read_bytes() == auth.read_bytes()

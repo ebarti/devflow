@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_delivery_store import _git
+from test_delivery_store import _git, submit_before_readiness
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_stopped_resume as resume
@@ -74,7 +74,7 @@ def native_preparation_stop(service, monkeypatch, tmp_path):
         project_url='https://github.com/users/example/projects/1', assignee='example')
     owner.config.path.write_text(json.dumps(config))
     store = DeliveryStore(DeliveryConfig.load(owner.config.path))
-    store.submit(request)
+    submit_before_readiness(store, request, monkeypatch)
     store.mark_start('run-1', accepted=True)
     spec = prepare_authority(store, store.submitted_spec('run-1'))
     broker = DeliveryBroker(store, spec)
