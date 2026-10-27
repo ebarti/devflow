@@ -269,7 +269,7 @@ def test_real_pre_ready_child_survives_killed_owners_and_public_reconcile(
                 [
                     "git",
                     "-C",
-                    spec["source_path"],
+                    str(broker.source),
                     "worktree",
                     "remove",
                     "--force",
