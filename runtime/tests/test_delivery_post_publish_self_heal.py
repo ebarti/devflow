@@ -441,7 +441,18 @@ class RealDelivery:
         self.monkeypatch = monkeypatch
         self.seen = {'roles': [], 'ci_heads': [], 'uncertain': [], 'release': [],
                      'checks': 0, 'ci': 0}
-        store, request = service
+        self.service = service
+
+    def _setup(self, temporal_address):
+        from devflow_temporal.delivery_config import DeliveryConfig
+        from devflow_temporal.delivery_store import DeliveryStore
+
+        original, request = self.service
+        raw = json.loads(original.config.path.read_text())
+        raw['temporal_address'] = temporal_address
+        original.config.path.write_text(json.dumps(raw))
+        store = DeliveryStore(DeliveryConfig.load(original.config.path))
+        monkeypatch = self.monkeypatch
         original_admit = type(store.config).admit
 
         def closing_admit(config, supplied):
@@ -584,6 +595,8 @@ class RealDelivery:
         from temporalio.worker import Worker
 
         async with await WorkflowEnvironment.start_time_skipping() as environment:
+            # Bind the owned server before admission freezes execution configuration.
+            self._setup(environment.client.service_client.config.target_host)
             async with Worker(environment.client, task_queue=self.queue,
                               workflows=[DeliveryWorkflow],
                               activities=self.activities()):
@@ -592,7 +605,8 @@ class RealDelivery:
 
     async def start(self):
         handle = await self.client.start_workflow(
-            DeliveryWorkflow.run, self.spec, id='delivery-run-1', task_queue=self.queue)
+            DeliveryWorkflow.run, self.spec, id='delivery-run-1', task_queue=self.queue,
+            memo={'request_digest': self.spec['request_digest']})
         result = await handle.result()
         self.closed = {'workflow_id': 'delivery-run-1', 'execution_run_id': handle.result_run_id,
                        'closed_at': '2026-10-12T00:00:00Z',
@@ -624,7 +638,8 @@ class RealDelivery:
         effective = self.store.effective_spec('run-1')
         result = await self.client.execute_workflow(
             DeliveryWorkflow.run, args=[effective, recovery], id=workflow_id,
-            task_queue=self.queue)
+            task_queue=self.queue, memo={'request_digest': effective['request_digest'],
+                                        'recovery_digest': digest(recovery)})
         return result, recovery
 
 
@@ -645,6 +660,7 @@ async def test_stalled_repair_publication_heals_through_the_real_stop(service, m
     script = {'implement': interrupt_repair_publication,
               'review': lambda iteration: ['Needs a second edit'] if iteration == 0 else None}
     async with RealDelivery(service, monkeypatch, script=script).running() as run:
+        assert run.store.config.temporal_address == run.client.service_client.config.target_host
         stopped = await run.start()
         first_head = stopped['pull_request']['head']
         assert stopped['outcome'] == 'blocked' and stopped['iteration'] == 1
