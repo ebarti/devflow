@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from test_delivery_api import api_fixture as api_fixture
+from test_delivery_store import submit_before_readiness
 
 from devflow_temporal.delivery_activities import delivery_role
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -284,7 +285,7 @@ print('completed',flush=True)
 
 @pytest.mark.parametrize('invalid_source', [False, True])
 def test_real_supervisor_completion_preserves_receipt_and_releases_capacity(
-        api_fixture, tmp_path, invalid_source):
+        api_fixture, tmp_path, invalid_source, monkeypatch):
     from devflow_temporal.delivery_resources import RunResources, read_private
     from devflow_temporal.delivery_stopped_resume import _candidate
 
@@ -301,7 +302,7 @@ def test_real_supervisor_completion_preserves_receipt_and_releases_capacity(
         assignee='example')
     path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(path))
-    store.submit(submission)
+    submit_before_readiness(store, submission, monkeypatch)
     spec = store.spec(submission['run_id'])
     broker = DeliveryBroker(store, spec)
     request = {'spec': spec, 'role': 'implement', 'iteration': 0,
@@ -353,7 +354,8 @@ def test_real_supervisor_completion_preserves_receipt_and_releases_capacity(
 
 
 @pytest.mark.parametrize('checkpoint', ['running', 'completed'])
-def test_original_activity_reattaches_after_real_worker_sigkill(api_fixture, tmp_path, checkpoint):
+def test_original_activity_reattaches_after_real_worker_sigkill(
+        api_fixture, tmp_path, checkpoint, monkeypatch):
     from devflow_temporal.delivery_native_process import stop_observed
     from devflow_temporal.delivery_resources import RunResources, read_private
 
@@ -370,7 +372,7 @@ def test_original_activity_reattaches_after_real_worker_sigkill(api_fixture, tmp
         assignee='example')
     path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(path))
-    store.submit(submission)
+    submit_before_readiness(store, submission, monkeypatch)
     spec = store.spec(submission['run_id'])
     broker = DeliveryBroker(store, spec)
     request = {'spec': spec, 'role': 'implement', 'iteration': 0,
