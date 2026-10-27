@@ -127,11 +127,12 @@ def test_configured_environment_does_not_adopt_foreign_or_unlocked_paths(tmp_pat
 def test_real_native_preparation_owns_locked_python_before_consumers(
     api_fixture, tmp_path, fails, stage, monkeypatch,
 ):
+    from test_delivery_store import submit_before_readiness
+
     from devflow_temporal.delivery_baseline import run_baseline_checks
     from devflow_temporal.delivery_config import DeliveryConfig
     from devflow_temporal.delivery_preparation import prepare_authority
     from devflow_temporal.delivery_store import DeliveryStore
-    from test_delivery_store import submit_before_readiness
 
     config_path, request = api_fixture
     raw = json.loads(config_path.read_text())

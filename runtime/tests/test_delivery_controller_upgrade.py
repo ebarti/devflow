@@ -19,6 +19,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
+from test_delivery_store import submit_before_readiness
 
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_native_process import stop_observed
@@ -285,7 +286,7 @@ else:
 
 
 @pytest.fixture
-def installed_controller(native_configuration, tmp_path, request):
+def installed_controller(native_configuration, tmp_path, request, monkeypatch):
     config, submission = native_configuration
     mode = getattr(request, 'param', 'trusted-local')
     config.raw['execution_mode'] = 'trusted-local' if mode == 'gate-retry' else mode
@@ -328,8 +329,8 @@ def installed_controller(native_configuration, tmp_path, request):
                  ('add', '.'), ('commit', '-qm', 'test: previous installed controller')]:
         subprocess.run(['git', '-C', str(source), *args], check=True, capture_output=True)
     store = DeliveryStore(config)
-    store.submit({**submission,
-                  'accepted_plan': 'Change only the fixture README and run its checks'})
+    submit_before_readiness(store, {**submission,
+        'accepted_plan': 'Change only the fixture README and run its checks'}, monkeypatch)
     driver = tmp_path / 'preparation.py'
     driver.write_text(PREPARATION_DRIVER)
     spec_path = tmp_path / 'prepared.json'
