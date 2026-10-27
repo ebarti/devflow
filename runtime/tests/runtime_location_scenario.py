@@ -107,6 +107,22 @@ def fixture_service(root):
         },
     )
     raw["repositories"]["fixture-browser"] = browser_repository
+    from portable_temporal_fixture import fixture_root
+
+    provenance = fixture_root() / "temporal-prerequisites.provenance.v1.json"
+    # Freeze the later fresh admission's real Temporal backend before any
+    # historical owner is recorded. The retained admissions keep their old flags.
+    raw["repositories"]["fixture"]["readiness"] = {
+        "version": 1, "generation": 0, "browser_engines": [],
+        "temporal_checks": ["worker-regressions"],
+        "temporal_provenance": {
+            "check_id": "worker-regressions", "python_project": "workers/automation",
+            "provenance_path": str(
+                store.config.state_root / "operator-inputs/temporal-prerequisites.json"
+            ),
+            "provenance_sha256": hashlib.sha256(provenance.read_bytes()).hexdigest(),
+        },
+    }
     store.config.path.write_text(json.dumps(raw))
     store.config.path.chmod(0o600)
     return DeliveryStore(DeliveryConfig.load(store.config.path)), request
