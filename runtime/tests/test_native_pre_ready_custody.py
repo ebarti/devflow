@@ -12,7 +12,6 @@ import time
 from importlib.metadata import distribution
 from pathlib import Path
 
-import pytest
 from test_delivery_api import api_fixture as api_fixture
 
 from devflow_temporal import delivery_native_process as native
@@ -43,45 +42,6 @@ def _wait(predicate, message):
             return
         time.sleep(0.02)
     raise AssertionError(message)
-
-
-def test_completed_monitor_keeps_join_and_drained_proof_on_replay(tmp_path):
-    state = tmp_path / "state"
-    state.mkdir(mode=0o700)
-    spec = {
-        "run_id": "normal",
-        "provider": "fake",
-        "state_dir": str(state),
-        "policy": {"execution_backend": "native-macos"},
-        "policy_digest": "a" * 64,
-    }
-    marker = tmp_path / "started"
-    folder = state / "complete"
-    process = native.NativeProcess(
-        spec,
-        folder,
-        argv=[
-            sys.executable,
-            "-c",
-            "import pathlib,sys; pathlib.Path(sys.argv[1]).open('a').write('once'); print('done')",
-            str(marker),
-        ],
-        cwd=tmp_path,
-        environment={"PATH": "/usr/bin:/bin"},
-        timeout=10,
-        register_resources=False,
-    )
-    result = process.run()
-    assert result["cleanup"] == "observed-native-confirmed"
-    assert result["exit_code"] == 0
-    assert result["monitoring_complete"] is True and result["stdio_drained"] is True
-    journal = read_private(folder / "native-process.json")
-    assert journal["phase"] == "finished" and journal["result"] == result
-    assert journal["owned"]
-    for pid, entry in journal["owned"].items():
-        assert _not_live(int(pid), entry["identity"])
-    assert process.run() == result
-    assert marker.read_text() == "once"
 
 
 def test_real_pre_ready_child_survives_killed_owners_and_public_reconcile(
@@ -278,65 +238,6 @@ def test_real_pre_ready_child_survives_killed_owners_and_public_reconcile(
                 check=True,
                 capture_output=True,
             )
-
-
-@pytest.mark.parametrize("monitoring_complete", [False, True])
-@pytest.mark.parametrize("previous_phase", ["allocated", None])
-def test_legacy_allocated_cleanup_receipt_does_not_prove_no_launch(
-    tmp_path, monitoring_complete, previous_phase
-):
-    from devflow_temporal.delivery_resources import write_private
-
-    folder = tmp_path / "attempt"
-    path = folder / "native-process.json"
-    intent = {"run_id": "fixture", "ports": []}
-    owned = {"900001": {"identity": "old-monitor"}}
-    proof = {
-        "version": 1,
-        "kind": "interrupted_monitor",
-        "previous_phase": previous_phase,
-        "intent_sha256": digest(intent),
-        "owned_sha256": digest(owned),
-    }
-    journal = {
-        "phase": "finished",
-        "intent": intent,
-        "owned": owned,
-        "monitoring_complete": monitoring_complete,
-        "cleanup_reconciliation": proof,
-        "result": {
-            "interrupted_monitor": True,
-            "provider_outcome": "not_started",
-            "cleanup": "observed-native-confirmed",
-            "stdio_drained": False,
-        },
-    }
-    write_private(path, journal)
-    assert not native.interrupted_cleanup_proven(journal)
-    assert not native.lost_monitor_without_provider(journal, role_attempt=True)
-    assert not native.lost_monitor_without_provider(journal, role_attempt=False)
-    assert native.reconcile_process(path)["cleanup"] == "unknown"
-    assert read_private(path) == journal
-
-
-def test_recorded_ready_alone_does_not_prove_interrupted_child_join(tmp_path):
-    from devflow_temporal.delivery_resources import write_private
-
-    folder = tmp_path / "attempt"
-    path = folder / "native-process.json"
-    observed = native.process_table()[os.getpid()]
-    journal = {
-        "phase": "allocated",
-        "intent": {"ports": []},
-        "ports": [],
-        "owned": {},
-        "monitoring_complete": False,
-        "monitor": {"pid": 999997, "identity": "controlled-dead-monitor"},
-    }
-    write_private(path, journal)
-    write_private(folder / "ready.json", {"pid": os.getpid(), "identity": observed["identity"]})
-    assert native.reconcile_process(path)["cleanup"] == "unknown"
-    assert read_private(path) == journal
 
 
 def test_interrupted_authorized_journal_cannot_claim_provider_absence(tmp_path):

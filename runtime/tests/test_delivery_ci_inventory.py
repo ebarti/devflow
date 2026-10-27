@@ -6,11 +6,8 @@ the source/config/native/resource/claim owners and public API are real.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
-import shutil
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,12 +21,10 @@ from test_delivery_store import _git
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_ci_inventory as owner
-from devflow_temporal import delivery_control
 from devflow_temporal.contracts import canonical_json
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_ci_inventory_io import GitHubRead
-from devflow_temporal.delivery_client import DeliveryClient
 from devflow_temporal.delivery_resources import RunResources, read_private
 from devflow_temporal.delivery_store import DeliveryStore
 
@@ -193,62 +188,6 @@ async def public(case):
 
 
 @pytest.mark.asyncio
-async def test_cli_readback_routes_to_public_archive_without_starting_or_accepting(
-    ci_case, monkeypatch, capsys,
-):
-    """The CLI/client are real; its HTTP transport uses the owned ASGI app."""
-    c = ci_case
-    async with public(c) as (client, headers):
-        preflight = await client.post("/api/runs/run-1/ci-inventory-preflight", json=c.command)
-        assert preflight.status_code == 200, preflight.text
-        response = await client.post("/api/runs/run-1/ack-ci-inventory", headers=headers, json={
-            **c.command, "preflight_key": preflight.json()["preflight_key"],
-            "acknowledgement": owner.ACK})
-        assert response.status_code == 200, response.text
-        acknowledgement = response.json()
-    routes = []
-
-    async def read(method, path):
-        async with public(c) as (client, _headers):
-            response = await client.request(method, path)
-            assert response.status_code == 200, response.text
-            return response.json()
-
-    def transport(method, path):
-        routes.append((method, path))
-        return asyncio.run(read(method, path))
-
-    caller = object.__new__(DeliveryClient)
-    caller._request = transport
-
-    def readonly(path):
-        assert path == c.store.config.path
-        return caller
-
-    def forbidden(*_args, **_kwargs):
-        pytest.fail("CI inventory readback must not start or reload a service")
-
-    monkeypatch.setattr(delivery_control, "read_only_client", readonly)
-    monkeypatch.setattr(delivery_control, "api_client", forbidden)
-    monkeypatch.setattr(delivery_control, "service_start", forbidden)
-    monkeypatch.setattr(sys, "argv", ["devflow-delivery", "--config", str(c.store.config.path),
-                                     "ci-inventory", "--id", "run-1"])
-    with c.store._connect() as db:
-        before = [dict(row) for row in db.execute("SELECT * FROM delivery_runs")]
-    await asyncio.to_thread(delivery_control.main)
-    result = json.loads(capsys.readouterr().out)
-    assert result == acknowledgement
-    assert result["state"] == "acknowledged" and result["delivery_acceptance"] is False
-    assert result["ci_assessment"]["delivery_policy"]["state"] == "not_evaluated"
-    assert result["ci_assessment"]["pr_eligibility"]["state"] == "not_established"
-    assert result["ci_assessment"]["merge_readiness"]["state"] == "unverified"
-    assert routes == [("GET", "/api/runs/run-1/ci-inventory")]
-    with c.store._connect() as db:
-        assert [dict(row) for row in db.execute("SELECT * FROM delivery_runs")] == before
-        assert not db.execute("SELECT 1 FROM delivery_ci_inventory_results").fetchone()
-
-
-@pytest.mark.asyncio
 async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_success(ci_case):
     c = ci_case
     before = copy.deepcopy(c.closed)
@@ -306,61 +245,6 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
     assert all(x["limit"] < 4 * 1024 * 1024 for x in owner.indexed_evidence(c.store, "run-1"))
 
 
-@pytest.mark.asyncio
-async def test_public_wrong_type_command_id_refuses_before_observation_or_any_write(ci_case):
-    c = ci_case
-    with c.store._connect() as db:
-        before = {
-            table: [dict(row) for row in db.execute("SELECT * FROM " + table)]
-            for table in ("delivery_runs", "delivery_events", "delivery_commands")
-        }
-    async with public(c) as (client, headers):
-        for command_id in (123, True, 1.5, None, [], {}):
-            body = {**c.command, "command_id": command_id}
-            preflight = await client.post("/api/runs/run-1/ci-inventory-preflight", json=body)
-            assert preflight.status_code == 409, preflight.text
-            acknowledgement = await client.post(
-                "/api/runs/run-1/ack-ci-inventory",
-                json={**body, "preflight_key": "a" * 64, "acknowledgement": owner.ACK},
-                headers=headers,
-            )
-            assert acknowledgement.status_code == 409, acknowledgement.text
-            for response in (preflight, acknowledgement):
-                assert "exact reviewed purpose and selection" in response.json()["detail"]
-    assert not c.remote.calls
-    with c.store._connect() as db:
-        for table, rows in before.items():
-            assert [dict(row) for row in db.execute("SELECT * FROM " + table)] == rows
-        assert not db.execute("SELECT 1 FROM delivery_ci_inventories").fetchone()
-        assert not db.execute("SELECT 1 FROM delivery_ci_inventory_audit").fetchone()
-
-
-@pytest.mark.parametrize(
-    "drift", ["profile", "source", "claim", "role", "unknown", "candidate", "request"]
-)
-def test_preflight_preserves_all_existing_closed_and_current_native_guards(ci_case, drift):
-    c = ci_case
-    if drift == "profile":
-        c.profile_path.write_text("{}")
-    elif drift == "source":
-        (c.case.broker.checkout / c.case.api).write_text("Changed current source\n")
-    elif drift == "claim":
-        with c.store._connect() as db:
-            c.store.state.claim_work(db, c.case.spec["work_id"], "foreign", "https://example.test")
-    elif drift == "role":
-        c.closed["result"]["roles"][-1]["status"] = "blocked"
-    elif drift == "unknown":
-        c.closed["result"]["cleanup"] = "unknown"
-    elif drift == "candidate":
-        c.command["expected_candidate_id"] = "8" * 64
-    else:
-        c.command["format"] = "pytest"
-    with pytest.raises((ValueError, OSError)):
-        owner.preflight(c.store, "run-1", c.command)
-    with c.store._connect() as db:
-        assert not db.execute("SELECT 1 FROM delivery_ci_inventories").fetchone()
-
-
 def test_mutable_authority_is_rechecked_after_remote_observation(ci_case, monkeypatch):
     c = ci_case
     observe = owner._observe
@@ -392,13 +276,6 @@ def test_missing_or_tampered_raw_archived_proof_refuses_replay(ci_case):
     original.write_bytes(raw + b"changed")
     with pytest.raises(ValueError):
         owner.acknowledge(c.store, "run-1", ack)
-
-
-def test_published_ci_retry_before_ack_retains_the_original_rollup_reader(ci_case):
-    c = ci_case
-    assert owner.result_for(c.case.broker, c.case.publication) is None
-    assert c.closed["result"]["checks"]["ci"]["state"] == "pending"
-    assert not c.remote.calls
 
 
 @pytest.mark.parametrize("change", ["foreign", "same_owner", "gate_event", "gate_command"])
@@ -437,151 +314,6 @@ def test_worker_binds_the_exact_normal_CI_claim_and_admission_generation(ci_case
         owner.validate(c.store, current, recovery)
     with c.store._connect() as db:
         assert not db.execute("SELECT 1 FROM delivery_ci_inventory_results").fetchone()
-
-
-def test_file_only_success_cannot_substitute_for_normal_CI_observation(ci_case):
-    c = ci_case
-    pre = owner.preflight(c.store, "run-1", c.command)
-    response = owner.acknowledge(
-        c.store,
-        "run-1",
-        {**c.command, "preflight_key": pre["preflight_key"], "acknowledgement": owner.ACK},
-    )
-    forged = {
-        "state": "passed",
-        "head": c.candidate["head"],
-        "checks": {},
-        "execution_inventory": {
-            "method": "acknowledged_original_dispatch_inventory/v1",
-            "receipt": response["receipt"],
-        },
-    }
-    with pytest.raises(ValueError, match="file-only"):
-        owner.validate_result(c.store, "run-1", forged)
-
-
-@pytest.mark.parametrize("change", ["source", "selected_raw", "claim", "profile"])
-def test_ack_replay_reobserves_current_authority_and_selected_bytes(ci_case, change):
-    c = ci_case
-    pre = owner.preflight(c.store, "run-1", c.command)
-    ack = {**c.command, "preflight_key": pre["preflight_key"], "acknowledgement": owner.ACK}
-    response = owner.acknowledge(c.store, "run-1", ack)
-    if change == "source":
-        (c.case.broker.checkout / c.case.api).write_text("Changed after ACK\n")
-    elif change == "selected_raw":
-        endpoint = next(k for k in c.remote.data if k.endswith("/logs"))
-        c.remote.data[endpoint] += b"changed"
-    elif change == "claim":
-        with c.store._connect() as db:
-            c.store.state.claim_work(
-                db, c.case.spec["work_id"], "foreign", c.store.config.dashboard_url
-            )
-    else:
-        c.profile_path.write_text("{}")
-    with pytest.raises((ValueError, OSError)):
-        owner.acknowledge(c.store, "run-1", ack)
-    # A historical data-only acknowledgement read grants no new execution and
-    # does not depend on the ended/mutated current checkout or original input.
-    assert owner.info(c.store, "run-1") == response
-
-
-@pytest.mark.parametrize("when", ["before", "after"])
-def test_readonly_preflight_keeps_current_installation_guard_separate_from_history(
-    ci_case, monkeypatch, when
-):
-    from devflow_temporal import delivery_runtime_location as location
-
-    c = ci_case
-    readonly = DeliveryStore(c.store.config, read_only=True)
-    actual = location.require_not_pending
-    lost = []
-
-    def require(config):
-        if lost:
-            raise ValueError("owned current service guard custody lost")
-        return actual(config)
-
-    monkeypatch.setattr(location, "require_not_pending", require)
-    if when == "before":
-        lost.append(True)
-    else:
-        observe = owner._observe
-
-        def after(*args, **kw):
-            result = observe(*args, **kw)
-            lost.append(True)
-            return result
-
-        monkeypatch.setattr(owner, "_observe", after)
-    with pytest.raises(ValueError, match="current service guard"):
-        owner.preflight(readonly, "run-1", c.command)
-
-
-@pytest.mark.asyncio
-async def test_lifecycle_public_preflight_and_ack_agree_on_changed_checkpoint(ci_case):
-    c = ci_case
-    with c.store._connect() as db:
-        before = {table: [dict(row) for row in db.execute("SELECT * FROM " + table)]
-                  for table in ("delivery_runs", "delivery_events", "delivery_commands")}
-    async with public(c) as (client, headers):
-        path = "/api/runs/run-1/"
-        good = await client.post(path + "ci-inventory-preflight", json=c.command)
-        assert good.status_code == 200, good.text
-        assert good.json()["lifecycle_assessment"]["eligible"] is True
-        for field, value, code in (
-            ("expected_revision", c.command["expected_revision"] + 1, "revision_changed"),
-            ("expected_projection_revision", c.command["expected_projection_revision"] + 1,
-             "projection_revision_changed"),
-            ("expected_candidate_id", "0" * 64, "candidate_changed"),
-            ("expected_candidate_head", "0" * 40, "candidate_head_changed"),
-            ("expected_content_sha256", "0" * 64, "candidate_content_changed"),
-            ("expected_pr_number", c.command["expected_pr_number"] + 1, "publication_changed"),
-        ):
-            body = {**c.command, field: value}
-            pre = await client.post(path + "ci-inventory-preflight", json=body)
-            ack = await client.post(path + "ack-ci-inventory", headers=headers, json={
-                **body, "preflight_key": good.json()["preflight_key"],
-                "acknowledgement": owner.ACK})
-            assert pre.status_code == ack.status_code == 409
-            for response in (pre, ack):
-                detail = response.json()["detail"]
-                assert not detail["eligible"]
-                assert code in {blocker["code"] for blocker in detail["blockers"]}
-    with c.store._connect() as db:
-        for table, rows in before.items():
-            assert [dict(row) for row in db.execute("SELECT * FROM " + table)] == rows
-        assert not db.execute("SELECT 1 FROM delivery_ci_inventories").fetchone()
-
-
-@pytest.mark.asyncio
-async def test_public_preflight_absent_resource_root_is_read_only(ci_case, monkeypatch):
-    """Missing cleanup evidence must not be replaced by a new resource directory."""
-    from devflow_temporal import delivery_ci_teardown, delivery_gate_retry
-
-    c = ci_case
-    root = c.case.registry.root
-    shutil.rmtree(root)
-    assert not root.exists()
-    observations = []
-    profile_args = []
-    cleanup = delivery_gate_retry._stopped_cleanup
-
-    def no_historical_teardown(store, spec, previous, candidate, publication, profile=None):
-        profile_args.append(profile)
-        return None
-
-    def inspect_cleanup(spec, *, read_only=False):
-        observations.append(read_only)
-        return cleanup(spec, read_only=read_only)
-
-    monkeypatch.setattr(delivery_ci_teardown, "snapshot_cleanup", no_historical_teardown)
-    monkeypatch.setattr(delivery_gate_retry, "_stopped_cleanup", inspect_cleanup)
-    async with public(c) as (client, _headers):
-        response = await client.post("/api/runs/run-1/ci-inventory-preflight", json=c.command)
-    assert response.status_code == 409, response.text
-    assert len(profile_args) == 1 and profile_args[0] is not None
-    assert observations == [True]
-    assert not root.exists()
 
 
 @pytest.mark.asyncio

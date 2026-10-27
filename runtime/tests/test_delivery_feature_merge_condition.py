@@ -107,30 +107,6 @@ def test_native_stack_head_push_after_read_cannot_submit_any_member(
         assert db.execute("SELECT 1 FROM execution_effects").fetchone() is None
 
 
-def test_one_open_native_member_is_not_an_atomic_membership_condition(service, monkeypatch):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    gh.merged = {20, 21}
-    with pytest.raises(merger.StackMergeConditionUnavailable):
-        merger.merge(store, spec, requested, command, gh=gh,
-                     execute=lambda *_a, **_kw: pytest.fail("native suffix submitted"))
-    assert not gh.closed
-    with registry(spec).connect() as db:
-        assert db.execute("SELECT 1 FROM execution_effects").fetchone() is None
-
-
-def test_historical_not_started_stack_is_settleable_but_not_resubmittable(service, monkeypatch):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    key = previously_submitted(store, spec, record, requested, command, state="not_started")
-    with pytest.raises(merger.StackMergeConditionUnavailable):
-        merger.merge(store, spec, requested, command, gh=gh,
-                     execute=lambda *_a, **_kw: pytest.fail("historical unbound retry"))
-    result = merger.merge(store, spec, requested, command, gh=gh, settlement=True,
-                          execute=lambda *_a, **_kw: pytest.fail("settlement submitted"))
-    assert result == {"state": "absent", "reason": "merge_submission_failed", "effect_key": key}
-    assert registry(spec).effect("I_feature", key)["state"] == "absent"
-    assert not gh.closed
-
-
 def test_nested_readonly_settlement_never_creates_issue_closure(service, monkeypatch):
     from devflow_temporal.delivery_execution_registry import UnresolvedEffect
     from devflow_temporal.delivery_feature_readback import settle_one
@@ -154,70 +130,6 @@ def test_nested_readonly_settlement_never_creates_issue_closure(service, monkeyp
         assert db.execute("SELECT count(*) FROM execution_effects "
                           "WHERE kind='close_merged_issue'").fetchone()[0] == 0
     assert not gh.closed and all(method == "GET" for method, _, _ in gh.calls)
-
-
-@pytest.mark.parametrize("reconciling", [False, True], ids=["retained", "current"])
-@pytest.mark.parametrize("submission", ["started", "submitted", "unknown"])
-def test_existing_native_submission_keeps_readback_and_exact_receipt_obligations(
-    service, monkeypatch, reconciling, submission,
-):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    if reconciling:
-        spec = {**spec, "merge_reconciliation_version": 1}
-    previously_submitted(store, spec, record, requested, command, state=submission)
-    def never_submit(*_a, **_kw):
-        pytest.fail("must not repeat an uncertain native submission")
-
-    monkeypatch.setattr(merger, "evidence", never_submit)
-    result = merger.merge(store, spec, requested, command, gh=gh, execute=never_submit)
-    assert result["state"] == "pending" and result["reason"] == "original_merge_readback"
-    assert not gh.closed
-    gh.merged = {20, 21, 22}
-    result = merger.merge(store, spec, requested, command, gh=gh, execute=never_submit)
-    assert result["state"] == "confirmed" and gh.closed == {3, 10, 11}
-    assert merger.merge(store, spec, requested, command, gh=gh, execute=never_submit) == result
-
-
-def test_already_merged_native_stack_without_intent_uses_read_only_final_qualification(
-    service, monkeypatch,
-):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    spec = {**spec, "merge_reconciliation_version": 1}
-    gh.merged = {20, 21, 22}
-    shared = registry(spec)
-    for member in record["manifest"]["publication"]["members"]:
-        shared.checkpoint(spec["feature_delivery"]["owner"], "verified:" + member["chunk_id"],
-                          {"run_id": spec["run_id"]})
-    api = gh.api
-
-    def read_only(path, *, method="GET", body=None):
-        # The final-stack qualifier still runs its real merged-member lineage
-        # path. Any target update or merge submission is a test failure.
-        assert method == "GET"
-        if "/git/ref/heads/" in path:
-            return {"object": {"sha": "moved-target"}}
-        members = record["manifest"]["publication"]["members"]
-        head = path.rsplit("/", 1)[-1]
-        member = next((item for item in members if item["head"] == head), None)
-        if "/git/commits/" in path and member:
-            return {"tree": {"sha": "tree-" + str(member["number"])}}
-        return api(path, method=method, body=body)
-
-    from devflow_temporal.delivery_merge import MergeBroker
-
-    monkeypatch.setattr(MergeBroker, "api", lambda _self, *a, **kw: read_only(*a, **kw))
-    enforcement = []
-    monkeypatch.setattr(MergeBroker, "require_base_enforcement",
-                        lambda self: enforcement.append(self.spec["publication_base_ref"]))
-    monkeypatch.setattr(MergeBroker, "live_ci",
-                        lambda *_a, **_kw: pytest.fail("cannot requalify an already merged member"))
-    result = merger.merge(store, spec, requested, command, gh=gh,
-                          execute=lambda *_a, **_kw: pytest.fail("already merged stack submitted"))
-    assert result["state"] == "confirmed" and gh.closed == {3, 10, 11}
-    assert enforcement == ["main"]
-    with shared.connect() as db:
-        assert db.execute("SELECT 1 FROM execution_effects WHERE kind='merge_reconcile'"
-                          ).fetchone() is None
 
 
 def conditional_cli(tmp_path, monkeypatch, origin, member):

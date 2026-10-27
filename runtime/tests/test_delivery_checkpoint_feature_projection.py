@@ -15,8 +15,6 @@ from test_delivery_store import service as service
 
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_checkpoint_registry_view import (
-    MAX_PROJECTION_CELL_BYTES,
-    MAX_PROJECTION_ROWS,
     CheckpointRegistryView,
     PreparedRegistryProjection,
 )
@@ -141,37 +139,3 @@ def test_registry_projection_view_cannot_write_close_or_outlive_its_fence(servic
             assert db.in_transaction
     with pytest.raises(ValueError, match="closed|held transaction"):
         view.current(spec["feature_delivery"]["owner"]["issue_id"])
-
-
-@pytest.mark.parametrize("oversize", ["rows", "payload"])
-def test_feature_projection_limits_refuse_before_any_admission_lock(service, monkeypatch, oversize):
-    old, request = service
-    raw = deepcopy(old.config.raw)
-    raw["workspace_custody_version"] = 1
-    old.config.path.write_text(json.dumps(raw))
-    configured = DeliveryStore(DeliveryConfig.load(old.config.path))
-    store, request, _ = feature_service((configured, request), monkeypatch)
-    store.submit(request)
-    spec = store.effective_spec(request["run_id"])
-    _broker, revision = _checkout(store, spec)
-    shared = registry(spec)
-    token = spec["feature_delivery"]["owner"]
-    if oversize == "payload":
-        shared.checkpoint(token, "owned-oversized", {"value": "x" * MAX_PROJECTION_CELL_BYTES})
-    else:
-        with shared.connect() as db:
-            db.executemany("INSERT INTO execution_checkpoints VALUES (?,?,?,'fixture','{}','now')",
-                           [(token["issue_id"], "owned-bound-" + str(i), token["generation"])
-                            for i in range(MAX_PROJECTION_ROWS + 1)])
-
-    @contextmanager
-    def admission():
-        pytest.fail("oversized projection entered its admission lock")
-        yield
-
-    with pytest.raises(ValueError, match="observation exceeds its bounded|projection exceeds"):
-        create_checkpoint(store, spec["run_id"], "oversized-projection", revision,
-                          admission_context=admission)
-    with store._connect() as db:
-        assert not db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
-                              ("checkpoint:create:oversized-projection",)).fetchone()

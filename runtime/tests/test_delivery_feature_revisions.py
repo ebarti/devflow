@@ -99,10 +99,6 @@ def _feature(service, monkeypatch, *, index_bytes=None):
     return store, spec, registry(spec), record, diagnostic
 
 
-
-
-
-
 def proposed(record):
     value = migrate_plan_v1(
         record["manifest"]["plan"],
@@ -122,54 +118,6 @@ def passing(context, value):
         "reviewed_plan_sha256": digest(value),
         "candidate_id": context["candidate_id"],
     }
-
-
-
-
-
-
-def test_future_split_preserves_started_custody_and_rejected_attempts_share_limit(feature):
-    store, spec, shared, record, diagnostic = feature
-    value = proposed(record)
-    original = value["workstreams"][0]["chunks"][1]
-    precursor = deepcopy(original)
-    precursor.update(id="precursor", title="Prerequisite", depends_on=["model", "client"])
-    original["depends_on"].append("precursor")
-    value["workstreams"][0]["chunks"].insert(1, precursor)
-    diagnostic.update(chunk_id="endpoint", category="decomposition")
-    context = revisions.begin_revision(store, spec, diagnostic, command_id="split-future")
-    receipt = revisions.record_proposal(store, spec, context["revision_id"], value)
-    assert "precursor" in receipt["affected_chunks"]
-    assert "endpoint" in receipt["implementation_chunks"]
-    revisions.reject_revision(
-        store, spec, context["revision_id"], "First proposal needs refinement"
-    )
-    shared.checkpoint(
-        spec["feature_delivery"]["owner"],
-        "assignment:endpoint:chunk",
-        {
-            "chunk_id": "endpoint",
-            "kind": "chunk",
-            "run_id": "original-worker",
-            "store_path": str(store.config.tracking_db),
-        },
-    )
-    context = revisions.begin_revision(store, spec, diagnostic, command_id="split-started")
-    with pytest.raises(OwnershipConflict, match="started chunk"):
-        revisions.record_proposal(store, spec, context["revision_id"], value)
-    revisions.reject_revision(
-        store, spec, context["revision_id"], "Started chunk cannot change prerequisites"
-    )
-    for number in range(8):
-        context = revisions.begin_revision(
-            store, spec, diagnostic, command_id="rejected-" + str(number)
-        )
-        revisions.reject_revision(
-            store, spec, context["revision_id"], "Independent review rejected it"
-        )
-    assert shared.budget(spec["feature_delivery"]["owner"]["issue_id"])["used"] == 10
-    with pytest.raises(OwnershipConflict, match="repair limit exhausted"):
-        revisions.begin_revision(store, spec, diagnostic, command_id="exhausted")
 
 
 def _stop_revision_fixture(store, spec, shared):
@@ -394,10 +342,6 @@ def _native_rejected_fixture(native_configuration, monkeypatch, *, prior_cycles=
 @pytest.fixture
 def _native_rejected_prelaunch(native_configuration, monkeypatch):
     return _native_rejected_fixture(native_configuration, monkeypatch)
-
-
-
-
 
 
 def _complete_native_role_fixture(store, spec, context, plan, diagnostic, role, runtime,

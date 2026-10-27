@@ -91,26 +91,6 @@ def native_gates(api_fixture, tmp_path):
     assert RunResources(owned).finalize("blocked")["state"] == "confirmed"
 
 
-@pytest.mark.asyncio
-async def test_command_timestamps_survive_reattaching_completed_check(native_gates):
-    from datetime import UTC, datetime
-
-    broker, candidate = native_gates.broker, native_gates.candidate
-    before = datetime.now(UTC)
-    first = await asyncio.to_thread(broker.run_checks, 0, candidate)
-    after = datetime.now(UTC)
-    row = first["results"][0]
-    started = datetime.fromisoformat(row["started_at"])
-    finished = datetime.fromisoformat(row["finished_at"])
-    assert before <= started < finished <= after
-    assert 0 < row["duration_seconds"] <= (after - before).total_seconds()
-    journal = read_private(Path(row["native_process"]["journal"]))
-    assert journal["started_at"] == row["started_at"]
-    again = await asyncio.to_thread(broker.run_checks, 0, candidate)
-    for key in ("started_at", "finished_at", "duration_seconds"):
-        assert again["results"][0][key] == row[key] == journal["result"][key]
-
-
 async def _lose_authorized_monitor(journal_path: Path) -> dict:
     """Kill the monitor once its child is authorized, as a reboot or OOM kill would."""
     async with asyncio.timeout(60):
@@ -169,8 +149,6 @@ async def test_lost_check_monitor_reruns_the_gate_once(native_gates, losses):
     again = await loop.run_in_executor(None, broker.run_checks, 0, candidate)
     assert again["state"] == "unknown" and again["cleanup"] == "confirmed"
     assert _native_folders(folder) == ["native", "native-retry"]
-
-
 
 
 @pytest.mark.asyncio

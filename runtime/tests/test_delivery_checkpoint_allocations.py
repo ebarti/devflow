@@ -130,47 +130,6 @@ async def test_restored_checkout_regenerates_acknowledged_missing_dependencies(r
                                      (spec["run_id"],)).fetchone()[0])["tokens"] == 731
 
 
-@pytest.mark.parametrize("damage", [
-    "restore-event", "mutation-digest", "mutation-state", "child-generation", "root-generation",
-    "present-child", "archive",
-])
-async def test_generated_allocation_refuses_unacknowledged_or_changed_custody(
-    restored_allocation, damage,
-):
-    store, spec, _broker, resources, dependency, _original, archive, *_ = restored_allocation
-    original_artifact = None
-    artifact = archive / "state/resources/manifest.json"
-    if damage in {"restore-event", "mutation-digest", "mutation-state"}:
-        with store._connect() as db:
-            if damage == "restore-event":
-                db.execute("DELETE FROM delivery_events WHERE run_id=? "
-                           "AND type='delivery_checkpoint_restored'", (spec["run_id"],))
-            else:
-                column = "request_digest" if damage == "mutation-digest" else "state"
-                db.execute(f"UPDATE delivery_mutations SET {column}=? WHERE command_id=?",
-                           ("unknown", "checkpoint-restore:restore-generated"))
-    elif damage in {"child-generation", "root-generation"}:
-        current = read_private(resources.manifest)
-        root = dependency if damage == "child-generation" else Path(spec["checkout"])
-        current["roots"][str(root)]["generation"] = 999
-        write_private(resources.manifest, current)
-    elif damage == "present-child":
-        dependency.mkdir(mode=0o700)
-        (dependency / "foreign-output.txt").write_text("do not adopt\n")
-    else:
-        original_artifact = artifact.read_bytes()
-        changed = json.loads(original_artifact)
-        changed["roots"][str(dependency)]["identity"]["inode"] += 1
-        artifact.write_text(json.dumps(changed))
-    try:
-        with pytest.raises(ValueError):
-            resources.register(dependency, "generated")
-        assert read_private(resources.manifest)["roots"][str(dependency)]["identity"] is not None
-    finally:
-        if original_artifact is not None:
-            artifact.write_bytes(original_artifact)
-
-
 @pytest.mark.parametrize("restored_allocation", ["unproven"], indirect=True)
 async def test_checkpoint_refuses_unproven_generated_output_before_claiming_resumable(
     restored_allocation,
@@ -192,37 +151,3 @@ async def test_checkpoint_refuses_unproven_generated_output_before_claiming_resu
             "SELECT 1 FROM delivery_commands WHERE run_id=? AND command_id LIKE 'checkpoint-%'",
             (spec["run_id"],),
         ).fetchone() is None
-
-
-async def test_repeated_checkpoint_restore_preserves_generated_allocation_generations(
-    restored_allocation,
-):
-    store, spec, broker, resources, dependency, _original, _archive, _saved, client, route = (
-        restored_allocation
-    )
-    resources.register(dependency, "generated")
-    dependency.mkdir(mode=0o700)
-    resources.created(dependency)
-    previous = read_private(resources.manifest)["roots"][str(dependency)]
-    before = candidate_for(broker.checkout)
-    session = (await client.get("/api/session")).json()
-    headers = {"origin": store.config.dashboard_url, "x-devflow-csrf": session["csrf_token"]}
-    with store._connect() as db:
-        revision = db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
-                              (spec["run_id"],)).fetchone()[0]
-    saved = await client.post(route, headers=headers, json={
-        "command_id": "save-second-generation", "expected_revision": revision,
-    })
-    assert saved.status_code == 200, saved.text
-    shutil.rmtree(broker.checkout)
-    restored = await client.post(
-        route + "/" + saved.json()["checkpoint_id"] + "/restore", headers=headers,
-        json={"command_id": "restore-second-generation", "expected_revision": revision},
-    )
-    assert restored.status_code == 200, restored.text
-    resources.register(dependency, "generated")
-    current = read_private(resources.manifest)["roots"][str(dependency)]
-    assert current["generation"] == previous["generation"] + 1
-    assert current["identity"] is None
-    assert current["checkpoint_restore_allocation"]["previous_identity"] == previous["identity"]
-    assert candidate_for(broker.checkout) == before

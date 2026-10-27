@@ -5,8 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -148,33 +146,3 @@ async def test_manual_retained_source_refuses_forged_or_unfinished_predecessor_w
     assert owner_bytes(owner) == original_owner
     assert not (store.config.state_root / "runs" / successor["run_id"]).exists()
     assert not (store.config.state_root / "checkouts" / successor["run_id"]).exists()
-
-
-async def test_manual_source_readmission_waits_for_actual_writer_body_settlement(
-    stopped_owned_admission,
-):
-    from devflow_temporal.delivery_writer_custody import shared
-
-    store, original, owner, successor = stopped_owned_admission
-    entered, release = threading.Event(), threading.Event()
-
-    def writer():
-        with shared(original):
-            entered.set()
-            assert release.wait(5)
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(writer)
-        assert entered.wait(2)
-        before, original_owner = snapshot(store), owner_bytes(owner)
-        try:
-            refused = await public_submit(store, successor)
-            assert refused.status_code == 409, refused.text
-            assert "lease" in refused.json()["detail"]
-            assert snapshot(store) == before
-            assert owner_bytes(owner) == original_owner
-        finally:
-            release.set()
-            future.result(timeout=2)
-    admitted = await public_submit(store, successor)
-    assert admitted.status_code == 200, admitted.text

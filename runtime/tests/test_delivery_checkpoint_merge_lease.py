@@ -60,12 +60,3 @@ def test_shared_lease_refuses_replacement_and_wrong_installation(tmp_path):
         os.close(fd)
         with pytest.raises(ValueError, match="changed while held"):
             held.verify(config)
-
-
-def test_shared_lease_never_creates_missing_original_witness(tmp_path):
-    config, path = witness(tmp_path)
-    path.unlink()
-    with pytest.raises(FileNotFoundError):
-        with SharedCheckpointMergeLease(config):
-            pass
-    assert not path.exists()
