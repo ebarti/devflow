@@ -126,6 +126,9 @@ def plan(skills, home, force, *, migration_source=None, predecessor=None):
     if predecessor is not None and (predecessor != migration_source or predecessor == ROOT):
         raise ValueError("agent predecessor must be the exact distinct source being migrated")
     migration = migration_helper.plan(migration_source or ROOT, skills, home, guard)
+    if (predecessor is None and migration is not None and migration_source is not None
+            and migration_source != ROOT):
+        predecessor = migration_source
     _, _, actions, obsolete, _ = agents.plan(ROOT, skills, home, force, predecessor=predecessor)
     service = skills / "devflow-local-delivery"
     source = ROOT / "runtime/desktop/devflow-local-delivery"
@@ -199,7 +202,8 @@ def plan(skills, home, force, *, migration_source=None, predecessor=None):
                 adopted.append((registered, child))
     return {"migration": migration, "scripts_upgrade": scripts_upgrade, "adopted": adopted,
             "plugin": plugin, "service": service, "source": source, "compatibility": compatibility,
-            "children": children, "obsolete": obsolete, "actions": actions}
+            "children": children, "obsolete": obsolete, "actions": actions,
+            "predecessor": predecessor}
 
 
 def install(skills, home, force, backup=None, *, migration_source=None, lease_fd=None, predecessor=None):
@@ -211,6 +215,7 @@ def install(skills, home, force, backup=None, *, migration_source=None, lease_fd
     plugin, service, source = (prepared[name] for name in ("plugin", "service", "source"))
     compatibility, children = prepared["compatibility"], prepared["children"]
     obsolete, actions = prepared["obsolete"], prepared["actions"]
+    predecessor = prepared["predecessor"]
     MUTATING = True
     migration_helper.apply(migration, ROOT, skills, agents, rollback, backup)
     if scripts_upgrade and not adopted:
