@@ -11,6 +11,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 from importlib.metadata import distribution
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -94,10 +95,12 @@ def historical_ci(service, monkeypatch):
                     text = observed.stdout
                     if isinstance(text, str) and len(text) <= 4096:
                         lines = text.splitlines()
-                        if all(line.startswith('p') and line[1:].isascii()
-                               and line[1:].isdigit() and len(line[1:]) <= 10
-                               and 0 < int(line[1:]) <= 2**31 - 1 for line in lines):
-                            pids = [int(line[1:]) for line in lines]
+                        if all((line.startswith('p') and line[1:].isascii()
+                                and line[1:].isdigit() and len(line[1:]) <= 10
+                                and 0 < int(line[1:]) <= 2**31 - 1)
+                               or re.fullmatch(r'f(?:[0-9]{1,6}[rwu]?|cwd|rtd|txt|mem|DEL)', line)
+                               for line in lines):
+                            pids = [int(line[1:]) for line in lines if line.startswith('p')]
                             facts.update(holder_pids=pids[:8],
                                          holder_count_capped=min(8, len(pids)),
                                          self_pid_reported=os.getpid() in pids)
