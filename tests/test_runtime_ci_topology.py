@@ -69,6 +69,13 @@ if [ \"$1 $2\" = 'python find' ]; then printf '%s\\n' \"$STUB_PYTHON\"; fi
             stub.write_text('''\
 import fcntl, json, os, sys, time
 path, key = os.environ['STUB_LOG'], sys.argv[1]
+if key.startswith('source-'):
+    if key == 'source-install':
+        assert os.environ['DEVFLOW_PYTHON'] == os.environ['STUB_SOURCE_PYTHON']
+    else:
+        assert os.environ['DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON'] == os.environ['STUB_SOURCE_PYTHON']
+else:
+    assert os.environ['DEVFLOW_PYTHON'] == os.environ['STUB_NATIVE_PYTHON']
 for event in ('start', 'end'):
     if event == 'end':
         time.sleep(.03)
@@ -81,8 +88,9 @@ if key == os.environ.get('STUB_FAIL'):
 ''')
             runner = f'{shlex.quote(sys.executable)} {shlex.quote(str(stub))}'
             substitutions = {
-                'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \\\n    sh ../scripts/check-install.sh': f'{runner} source-install',
-                'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \\\n      python3.12 -B -m unittest discover -s tests -p \'test_reconcile.py\' -v':
+                'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \\\n    DEVFLOW_PYTHON="$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" sh ../scripts/check-install.sh':
+                    f'env DEVFLOW_PYTHON="$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" {runner} source-install',
+                'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \\\n      "$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" -B -m unittest discover -s tests -p \'test_reconcile.py\' -v':
                     f'{runner} source-reconcile',
                 '.venv/bin/python runtime_ci.py --index "$index" --count 4 \\\n    --basetemp "$RUNNER_TEMP/devflow-pytest-$index"': f'{runner} "$index"',
             }
@@ -98,7 +106,11 @@ if key == os.environ.get('STUB_FAIL'):
                 for failed_index in failures:
                     log.unlink(missing_ok=True)
                     env = {**os.environ, 'STUB_LOG': str(log), 'RUNNER_TEMP': str(root),
-                           'HOME': str(home)}
+                           'HOME': str(home),
+                           'DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON': sys.executable,
+                           'STUB_SOURCE_PYTHON': sys.executable,
+                           'DEVFLOW_PYTHON': 'original-native-interpreter',
+                           'STUB_NATIVE_PYTHON': 'original-native-interpreter'}
                     env.pop('STUB_FAIL', None)
                     if failed_index is not None:
                         env['STUB_FAIL'] = failed_index

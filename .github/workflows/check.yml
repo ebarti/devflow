@@ -117,12 +117,12 @@ jobs:
             fixture_parent="$(mktemp -d "$HOME/devflow-install-fixtures.XXXXXX")"
             export DEVFLOW_PRODUCTION_FIXTURE_PARENT="$fixture_parent"
             env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-              sh ../scripts/check-install.sh &
+              DEVFLOW_PYTHON="$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" sh ../scripts/check-install.sh &
             processes+=("$!")
             (
               cd ..
               env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-                python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v
+                "$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" -B -m unittest discover -s tests -p 'test_reconcile.py' -v
             ) &
             processes+=("$!")
             for process in "${processes[@]}"; do
