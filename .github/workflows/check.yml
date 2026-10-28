@@ -129,8 +129,9 @@ jobs:
           rmdir "$fixture_parent" || result=1
           for lane in 0 1; do
             index=$(( ${{ matrix.shard }} + lane * 2 ))
+            # Exclude private transient fixtures from ambient metadata indexing.
             .venv/bin/python runtime_ci.py --index "$index" --count 4 \
-              --basetemp "$RUNNER_TEMP/devflow-pytest-$index" &
+              --basetemp "$RUNNER_TEMP/devflow-pytest-$index.noindex" &
             processes+=("$!")
           done
           for process in "${processes[@]}"; do

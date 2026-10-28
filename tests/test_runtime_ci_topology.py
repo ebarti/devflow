@@ -83,6 +83,13 @@ if key.startswith('source-'):
 else:
     assert os.environ['DEVFLOW_PYTHON'] == os.environ['STUB_NATIVE_PYTHON']
     assert os.environ['DEVFLOW_PRODUCTION_FIXTURE_PARENT'] == 'original-native-fixture-parent'
+    assert len(sys.argv) == 3
+    base = Path(sys.argv[2])
+    assert base.parent == Path(os.environ['RUNNER_TEMP'])
+    assert base.name == f'devflow-pytest-{key}.noindex'
+    with open(os.environ['STUB_ROOT_LOG'], 'a') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.write(json.dumps([key, str(base)]) + '\\n')
 for event in ('start', 'end'):
     if event == 'end':
         time.sleep(.03)
@@ -100,19 +107,23 @@ if key == os.environ.get('STUB_FAIL'):
                     f'DEVFLOW_PYTHON="$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" {runner} source-install',
                 'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \\\n      DEVFLOW_PRODUCTION_FIXTURE_PARENT="$fixture_parent" \\\n      "$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" -B -m unittest discover -s tests -p \'test_reconcile.py\' -v':
                     f'env DEVFLOW_PRODUCTION_FIXTURE_PARENT="$fixture_parent" {runner} source-reconcile',
-                '.venv/bin/python runtime_ci.py --index "$index" --count 4 \\\n    --basetemp "$RUNNER_TEMP/devflow-pytest-$index"': f'{runner} "$index"',
+                '.venv/bin/python runtime_ci.py --index "$index" --count 4 \\\n    --basetemp "$RUNNER_TEMP/devflow-pytest-$index.noindex"':
+                    f'{runner} "$index" "$RUNNER_TEMP/devflow-pytest-$index.noindex"',
             }
             for original, replacement in substitutions.items():
                 self.assertIn(original, script)
                 script = script.replace(original, replacement)
-            all_indices, all_sources = [], []
+            all_indices, all_sources, all_roots = [], [], []
             for host in range(2):
                 log = root / f'{host}.jsonl'
+                root_log = root / f'{host}-roots.jsonl'
                 source = 'source-reconcile' if host == 0 else 'source-install'
                 failures = [None, str(host), str(host + 2), source, 'cleanup']
                 for failed_index in failures:
                     log.unlink(missing_ok=True)
-                    env = {**os.environ, 'STUB_LOG': str(log), 'RUNNER_TEMP': str(root),
+                    root_log.unlink(missing_ok=True)
+                    env = {**os.environ, 'STUB_LOG': str(log), 'STUB_ROOT_LOG': str(root_log),
+                           'RUNNER_TEMP': str(root),
                            'HOME': str(home),
                            'DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON': sys.executable,
                            'STUB_SOURCE_PYTHON': sys.executable,
@@ -140,6 +151,9 @@ if key == os.environ.get('STUB_FAIL'):
                     self.assertLessEqual(peak, 2)
                     indices = sorted(int(key) for key in starts if key.isdigit())
                     self.assertEqual(indices, [host, host + 2])
+                    roots = [json.loads(line) for line in root_log.read_text().splitlines()]
+                    self.assertEqual(sorted(roots), [[str(i), str(root / f'devflow-pytest-{i}.noindex')]
+                                                     for i in [host, host + 2]])
                     self.assertEqual(set(starts), {source, str(host), str(host + 2)})
                     self.assertEqual(starts.count(source), 1)
                     last_source = max(i for i, (_, key) in enumerate(events)
@@ -153,9 +167,11 @@ if key == os.environ.get('STUB_FAIL'):
                         shutil.rmtree(fixture)
                     if failed_index is None:
                         all_indices.extend(indices)
+                        all_roots.extend(path for _, path in roots)
                         all_sources.extend(key for key in starts if key.startswith('source-'))
             self.assertEqual(sorted(all_indices), list(range(4)))
             self.assertEqual(sorted(all_sources), ['source-install', 'source-reconcile'])
+            self.assertEqual(len(set(all_roots)), 4)
 
 
 if __name__ == '__main__':
