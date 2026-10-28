@@ -601,5 +601,51 @@ def admit(store, run_id, payload, *, preflight=False):
         recovery = json.loads(row[0])
         readback(store, recovery["spec"], recovery)
         return {**json.loads(prior["response_json"]), "existing": True, "preflight": preflight}
-    raise ValueError("QA findings require repair and a passing QA assessment; "
-                     "new adjudication admissions are retired")
+    from .delivery_lifecycle import RecoveryRefused, require_transition
+
+    try:
+        require_transition(_retired_facts(), {})
+    except RecoveryRefused as exc:
+        # Preserve the legacy explanation while retaining structured refusal facts.
+        exc.args = ("QA findings require repair and a passing QA assessment; "
+                    "new adjudication admissions are retired",)
+        raise
+
+
+def _retired_facts():
+    return {
+        "operation": KIND, "owner": "investigation_adjudication", "owner_proof": True,
+        "proof_digest": digest({"admission_policy": "retired", "operation": KIND}),
+        "normalized_lifecycle": "unknown", "comparisons": [], "predicates": [{
+            "code": "adjudication_admission_retired", "satisfied": False,
+            "missing_or_unknown_fact": "authorization for a new adjudication admission",
+            "next_action": "repair findings and obtain a passing QA assessment",
+            "new_authorization_required": True,
+        }],
+    }
+
+
+def assess(store, run_id, payload):
+    """Historical command replay is not authorization for a new admission."""
+    from .delivery_lifecycle import evaluate_transition
+
+    try:
+        _request(payload)
+    except (ValueError, KeyError, TypeError):
+        return evaluate_transition({"operation": KIND, "owner": "investigation_adjudication",
+                                    "comparisons": [], "predicates": [{
+            "code": "adjudication_request_invalid", "satisfied": False,
+            "missing_or_unknown_fact": "valid bounded adjudication request",
+            "next_action": "inspect the investigation adjudication request",
+        }]}, {})
+    with store._connect() as db:
+        prior = db.execute("SELECT 1 FROM delivery_commands WHERE command_id=?",
+                           (payload["command_id"],)).fetchone()
+    if prior:
+        return evaluate_transition({"operation": KIND, "owner": "investigation_adjudication",
+                                    "comparisons": [], "predicates": [{
+            "code": "adjudication_historical_replay", "satisfied": None,
+            "missing_or_unknown_fact": "fresh admission authority for historical command",
+            "next_action": "inspect the retained adjudication readback",
+        }]}, {})
+    return evaluate_transition(_retired_facts(), {})

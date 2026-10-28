@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path
@@ -117,7 +117,9 @@ def canonical_owner(spec):
         or _authority(intent) != supplied["intent_authority_sha256"]
     ):
         raise ValueError("native preparation lost its exact recorded resource attempt")
-    with closing(sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)) as db:
+    from .delivery_store import tracking_read_connection
+
+    with tracking_read_connection(config.tracking_db) as db:
         db.execute("PRAGMA query_only=ON")
         row = db.execute(
             "SELECT request_json,request_digest,work_id FROM delivery_runs WHERE run_id=?",

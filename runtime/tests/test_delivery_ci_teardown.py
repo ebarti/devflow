@@ -107,6 +107,20 @@ def historical_ci(service, monkeypatch):
                 break
             trace = trace.tb_next
         exc.add_note('historical root-user observation: ' + json.dumps(facts, sort_keys=True))
+        try:
+            from runtime_location_scenario import (
+                artifact_holder_failure_snapshot,
+                ci_failure_diagnostics,
+            )
+
+            if ci_failure_diagnostics():
+                snapshot = artifact_holder_failure_snapshot(
+                    exc, resources._observe_locked_resources, root_observation=True)
+                if snapshot is not None:
+                    exc.add_note('historical root-holder snapshot: '
+                                 + json.dumps(snapshot, sort_keys=True))
+        except BaseException:
+            pass
         raise
     assert asyncio.run(delivery_repair_preflight({"spec": current, "recovery": previous})) == {
         "state": "confirmed"

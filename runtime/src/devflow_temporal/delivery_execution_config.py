@@ -6,14 +6,90 @@ import errno
 import json
 import os
 import re
+import sqlite3
 import stat
 import tempfile
+import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from .contracts import canonical_json, digest
 from .delivery_config import DeliveryConfig
 
 TRANSPORT_FIELDS = ("tracking_db", "state_root", "temporal_address", "temporal_namespace", "queue")
+
+_observation_mode = ContextVar("execution_configuration_observation", default=False)
+_observation_scope = ContextVar("execution_configuration_observation_scope", default=None)
+
+
+class _ObservationScope:
+    def __init__(self):
+        self.resources = {}
+        self.lock = threading.RLock()
+        self.closed = False
+
+    def resource(self, key, factory):
+        with self.lock:
+            if self.closed:
+                raise sqlite3.OperationalError("tracking observation scope is closed")
+            if key not in self.resources:
+                self.resources[key] = factory()
+            return self.resources[key]
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            resources = list(self.resources.values())
+        failure = None
+        for resource in reversed(resources):
+            try:
+                resource.close()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
+
+def is_observation_mode() -> bool:
+    return _observation_mode.get()
+
+
+def observation_scope():
+    return _observation_scope.get()
+
+
+@contextmanager
+def observation_mode():
+    """Share read-only evidence and verify it before the outer observation returns."""
+    token = _observation_mode.set(True)
+    scope = _observation_scope.get()
+    owner = scope is None
+    scope_token = None
+    if owner:
+        scope = _ObservationScope()
+        scope_token = _observation_scope.set(scope)
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            if owner:
+                try:
+                    scope.close()
+                except Exception:
+                    if not failed:
+                        raise
+        finally:
+            if scope_token is not None:
+                _observation_scope.reset(scope_token)
+            _observation_mode.reset(token)
 
 
 def transport_binding(config: DeliveryConfig) -> tuple:
@@ -50,6 +126,8 @@ def _owned_directory(path: Path, *, create: bool = False) -> None:
     non-directories never do.
     """
     if create:
+        if _observation_mode.get():
+            raise ValueError("configuration observation cannot create directories")
         path.mkdir(mode=0o700, exist_ok=True)
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -63,6 +141,8 @@ def _owned_directory(path: Path, *, create: bool = False) -> None:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError("execution configuration requires an owned private directory")
         if stat.S_IMODE(info.st_mode) != 0o700:
+            if _observation_mode.get():
+                raise ValueError("execution configuration directory permissions are not private")
             os.fchmod(descriptor, 0o700)
             if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
                 raise ValueError("execution configuration requires an owned private directory")
@@ -105,6 +185,8 @@ def _read_snapshot(path: Path, expected: str) -> dict:
         if not isinstance(raw, dict) or digest(raw) != expected:
             raise ValueError("immutable admitted configuration changed")
         if stat.S_IMODE(info.st_mode) != 0o600:
+            if _observation_mode.get():
+                raise ValueError("admitted configuration snapshot permissions are not private")
             # Content-authenticated, owner-owned mode drift is repaired in place.
             # A reader never republishes, replaces or widens an inode.
             os.fchmod(descriptor, 0o600)
@@ -115,8 +197,21 @@ def _read_snapshot(path: Path, expected: str) -> dict:
         os.close(descriptor)
 
 
+def verify_existing_execution_config(config: DeliveryConfig) -> None:
+    """Prove admission can reuse its exact private snapshot without publishing one."""
+    with observation_mode():
+        DeliveryConfig._from_raw(config.path, config.raw)
+        _owned_directory(config.state_root)
+        folder = config.state_root / "configuration-snapshots"
+        _owned_directory(folder)
+        expected = digest(config.raw)
+        _read_snapshot(folder / (expected + ".json"), expected)
+
+
 def preserve_execution_config(config: DeliveryConfig) -> None:
     """Only admission/service initialization publishes immutable private snapshots."""
+    if _observation_mode.get():
+        raise ValueError("configuration observation cannot publish snapshots")
     # Authenticate the same complete schema as a live config, without rereading a
     # mutable path after a service has already loaded it.
     DeliveryConfig._from_raw(config.path, config.raw)

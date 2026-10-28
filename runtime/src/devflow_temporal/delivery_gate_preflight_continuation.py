@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -206,7 +207,7 @@ def observe_interrupted(store, spec, row, attempts, effects, closed):
         return await interrupted_events(sealed['history'], spec, recovery, state)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        history = pool.submit(lambda: asyncio.run(read())).result(35)
+        history = pool.submit(copy_context().run, lambda: asyncio.run(read())).result(35)
     if history['history_sha256'] != authenticated['history_sha256']:
         raise ValueError('interrupted gate history changed during readback')
     gates.readback(store, spec, recovery, resource_spec=spec)
@@ -511,7 +512,7 @@ def validate(store, spec, recovery, *, resource_spec=None):
             return await interrupted_events(sealed['history'], before, previous, recovery['state'])
 
         with ThreadPoolExecutor(max_workers=1) as pool:
-            history = pool.submit(lambda: asyncio.run(read())).result(35)
+            history = pool.submit(copy_context().run, lambda: asyncio.run(read())).result(35)
         if history != proof['interrupted_assessment']:
             raise ValueError('interrupted gate predecessor history changed')
     gates.readback(store, before, previous, resource_spec=resource_spec or spec)

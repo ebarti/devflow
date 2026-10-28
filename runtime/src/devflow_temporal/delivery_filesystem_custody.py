@@ -15,13 +15,13 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import stat
 import sys
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from contextvars import copy_context
 from pathlib import Path
 
 from .contracts import canonical_json, digest
@@ -131,7 +131,9 @@ def _acknowledged(spec):
     if "config_path" not in spec:
         return None
     config = load_execution_config(spec)
-    with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
+    from .delivery_store import tracking_read_connection
+
+    with tracking_read_connection(config.tracking_db) as db:
         row = db.execute(
             "SELECT payload_json FROM delivery_events WHERE run_id=? AND type=? "
             "ORDER BY sequence DESC LIMIT 1",
@@ -265,7 +267,8 @@ def _workflow(store, row):
         }
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), 20))).result()
+        return pool.submit(
+            copy_context().run, lambda: asyncio.run(asyncio.wait_for(read(), 20))).result()
 
 
 def _rows(store, run_id):
@@ -447,13 +450,35 @@ def _collect(store, run_id, leases):
     return spec, evidence, originals, descriptors
 
 
+def _lifecycle_facts(evidence, request):
+    evidence_sha256 = digest(evidence)
+    return {
+        "operation": "adopt_filesystem_custody", "owner": "filesystem_custody",
+        "owner_proof": True, "normalized_lifecycle": "stopped", "proof_digest": evidence_sha256,
+        "revision": evidence["row"]["revision"], "evidence_sha256": evidence_sha256,
+        "comparisons": [("revision", "expected_revision", "revision_changed"),
+                        ("evidence_sha256", "expected_evidence_sha256", "custody_changed")],
+        "predicates": [{"code": "filesystem_adoption_authorization_required",
+                        "satisfied": request.get("answer") == ANSWER,
+                        "missing_or_unknown_fact": "explicit current-object adoption decision",
+                        "next_action": "provide the explicit adoption decision",
+                        "new_authorization_required": True}],
+    }
+
+
 def preflight(store, run_id):
     from .delivery_interrupted_recovery import installation_recovery_lease
 
     with installation_recovery_lease(store.config, exclusive=True), ExitStack() as leases:
         _, evidence, _, _ = _collect(store, run_id, leases)
+        from .delivery_lifecycle import evaluate_transition
+
+        request = {"expected_revision": evidence["row"]["revision"],
+                   "expected_evidence_sha256": digest(evidence)}
         return {
             "run_id": run_id,
+            "lifecycle_assessment": evaluate_transition(
+                _lifecycle_facts(evidence, request), request),
             "expected_revision": evidence["row"]["revision"],
             "expected_evidence_sha256": digest(evidence),
             "objects": evidence["objects"],
@@ -551,11 +576,9 @@ def adopt(store, run_id, supplied):
         return json.loads(prior[1])
     with installation_recovery_lease(store.config, exclusive=True), ExitStack() as leases:
         spec, evidence, originals, descriptors = _collect(store, run_id, leases)
-        if (
-            evidence["row"]["revision"] != supplied["expected_revision"]
-            or digest(evidence) != supplied["expected_evidence_sha256"]
-        ):
-            raise ValueError("filesystem custody preflight evidence or revision changed")
+        from .delivery_lifecycle import require_transition
+
+        require_transition(_lifecycle_facts(evidence, supplied), supplied)
         folder = Path(spec["state_dir"]) / "filesystem-custody"
         receipt = {
             "kind": KIND,

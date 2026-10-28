@@ -4,21 +4,35 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
+import sqlite3
+import stat
 import subprocess
 from copy import deepcopy
 from pathlib import Path
+
+from temporalio.service import RPCError
 
 from .contracts import canonical_json, digest
 from .delivery_broker import BrokerReadbackUnavailable, DeliveryBroker, _git
 from .delivery_closures import history_sha256
 from .delivery_codec import DELIVERY_DATA_CONVERTER
+from .delivery_lifecycle import (
+    RecoveryRefused,
+    evaluate_transition,
+    require_same_proof,
+    require_transition,
+)
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_resources import RunResources, read_private
 
 logger = logging.getLogger(__name__)
+CLOSED_HISTORY_TIMEOUT_SECONDS = 30
+_UNOBSERVED = object()
 
 
-async def _closed_execution(store, workflow_id, client, run_id):
+async def _closed_execution(store, workflow_id, client, run_id, *, preserve=True):
     """Describe the closed execution from Temporal, or from its sealed original."""
     from .delivery_closures import not_found, sealed_closure
 
@@ -28,7 +42,7 @@ async def _closed_execution(store, workflow_id, client, run_id):
     except Exception as exc:
         if not not_found(exc):
             raise
-        sealed = await sealed_closure(store, workflow_id)
+        sealed = await sealed_closure(store, workflow_id, read_only=not preserve)
         if sealed is None:
             raise ValueError('terminal predecessor history is no longer retained and was '
                              'never sealed') from exc
@@ -48,7 +62,8 @@ async def _closed_execution(store, workflow_id, client, run_id):
         return closed, None
     history = await client.get_workflow_handle(
         description.id, run_id=description.run_id).fetch_history()
-    await _preserve(store, history, run_id)
+    if preserve:
+        await _preserve(store, history, run_id)
     return closed, history
 
 
@@ -66,9 +81,9 @@ async def _preserve(store, history, run_id):
                        run_id, type(exc).__name__, exc)
 
 
-async def closed_tail(store, run_id, client):
+async def closed_tail(store, run_id, client, *, preserve=True, workflow_id=None):
     closed, history = await _closed_execution(
-        store, store.active_workflow_id(run_id), client, run_id)
+        store, workflow_id or store.active_workflow_id(run_id), client, run_id, preserve=preserve)
     if (closed['status'] not in {'COMPLETED', 'TIMED_OUT'}
             or not closed['closed_at'] or history is None
             or closed['workflow_type'] != 'DevflowDeliveryWorkflow'):
@@ -158,7 +173,7 @@ def published_readback(store, spec, candidate, pr):
     return {'number': pr['number'], 'head': pr['head'], 'url': pr['url']}
 
 
-def snapshot(store, spec):
+def snapshot(store, spec, *, read_only=False, captured_published=_UNOBSERVED):
     row, attempts, effects, claim = _rows(store, spec['run_id'])
     with store._connect() as db:
         work = store.state.row(db, 'works', spec['work_id'])
@@ -168,21 +183,22 @@ def snapshot(store, spec):
             or any(e['state'] != 'complete' for e in effects)
             or (claim is not None and claim['owner'] != f"external:devflow:{spec['run_id']}")):
         raise ValueError('terminal issue, attempt, effect or ownership changed')
-    cleanup = _stopped_cleanup(spec)
+    cleanup = _stopped_cleanup(spec, read_only=read_only)
     checks = json.loads(row['checks_json'] or '{}')
     if checks.get('resource_cleanup', {}).get('receipt_sha256') != cleanup['receipt_sha256']:
         raise ValueError('terminal cleanup proof differs from the frozen gate')
     published = None
     candidate = json.loads(row['candidate_json'] or 'null')
     if checks.get('terminal_tracker_checkpoint', {}).get('outcome') == 'delivered':
-        published = published_readback(store, spec, candidate,
-                                      json.loads(row['pr_json'] or 'null'))
+        published = (published_readback(store, spec, candidate,
+                                       json.loads(row['pr_json'] or 'null'))
+                     if captured_published is _UNOBSERVED else captured_published)
     elif candidate is not None:
         if Path(spec['checkout']).exists():
             if DeliveryBroker(store, spec).candidate() != candidate:
                 raise ValueError('terminal preserved candidate source changed')
         else:
-            resources = RunResources(spec)
+            resources = RunResources(spec, read_only=read_only)
             manifest = read_private(resources.manifest)
             receipt = read_private(resources.root / 'finalization.json')
             entry = manifest['roots'].get(spec['checkout'], {})
@@ -204,12 +220,13 @@ def snapshot(store, spec):
                  'candidate_sha256': digest(candidate), 'work_binding': binding}
 
 
-def _grant(store, run_id, payload, closed):
-    prior = receipt(store, run_id, payload)
-    if prior is not None:
-        return prior
+def _observe(store, run_id, closed, payload, *, read_only=False,
+             captured_published=_UNOBSERVED):
     spec = store.effective_spec(run_id)
-    row, observed = snapshot(store, spec)
+    if not store.owns_execution(spec):
+        raise ValueError('terminal recovery belongs to another service transport')
+    row, observed = snapshot(store, spec, read_only=read_only,
+                             captured_published=captured_published)
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     tail = closed['projection']
     checkpoint = tail.get('checks', {}).get('terminal_tracker_checkpoint', {})
@@ -217,9 +234,7 @@ def _grant(store, run_id, payload, closed):
     # initial input. Bind authentic start input to its durable admission stage,
     # while the completed tail remains bound to the final effective authority.
     starts = [spec] if previous else [store.submitted_spec(run_id), store.spec(run_id), spec]
-    if row['protocol_revision'] != payload['expected_revision']:
-        raise ValueError('stale run revision')
-    if (spec.get('terminal_tracker_version') != 1 or tail.get('spec') != spec
+    invalid_projection = (spec.get('terminal_tracker_version') != 1 or tail.get('spec') != spec
             or closed['workflow_id'] != (row['workflow_id'] or f'delivery-{run_id}')
             or closed['input_spec'] not in starts
             or closed['input_recovery_sha256'] != (digest(previous) if previous else None)
@@ -238,8 +253,147 @@ def _grant(store, run_id, payload, closed):
             or checkpoint.get('status') != (
                 ('done' if spec.get('merge_version') == 1 else 'in-review')
                 if checkpoint['event'] == 'delivered' else 'blocked')
-            or not checkpoint.get('release')):
-        raise ValueError('closed terminal projection, cleanup or frozen transition changed')
+            or not checkpoint.get('release'))
+    candidate = json.loads(row['candidate_json'] or 'null') or {}
+    with store._connect() as db:
+        mutation = db.execute(
+            'SELECT run_id,kind,request_digest,state FROM delivery_mutations WHERE command_id=?',
+            (payload['command_id'],),
+        ).fetchone()
+        command = db.execute(
+            'SELECT run_id,request_digest FROM delivery_commands WHERE command_id=?',
+            (payload['command_id'],),
+        ).fetchone()
+    mutation_ok = mutation is None or (tuple(mutation[:3]) ==
+        (run_id, 'reconcile_tracker', digest(payload)) and mutation['state'] != 'rejected')
+    command_ok = command is None or tuple(command) == (
+        run_id, digest({'kind': 'terminal_tracker_recovery', 'run_id': run_id, **payload}))
+    facts = {
+        'operation': 'terminal_tracker_recovery', 'owner': 'terminal_tracker',
+        'owner_proof': True, 'normalized_lifecycle': 'stopped',
+        'revision': row['protocol_revision'], 'iteration': row['iteration'],
+        'candidate_id': candidate.get('id'), 'candidate_head': candidate.get('head'),
+        'proof_digest': digest({'row': row, 'snapshot': observed, 'closed': closed}),
+        'comparisons': [('revision', 'expected_revision', 'revision_changed')],
+        'predicates': [{
+            'code': 'terminal_projection_changed', 'satisfied': not invalid_projection,
+            'missing_or_unknown_fact': 'authenticated terminal projection and custody',
+            'next_action': 'inspect the terminal tracker recovery preflight',
+        }, {
+            'code': 'command_identity_conflict', 'satisfied': mutation_ok and command_ok,
+            'missing_or_unknown_fact': 'unchanged reconciliation command identity',
+            'next_action': 'inspect the existing reconciliation command',
+        }],
+    }
+    return spec, row, observed, previous, tail, facts
+
+
+def unknown_assessment(request=None):
+    """A missing closed history or custody observation is never eligibility."""
+    return evaluate_transition({
+        'operation': 'terminal_tracker_recovery', 'owner': 'terminal_tracker',
+        'comparisons': [], 'predicates': [{
+            'code': 'terminal_history_or_custody_unknown', 'satisfied': None,
+            'missing_or_unknown_fact': 'authenticated closed tracker history and custody',
+            'next_action': 'inspect the closed tracker history and current custody',
+        }],
+    }, request if isinstance(request, dict) else {})
+
+
+async def assess(store, run_id, request, client):
+    """Observe the real predecessor without sealing, mutating, or granting a successor."""
+    if (not isinstance(request, dict) or set(request) != {'command_id', 'expected_revision'}
+            or not isinstance(request['command_id'], str)):
+        return unknown_assessment(request)
+    from .delivery_execution_config import observation_mode
+
+    try:
+        with observation_mode():
+            closed = await closed_tail(store, run_id, client, preserve=False)
+            *_, facts = await asyncio.to_thread(
+                _observe, store, run_id, closed, request, read_only=True)
+            return evaluate_transition(facts, request)
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError, sqlite3.Error,
+            subprocess.SubprocessError):
+        return unknown_assessment(request)
+    except RPCError:
+        return unknown_assessment(request)
+
+
+def _closure_custody(store, record):
+    """Bind the already-verified content address to its owned file identity."""
+    if not re.fullmatch(r'[0-9a-f]{64}', str(record.get('history_sha256', ''))):
+        raise ValueError('terminal closure content address is invalid')
+    root = Path(store.config.state_root) / 'closures'
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root_info = os.fstat(root_fd)
+        path_info = root.lstat()
+        if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid()
+                or stat.S_IMODE(root_info.st_mode) != 0o700
+                or (root_info.st_dev, root_info.st_ino) != (path_info.st_dev, path_info.st_ino)):
+            raise ValueError('terminal closure directory custody changed')
+        fd = os.open(record['history_sha256'] + '.json.xz',
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                raise ValueError('terminal closure file custody changed')
+            keys = ('st_dev', 'st_ino', 'st_uid', 'st_mode', 'st_nlink', 'st_size',
+                    'st_mtime_ns', 'st_ctime_ns')
+            return {'root': [root_info.st_dev, root_info.st_ino],
+                    'file': [getattr(info, key) for key in keys]}
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+
+
+async def _capture_closure(store, run_id, closed):
+    """Authenticate and preserve one immutable, database-selected execution."""
+    from .delivery_closures import sealed_closure, sealed_record
+
+    record = await asyncio.to_thread(sealed_record, store, closed['workflow_id'])
+    if (record is None or record['run_id'] != run_id
+            or record['execution_run_id'] != closed['execution_run_id']
+            or record['history_sha256'] != closed['history_sha256']
+            or any(record[key] != closed[key] for key in
+                   ('status', 'request_digest', 'recovery_digest'))):
+        raise ValueError('terminal closed execution is not the selected sealed history')
+    before = await asyncio.to_thread(_closure_custody, store, record)
+    sealed = await sealed_closure(store, closed['workflow_id'],
+                                  execution_run_id=closed['execution_run_id'])
+    after = await asyncio.to_thread(_closure_custody, store, record)
+    if (sealed is None or before != after
+            or history_sha256(sealed['history']) != closed['history_sha256']):
+        raise ValueError('terminal sealed history changed during authentication')
+    from .delivery_execution_config import transport_digest
+
+    return {'record': record, 'custody': after,
+            'transport_sha256': transport_digest(store.config),
+            'projection_sha256': digest(closed['projection'])}
+
+
+def _current_closure_proof(store, closed):
+    from .delivery_closures import sealed_record
+
+    record = sealed_record(store, closed['workflow_id'])
+    if record is None:
+        raise ValueError('terminal selected sealed history is unavailable')
+    from .delivery_execution_config import transport_digest
+
+    return {'record': record, 'custody': _closure_custody(store, record),
+            'transport_sha256': transport_digest(store.config),
+            'projection_sha256': digest(closed['projection'])}
+
+
+def _grant(store, run_id, payload, closed, closure_proof):
+    prior = receipt(store, run_id, payload)
+    if prior is not None:
+        return prior
+    spec, row, observed, previous, tail, facts = _observe(store, run_id, closed, payload)
+    require_transition(facts, payload)
     while previous and previous.get('kind') == 'terminal_tracker_recovery':
         previous = previous['original_recovery']
     state = {key: deepcopy(value) for key, value in tail.items() if key not in (
@@ -264,6 +418,7 @@ def _grant(store, run_id, payload, closed):
         'kind': 'terminal_tracker_recovery', 'original_recovery': previous,
         'state': state, 'spec_sha256': digest(spec), 'closed': closed,
         'seal': observed, 'command_id': payload['command_id'],
+        'closure_proof': closure_proof,
     }
     workflow_id = f"delivery-{run_id}-terminal-tracker-{digest(payload['command_id'])}"
     response = {'run_id': run_id, 'phase': 'terminal_tracker_recovery_queued',
@@ -281,6 +436,20 @@ def _grant(store, run_id, payload, closed):
             return json.loads(prior['response_json'])
         if dict(current) != row:
             raise ValueError('terminal recovery lost its frozen projection')
+        try:
+            current_closure = _current_closure_proof(store, closed)
+        except (ValueError, OSError, KeyError) as exc:
+            raise RecoveryRefused(unknown_assessment(payload)) from exc
+        require_same_proof('terminal_tracker_recovery', 'terminal_tracker',
+                           digest(current_closure), digest(closure_proof))
+        current_spec, current_row, current_observed, _, _, current_facts = _observe(
+            store, run_id, closed, payload, read_only=True,
+            captured_published=observed['published'])
+        require_transition(current_facts, payload)
+        require_same_proof('terminal_tracker_recovery', 'terminal_tracker',
+                           current_facts['proof_digest'], facts['proof_digest'])
+        if current_spec != spec or current_row != row or current_observed != observed:
+            raise ValueError('terminal recovery lost its frozen projection or custody')
         db.execute("UPDATE delivery_runs SET phase='terminal_tracker_recovery_queued',"
                    "execution_state='queued',revision=revision+1,workflow_id=?,recovery_json=?,"
                    'updated_at=? WHERE run_id=?',
@@ -298,8 +467,14 @@ def _grant(store, run_id, payload, closed):
 
 
 async def recover(store, run_id, payload, client):
-    closed = await closed_tail(store, run_id, client)
-    return await asyncio.to_thread(_grant, store, run_id, payload, closed)
+    try:
+        closed = await asyncio.wait_for(
+            closed_tail(store, run_id, client), timeout=CLOSED_HISTORY_TIMEOUT_SECONDS)
+        closure_proof = await asyncio.wait_for(
+            _capture_closure(store, run_id, closed), timeout=CLOSED_HISTORY_TIMEOUT_SECONDS)
+    except (ValueError, RuntimeError, OSError, TimeoutError, RPCError) as exc:
+        raise RecoveryRefused(unknown_assessment(payload)) from exc
+    return await asyncio.to_thread(_grant, store, run_id, payload, closed, closure_proof)
 
 
 def preflight(store, spec, recovery):

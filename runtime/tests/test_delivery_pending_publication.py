@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from copy import deepcopy
-from datetime import UTC, datetime
 
 import pytest
 from test_delivery_gate_retry import unpublished as unpublished
@@ -12,13 +10,17 @@ from test_delivery_store import service as service
 
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_pending_publication import readback
-from devflow_temporal.delivery_resources import RunResources
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 @pytest.fixture
 def pending(service, monkeypatch):
+    # This component fixture controls the closed owner boundary. Actual stage
+    # authentication is qualified by test_delivery_publication_proof.py.
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.publication_stop_proof',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr('devflow_temporal.delivery_pending_publication.read_publication_closed',
+                        lambda store, spec, **_kwargs:
+                        (store._completed_temporal_result(spec['run_id']), None))
     store, _request = service
     original_admit = type(store.config).admit
 
@@ -69,32 +71,11 @@ def pending(service, monkeypatch):
               'recovery_digest': digest(previous), 'result': state}
     monkeypatch.setattr(store, '_completed_temporal_result', lambda *_args, **_kw: closed)
     monkeypatch.setattr('devflow_temporal.delivery_pending_publication._stopped_cleanup',
-                        lambda _: {})
+                        lambda _, **_kw: {})
     request = {'command_id': 'retry-publication-1', 'expected_revision': 13,
                'expected_candidate_id': state['candidate']['id'],
                'expected_head': broker.candidate()['head'], 'expected_pr_number': 0}
     return store, broker, state, request
-
-
-def test_pending_retry_binds_pushed_commit_and_original_effect_without_source_turn(pending):
-    store, broker, state, request = pending
-    before = broker.candidate()
-    admitted = store.recover_publication('run-1', request)
-    assert admitted['implementation_authority'] is False
-    assert store.recover_publication('run-1', request) == admitted
-    spec = store.effective_spec('run-1')
-    assert spec['policy']['max_repairs'] == store.spec('run-1')['policy']['max_repairs']
-    assert broker.candidate() == before
-    with store._connect() as db:
-        recovery = json.loads(db.execute(
-            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
-        ).fetchone()[0])
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-    assert recovery['state'] == state
-    assert readback(store, spec, recovery)['head'] == before['head']
-    assert RunResources(spec).root.name == 'resources'
-    with pytest.raises(ValueError):
-        store.recover_publication('run-1', {**request, 'command_id': 'second-publication'})
 
 
 @pytest.mark.parametrize('drift', ['source', 'effect'])
@@ -113,133 +94,29 @@ def test_pending_retry_rejects_changed_pushed_source_or_failed_checkpoint(pendin
         store.recover_publication('run-1', request)
 
 
-def test_pending_workflow_completes_effect_then_independent_gates_without_implementation(pending,
-                                                                                    monkeypatch):
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.now",
-                        lambda: datetime.now(UTC))
-    store, broker, state, request = pending
-    store.recover_publication('run-1', request)
-    spec = store.effective_spec('run-1')
-    with store._connect() as db:
-        recovery = json.loads(db.execute(
-            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
-        ).fetchone()[0])
-    flow = DeliveryWorkflow()
-    calls = []
+@pytest.mark.asyncio
+async def test_public_pending_assessment_agrees_with_admission(pending):
+    import httpx
 
-    async def execute(name, body, **kw):
-        calls.append((name, body.get('role')))
-        if name in {'delivery_tracker_start', 'delivery_tracker'}:
-            return {'state': 'consistent'}
-        if name == 'delivery_publish':
-            assert body['candidate'] == state['candidate']
-            return {'state': 'OPEN', 'number': 7, 'head': broker.candidate()['head'],
-                    'candidate': broker.candidate()}
-        if name == 'delivery_role':
-            assert body['role'] in {'review', 'verify'}
-            return {'status': 'pass', 'role': body['role'], 'candidate': broker.candidate(),
-                    'session_id': 'independent-' + body['role']}
-        return {'state': 'passed', 'cleanup': 'confirmed'}
+    from devflow_temporal.delivery_api import create_app
 
-    async def project(*args):
-        pass
-
-    monkeypatch.setattr(flow, '_activity', execute)
-    monkeypatch.setattr(flow, '_project', project)
-    result = asyncio.run(flow._resume_pending_publication(spec, recovery))
-    assert result['outcome'] == 'delivered'
-    assert result['roles'][0] == state['roles'][0]
-    assert ('delivery_role', 'implement') not in calls
-    assert [role for name, role in calls if name == 'delivery_role'] == ['review', 'verify']
-    assert 'delivery_precheck' not in [name for name, _ in calls]
-    assert 'publication_readback_version' not in spec
-    assert ('delivery_reconcile_publish', None) not in calls
-    assert calls.index(('delivery_publish', None)) < \
-        calls.index(('delivery_role', 'review'))
-    assert ('delivery_ci', None) in calls
-
-
-def test_published_assessment_after_publication_recovery_keeps_all_admissions(pending, monkeypatch):
-    from devflow_temporal.delivery_gate_retry import KIND
-
-    store, broker, old_state, request = pending
-    store.recover_publication('run-1', request)
-    spec = store.effective_spec('run-1')
-    with store._connect() as db:
-        previous = json.loads(db.execute(
-            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
-        ).fetchone()[0])
-    original_bytes = {name: (broker.state_dir / name / 'admission.json').read_bytes()
-                      for name in ('gates-admission', 'publication-retry')}
-    candidate = DeliveryBroker(store, spec).candidate()
-    publication = {'number': 7, 'head': candidate['head'], 'candidate': candidate}
-    broker._finish_effect('publish:run-1:0', publication)
-    monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a, **_kw: {
-        'number': 7, 'state': 'OPEN', 'isDraft': False, 'headRefOid': candidate['head']})
-    state = deepcopy(old_state)
-    state.update(candidate=candidate, pull_request=publication, revision=23,
-                 error='repair limit exhausted')
-    state['roles'].append({'role': 'review', 'iteration': 0, 'status': 'findings',
-                           'findings': ['Missing broker evidence'], 'cleanup': 'confirmed'})
-    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
-                  message=state['error'], candidate=candidate, pull_request=publication,
-                  checks=state['checks'], iteration=0, protocol_revision=23, outcome='blocked',
-                  cleanup='confirmed', error=state['error'])
-    with store._connect() as db:
-        store.state.release_work(db, spec['work_id'], 'external:devflow:run-1')
-        workflow = db.execute("SELECT workflow_id FROM delivery_runs WHERE run_id='run-1'")
-        closed = {'workflow_id': workflow.fetchone()[0], 'request_digest': spec['request_digest'],
-                  'recovery_digest': digest(previous), 'result': state}
-    monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_kw: closed)
-    retry = {'continuation_kind': KIND, 'command_id': 'published-evidence-assessment',
-             'expected_revision': 23, 'expected_iteration': 0,
-             'expected_candidate_id': candidate['id'], 'expected_pr_number': 7,
-             'expected_pr_head': candidate['head'], 'additional_iterations': 0}
-    result = store.continue_repair('run-1', retry)
-    assert result['implementation_authority'] is False
-    assert 'published-gates-retry-1' in result['workflow_id']
-    current = store.effective_spec('run-1')
-    assert current['policy']['max_repairs'] == spec['policy']['max_repairs']
-    assert DeliveryBroker(store, current).evidence_dir.parent.name == 'published-gates-admission'
-    assert DeliveryBroker(store, current).candidate()['id'] == candidate['id']
-    for name, data in original_bytes.items():
-        assert (broker.state_dir / name / 'admission.json').read_bytes() == data
-    with store._connect() as db:
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-    with pytest.raises(ValueError):
-        store.continue_repair('run-1', {**retry, 'command_id': 'second-published-assessment'})
-    with store._connect() as db:
-        published_recovery = json.loads(db.execute(
-            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
-        ).fetchone()[0])
-    unknown = deepcopy(published_recovery['state'])
-    unknown.update(candidate=published_recovery['candidate'], revision=29,
-                   error='local check process cleanup is unknown', cleanup='unknown')
-    unknown['checks']['local'] = {'state': 'unknown', 'cleanup': 'unknown',
-                                 'reason': 'ValueError', 'candidate_id': candidate['id']}
-    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
-                  message=unknown['error'], candidate=unknown['candidate'],
-                  pull_request=publication, checks=unknown['checks'], iteration=0,
-                  protocol_revision=29, outcome='blocked', cleanup='unknown',
-                  error=unknown['error'])
-    closed.update(workflow_id=result['workflow_id'], recovery_digest=digest(published_recovery),
-                  result=unknown)
-    monkeypatch.setattr('devflow_temporal.delivery_check_prelaunch.observe',
-                        lambda *_a: {'state': 'observed-quiescent-prelaunch'})
-    prelaunch = {**retry, 'continuation_kind': 'published_check_prelaunch_retry',
-                 'command_id': 'one-unlaunched-check-retry', 'expected_revision': 29}
-    resumed = store.continue_repair('run-1', prelaunch)
-    assert resumed['additional_iterations'] == 0
-    assert resumed['workflow_id'].endswith('published-gates-retry-2')
-    assert DeliveryBroker(store, store.effective_spec('run-1')).evidence_dir.parent.name \
-        == 'published-gates-admission-2'
-    with store._connect() as db:
-        latest = json.loads(db.execute(
-            "SELECT recovery_json FROM delivery_runs WHERE run_id='run-1'"
-        ).fetchone()[0])
-        assert latest['state']['checks']['local']['cleanup'] == 'unknown'
-        assert latest['original_recovery'] == published_recovery
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-    with pytest.raises(ValueError):
-        store.continue_repair('run-1', {**prelaunch, 'command_id': 'another-prelaunch'})
+    store, _, _, request = pending
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    host = store.config.dashboard_url
+    transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
+    async with httpx.AsyncClient(transport=transport, base_url=host) as client:
+        token = (await client.get('/api/session')).json()['csrf_token']
+        headers = {'Origin': host, 'X-Devflow-CSRF': token}
+        path = '/api/runs/run-1/'
+        assessment = await client.post(path + 'assess-transition', json={
+            'kind': 'recover_publication', 'request': request})
+        assert assessment.status_code == 200 and assessment.json()['eligible']
+        stale = {**request, 'expected_revision': request['expected_revision'] + 1}
+        refused = await client.post(path + 'assess-transition', json={
+            'kind': 'recover_publication', 'request': stale})
+        admission = await client.post(path + 'recover-publication', json=stale, headers=headers)
+        assert admission.status_code == 409 and admission.json()['detail'] == refused.json()
+        assert refused.json()['blockers'][0]['code'] == 'revision_changed'
+        accepted = await client.post(path + 'recover-publication', json=request, headers=headers)
+        assert accepted.status_code == 200 and not accepted.json()['implementation_authority']

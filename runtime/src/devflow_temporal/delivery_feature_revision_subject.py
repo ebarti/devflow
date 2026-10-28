@@ -11,6 +11,8 @@ import os
 import re
 import sqlite3
 import stat
+import sys
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +27,52 @@ CANDIDATE_FIELDS = ("id", "head", "content_sha256", "base_sha", "environment_dig
 ROLE_FIELDS = {"role", "iteration", "candidate", "attempt_id", "input_candidate_id", "provider"}
 
 
+class FeatureRegistryObservationError(sqlite3.OperationalError):
+    """An outer observation could not retain stable feature registry evidence."""
+
+
+class _ScopedRegistryObservation:
+    """Retain one authenticated source and private copy through outer observation."""
+
+    def __init__(self, path):
+        from .delivery_feature_handoff import readonly_registry_database
+
+        self.lock = threading.RLock()
+        self.closed = False
+        self.manager = readonly_registry_database(path, require_rollback=True)
+        self.anchor = self.manager.__enter__()
+        try:
+            self.target = Path(self.anchor.execute("PRAGMA database_list").fetchone()[2])
+        except BaseException:
+            self.manager.__exit__(*sys.exc_info())
+            raise
+
+    @contextmanager
+    def connect(self):
+        with self.lock:
+            if self.closed:
+                raise FeatureRegistryObservationError("feature observation scope is closed")
+            db = sqlite3.connect(self.target.as_uri() + "?mode=ro&immutable=1", uri=True)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            yield db
+        finally:
+            db.close()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self.manager.__exit__(None, None, None)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                raise FeatureRegistryObservationError(
+                    "feature registry changed during observation") from exc
+
+
 class _ReadOnlyRegistry(ExecutionRegistry):
     """An existing registry view: no schema, directory, lock or journal creation."""
     def __init__(self, path):
@@ -35,34 +83,19 @@ class _ReadOnlyRegistry(ExecutionRegistry):
         _ancestors(self.path)
         if not self.path.is_absolute() or self.path.resolve(strict=True) != self.path:
             raise ValueError("retained observation requires the existing canonical registry")
-        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
-                raise ValueError("retained observation registry is not a private owned file")
-            header = os.read(fd, 100)
-            if (len(header) != 100 or header[:16] != b"SQLite format 3\x00"
-                    or header[18:20] != b"\x01\x01"
-                    or any(os.path.lexists(str(self.path) + suffix)
-                           for suffix in ("-wal", "-shm", "-journal"))):
-                # A read-only SQLite connection can create WAL sidecars. Do not
-                # use immutable=1: it can hide committed, uncheckpointed rows.
-                raise ValueError("retained observation requires a settled rollback registry")
-            db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30)
-            try:
-                observed = self.path.lstat()
-                keys = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink")
-                if any(getattr(observed, key) != getattr(info, key) for key in keys):
-                    raise ValueError("retained observation registry was replaced")
-                db.row_factory = sqlite3.Row
-                db.execute("PRAGMA query_only=ON")
+        from .delivery_execution_config import observation_scope
+        from .delivery_feature_handoff import readonly_registry_database
+
+        scope = observation_scope()
+        if scope is None:
+            with readonly_registry_database(self.path, require_rollback=True) as db:
                 db.execute("BEGIN")
                 yield db
-            finally:
-                db.close()
-        finally:
-            os.close(fd)
+        else:
+            snapshot = scope.resource(
+                ("feature_registry", str(self.path)), lambda: _ScopedRegistryObservation(self.path))
+            with snapshot.connect() as db:
+                yield db
 
     def checkpoints(self, issue_id):
         with self.connect() as db:
@@ -441,7 +474,7 @@ def _progress(store, spec, row, attempts, recovery, seal):
             "native_progress_sha256": digest(proofs)}
 
 
-def retained_worker_subject(store, original, row, attempts, recovery):
+def retained_worker_subject(store, original, row, attempts, recovery, *, shared=None):
     """Establish full ordinary continuation prerequisites before review reservation."""
     from .delivery_stopped_resume import review_snapshot
 
@@ -473,7 +506,8 @@ def retained_worker_subject(store, original, row, attempts, recovery):
             from .delivery_feature_execution import registry
             from .delivery_stopped_resume import remaining_worker_repairs
 
-            budget = registry(original).budget(original["feature_delivery"]["owner"]["issue_id"])
+            budget = (shared or registry(original)).budget(
+                original["feature_delivery"]["owner"]["issue_id"])
             remaining = remaining_worker_repairs(budget, original, seal["state"]["iteration"])
         if remaining <= 0:
             raise ValueError("unpassed retained worker has no ordinary implementation turn left")

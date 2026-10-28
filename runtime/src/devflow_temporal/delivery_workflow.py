@@ -22,7 +22,7 @@ from .delivery_baseline_contract import preparation_failure as _preparation_fail
 from .delivery_baseline_contract import repairable_baseline
 from .delivery_budget_contract import continuation_maximum, fixed_budget_allows
 from .delivery_metadata_contract import evidence_applicability
-from .delivery_publication import stopped_at_publication
+from .delivery_publication import admitted_recovery_stage, stopped_at_publication
 from .delivery_questions import valid_blocking_questions
 
 # One publish attempt is bounded; the readback window that follows it must
@@ -1703,8 +1703,9 @@ class DeliveryWorkflow:
         if (
             previous.get("run_id") != spec["run_id"]
             or previous.get("phase") != "blocked"
-            or not (previous.get("error") == "publication unresolved: ActivityError"
-                    or self.publication_v1 and stopped_at_publication(previous))
+            or not admitted_recovery_stage(spec, recovery, legacy_hint=(
+                previous.get("error") == "publication unresolved: ActivityError"
+                or self.publication_v1 and stopped_at_publication(previous)))
             or previous.get("cleanup") not in {"none", "pending_publication_readback"}
             or not previous.get("roles")
             or previous["roles"][-1].get("role") != "implement"

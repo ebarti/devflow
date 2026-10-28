@@ -87,15 +87,29 @@ def intent_command_id(receipt, run_id):
     return "runtime-location-intent-" + digest([receipt["command"]["command_id"], run_id])[:48]
 
 
+@contextmanager
+def _read_tracking(config):
+    from .delivery_execution_config import is_observation_mode
+
+    if is_observation_mode():
+        from .delivery_store import _observation_tracking_connection
+
+        with _observation_tracking_connection(config.tracking_db) as db:
+            yield db
+        return
+    db = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA query_only=ON")
+        yield db
+    finally:
+        db.close()
+
+
 def pending_acknowledged(config, receipt, reference, *, db=None):
     """An original preimage on disk alone is not an attributable interrupted apply."""
     if db is None:
-        connection = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
-        try:
-            connection.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as connection:
             return pending_acknowledged(config, receipt, reference, db=connection)
-        finally:
-            connection.close()
     for item in receipt["runs"]:
         key = intent_command_id(receipt, item["run_id"])
         response = {**reference, "run_id": item["run_id"], "command_id": key}
@@ -121,8 +135,7 @@ def pending_acknowledged(config, receipt, reference, *, db=None):
 def reversed_reference(config, reference, *, db=None):
     """A reversed intent is final even when its forward ACK never committed."""
     if db is None:
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as source:
-            source.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as source:
             return reversed_reference(config, reference, db=source)
     return bool(
         db.execute(
@@ -139,12 +152,8 @@ def _acknowledged(config, *, db=None, historical=False, reference=None):
         return None
     pointer = reference if reference is not None else json.loads(private_bytes(path))
     if db is None:
-        connection = sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True)
-        try:
-            connection.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as connection:
             return _acknowledged(config, db=connection, historical=historical, reference=pointer)
-        finally:
-            connection.close()
     receipt_path = Path(pointer["receipt"])
     expected = config.state_root / "runtime-installations" / pointer["command_id"] / "receipt.json"
     if receipt_path != expected:
@@ -426,13 +435,25 @@ def compatible_owner(spec, frozen, live):
     return before == after
 
 
-def helper_path(config, *, read_only=False):
+def _bootstrap_scope(config):
     boot = _BOOTSTRAP.get()
-    if (
-        boot
-        and _transport(config) == boot["transport"]
-        and (str(config.helpers_dir) == boot["helpers_dir"])
-    ):
+    if boot is None:
+        return None
+    if (_transport(config) != boot["transport"]
+            or str(config.helpers_dir) != boot["helpers_dir"]
+            or str(config.path) != boot["owner_path"]):
+        raise ValueError("installation bootstrap belongs to another original owner/transport")
+    if "helper_compatibility" in boot:
+        from .delivery_runtime_installation import verify_helper_compatibility
+
+        verify_helper_compatibility(
+            config, boot["helper_compatibility"], descriptor=boot["database_descriptor"]
+        )
+    return boot
+
+
+def helper_path(config, *, read_only=False):
+    if _bootstrap_scope(config):
         return source_root() / "skills/devflow/scripts/state.py"
     from .delivery_runtime_service_guard import GuardCustodyError
 
@@ -467,7 +488,7 @@ def helper_path(config, *, read_only=False):
 
 def require_not_pending(config):
     """A new-code writer cannot pass a staged, unacknowledged location intent."""
-    if _BOOTSTRAP.get():
+    if _bootstrap_scope(config):
         return
     pending = config.state_root / "runtime-installations/pending.json"
     if not os.path.lexists(pending):
@@ -484,8 +505,7 @@ def require_not_pending(config):
             return
         if not folder.exists() or not config.tracking_db.exists():
             return
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
-            db.execute("PRAGMA query_only=ON")
+        with _read_tracking(config) as db:
             values = db.execute(
                 "SELECT payload_json FROM delivery_events WHERE type=? ORDER BY sequence DESC",
                 (PENDING,),
@@ -502,7 +522,7 @@ def require_not_pending(config):
 
 def require_ready(config):
     """Fence execution-critical new code; this does not fence old tracker writers."""
-    if _BOOTSTRAP.get():
+    if _bootstrap_scope(config):
         return
     require_not_pending(config)
     pending = config.state_root / "runtime-installations/pending.json"
@@ -566,10 +586,19 @@ def validate_destination(expected, original, *, strict_source=True, installed_id
 @contextmanager
 def bootstrap(config, authenticated):
     """Only the public installation owner supplies already authenticated inputs."""
-    token = _BOOTSTRAP.set(
-        {"transport": _transport(config), "helpers_dir": authenticated["helpers_dir"]}
-    )
+    value = {"transport": _transport(config), "helpers_dir": authenticated["helpers_dir"],
+             "owner_path": str(config.path)}
+    descriptor = None
+    if "helper_compatibility" in authenticated:
+        descriptor = os.open(config.tracking_db, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        value.update(helper_compatibility=deepcopy(authenticated["helper_compatibility"]),
+                     database_descriptor=descriptor)
+    token = _BOOTSTRAP.set(value)
     try:
+        _bootstrap_scope(config)
         yield
+        _bootstrap_scope(config)
     finally:
         _BOOTSTRAP.reset(token)
+        if descriptor is not None:
+            os.close(descriptor)

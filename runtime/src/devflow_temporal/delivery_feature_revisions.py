@@ -179,16 +179,64 @@ def _evidence_shape(evidence):
     return evidence
 
 
-def _evidence(store, spec, items):
+def _readonly_revision_worker_spec(store, parent, run_id):
+    """Read an unamended worker's prepared input without constructing a registry."""
+    with store._connect() as db:
+        row = db.execute("SELECT request_json,recovery_json,accepted_plan_text "
+                         "FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            raise ValueError("retained worker input is unavailable")
+        recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
+        original = store._prepared_original(db, json.loads(row["request_json"]))
+    if row["accepted_plan_text"] is not None:
+        original["accepted_plan"] = row["accepted_plan_text"]
+    if recovery is not None:
+        from .delivery_execution_config import observation_mode
+        from .delivery_feature_revision_recovery import retained_recovery
+
+        if (not isinstance(recovery, dict)
+                or recovery.get("kind") != "stopped_delivery_resume"
+                or (retained_recovery(recovery) or {}).get("feature_plan_revision")):
+            raise ValueError("retained worker recovery authority needs separate observation")
+        # The ordinary stopped-worker reader verifies its command, immutable
+        # admission, budget, session and policy custody in observation mode.
+        with observation_mode():
+            original = store.effective_spec(run_id)
+    owner = original.get("feature_delivery", {}).get("owner", {})
+    if (not original.get("feature_worker") or original.get("run_id") != run_id
+            or owner.get("issue_id") != parent["feature_delivery"]["owner"]["issue_id"]
+            or owner.get("store_path") != str(store.config.tracking_db)):
+        raise ValueError("retained worker differs from its feature ownership")
+    return original
+
+
+def _evidence(store, spec, items, *, shared=None):
     """Read only existing owned run evidence and seal exact bytes, not caller assertions."""
     _evidence_shape(items)
     roots = {Path(spec["state_dir"])}
-    values = _values(spec)
+    values = _values(spec, shared)
     for key, assignment in values.items():
         if "assignment:" not in key or not isinstance(assignment, dict):
             continue
         if assignment.get("store_path") != str(store.config.tracking_db):
             continue
+        if shared is not None:
+            from .delivery_execution_config import is_observation_mode
+
+            if is_observation_mode():
+                # Evidence already in this coordinator does not require child lookup.
+                if all((Path(item["path"]) if Path(item["path"]).is_absolute()
+                        else Path(spec["state_dir"]) / item["path"]).is_relative_to(
+                            Path(spec["state_dir"])) for item in items):
+                    continue
+                try:
+                    child = _readonly_revision_worker_spec(store, spec, assignment["run_id"])
+                except (KeyError, ValueError):
+                    continue
+                _checkpoint_proof(shared, spec["feature_delivery"]["owner"]["issue_id"],
+                                  values, [key])
+                roots.add(Path(child["state_dir"]))
+                continue
         try:
             child = store.effective_spec(assignment["run_id"])
         except (KeyError, ValueError):
@@ -243,8 +291,8 @@ def _assert_identity(record, identity):
     return observed
 
 
-def _worker_candidates(store, spec):
-    values = _values(spec)
+def _worker_candidates(store, spec, *, shared=None):
+    values = _values(spec, shared)
     result = {}
     for key, assignment in values.items():
         if "assignment:" not in key or not isinstance(assignment, dict):
@@ -262,7 +310,7 @@ def _worker_candidates(store, spec):
     return result
 
 
-def validate_diagnostic(store, spec, diagnostic, *, identity=None, candidate_id=None):
+def validate_diagnostic(store, spec, diagnostic, *, identity=None, candidate_id=None, shared=None):
     from .delivery_feature_execution import plan_for
     from .delivery_github_contract import ordered_chunks
 
@@ -288,24 +336,18 @@ def validate_diagnostic(store, spec, diagnostic, *, identity=None, candidate_id=
         raise OwnershipConflict("planning diagnostic refers to a stale plan revision")
     if diagnostic["chunk_id"] not in {item["id"] for item in ordered_chunks(plan_for(spec))}:
         raise ValueError("planning diagnostic names an unknown chunk")
-    candidates = _worker_candidates(store, spec).get(diagnostic["chunk_id"], set())
+    candidates = _worker_candidates(store, spec, shared=shared).get(diagnostic["chunk_id"], set())
     if candidate_id:
         candidates.add(candidate_id)
     if diagnostic["candidate_id"] not in candidates:
         raise OwnershipConflict("planning diagnostic candidate has no matching execution evidence")
     if not diagnostic["evidence"]:
         raise ValueError("planning defect requires durable evidence")
-    _evidence(store, spec, diagnostic["evidence"])
+    _evidence(store, spec, diagnostic["evidence"], shared=shared)
     return deepcopy(diagnostic)
 
 
-def revise_feature_plan(store, run_id, request):
-    """Public stopped-feature admission; the runtime crafts and reviews the plan."""
-    from .delivery_feature_closure import closed_coordinator
-    from .delivery_feature_execution import continue_feature
-    from .delivery_feature_publication import current_record, live_members
-    from .delivery_github_plans import require_publication_capacity
-
+def _revision_request_shape(request):
     if (
         not isinstance(request, dict)
         or not {"command_id", "expected_revision", "reason"} <= request.keys()
@@ -316,15 +358,222 @@ def revise_feature_plan(store, run_id, request):
         or type(request.get("expected_revision")) is not int
         or request["expected_revision"] < 1
     ):
-        raise ValueError(
-            "plan revision requires a command ID, projection revision and bounded reason"
-        )
+        raise ValueError("plan revision requires a command ID, projection revision "
+                         "and bounded reason")
     _text(request["reason"], "revision reason")
     _evidence_shape(request.get("evidence", []))
     if "reconsideration" in request:
         if request["reconsideration"] is None:
             raise ValueError("reconsideration must be an exact version1 selector object")
         _reconsideration_shape(request["reconsideration"])
+
+
+def _revision_owner_facts(shared, token, row, request, *, admission=None, reserved=None):
+    """Shared stopped-owner and reservation checks, usable before any writes."""
+    from .delivery_feature_handoff import feature_projection_facts, handoff_facts
+
+    with shared.connect() as db:
+        facts = handoff_facts(db, token, operation="revise_feature_plan")
+        budget = shared._budget(db, token["issue_id"])
+        current_reservation = shared._pending_revision(db, token["issue_id"])
+    projection = feature_projection_facts(row, "revise_feature_plan")
+    facts.update(owner="feature_revision", revision=projection["revision"],
+                 comparisons=projection["comparisons"])
+    facts["predicates"].extend(projection["predicates"])
+    permitted = (current_reservation is None or
+                 (admission is not None and current_reservation == admission) or
+                 (reserved is not None and current_reservation == reserved))
+    facts["predicates"].extend([
+        {"code": "feature_product_budget_exhausted",
+         "satisfied": (admission is not None and current_reservation == admission)
+                      or budget["used"] < budget["maximum"],
+         "missing_or_unknown_fact": "remaining product repair allowance",
+         "next_action": "inspect the feature repair allowance"},
+        {"code": "feature_revision_reservation_conflict", "satisfied": permitted,
+         "missing_or_unknown_fact": "available or exact matching revision reservation",
+         "next_action": "inspect the existing revision reservation"},
+    ])
+    facts["proof_digest"] = digest({"registry": facts["proof_digest"], "budget": budget,
+                                    "reservation": current_reservation,
+                                    "admission": admission})
+    return facts
+
+
+def _readonly_revision_record(spec, shared):
+    """Read the exact GitHub plan and stack without reconciling registry effects."""
+    from .delivery_feature_publication import live_members
+    from .delivery_github_contract import GitHubDelivery, bounded_github_observation
+    from .delivery_github_plans import verify_parent_binding
+
+    feature = spec["feature_delivery"]
+    issue = feature["snapshot"]["issue"]
+    identity = adopted_plan_identity(spec, shared)
+    explicit = spec.get("feature_plan_revision")
+    if explicit is not None and any(explicit.get(key) != identity.get(key)
+                                    for key in ("plan_revision", "plan_digest")):
+        raise OwnershipConflict("coordinator carries a superseded plan revision")
+    reference = {key: identity.get(key) for key in ("comment_id", "comment_node_id")}
+    if reference["comment_id"] is None:
+        reference = _values(spec, shared).get("github-record")
+    if reference is None or reference.get("comment_id") is None:
+        reference = feature["snapshot"].get("delivery")
+    if reference is None or reference.get("comment_id") is None:
+        raise OwnershipConflict("feature has no published delivery record")
+    gh = GitHubDelivery()
+    with bounded_github_observation(spec["github_repo"]):
+        record = gh.load_record(issue, reference)
+        if record["manifest"]["version"] == 2:
+            verify_parent_binding(gh, issue, reference)
+        _assert_identity(record, identity)
+        live_members(spec, record, gh)
+    return record
+
+
+def _validate_revision_submission_binding(spec, admission, original, saved):
+    """The shared plan/owner portion of actual and prospective submission."""
+    predecessor = spec.get("feature_predecessor")
+    if (not isinstance(admission, dict) or not predecessor or saved != admission
+            or admission["owner"] != predecessor or admission["successor_id"] != spec["run_id"]
+            or digest(json.loads(spec["accepted_plan"])) != admission["old_identity"]["plan_digest"]
+            or original["feature_delivery"]["owner"] != admission["owner"]):
+        raise OwnershipConflict("revision continuation changed its sealed plan admission")
+
+
+def assess_feature_revision(store, run_id, request):
+    from .delivery_execution_config import observation_mode
+    from .delivery_feature_closure import closed_coordinator
+    from .delivery_feature_handoff import observe_handoff, readonly_feature_spec, readonly_registry
+    from .delivery_github_plans import require_publication_capacity
+    from .delivery_lifecycle import evaluate_transition
+
+    unknown = {"operation": "revise_feature_plan", "owner": "feature_revision",
+               "comparisons": [], "predicates": [{
+        "code": "feature_revision_proof_unknown", "satisfied": None,
+        "missing_or_unknown_fact": "revision request, plan, reservation and successor authority",
+        "next_action": "inspect the feature revision owner evidence"}]}
+    facts = None
+    with observation_mode():
+        try:
+            _revision_request_shape(request)
+            with store._connect() as db:
+                row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+                prior = db.execute(
+                    "SELECT request_digest FROM delivery_commands WHERE command_id=?",
+                    (request["command_id"],)).fetchone()
+            if prior:
+                unknown["predicates"][0].update(
+                    code="feature_revision_historical_replay",
+                    missing_or_unknown_fact="fresh admission authority for a historical command",
+                    next_action="inspect the retained revision command response")
+                return evaluate_transition(unknown, request)
+            unknown["predicates"][0].update(
+                code="feature_revision_owner_proof_unknown",
+                missing_or_unknown_fact="authenticated feature owner and immutable registry",
+                next_action="inspect feature registry custody")
+            spec = readonly_feature_spec(store, run_id)
+            token = spec["feature_delivery"]["owner"]
+            command_digest = digest({"run_id": run_id, "request": request})
+            revision_id = "revision-" + command_digest[:24]
+            inner = {"command_id": "revision-owner-" + command_digest[:32],
+                     "expected_revision": request["expected_revision"]}
+            successor_id = "run-feature-" + digest({"run": run_id, "command": inner})[:20]
+            with readonly_registry(spec) as shared:
+                values = _values(spec, shared)
+                saved = values.get(PREFIX + "request:" + revision_id)
+                if saved:
+                    if saved["request_digest"] != command_digest or saved["request"] != request:
+                        raise OwnershipConflict("recorded revision admission changed")
+                    _checkpoint_proof(shared, token["issue_id"], values,
+                                      [PREFIX + "request:" + revision_id])
+                facts = _revision_owner_facts(shared, token, row, request, admission=saved)
+                if saved:
+                    admission = saved
+                else:
+                    unknown["predicates"][0].update(
+                        code="feature_revision_closure_unknown",
+                        missing_or_unknown_fact="authenticated closed predecessor and cleanup",
+                        next_action="inspect the feature coordinator closure")
+                    closed = closed_coordinator(store, run_id, preserve=False)
+                    if closed["result"].get("cleanup") != "confirmed":
+                        raise OwnershipConflict("revision predecessor cleanup is unconfirmed")
+                    unknown["predicates"][0].update(
+                        code="feature_revision_evidence_unknown",
+                        missing_or_unknown_fact="owned revision evidence and its exact digests",
+                        next_action="inspect the retained revision evidence")
+                    _evidence(store, spec, request.get("evidence", []), shared=shared)
+                    unknown["predicates"][0].update(
+                        code="feature_revision_plan_unknown",
+                        missing_or_unknown_fact="current GitHub plan and publication ownership",
+                        next_action="inspect the retained GitHub plan and stack")
+                    record = _readonly_revision_record(spec, shared)
+                    identity = _assert_identity(record, adopted_plan_identity(spec, shared))
+                    issue = spec["feature_delivery"]["snapshot"]["issue"]
+                    require_publication_capacity(issue, record["manifest"],
+                                                 trunk=spec.get("publication_base_ref"),
+                                                 head_width=len(spec["base_sha"]))
+                    # Superseded attempts are inspectable without closing them.
+                    for key, context in values.items():
+                        if (key.startswith(PREFIX + "begin:")
+                                and not _terminal(values, context["revision_id"])):
+                            _releasable_custody(shared, token["issue_id"], context["revision_id"])
+                    with shared.connect() as db:
+                        reserved = shared._pending_revision(db, token["issue_id"])
+                    if reserved and PREFIX + "begin:" + reserved["revision_id"] in values:
+                        facts = _revision_owner_facts(shared, token, row, request,
+                                                      reserved=reserved)
+                    admission = {"revision_id": revision_id, "phase": "requested", "owner": token,
+                        "predecessor_run_id": run_id, "successor_id": successor_id,
+                        "request": deepcopy(request), "request_digest": command_digest,
+                        "old_identity": identity, "old_plan": record["manifest"]["plan"],
+                        "record": record, "predecessor_closure": {
+                            key: value for key, value in closed.items() if key != "result"}}
+                    if request.get("reconsideration"):
+                        unknown["predicates"][0].update(
+                            code="feature_reconsideration_proof_unknown",
+                            missing_or_unknown_fact="immutable native review and worker provenance",
+                            next_action="inspect reconsideration owner evidence")
+                        proof, findings = _reconsideration_proof(
+                            store, spec, request["reconsideration"], record,
+                            admission["predecessor_closure"], values, shared=shared)
+                        _check_reconsideration_reservations(shared, token, values, proof,
+                                                            command_digest)
+                        admission.update(reconsideration=proof, unresolved_prior_findings=findings)
+                prospective = {"feature_predecessor": token, "run_id": successor_id,
+                               "accepted_plan": spec["accepted_plan"]}
+                _validate_revision_submission_binding(prospective, admission, spec, admission)
+                facts["proof_digest"] = digest({"owner": facts["proof_digest"],
+                                                "revision_admission": admission})
+                unknown["predicates"][0].update(
+                    code="feature_revision_registry_changed",
+                    missing_or_unknown_fact="stable feature registry through successor assessment",
+                    next_action="refresh the feature revision checkpoint")
+                successor = observe_handoff(store, run_id, inner, operation="continue_feature",
+                                             **({"revision_admission": admission} if saved else {}))
+                facts["predicates"].extend(
+                    {"code": item["code"], "satisfied": item.get("satisfied"),
+                     "owner": item["owner"],
+                     "missing_or_unknown_fact": item["missing_or_unknown_fact"],
+                     "next_action": item["next_action"],
+                     "new_authorization_required": item["new_authorization_required"]}
+                    for item in successor["blockers"])
+                facts["proof_digest"] = digest({"revision": facts["proof_digest"],
+                                                "successor": successor["proof_digest"]})
+                return evaluate_transition(facts, request)
+        except (AttributeError, OSError, RuntimeError, ValueError, KeyError, TypeError):
+            if facts is not None:
+                facts["predicates"].extend(unknown["predicates"])
+                return evaluate_transition(facts, request)
+            return evaluate_transition(unknown, request)
+
+
+def revise_feature_plan(store, run_id, request):
+    """Public stopped-feature admission; the runtime crafts and reviews the plan."""
+    from .delivery_feature_closure import closed_coordinator
+    from .delivery_feature_execution import continue_feature
+    from .delivery_feature_publication import current_record, live_members
+    from .delivery_github_plans import require_publication_capacity
+
+    _revision_request_shape(request)
     command_digest = digest({"run_id": run_id, "request": request})
     with store._connect() as db:
         prior = db.execute(
@@ -346,7 +595,15 @@ def revise_feature_plan(store, run_id, request):
         or row["cleanup"] != "confirmed"
         or not store.owns_execution(spec)
     ):
-        raise OwnershipConflict("feature is not at the specified stopped checkpoint")
+        from .delivery_execution_registry import FeatureHandoffRefused
+        from .delivery_feature_handoff import feature_projection_facts
+        from .delivery_lifecycle import evaluate_transition
+
+        facts = {"operation": "revise_feature_plan", "owner": "feature_revision",
+                 "owner_proof": None, **feature_projection_facts(row, "revise_feature_plan")}
+        error = FeatureHandoffRefused(evaluate_transition(facts, request))
+        error.args = ("feature is not at the specified stopped checkpoint",)
+        raise error
     shared = _registry(spec)
     token = spec["feature_delivery"]["owner"]
     revision_id = "revision-" + command_digest[:24]
@@ -355,14 +612,29 @@ def revise_feature_plan(store, run_id, request):
         "expected_revision": request["expected_revision"],
     }
     successor_id = "run-feature-" + digest({"run": run_id, "command": inner})[:20]
-    saved = _values(spec).get(PREFIX + "request:" + revision_id)
+    values = _values(spec, shared)
+    saved = values.get(PREFIX + "request:" + revision_id)
+    from .delivery_execution_registry import FeatureHandoffRefused
+    from .delivery_lifecycle import evaluate_transition
+
     if saved:
+        # Its continuation owns any admitted successor. Replaying that exact
+        # command must not require the predecessor to own the feature again.
         if saved["request_digest"] != command_digest or saved["request"] != request:
             raise OwnershipConflict("recorded revision admission changed")
         _checkpoint_proof(shared, token["issue_id"], _values(spec),
                           [PREFIX + "request:" + revision_id])
         admission = saved
     else:
+        initial = _revision_owner_facts(shared, token, row, request)
+        # Reservation and budget have their own historical, detailed refusals below.
+        initial["predicates"] = [p for p in initial["predicates"] if p["code"] not in {
+            "feature_product_budget_exhausted", "feature_revision_reservation_conflict"}]
+        assessment = evaluate_transition(initial, request)
+        if not assessment["eligible"]:
+            error = FeatureHandoffRefused(assessment)
+            error.args = ("feature workers or effects have not reached a safe handoff",)
+            raise error
         closed = closed_coordinator(store, run_id)
         if closed["result"].get("cleanup") != "confirmed":
             raise OwnershipConflict("revision predecessor cleanup is unconfirmed")
@@ -380,11 +652,6 @@ def revise_feature_plan(store, run_id, request):
             reserved and reserved["revision_id"] != revision_id
             and PREFIX + "begin:" + reserved["revision_id"] not in _values(spec, shared)
         )
-        if not unstarted:
-            # GitHub still shows the adopted plan, so this stopped owner's unfinished
-            # attempts can end here before a new correction is reserved.
-            _close_stopped_attempts(shared, token, _values(spec, shared),
-                                    "superseded by revision command " + request["command_id"])
         budget = shared.budget(token["issue_id"])
         if budget["used"] >= budget["maximum"]:
             raise OwnershipConflict("feature product repair limit exhausted")
@@ -414,6 +681,18 @@ def revise_feature_plan(store, run_id, request):
                 ).fetchone()
             if dict(current) != dict(row):
                 raise OwnershipConflict("stopped feature changed before revision admission")
+            from .delivery_lifecycle import require_transition
+
+            require_transition(_revision_owner_facts(shared, token, current, request,
+                                                      reserved=reserved), request)
+            from .delivery_feature_handoff import validate_retained_configuration
+
+            validate_retained_configuration(store, spec)
+            fresh_record = current_record(spec)
+            live_members(spec, fresh_record)
+            if fresh_record != record:
+                raise OwnershipConflict("GitHub plan changed before revision admission")
+            _assert_identity(fresh_record, identity)
             if request.get("reconsideration"):
                 # Recheck and reserve under the same existing issue lock. A new
                 # command, run, or unrelated source commit cannot spend again.
@@ -426,21 +705,7 @@ def revise_feature_plan(store, run_id, request):
                 )
                 if current_proof != proof or current_findings != findings:
                     raise OwnershipConflict("reconsideration proof changed before reservation")
-                for key, item in values.items():
-                    existing = item.get("reconsideration") if isinstance(item, dict) else None
-                    if (not key.startswith(PREFIX + "request:") or not existing
-                            or existing["context_key"] != proof["context_key"]
-                            or item["request_digest"] == command_digest):
-                        continue
-                    holder = item["revision_id"]
-                    if not _terminal(values, holder):
-                        raise OwnershipConflict("review context already reserved by " + holder)
-                    # A closed reservation keeps the context only if it was spent on it.
-                    if _started_reservation(shared, token, holder, values):
-                        raise OwnershipConflict(
-                            "review context already consumed by " + holder
-                            + ", which was closed after it was charged"
-                        )
+                _check_reconsideration_reservations(shared, token, values, proof, command_digest)
             if unstarted:
                 raise OwnershipConflict(
                     "feature has another revision command in custody: revision "
@@ -451,6 +716,8 @@ def revise_feature_plan(store, run_id, request):
                     " run to carry it (abandon_revision would permanently reject the"
                     " pending revision; that is an owner decision, not a retry)"
                 )
+            _close_stopped_attempts(shared, token, _values(spec, shared),
+                                    "superseded by revision command " + request["command_id"])
             shared.revision_checkpoint(
                 token, PREFIX + "request:" + revision_id, admission, stopped=True
             )
@@ -501,11 +768,11 @@ def _preparation_lineage(shared, public, values):
     return chain
 
 
-def _preparation_retry(store, spec, public, values):
+def _preparation_retry(store, spec, public, values, *, shared=None):
     reference = spec.get("feature_plan_revision_preparation_retry")
     if reference is None:
         return None
-    shared = _registry(spec)
+    shared = _registry(spec, shared)
     chain = _preparation_lineage(shared, public, values)
     key = reference.get("checkpoint_key")
     saved = next((receipt for name, receipt in chain if name == key), None)
@@ -518,8 +785,16 @@ def _preparation_retry(store, spec, public, values):
                 "generation": saved["predecessor"]["generation"] + 1}):
         raise OwnershipConflict("preparation continuation lost its sealed reservation lineage")
     for name, receipt in chain:
-        authenticate_adopted_plan_custody(store, spec, {"owner": receipt["predecessor"]})
-        previous = store.effective_spec(receipt["predecessor"]["run_id"])
+        authenticate_adopted_plan_custody(
+            store, spec, {"owner": receipt["predecessor"]}, shared=shared)
+        from .delivery_execution_config import is_observation_mode
+
+        if is_observation_mode():
+            from .delivery_feature_handoff import readonly_feature_spec
+
+            previous = readonly_feature_spec(store, receipt["predecessor"]["run_id"])
+        else:
+            previous = store.effective_spec(receipt["predecessor"]["run_id"])
         with store._connect() as db:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
                              (previous["run_id"],)).fetchone()
@@ -576,7 +851,7 @@ def _current_runtime_selectors(selectors):
                      "expected_runtime_payload_sha256": current["runtime_payload_sha256"]}
 
 
-def _refresh_preparation_reconsideration(store, original, public, values):
+def _refresh_preparation_reconsideration(store, original, public, values, *, shared=None):
     from .delivery_feature_review_context import compatible_external_guards
 
     receipt = public.get("reconsideration")
@@ -586,11 +861,14 @@ def _refresh_preparation_reconsideration(store, original, public, values):
     if (current["context_sha256"] != receipt["current_runtime"]["context_sha256"]
             or not compatible_external_guards(receipt["current_runtime"], current)):
         raise OwnershipConflict("preparation retry changed its normalized review context")
+    from .delivery_execution_config import is_observation_mode
+
     proof, findings = _reconsideration_proof(
         store, original, selectors, public["record"], public["predecessor_closure"], values,
+        **({"shared": shared} if is_observation_mode() and shared is not None else {}),
     )
     if proof["original_repair_budget"] != receipt["original_repair_budget"]:
-        shared = _registry(original)
+        shared = _registry(original, shared)
         current_budget = shared.require_unspent_budget(
             original["feature_delivery"]["owner"]["issue_id"], receipt["original_repair_budget"])
         if proof["original_repair_budget"] != current_budget:
@@ -604,11 +882,15 @@ def _refresh_preparation_reconsideration(store, original, public, values):
 
 def _preparation_observation(store, spec, row, *, custodian=None):
     from .delivery_broker import DeliveryBroker, _git
+    from .delivery_execution_config import is_observation_mode
     from .delivery_feature_closure import closed_coordinator
     from .delivery_policy_recovery import _remote, _stopped_cleanup, work_binding
     from .delivery_resources import RunResources, _identity, read_private
 
-    closed = closed_coordinator(store, spec["run_id"])
+    if is_observation_mode():
+        closed = closed_coordinator(store, spec["run_id"], preserve=False)
+    else:
+        closed = closed_coordinator(store, spec["run_id"])
     state = closed["result"]
     candidate = json.loads(row["candidate_json"] or "null")
     if (state.get("roles") != [] or state.get("iteration") != 0
@@ -669,16 +951,25 @@ def _preparation_observation(store, spec, row, *, custodian=None):
                 "checkout": spec["checkout"], "candidate": candidate,
                 "provenance": None, "continuation": None}):
         raise OwnershipConflict("preparation effects differ from the completed checkout receipt")
+    if is_observation_mode():
+        from .delivery_github_contract import bounded_github_observation
+
+        with bounded_github_observation(spec["github_repo"]):
+            remote = _remote(broker)
+    else:
+        remote = _remote(broker)
     return closed, {"cleanup": cleanup, "work_binding": binding, "effects_sha256": digest(effects),
-                    "remote": _remote(broker)}
+                    "remote": remote}
 
 
-def continue_pending_preparation(store, spec, row, request, successor_id):
+def continue_pending_preparation(
+    store, spec, row, request, successor_id, *, shared=None, observe=False
+):
     """Transport one unstarted reservation through at most three preparation continuations."""
     from .delivery_config import DeliveryConfig
     from .delivery_execution_registry import PREPARATION_CONTINUATION_LIMIT
 
-    shared = _registry(spec)
+    shared = _registry(spec, shared)
     token = spec["feature_delivery"]["owner"]
     values = _values(spec, shared)
     public = revision_request(spec, shared)
@@ -687,6 +978,8 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     revision_id = public["revision_id"]
     replay = "; replay continue-feature " + request["command_id"] + " to continue without it"
     if _started_reservation(shared, token, revision_id, values):
+        if observe:
+            raise OwnershipConflict("started revision requires owner settlement")
         # A begun (or charged) attempt belongs to the generation that began it: no
         # continuation can transport it and no later begin may resume it, so this
         # refusal is final. Unstarted reservations are never closed here; their
@@ -707,8 +1000,9 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         # An unstarted reservation has spent nothing and nothing is written before
         # this. A stopped feature publishes nothing, so it proceeds only after the
         # owner changes the record.
+        record = _readonly_revision_record(spec, shared) if observe else current_record(spec)
         require_publication_capacity(spec["feature_delivery"]["snapshot"]["issue"],
-                                     current_record(spec)["manifest"],
+                                     record["manifest"],
                                      trunk=spec.get("publication_base_ref"),
                                      head_width=len(spec["base_sha"]))
     except ValueError as exc:
@@ -729,10 +1023,13 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     # before appending a transport receipt. Existing execution stays frozen.
     if digest(DeliveryConfig.load(store.config.path).raw) != digest(store.config.raw):
         raise OwnershipConflict("preparation admission configuration changed")
-    incoming = _preparation_retry(store, spec, public, values)
+    incoming = _preparation_retry(
+        store, spec, public, values, **({"shared": shared} if observe else {}))
     sequence = next((index + 2 for index, (_, receipt) in enumerate(chain)
                      if receipt == incoming), 1)
     if sequence > PREPARATION_CONTINUATION_LIMIT:
+        if observe:
+            raise OwnershipConflict("preparation continuation limit requires owner settlement")
         _abandon_reservation(
             store, spec, shared, public, values,
             "preparation continuation limit reached after " + str(len(chain))
@@ -763,8 +1060,14 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
     closed, observation = _preparation_observation(store, spec, row)
     state = closed["result"]
     candidate = json.loads(row["candidate_json"])
-    original = store.effective_spec(public["predecessor_run_id"])
-    proof, selectors = _refresh_preparation_reconsideration(store, original, public, values)
+    if observe:
+        from .delivery_feature_handoff import readonly_feature_spec
+
+        original = readonly_feature_spec(store, public["predecessor_run_id"])
+    else:
+        original = store.effective_spec(public["predecessor_run_id"])
+    proof, selectors = _refresh_preparation_reconsideration(
+        store, original, public, values, shared=shared)
     shared.require_unspent_budget(token["issue_id"], proof["original_repair_budget"])
     receipt = {
         "version": 1, "revision_id": revision_id, "admission_sha256": digest(public),
@@ -787,6 +1090,8 @@ def continue_pending_preparation(store, spec, row, request, successor_id):
         # its normalized review context is unchanged, so the receipt stands as written
         # and the replay spends nothing and adds no continuation.
         receipt = saved
+    if observe:
+        return {"admission": deepcopy(public), "preparation_retry": receipt}
     with shared.serialized(token["issue_id"]):
         if _preparation_lineage(shared, public, _values(spec, shared)) != chain:
             raise OwnershipConflict("preparation continuation lineage changed before admission")
@@ -816,16 +1121,13 @@ def authenticate_revision_submission(store, spec, admission):
     saved = shared.checkpoints(predecessor["issue_id"]).get(
         PREFIX + "request:" + admission["revision_id"]
     )
-    if (
-        saved != admission
-        or (retry is None and (admission["owner"] != predecessor
-                              or admission["successor_id"] != spec["run_id"]))
-        or digest(json.loads(spec["accepted_plan"])) != admission["old_identity"]["plan_digest"]
-    ):
-        raise OwnershipConflict("revision continuation changed its sealed plan admission")
     original = store.effective_spec(admission["predecessor_run_id"])
-    if original["feature_delivery"]["owner"] != admission["owner"]:
-        raise OwnershipConflict("revision continuation changed original owner custody")
+    if retry is None:
+        _validate_revision_submission_binding(spec, admission, original, saved)
+    elif (saved != admission
+          or digest(json.loads(spec["accepted_plan"])) != admission["old_identity"]["plan_digest"]
+          or original["feature_delivery"]["owner"] != admission["owner"]):
+        raise OwnershipConflict("revision continuation changed its sealed plan admission")
     if retry is not None:
         chain = _preparation_lineage(shared, admission, values)
         key = next((name for name, receipt in chain if receipt == retry), None)
@@ -860,9 +1162,14 @@ def authenticate_continued_plan(store, spec):
     if not predecessor:
         return
     original = store.effective_spec(predecessor["run_id"])
+    _validate_continued_plan(store, spec, original, _registry(original))
+
+
+def _validate_continued_plan(store, spec, original, shared):
+    """Authenticate accepted-plan lineage using an owning or read-only registry view."""
+    predecessor = spec.get("feature_predecessor")
     if original.get("feature_delivery", {}).get("owner") != predecessor:
         raise OwnershipConflict("feature continuation changed its original owner custody")
-    shared = _registry(original)
     with shared.connect() as db:
         current = shared.current(predecessor["issue_id"])
         retry = next((item for key, item in shared.checkpoints(predecessor["issue_id"]).items()
@@ -890,7 +1197,7 @@ def authenticate_continued_plan(store, spec):
         spec["feature_plan_revision"] = identity
 
 
-def authenticate_adopted_plan_custody(store, parent, receipt):
+def authenticate_adopted_plan_custody(store, parent, receipt, *, shared=None):
     """An accepted adoption survives only the registry's exact stopped-owner chain."""
     owner = parent["feature_delivery"]["owner"]
     previous = receipt["owner"]
@@ -898,7 +1205,7 @@ def authenticate_adopted_plan_custody(store, parent, receipt):
         return
     if owner["issue_id"] != previous["issue_id"] or owner["generation"] <= previous["generation"]:
         raise OwnershipConflict("adopted plan belongs to an unrelated execution owner")
-    shared = _registry(parent)
+    shared = _registry(parent, shared)
     with shared.connect() as db:
         snapshots = [
             dict(row)
@@ -1276,7 +1583,7 @@ def _admit_plan(spec, old, proposed, identity):
     return plan, sorted(changed), sorted(implementation)
 
 
-def _role_context(store, spec, context, proposal=None):
+def _role_context(store, spec, context, proposal=None, *, shared=None):
     diagnostic = proposal["diagnostic"] if proposal else context["diagnostic"]
     references = (
         diagnostic["evidence"] if diagnostic else (context.get("request") or {}).get("evidence", [])
@@ -1297,7 +1604,7 @@ def _role_context(store, spec, context, proposal=None):
         "namespace": "plan-revisions/" + context["revision_id"],
         "diagnostic": deepcopy(diagnostic),
         "proposed_plan_sha256": proposal["proposal_digest"] if proposal else None,
-        "trusted_evidence": _evidence(store, spec, references),
+        "trusted_evidence": _evidence(store, spec, references, shared=shared),
     }
 
 
@@ -1345,13 +1652,15 @@ def _private_canonical(path, expected):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _saved_revision_role(store, spec, context, proposal, candidate, role, *, closed_at=None):
+def _saved_revision_role(store, spec, context, proposal, candidate, role, *, closed_at=None,
+                         shared=None):
     """Authenticate the exact supervised launcher and actual completed provider."""
     from .delivery_feature_revision_roles import revision_comparison
     from .delivery_resources import read_private
     from .supervisor import DeliverySupervisor
 
-    expected_context = _role_context(store, spec, context, proposal if role == "review" else None)
+    expected_context = _role_context(store, spec, context, proposal if role == "review" else None,
+                                     shared=shared)
     if role == "review":
         expected_context["proposed_plan"] = proposal["plan"]
     expected = {"spec": spec, "role": role, "iteration": 0, "candidate": candidate,
@@ -1456,7 +1765,7 @@ def _saved_revision_role(store, spec, context, proposal, candidate, role, *, clo
                     "runtime_identity": native["runtime_identity"]}
 
 
-def _historical_rejection(store, spec, rejected, values, *, closure=None):
+def _historical_rejection(store, spec, rejected, values, *, closure=None, shared=None):
     """Bind genuine findings to their original input, closure and actual runtime."""
     from .delivery_feature_review_context import authenticated_runtime_context
 
@@ -1473,8 +1782,13 @@ def _historical_rejection(store, spec, rejected, values, *, closure=None):
             or rejected["old_identity"] != previous["old_identity"]
             or any(item["repair_key"] != previous["repair_key"] for item in (proposal, rejected))):
         raise OwnershipConflict("selected rejection lost its exact begin/proposal custody")
-    authenticate_adopted_plan_custody(store, spec, {"owner": owner})
-    historical = store.effective_spec(owner["run_id"])
+    authenticate_adopted_plan_custody(store, spec, {"owner": owner}, shared=shared)
+    if shared is not None:
+        from .delivery_feature_handoff import readonly_feature_spec
+
+        historical = readonly_feature_spec(store, owner["run_id"])
+    else:
+        historical = store.effective_spec(owner["run_id"])
     with store._connect() as db:
         row = db.execute(
             "SELECT * FROM delivery_runs WHERE run_id=?", (owner["run_id"],),
@@ -1515,7 +1829,7 @@ def _historical_rejection(store, spec, rejected, values, *, closure=None):
     closed_at = datetime.fromisoformat(closure["closed_at"])
     if closed_at.tzinfo is None:
         raise ValueError("selected rejection closure time is unbound")
-    shared = _registry(spec)
+    shared = _registry(spec, shared)
     _checkpoint_proof(shared, owner["issue_id"], values, keys)
     with shared.connect() as db:
         paid = db.execute(
@@ -1529,9 +1843,11 @@ def _historical_rejection(store, spec, rejected, values, *, closure=None):
         raise ValueError("selected rejection changed its original candidate")
     intake, intake_proof = _saved_revision_role(
         store, historical, previous, proposal, candidate, "intake", closed_at=closed_at,
+        shared=shared,
     )
     review, review_proof = _saved_revision_role(
         store, historical, previous, proposal, candidate, "review", closed_at=closed_at,
+        shared=shared,
     )
     if (intake.get("status") != "plan" or intake.get("plan") != proposal["plan"]
             or intake.get("diagnostic") != proposal["diagnostic"]
@@ -1551,7 +1867,7 @@ def _historical_rejection(store, spec, rejected, values, *, closure=None):
             "closure": deepcopy(closure)}
 
 
-def _worker_subject(store, parent, previous, proposal, values):
+def _worker_subject(store, parent, previous, proposal, values, *, shared=None):
     from .delivery_feature_completed_build import completed_build_subject
     from .delivery_feature_execution import revised_worker_spec
     from .delivery_feature_review_context import preserved_worker
@@ -1573,13 +1889,17 @@ def _worker_subject(store, parent, previous, proposal, values):
         raise ValueError("reconsideration worker evidence exceeds its bounded context")
     summaries, inputs, subjects = [], {}, []
     for run_id, assignment in sorted(workers.items()):
-        original = store.effective_spec(run_id)
         with store._connect() as db:
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             attempts = list(db.execute(
                 "SELECT * FROM delivery_attempts WHERE run_id=? "
                 "ORDER BY job_key", (run_id,),
             ))
+        if shared is not None and row and row["recovery_json"]:
+            transport = json.loads(row["recovery_json"])
+            if (retained_recovery(transport) or {}).get("feature_plan_revision"):
+                raise ValueError("retained worker revision lineage needs read-only custody proof")
+        original = store.effective_spec(run_id)
         worker = original.get("feature_worker") or {}
         if (not row or row["cleanup"] != "confirmed"
                 or row["outcome"] not in {"blocked", "cancelled", "delivered", "merged"}
@@ -1593,16 +1913,18 @@ def _worker_subject(store, parent, previous, proposal, values):
                       if key.startswith("worker-input:" + run_id + ":") and value == submitted]
         if not input_keys:
             raise ValueError("reconsideration lacks an immutable original worker input")
-        _checkpoint_proof(_registry(parent), parent["feature_delivery"]["owner"]["issue_id"],
-                          values, input_keys)
+        issue_id = parent["feature_delivery"]["owner"]["issue_id"]
+        _checkpoint_proof(_registry(parent, shared), issue_id, values, input_keys)
         recovery = retained_recovery(json.loads(row["recovery_json"] or "null"))
         if (worker.get("kind") == "build" and row["outcome"] == "delivered"
                 and worker["chunk_id"] not in implementation):
             observation = completed_build_subject(
-                store, parent, original, row, attempts, assignment, values, _registry(parent),
+                store, parent, original, row, attempts, assignment, values,
+                _registry(parent, shared),
             )
         else:
-            observation = retained_worker_subject(store, original, row, attempts, recovery)
+            observation = retained_worker_subject(store, original, row, attempts, recovery,
+                                                  shared=shared)
         derived = revised_worker_spec(
             parent, plan, assignment["chunk_id"],
             expected_revision={"plan_revision": previous["old_identity"]["plan_revision"] + 1,
@@ -1633,7 +1955,8 @@ def _worker_subject(store, parent, previous, proposal, values):
             "current_worker_subject_sha256": digest(subjects)}
 
 
-def _prove_reconsideration(store, spec, selectors, record, closure, values, *, planning_paid=False):
+def _prove_reconsideration(store, spec, selectors, record, closure, values, *, planning_paid=False,
+                           shared=None):
     from .delivery_feature_review_context import (
         SCHEMA,
         candidate_subject,
@@ -1645,7 +1968,7 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
     rejected = values.get(PREFIX + "rejected:" + selected_id)
     previous = values.get(PREFIX + "begin:" + selected_id)
     proposal = values.get(PREFIX + "proposal:" + selected_id)
-    identity = _assert_identity(record, adopted_plan_identity(spec))
+    identity = _assert_identity(record, adopted_plan_identity(spec, shared))
     if (not rejected or not previous or not proposal
             or previous["owner"] != spec["feature_delivery"]["owner"]
             or rejected.get("proposal_digest") != selectors["proposal_sha256"]
@@ -1653,7 +1976,8 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
             or not _same_publication(previous["record"]["manifest"]["publication"],
                                      record["manifest"]["publication"])):
         raise ValueError("reconsideration must select this stopped owner's exact genuine rejection")
-    historical = _historical_rejection(store, spec, rejected, values, closure=closure)
+    historical = _historical_rejection(store, spec, rejected, values, closure=closure,
+                                       shared=shared)
     if historical["classification"] != "genuine":
         raise ValueError("reconsideration requires a genuine completed independent review")
     current = current_runtime_context()
@@ -1664,8 +1988,8 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
         raise ValueError("reconsideration changed an external authority/model binding")
     if current["context_sha256"] == historical["runtime"]["context_sha256"]:
         raise ValueError("reconsideration requires a changed relevant derivation context")
-    subject = _worker_subject(store, spec, previous, proposal, values)
-    budget = _registry(spec).budget(previous["owner"]["issue_id"])
+    subject = _worker_subject(store, spec, previous, proposal, values, shared=shared)
+    budget = _registry(spec, shared).budget(previous["owner"]["issue_id"])
     if (any(worker.get("current_review_subject") for worker in subject["worker_summaries"])
             and budget["maximum"] - budget["used"] < 1 + int(not planning_paid)):
         raise ValueError("unpassed retained worker lacks the ordinary planning and repair budget")
@@ -1676,7 +2000,8 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
          and item.get("old_identity") == identity),
         key=lambda item: values[PREFIX + "begin:" + item["revision_id"]]["owner"]["generation"],
     ):
-        proof = historical if item == rejected else _historical_rejection(store, spec, item, values)
+        proof = historical if item == rejected else _historical_rejection(
+            store, spec, item, values, shared=shared)
         if proof["classification"] == "genuine":
             if not compatible_external_guards(proof["runtime"], current):
                 raise ValueError("prior genuine review has unsupported external bindings")
@@ -1723,10 +2048,11 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
     return receipt, findings
 
 
-def _reconsideration_proof(store, spec, selectors, record, closure, values, *, planning_paid=False):
+def _reconsideration_proof(store, spec, selectors, record, closure, values, *, planning_paid=False,
+                           shared=None):
     try:
         return _prove_reconsideration(store, spec, selectors, record, closure, values,
-                                     planning_paid=planning_paid)
+                                     planning_paid=planning_paid, shared=shared)
     except (KeyError, TypeError, OSError, StopIteration, SyntaxError) as exc:
         raise OwnershipConflict("reconsideration evidence is missing or unsupported") from exc
 
@@ -2199,6 +2525,21 @@ def _close_stopped_investigation(shared, token, context, values):
         + str(token["generation"])
     )
     return _close_attempt(shared, token, context, values, reason)
+
+
+def _check_reconsideration_reservations(shared, token, values, proof, command_digest):
+    for key, item in values.items():
+        existing = item.get("reconsideration") if isinstance(item, dict) else None
+        if (not key.startswith(PREFIX + "request:") or not existing
+                or existing["context_key"] != proof["context_key"]
+                or item["request_digest"] == command_digest):
+            continue
+        holder = item["revision_id"]
+        if not _terminal(values, holder):
+            raise OwnershipConflict("review context already reserved by " + holder)
+        if _started_reservation(shared, token, holder, values):
+            raise OwnershipConflict("review context already consumed by " + holder
+                                    + ", which was closed after it was charged")
 
 
 def _started_reservation(shared, token, revision_id, values):

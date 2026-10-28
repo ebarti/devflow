@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -366,6 +367,129 @@ async def test_native_timeout_confirms_tree_cleanup_and_releases_slot(owned_chec
     assert owned_checks.maximum() == 1
 
 
+async def check_slot_timeout_diagnostic(error, broker, journal, handle):
+    """Retain finite original failure facts without changing its refusal."""
+    from runtime_location_scenario import ci_failure_diagnostics
+
+    if not ci_failure_diagnostics():
+        return
+
+    def number(value, limit=2**31 - 1):
+        return value if type(value) is int and 0 <= value <= limit else None
+
+    def result_facts(value):
+        if not isinstance(value, dict):
+            return {"state": "unavailable"}
+        result = {}
+        for key in ("timed_out", "cancelled", "monitoring_complete", "stdio_drained"):
+            if type(value.get(key)) is bool:
+                result[key] = value[key]
+        for key, allowed in (
+            ("state", {"finished", "unknown", "passed", "failed", "blocked"}),
+            ("cleanup", {"observed-native-confirmed", "confirmed", "unknown"}),
+        ):
+            if isinstance(value.get(key), str) and value[key] in allowed:
+                result[key] = value[key]
+        exit_code = value.get("exit_code")
+        if type(exit_code) is int and -(2**31) <= exit_code < 2**31:
+            result["exit_code"] = exit_code
+        return result
+
+    try:
+        if (handle.id != "check-slots-timeout" or not isinstance(handle.run_id, str)
+                or not handle.run_id or handle.run_id != handle.result_run_id
+                or broker.spec.get("run_id") != "temporal-stopped"
+                or journal != Path(broker.spec["state_dir"]) / "native/native-process.json"):
+            return
+        facts = {"broker_started": broker.started.is_set(),
+                 "broker_finished": broker.finished.is_set(),
+                 "cleanup_confirmed": broker.native_cleanup_confirmed is True,
+                 "broker_result": result_facts(broker.result)}
+        try:
+            descriptor = os.open(journal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                info = os.fstat(descriptor)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_mode & 0o777 != 0o600 or info.st_nlink not in (0, 1)
+                        or info.st_size > 262144):
+                    raise ValueError("fixture journal observation unavailable")
+                raw = os.read(descriptor, 262145)
+                if len(raw) > 262144:
+                    raise ValueError("fixture journal observation exceeds bound")
+                value = json.loads(raw)
+            finally:
+                os.close(descriptor)
+            phase = value.get("phase")
+            facts["journal_phase"] = phase if phase in {
+                "allocated", "authorized", "finished", "unknown",
+            } else "other"
+            facts["journal_result"] = result_facts(value.get("result"))
+            owned = value.get("owned")
+            if isinstance(owned, dict):
+                facts["owned_entries_capped"] = min(len(owned), 64)
+        except BaseException:
+            facts["journal_phase"] = "unavailable"
+        events = []
+        try:
+            async with asyncio.timeout(2):
+                description = await handle.describe(rpc_timeout=timedelta(seconds=2))
+                facts["pending_activities"] = [{
+                    "state": number(int(item.state), 100),
+                    "attempt": number(item.attempt),
+                    "maximum_attempts": number(item.maximum_attempts),
+                    "current_retry_seconds": number(item.current_retry_interval.seconds, 86400),
+                    "current_retry_nanos": number(item.current_retry_interval.nanos, 999999999),
+                    "last_failure_timeout_type": number(int(
+                        item.last_failure.timeout_failure_info.timeout_type), 100)
+                    if item.last_failure.HasField("timeout_failure_info") else None,
+                } for item in description.raw_description.pending_activities[:4]]
+                origin = None
+                async for event in handle.fetch_history_events(
+                    page_size=32, wait_new_event=False, rpc_timeout=timedelta(seconds=2),
+                ):
+                    moment = event.event_time.seconds * 10**9 + event.event_time.nanos
+                    if origin is None:
+                        origin = moment
+                    row = {"type": number(int(event.event_type), 1000),
+                           "id": number(event.event_id),
+                           "elapsed_milliseconds": number((moment - origin) // 10**6, 86400000)}
+                    for kind in ("scheduled", "started", "completed", "timed_out", "failed"):
+                        field = f"activity_task_{kind}_event_attributes"
+                        if not event.HasField(field):
+                            continue
+                        attributes = getattr(event, field)
+                        if kind == "started":
+                            row["attempt"] = number(attributes.attempt)
+                        if kind == "scheduled":
+                            row.update(
+                                start_to_close=number(
+                                    attributes.start_to_close_timeout.seconds, 86400),
+                                start_to_close_nanos=number(
+                                    attributes.start_to_close_timeout.nanos, 999999999),
+                                maximum_attempts=number(attributes.retry_policy.maximum_attempts),
+                                retry_initial_seconds=number(
+                                    attributes.retry_policy.initial_interval.seconds, 86400),
+                                retry_maximum_seconds=number(
+                                    attributes.retry_policy.maximum_interval.seconds, 86400),
+                            )
+                        if (kind in {"timed_out", "failed"}
+                                and attributes.failure.HasField("timeout_failure_info")):
+                            row["timeout_type"] = number(int(
+                                attributes.failure.timeout_failure_info.timeout_type), 100)
+                    events.append(row)
+                    if len(events) == 64:
+                        break
+            facts["history_status"] = "observed"
+        except BaseException:
+            facts["history_status"] = "unavailable"
+        facts["history"] = events
+        text = json.dumps({"check_slot_timeout_observation": facts}, sort_keys=True)
+        if len(text) <= 16384:
+            error.add_note(text)
+    except BaseException:
+        pass
+
+
 @pytest.mark.parametrize("stop", ["cancel", "timeout"])
 async def test_temporal_cancel_or_monitor_timeout_preserves_native_slot_lifecycle(
     owned_checks, monkeypatch, tmp_path, stop,
@@ -411,7 +535,20 @@ async def test_temporal_cancel_or_monitor_timeout_preserves_native_slot_lifecycl
                     # Losing a monitor attempt does not end the durable check or
                     # free its slot while it is still running. Its replacement
                     # reattaches and returns the original check's result.
-                    result = await asyncio.wait_for(handle.result(), 15)
+                    try:
+                        result = await asyncio.wait_for(handle.result(), 15)
+                    except TimeoutError as error:
+                        try:
+                            if handle.result_run_id:
+                                observation = environment.client.get_workflow_handle(
+                                    handle.id, run_id=handle.result_run_id,
+                                )
+                                await check_slot_timeout_diagnostic(
+                                    error, broker, journal, observation,
+                                )
+                        except BaseException:
+                            pass
+                        raise
                     assert result == {"state": "passed", "cleanup": "confirmed"}
                     history = await handle.fetch_history()
                     started = [event.activity_task_started_event_attributes

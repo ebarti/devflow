@@ -12,6 +12,7 @@ from pathlib import Path
 from .contracts import canonical_json, digest
 from .delivery_broker import DeliveryBroker, _git
 from .delivery_continuation import session_state_digest
+from .delivery_lifecycle import evaluate_transition, require_transition
 from .delivery_metadata_recovery import _immutable, preserve_resources
 from .delivery_policy_recovery import _rows, _stopped_cleanup, work_binding
 from .delivery_preparation import _lock
@@ -185,13 +186,83 @@ def authority_readback(spec, seal, payload):
     return authority, semantic
 
 
-def preflight(store, run_id):
+def _lifecycle_facts(seal):
+    return {
+        "operation": "investigation_gates_only", "owner": "gates_admission",
+        "owner_proof": True, "normalized_lifecycle": "stopped",
+        "revision": seal["row"]["protocol_revision"], "iteration": seal["iteration"],
+        "candidate_id": seal["candidate"]["id"], "candidate_head": seal["candidate"]["head"],
+        "proof_digest": digest(seal),
+        "comparisons": [("proof_digest", "precheck_sha256", "custody_changed")],
+    }
+
+
+def _valid_request(payload):
+    fields = {
+        "command_id",
+        "precheck_sha256",
+        "authority_path",
+        "authority_sha256",
+        "semantic_path",
+        "semantic_sha256",
+    }
+    return not (
+        not isinstance(payload, dict)
+        or set(payload) not in (fields, fields | {
+            'preparation_authority_path', 'preparation_authority_sha256',
+        })
+        or not isinstance(payload.get("command_id"), str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", payload["command_id"])
+        or any(
+            not isinstance(payload.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", payload[key])
+            for key in ("precheck_sha256", "authority_sha256", "semantic_sha256")
+        )
+    )
+
+
+def assess(store, run_id, request):
+    """Assess the exact read-only owner seal without authorizing an admission."""
+    try:
+        observed = preflight(store, run_id)
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+        return evaluate_transition({"operation": "investigation_gates_only",
+                                    "owner": "gates_admission", "comparisons": []}, {})
+    assessment = evaluate_transition(_lifecycle_facts(observed["seal"]), request)
+    if not assessment['eligible']:
+        return assessment
+    try:
+        if not _valid_request(request):
+            raise ValueError('gates-only request fields do not match the contract')
+        authority_readback(store.effective_spec(run_id), observed['seal'], request)
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+        facts = _lifecycle_facts(observed['seal'])
+        facts['predicates'] = [{'code': 'gates_authority_unknown', 'satisfied': None,
+                                'missing_or_unknown_fact': 'authenticated gates authority',
+                                'next_action': 'inspect gates-only authority and custody',
+                                'new_authorization_required': False}]
+        return evaluate_transition(facts, request)
+    try:
+        from .delivery_native_renewal import readiness
+
+        readiness(store.effective_spec(run_id), request)
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+        facts = _lifecycle_facts(observed['seal'])
+        facts['predicates'] = [{'code': 'native_readiness_unknown', 'satisfied': None,
+                                'missing_or_unknown_fact': 'native renewal readiness',
+                                'next_action': 'inspect native renewal readiness',
+                                'new_authorization_required': False}]
+        return evaluate_transition(facts, request)
+    return assessment
+
+
+def preflight(store, run_id, *, preserve=False):
     spec = store.effective_spec(run_id)
     row, attempts, effects, claim = _rows(store, run_id)
     previous = json.loads(row["recovery_json"]) if row["recovery_json"] else None
     closed = store._completed_temporal_result(
         run_id,
         workflow_id=row["workflow_id"] or "delivery-" + run_id,
+        preserve=preserve,
     )
     state = closed["result"]
     implementation = next(
@@ -286,31 +357,18 @@ def preflight(store, run_id):
         "candidate": candidate,
         "iteration": state["iteration"],
         "precheck_sha256": digest(seal),
+        "lifecycle_assessment": evaluate_transition(
+            {**_lifecycle_facts(seal), 'predicates': [{
+                'code': 'gates_authority_unknown', 'satisfied': None,
+                'missing_or_unknown_fact': 'authenticated gates authority',
+                'next_action': 'inspect gates-only authority and custody',
+            }]}, {"precheck_sha256": digest(seal)}),
         "seal": seal,
     }
 
 
 def admit(store, run_id, payload):
-    fields = {
-        "command_id",
-        "precheck_sha256",
-        "authority_path",
-        "authority_sha256",
-        "semantic_path",
-        "semantic_sha256",
-    }
-    if (
-        not isinstance(payload, dict)
-        or set(payload) not in (fields, fields | {
-            'preparation_authority_path', 'preparation_authority_sha256',
-        })
-        or not isinstance(payload.get("command_id"), str)
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", payload["command_id"])
-        or any(
-            not isinstance(payload.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", payload[key])
-            for key in ("precheck_sha256", "authority_sha256", "semantic_sha256")
-        )
-    ):
+    if not _valid_request(payload):
         raise ValueError("gates-only request fields do not match the contract")
     command_digest = digest({"run_id": run_id, **payload})
     spec = store.effective_spec(run_id)
@@ -330,15 +388,15 @@ def admit(store, run_id, payload):
             return json.loads(prior["response_json"])
         if granted:
             raise ValueError("this original run already received its gates-only admission")
-        observed = preflight(store, run_id)
-        if observed["precheck_sha256"] != payload["precheck_sha256"]:
-            raise ValueError("gates-only preflight changed")
+        observed = preflight(store, run_id, preserve=True)
+        require_transition(_lifecycle_facts(observed["seal"]), payload)
         seal = observed["seal"]
         authority, semantic = authority_readback(spec, seal, payload)
         from .delivery_native_renewal import renew
 
         execution_spec, renewal = renew(spec, payload, command_digest)
-        if preflight(store, run_id)['precheck_sha256'] != observed['precheck_sha256']:
+        if (preflight(store, run_id, preserve=True)['precheck_sha256']
+                != observed['precheck_sha256']):
             raise ValueError('gates-only original custody changed during native renewal')
         after = DeliveryBroker(store, execution_spec).candidate()
         if any(canonical_json(after[k]) != canonical_json(seal['candidate'][k])

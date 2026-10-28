@@ -161,6 +161,31 @@ def _physical(store, spec, previous, *, resource_spec=None):
     return {"resources_sha256": resources, "operational_owner": owner}
 
 
+def _transition(seal, command):
+    """Compare only facts authenticated by the existing checkpoint owner."""
+    from .delivery_lifecycle import require_transition
+
+    row, candidate, publication = seal["row"], seal["candidate"], seal["publication"]
+    return require_transition({
+        "operation": KIND, "owner": "delivery_ci_inventory",
+        "owner_proof": True, "normalized_lifecycle": "stopped",
+        "proof_digest": digest(seal),
+        "revision": row["protocol_revision"], "projection_revision": row["revision"],
+        "iteration": row["iteration"], "candidate_id": candidate["id"],
+        "candidate_head": candidate["head"], "content_sha256": candidate["content_sha256"],
+        "publication_number": publication["number"], "publication_required": True,
+        "comparisons": [
+            ("revision", "expected_revision", "revision_changed"),
+            ("projection_revision", "expected_projection_revision", "projection_revision_changed"),
+            ("iteration", "expected_iteration", "iteration_changed"),
+            ("candidate_id", "expected_candidate_id", "candidate_changed"),
+            ("candidate_head", "expected_candidate_head", "candidate_head_changed"),
+            ("content_sha256", "expected_content_sha256", "candidate_content_changed"),
+            ("publication_number", "expected_pr_number", "publication_changed"),
+        ],
+    }, command)
+
+
 def _authority(store, run_id, command, profile):
     from .delivery_gate_retry import CI_KIND, snapshot
     from .delivery_runtime_location import require_not_pending
@@ -169,7 +194,7 @@ def _authority(store, run_id, command, profile):
     require_not_pending(store.config)
 
     readonly = store if store.read_only else DeliveryStore(store.config, read_only=True)
-    seal = snapshot(readonly, run_id, CI_KIND, _inventory_profile=profile)
+    seal = snapshot(readonly, run_id, CI_KIND, _inventory_profile=profile, _observation=True)
     spec, row, candidate = seal["original_spec"], seal["row"], seal["candidate"]
     _subject(spec, candidate, seal["publication"], profile)
     if (
@@ -177,16 +202,7 @@ def _authority(store, run_id, command, profile):
         != profile["subject"]["intake_policy_digest"]
     ):
         raise ValueError("ordinary CI inventory changed its original intake policy")
-    if (
-        command["expected_revision"] != row["protocol_revision"]
-        or command["expected_projection_revision"] != row["revision"]
-        or command["expected_iteration"] != row["iteration"]
-        or command["expected_candidate_id"] != candidate["id"]
-        or command["expected_candidate_head"] != candidate["head"]
-        or command["expected_content_sha256"] != candidate["content_sha256"]
-        or command["expected_pr_number"] != seal["publication"]["number"]
-    ):
-        raise ValueError("ordinary CI inventory lost its stopped current checkpoint")
+    _transition(seal, command)
     from .delivery_gate_retry import _retained_recovery, _rows, _sealed_row
     from .delivery_policy_recovery import work_binding
 
@@ -245,12 +261,13 @@ def preflight(store, run_id, payload):
             raise ValueError("ordinary CI command ID already belongs to another operation")
     _, before = _authority(store, run_id, command, profile)
     facts, _ = _observe(profile)
-    _, after = _authority(store, run_id, command, profile)
+    seal, after = _authority(store, run_id, command, profile)
     if before != after:
         raise ValueError("ordinary CI source/owner/ledger changed during preflight")
     return {
         "run_id": run_id,
         "preflight": True,
+        "lifecycle_assessment": _transition(seal, command),
         "kind": KIND,
         "preflight_key": digest({"command": command, "authority": before, "facts": facts}),
         "profile_sha256": APPROVED_PROFILE_SHA256,
@@ -375,6 +392,7 @@ def acknowledge(store, run_id, payload):
             ).fetchone()
         ):
             raise ValueError("ordinary CI acknowledgement lost its atomic original checkpoint")
+        _transition({**seal, "row": _sealed_row(current)}, command)
         for table, key_name, expected in (
             ("delivery_attempts", "job_key", seal["attempts"]),
             ("delivery_effects", "effect_key", seal["effects"]),

@@ -14,9 +14,12 @@ import re
 import sqlite3
 import stat
 import subprocess
+import tempfile
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import copy_context
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,7 +45,6 @@ from .delivery_execution_config import (
     transport_difference,
 )
 from .delivery_preparation import execution_retired
-from .delivery_publication import stopped_at_publication
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,179 @@ def _private_directory(path: Path) -> None:
                 raise ValueError(message)
     finally:
         os.close(descriptor)
+
+
+_OBSERVATION_MAX_BYTES = 64 * 1024 * 1024
+_OBSERVATION_COPY_SECONDS = 5
+
+
+def _tracking_signature(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            info.st_mode, info.st_uid, info.st_nlink)
+
+
+def _copy_tracking_stream(source, target, deadline, size):
+    remaining = size
+    while remaining:
+        if time.monotonic() >= deadline:
+            raise sqlite3.OperationalError("tracking observation copy timed out")
+        chunk = source.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise sqlite3.OperationalError("tracking database changed during snapshot")
+        target.write(chunk)
+        remaining -= len(chunk)
+
+
+def _open_tracking_source(path):
+    """Anchor one owned regular source inode without following its final component."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        named = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o022
+                or _tracking_signature(info) != _tracking_signature(named)):
+            raise sqlite3.OperationalError("tracking source identity or ownership is unproven")
+        return os.fdopen(descriptor, "rb"), info
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+class _TrackingObservation:
+    """One bounded DB/WAL copy, shared and revalidated for a whole assessment."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.wal = Path(str(self.path) + "-wal")
+        self.shm = Path(str(self.path) + "-shm")
+        self.journal = Path(str(self.path) + "-journal")
+        self.stack = ExitStack()
+        try:
+            if os.path.lexists(self.journal):
+                raise sqlite3.OperationalError("tracking rollback journal is active or unconfirmed")
+            self.has_wal = os.path.lexists(self.wal)
+            if self.has_wal and not os.path.lexists(self.shm):
+                raise sqlite3.OperationalError("tracking WAL has no existing shared-memory sidecar")
+            deadline = time.monotonic() + _OBSERVATION_COPY_SECONDS
+            self.paths = (self.path, self.wal) if self.has_wal else (self.path,)
+            self.sources, self.before = [], []
+            for source_path in self.paths:
+                source, info = _open_tracking_source(source_path)
+                self.sources.append(self.stack.enter_context(source))
+                self.before.append(info)
+            self.shm_source = self.shm_info = None
+            if self.has_wal:
+                source, self.shm_info = _open_tracking_source(self.shm)
+                self.shm_source = self.stack.enter_context(source)
+            if sum(info.st_size for info in self.before) > _OBSERVATION_MAX_BYTES:
+                raise sqlite3.OperationalError(
+                    "tracking database snapshot is unavailable or oversized")
+            directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(
+                prefix="devflow-tracking-observation-")))
+            if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+                raise sqlite3.OperationalError("tracking observation directory is not private")
+            self.target = directory / "tracking.sqlite3"
+            destinations = ((self.target, Path(str(self.target) + "-wal"))
+                            if self.has_wal else (self.target,))
+            for source, destination, info in zip(
+                self.sources, destinations, self.before, strict=True
+            ):
+                descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as output:
+                    _copy_tracking_stream(source, output, deadline, info.st_size)
+            self.verify()
+        except BaseException:
+            self.stack.close()
+            raise
+
+    def verify(self):
+        try:
+            for source, source_path, initial in zip(
+                self.sources, self.paths, self.before, strict=True
+            ):
+                expected = _tracking_signature(initial)
+                if (_tracking_signature(os.fstat(source.fileno())) != expected
+                        or _tracking_signature(source_path.lstat()) != expected):
+                    raise sqlite3.OperationalError("tracking database changed during observation")
+            shm_changed = self.has_wal and (
+                _tracking_signature(os.fstat(self.shm_source.fileno()))
+                != _tracking_signature(self.shm_info)
+                or _tracking_signature(self.shm.lstat()) != _tracking_signature(self.shm_info))
+            if (os.path.lexists(self.journal) or os.path.lexists(self.wal) != self.has_wal
+                    or shm_changed):
+                raise sqlite3.OperationalError(
+                    "tracking journal custody changed during observation")
+        except (OSError, ValueError) as exc:
+            raise sqlite3.OperationalError("tracking database changed during observation") from exc
+
+    @contextmanager
+    def connect(self):
+        self.verify()
+        options = "?mode=ro" if self.has_wal else "?mode=ro&immutable=1"
+        db = sqlite3.connect(self.target.as_uri() + options, uri=True, timeout=5)
+        deadline = time.monotonic() + _OBSERVATION_COPY_SECONDS
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+            yield db
+        finally:
+            db.close()
+        self.verify()
+
+    def close(self):
+        try:
+            self.verify()
+        finally:
+            self.stack.close()
+
+
+@contextmanager
+def _observation_tracking_connection(path):
+    from .delivery_execution_config import observation_scope
+
+    scope = observation_scope()
+    if scope is None:
+        raise sqlite3.OperationalError("tracking observation scope is unavailable")
+    try:
+        resource = scope.resource(("tracking", str(path)), lambda: _TrackingObservation(path))
+        with resource.connect() as db:
+            yield db
+    except OSError as exc:
+        raise sqlite3.OperationalError("tracking database snapshot is unavailable") from exc
+
+
+@contextmanager
+def tracking_read_connection(path):
+    """Use the shared snapshot during observation and the normal read connection otherwise."""
+    from .delivery_execution_config import is_observation_mode
+
+    if is_observation_mode():
+        with _observation_tracking_connection(path) as db:
+            yield db
+        return
+    db = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA query_only=ON")
+        yield db
+    finally:
+        db.close()
+
+
+def _observational_preflight(method):
+    from functools import wraps
+
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        if kwargs.get("preflight"):
+            from .delivery_execution_config import observation_mode
+
+            with observation_mode():
+                return method(self, *args, **kwargs)
+        return method(self, *args, **kwargs)
+
+    return call
 
 
 class DeliveryStore:
@@ -507,6 +682,13 @@ class DeliveryStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        from .delivery_execution_config import is_observation_mode
+
+        if is_observation_mode():
+            with _observation_tracking_connection(self.config.tracking_db) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                yield db
+            return
         if getattr(self, "read_only", False):
             db = sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
@@ -624,10 +806,13 @@ class DeliveryStore:
                 f"{reload} before new admission"
             ) from exc
         if digest(live.raw) != digest(self.config.raw):
-            raise ValueError(
-                f"service configuration changed; {reload} to reload the service before "
-                "new admission"
-            )
+            message = (f"service configuration changed; {reload} to reload the service before "
+                       "new admission")
+            if supplied.get("feature_predecessor"):
+                from .delivery_feature_handoff import feature_configuration_refusal
+
+                raise feature_configuration_refusal(message)
+            raise ValueError(message)
         preserve_execution_config(self.config)
         reference = None
         if _automatic is not None:
@@ -644,26 +829,9 @@ class DeliveryStore:
             # Repeat the same custody/plan check after ordinary config admission.
             authenticate_continued_plan(self, deepcopy(supplied))
             retained = self.effective_spec(supplied["feature_predecessor"]["run_id"])
-            frozen = load_execution_config(retained)
-            scope = retained.get("feature_scope_amendment")
-            if scope:
-                from .delivery_feature_scope import authenticate_receipt
+            from .delivery_feature_handoff import validate_retained_configuration
 
-                amended = authenticate_receipt(self, scope)
-                if (amended.path != frozen.path
-                        or digest(amended.raw) != digest(frozen.raw)):
-                    raise ValueError("feature continuation changed its retained scope authority")
-                frozen = load_execution_config(
-                    self.effective_spec(scope["predecessor"]["run_id"]))
-            # Capacity schedules actors through operational_config; it never
-            # rewrites the predecessor's frozen execution authority.
-            current_authority = {key: value for key, value in self.config.raw.items()
-                                 if key != "capacity"}
-            frozen_authority = {key: value for key, value in frozen.raw.items()
-                                if key != "capacity"}
-            if (self.config.path != frozen.path
-                    or digest(current_authority) != digest(frozen_authority)):
-                raise ValueError("feature continuation changed its original service configuration")
+            validate_retained_configuration(self, retained)
         admission = {}
         if reference:
             admission["_base_ref"] = reference
@@ -961,7 +1129,7 @@ class DeliveryStore:
         return {"published": digest(self.config.raw), "unavailable": unavailable}
 
     def _completed_temporal_result(
-        self, run_id: str, *, workflow_id: str | None = None
+        self, run_id: str, *, workflow_id: str | None = None, preserve: bool = True
     ) -> dict[str, Any]:
         """Read a closed workflow from Temporal or its sealed copy, never caller JSON.
 
@@ -969,11 +1137,33 @@ class DeliveryStore:
         Temporal's namespace retention deletes the history; an expired closure that
         was never sealed must be imported from its authentic exported history.
         """
-        if not self.owns_execution(self.effective_spec(run_id)):
+        preserve = preserve and not self.read_only
+        submitted = self.submitted_spec(run_id) if not preserve else None
+        if submitted and submitted.get("feature_worker"):
+            from .delivery_execution_config import observation_mode
+            from .delivery_feature_revision_recovery import retained_recovery
+
+            with self._connect() as db:
+                row = db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
+                                 (run_id,)).fetchone()
+            recovery = json.loads(row[0]) if row and row[0] else None
+            # Only the ordinary stopped-worker recovery has the pure custody path.
+            if recovery and (recovery.get("kind") != "stopped_delivery_resume"
+                             or (retained_recovery(recovery) or {}).get("feature_plan_revision")):
+                raise ValueError("worker recovery lineage is unavailable for read-only closure")
+            with observation_mode():
+                observation_spec = self.effective_spec(run_id)
+        elif submitted and submitted.get("feature_delivery"):
+            from .delivery_feature_handoff import readonly_feature_spec
+
+            observation_spec = readonly_feature_spec(self, run_id)
+        else:
+            observation_spec = self.effective_spec(run_id)
+        if not self.owns_execution(observation_spec):
             raise ValueError("continuation service transport ownership differs from frozen run")
 
         def coordinator_failure(closed: dict[str, Any]) -> None:
-            spec = self.effective_spec(run_id)
+            spec = self.effective_spec(run_id) if preserve else observation_spec
             if spec.get("feature_delivery") and not spec.get("feature_worker"):
                 from .delivery_feature_closure import FailedFeatureCoordinator
 
@@ -994,7 +1184,10 @@ class DeliveryStore:
                     raise
                 missing = exc
             if missing is not None:
-                sealed = await closures.sealed_closure(self, handle.id)
+                if preserve:
+                    sealed = await closures.sealed_closure(self, handle.id)
+                else:
+                    sealed = await closures.sealed_closure(self, handle.id, read_only=True)
                 if sealed is None:
                     raise closures.ClosureUnavailable(handle.id) from missing
                 closed = {
@@ -1037,13 +1230,14 @@ class DeliveryStore:
             # submit() is shared by synchronous CLI and the async API route.
             with ThreadPoolExecutor(max_workers=1) as pool:
                 closed, sealed = pool.submit(
-                    lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
+                    copy_context().run, lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))
                 ).result(timeout=35)
         except Exception as exc:
             from .delivery_feature_closure import FailedFeatureCoordinator
 
             if isinstance(exc, FailedFeatureCoordinator):
-                self._preserve_closure(run_id, exc.closed)
+                if preserve:
+                    self._preserve_closure(run_id, exc.closed)
                 raise
             if isinstance(exc, closures.ClosureUnavailable):
                 raise
@@ -1068,7 +1262,7 @@ class DeliveryStore:
             from .delivery_ci_inventory import validate_result
 
             validate_result(self, run_id, ci)
-        if not sealed:
+        if not sealed and preserve:
             self._preserve_closure(run_id, closed)
         return closed
 
@@ -1098,17 +1292,30 @@ class DeliveryStore:
                 logger.warning("Run %s: closure %s was not sealed (%s: %s)", run_id,
                                closed.get("workflow_id"), type(exc).__name__, exc)
 
-    def recover_publication(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+    @_observational_preflight
+    def recover_publication(
+        self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
+    ) -> dict[str, Any]:
         """Queue one same-run continuation after a pushed PR outlived readback.
 
         The completed Temporal result is the authority for the checkpoint.
         Git and GitHub are checked twice: before this transaction and by the
         read-only recovery activity before any downstream gate can start.
         """
+        if preflight and self.read_only:
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "recover_publication", "owner": "publication_recovery",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "locked_proof_unavailable", "satisfied": None,
+                    "missing_or_unknown_fact": "locked owner admission proof",
+                    "next_action": "inspect admission using the owning service"}],
+            }, supplied)}
         if isinstance(supplied, dict) and supplied.get('expected_pr_number') == 0:
             from .delivery_pending_publication import admit
 
-            return admit(self, run_id, supplied)
+            return admit(self, run_id, supplied, preflight=preflight)
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
@@ -1151,7 +1358,19 @@ class DeliveryStore:
         if row is None:
             raise ValueError("run ID not found")
         spec = self.spec(run_id)
-        closed = self._completed_temporal_result(run_id)
+        if preflight and spec.get("publication_readback_version") == 1:
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "recover_publication", "owner": "publication_recovery",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "publication_readback_proof_unknown", "satisfied": None,
+                    "missing_or_unknown_fact": "pending publication effect readback",
+                    "next_action": "reconcile publication effects"}],
+            }, supplied)}
+        from .delivery_publication_proof import read_closed as read_publication_closed
+
+        closed, history = read_publication_closed(self, spec, preserve=not preflight)
         state = closed["result"]
         candidate = state.get("candidate") if isinstance(state, dict) else None
         precheck = state.get("checks", {}).get("prepublish", {}) if isinstance(state, dict) else {}
@@ -1166,7 +1385,6 @@ class DeliveryStore:
             or state.get("phase") != "blocked"
             or state.get("outcome") != "blocked"
             or state.get("execution_state") != "blocked"
-            or not stopped_at_publication(state)
             or state.get("cleanup") not in {"none", "pending_publication_readback"}
             or state.get("revision") != supplied["expected_revision"]
             or type(iteration) is not int
@@ -1204,6 +1422,9 @@ class DeliveryStore:
             )
         ):
             raise ValueError("closed Temporal result is not a recoverable publication")
+        from .delivery_publication_proof import observe as publication_stop_proof
+
+        stage_proof = publication_stop_proof(self, spec, closed, history=history)
         broker = DeliveryBroker(self, spec)
         observed = broker.reconcile_publish(
             iteration,
@@ -1222,6 +1443,7 @@ class DeliveryStore:
             "expected_head": head,
             "expected_pr_number": pr_number,
             "observed_publication": observed,
+            "publication_stop_proof": stage_proof,
         }
         response = {
             "run_id": run_id,
@@ -1231,7 +1453,7 @@ class DeliveryStore:
             "existing": False,
         }
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("BEGIN" if preflight else "BEGIN IMMEDIATE")
             prior = db.execute(
                 "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
                 (command_id,),
@@ -1252,6 +1474,53 @@ class DeliveryStore:
             ).fetchall()
             key = f"publish:{run_id}:{iteration}"
             target = [item for item in effects if item["effect_key"] == key]
+            from .delivery_lifecycle import require_transition
+
+            facts = {
+                "operation": "recover_publication",
+                "owner": "publication_recovery",
+                "owner_proof": current is not None
+                and claim is not None
+                and claim["owner"] == f"external:devflow:{run_id}",
+                "normalized_lifecycle": "stopped",
+                "proof_digest": digest({"closed": closed, "observed": observed}),
+                "revision": current["protocol_revision"] if current else None,
+                "candidate_id": (json.loads(current["candidate_json"] or "null") or {}).get("id")
+                if current
+                else None,
+                "publication_number": pr_number,
+                "publication_required": True,
+                "comparisons": [
+                    ("revision", "expected_revision", "revision_changed"),
+                    ("candidate_id", "expected_candidate_id", "candidate_changed"),
+                    ("publication_number", "expected_pr_number", "publication_changed"),
+                ],
+                "predicates": [
+                    {
+                        "code": "publication_effect_unconfirmed",
+                        "satisfied": len(target) == 1
+                        and target[0]["state"] in {"pending", "complete"}
+                        and all(
+                            item["state"] == "complete"
+                            for item in effects if item["effect_key"] != key
+                        ),
+                        "missing_or_unknown_fact": "publication and other effects custody",
+                        "next_action": "reconcile publication effects",
+                    },
+                    {
+                        "code": "cleanup_unconfirmed",
+                        "satisfied": len(attempts) == len(roles)
+                        and all(
+                            item["state"] not in {"starting", "running", "unknown"}
+                            and item["cleanup"] == "confirmed"
+                            for item in attempts
+                        ),
+                        "missing_or_unknown_fact": "closed attempt cleanup",
+                        "next_action": "reconcile attempt cleanup",
+                    },
+                ],
+            }
+            assessment = require_transition(facts, supplied)
             if (
                 current is None
                 or current["request_json"] != row["request_json"]
@@ -1292,6 +1561,8 @@ class DeliveryStore:
                 )
             ):
                 raise ValueError("publication recovery lost its frozen run or effect")
+            if preflight:
+                return {"preflight": True, "lifecycle_assessment": assessment}
             revision = current["revision"] + 1
             db.execute(
                 """UPDATE delivery_runs SET phase='publication_recovery_queued',
@@ -1439,6 +1710,7 @@ class DeliveryStore:
         if DeliveryBroker(self, spec).candidate() != recovery["amended_candidate"]:
             raise ValueError("amended candidate changed before repair")
 
+    @_observational_preflight
     def continue_repair(
         self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
     ) -> dict[str, Any]:
@@ -1584,7 +1856,9 @@ class DeliveryStore:
         load_execution_config(spec)
         current_workflow_id = row["workflow_id"] or f"delivery-{run_id}"
         previous_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-        closed = self._completed_temporal_result(run_id, workflow_id=current_workflow_id)
+        closed = (self._completed_temporal_result(run_id, workflow_id=current_workflow_id,
+                                                   preserve=False) if preflight else
+                  self._completed_temporal_result(run_id, workflow_id=current_workflow_id))
         state = closed["result"]
         if not isinstance(state, dict):
             raise ValueError("closed Temporal result has no terminal state")
@@ -1593,6 +1867,27 @@ class DeliveryStore:
         roles = state.get("roles")
         checks = state.get("checks")
         iteration = state.get("iteration")
+        from .delivery_lifecycle import require_transition
+
+        facts = {
+            "operation": "repair_continuation", "owner": "repair_admission",
+            "owner_proof": True, "normalized_lifecycle": "stopped",
+            "proof_digest": digest({"row": dict(row), "closed": closed}),
+            "revision": state.get("revision"), "iteration": iteration,
+            "candidate_id": candidate.get("id") if isinstance(candidate, dict) else None,
+            "candidate_head": pr.get("head") if isinstance(pr, dict) else None,
+            "head_request_field": "expected_pr_head", "publication_required": True,
+            "publication_number": pr.get("number") if isinstance(pr, dict) else None,
+            "predicates": [{
+                "code": "product_budget_exhausted",
+                "satisfied": type(iteration) is int and
+                             iteration + supplied["additional_iterations"]
+                             <= spec["policy"]["max_repairs"] + 2,
+                "missing_or_unknown_fact": "remaining original finite repair allowance",
+                "next_action": "inspect the original repair budget",
+            }],
+        }
+        assessment = require_transition(facts, supplied)
         if (
             closed["workflow_id"] != current_workflow_id
             or closed["request_digest"] != row["request_digest"]
@@ -1662,7 +1957,12 @@ class DeliveryStore:
             raise ValueError("failed gate supplied no repair diagnostics")
         broker = DeliveryBroker(self, spec)
         observed_pr = published_identity(broker, candidate, pr)
-        cleanup_digest = confirmed_native_cleanup(spec)
+        if preflight:
+            from .delivery_stopped_resume import observed_native_cleanup
+
+            cleanup_digest = observed_native_cleanup(spec, read_only=True)
+        else:
+            cleanup_digest = confirmed_native_cleanup(spec)
         workflow_id = f"delivery-{run_id}-repair-continuation-1"
         recovery = {
             "kind": "repair_continuation",
@@ -1699,7 +1999,7 @@ class DeliveryStore:
                         claim is None or claim["owner"] != f"external:devflow:{run_id}"):
                     raise ValueError("repair preflight claim authority changed")
             return {**response, "preflight": True, "diagnostics": findings,
-                    "title_constraint_sha256": None}
+                    "lifecycle_assessment": assessment, "title_constraint_sha256": None}
         if finalized:
             from .delivery_gate_retry import prepare_runtime
             from .delivery_metadata_recovery import _immutable, preserve_resources
@@ -1836,8 +2136,21 @@ class DeliveryStore:
         return response
 
 
-    def retry_prelaunch(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+    @_observational_preflight
+    def retry_prelaunch(
+        self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
+    ) -> dict[str, Any]:
         """Retry one proved no-process repair launch under its existing grant."""
+        if preflight and self.read_only:
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "retry_prelaunch", "owner": "repair_prelaunch",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "locked_proof_unavailable", "satisfied": None,
+                    "missing_or_unknown_fact": "locked owner admission proof",
+                    "next_action": "inspect admission using the owning service"}],
+            }, supplied)}
         from .delivery_native_process import reconciled_not_started
         from .delivery_preparation import require_native_execution
 
@@ -1898,7 +2211,9 @@ class DeliveryStore:
             or digest(load_execution_config(spec).raw) != spec["config_digest"]
         ):
             raise ValueError("prelaunch retry changed the frozen repair authority")
-        closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        closed = (self._completed_temporal_result(run_id, workflow_id=row["workflow_id"],
+                                                  preserve=False) if preflight
+                  else self._completed_temporal_result(run_id, workflow_id=row["workflow_id"]))
         state = closed["result"]
         if not isinstance(state, dict):
             raise ValueError("closed prelaunch result is missing")
@@ -2009,7 +2324,27 @@ class DeliveryStore:
             raise ValueError("prelaunch provider absence or cleanup is unproven")
         broker = DeliveryBroker(self, spec)
         observed_pr = published_identity(broker, candidate, pr)
+        if preflight and spec.get("provider") == "codex":
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "retry_prelaunch", "owner": "repair_prelaunch",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "native_cleanup_proof_unknown", "satisfied": None,
+                    "missing_or_unknown_fact": "native process cleanup",
+                    "next_action": "reconcile native process cleanup"}],
+            }, supplied)}
         confirmed_native_cleanup(spec)
+        if preflight and spec["policy"].get("required_ci"):
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "retry_prelaunch", "owner": "repair_prelaunch",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "ci_evidence_proof_unknown", "satisfied": None,
+                    "missing_or_unknown_fact": "required CI observation",
+                    "next_action": "inspect required CI observation"}],
+            }, supplied)}
         ci_evidence = current_head_ci_evidence(broker, observed_pr)
         review_findings = list(review["findings"])
         findings = [*review_findings, *ci_evidence["diagnostics"]]
@@ -2040,7 +2375,7 @@ class DeliveryStore:
             "existing": False,
         }
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("BEGIN" if preflight else "BEGIN IMMEDIATE")
             prior = db.execute(
                 "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
                 (command_id,),
@@ -2061,6 +2396,63 @@ class DeliveryStore:
             effects = db.execute(
                 "SELECT kind,state,observed_json FROM delivery_effects WHERE run_id=?", (run_id,)
             ).fetchall()
+            from .delivery_lifecycle import require_transition
+
+            facts = {
+                "operation": "retry_prelaunch",
+                "owner": "repair_prelaunch",
+                "owner_proof": current is not None
+                and claim is not None
+                and claim["owner"] == f"external:devflow:{run_id}",
+                "normalized_lifecycle": "stopped",
+                "proof_digest": digest(
+                    {"closed": closed, "grant": dict(grant), "attempt": dict(failed_attempt)}
+                ),
+                "revision": current["protocol_revision"] if current else None,
+                "iteration": current["iteration"] if current else None,
+                "candidate_id": (json.loads(current["candidate_json"] or "null") or {}).get("id")
+                if current
+                else None,
+                "candidate_head": (json.loads(current["pr_json"] or "null") or {}).get("head")
+                if current
+                else None,
+                "head_request_field": "expected_pr_head",
+                "publication_required": True,
+                "publication_number": (json.loads(current["pr_json"] or "null") or {}).get("number")
+                if current
+                else None,
+                "predicates": [
+                    {
+                        "code": "repair_grant_changed",
+                        "satisfied": (
+                            current_grant is not None and dict(current_grant) == dict(grant)
+                        ),
+                        "missing_or_unknown_fact": "original repair grant and budget",
+                        "next_action": "inspect original repair grant",
+                    },
+                    {
+                        "code": "cleanup_unconfirmed",
+                        "satisfied": len(current_attempts) == len(attempts)
+                        and all(
+                            item["state"] == "finished" and item["cleanup"] == "confirmed"
+                            for item in current_attempts
+                        ),
+                        "missing_or_unknown_fact": "closed attempt cleanup",
+                        "next_action": "reconcile attempt cleanup",
+                    },
+                    {
+                        "code": "effects_unconfirmed",
+                        "satisfied": any(item["kind"] == "publish" for item in effects)
+                        and all(
+                            item["state"] == "complete" and item["observed_json"] is not None
+                            for item in effects
+                        ),
+                        "missing_or_unknown_fact": "publication and effect readback",
+                        "next_action": "reconcile effects",
+                    },
+                ],
+            }
+            assessment = require_transition(facts, supplied)
             if (
                 current is None
                 or current["request_json"] != row["request_json"]
@@ -2098,6 +2490,8 @@ class DeliveryStore:
                     folder, receipt=receipt.get("native_process") if receipt else None))
             ):
                 raise ValueError("prelaunch retry lost its frozen run or ownership")
+            if preflight:
+                return {"preflight": True, "lifecycle_assessment": assessment}
             revision = current["revision"] + 1
             db.execute(
                 """UPDATE delivery_runs SET phase='repair_prelaunch_retry_queued',
@@ -2132,8 +2526,21 @@ class DeliveryStore:
         return response
 
 
-    def amend_scope(self, run_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+    @_observational_preflight
+    def amend_scope(
+        self, run_id: str, supplied: dict[str, Any], *, preflight: bool = False,
+    ) -> dict[str, Any]:
         """Authorize one native original-session turn for omitted test files."""
+        if preflight and self.read_only:
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "amend_scope", "owner": "scope_amendment",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "locked_proof_unavailable", "satisfied": None,
+                    "missing_or_unknown_fact": "locked owner admission proof",
+                    "next_action": "inspect admission using the owning service"}],
+            }, supplied)}
         from .delivery_preparation import require_native_execution
 
         require_native_execution(self.spec(run_id))
@@ -2210,7 +2617,9 @@ class DeliveryStore:
         if row["accepted_plan_text"] is not None:
             original["accepted_plan"] = row["accepted_plan_text"]
         prior_recovery = json.loads(row["recovery_json"]) if row["recovery_json"] else None
-        closed = self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+        closed = (self._completed_temporal_result(run_id, workflow_id=row["workflow_id"],
+                                                  preserve=False) if preflight
+                  else self._completed_temporal_result(run_id, workflow_id=row["workflow_id"]))
         state = closed["result"]
         roles = state.get("roles") if isinstance(state, dict) else None
         last = roles[-1] if isinstance(roles, list) and roles else None
@@ -2348,6 +2757,16 @@ class DeliveryStore:
                     raise ValueError("added test path has an unsafe ancestor")
                 parent = parent.parent
         observed_pr = published_identity(original_broker, candidate, pr)
+        if preflight and original.get("provider") == "codex":
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "amend_scope", "owner": "scope_amendment",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "native_cleanup_proof_unknown", "satisfied": None,
+                    "missing_or_unknown_fact": "native process cleanup",
+                    "next_action": "reconcile native process cleanup"}],
+            }, supplied)}
         cleanup_digest = confirmed_native_cleanup(original)
         effective = scope_amended_spec(
             original, Path(supplied["amended_config_path"]),
@@ -2357,6 +2776,16 @@ class DeliveryStore:
         if any(amended_candidate.get(key) != candidate.get(key)
                for key in ("head", "content_sha256", "base_sha", "environment_digest", "id")):
             raise ValueError("amended policy changed the implementation bytes")
+        if preflight and original["policy"].get("required_ci"):
+            from .delivery_lifecycle import evaluate_transition
+
+            return {"lifecycle_assessment": evaluate_transition({
+                "operation": "amend_scope", "owner": "scope_amendment",
+                "owner_proof": None, "comparisons": [],
+                "predicates": [{"code": "ci_evidence_proof_unknown", "satisfied": None,
+                    "missing_or_unknown_fact": "required CI observation",
+                    "next_action": "inspect required CI observation"}],
+            }, supplied)}
         ci_evidence = current_head_ci_evidence(original_broker, pr)
         findings = [*last["findings"][:8], *ci_evidence["diagnostics"]]
         if not findings:
@@ -2393,7 +2822,7 @@ class DeliveryStore:
             "existing": False,
         }
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("BEGIN" if preflight else "BEGIN IMMEDIATE")
             current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             current_attempts = db.execute(
                 "SELECT * FROM delivery_attempts WHERE run_id=?", (run_id,)
@@ -2402,6 +2831,49 @@ class DeliveryStore:
                 "SELECT * FROM delivery_effects WHERE run_id=?", (run_id,)
             ).fetchall()
             claim = self.state.claim_for(db, original["work_id"])
+            from .delivery_lifecycle import require_transition
+
+            facts = {
+                "operation": "amend_scope",
+                "owner": "scope_amendment",
+                "owner_proof": current is not None
+                and claim is not None
+                and claim["owner"] == f"external:devflow:{run_id}",
+                "normalized_lifecycle": "stopped",
+                "proof_digest": digest(
+                    {"closed": closed, "grant": dict(grant), "attempt": dict(attempt)}
+                ),
+                "revision": current["protocol_revision"] if current else None,
+                "iteration": current["iteration"] if current else None,
+                "candidate_id": candidate.get("id"),
+                "candidate_head": pr.get("head"),
+                "head_request_field": "expected_pr_head",
+                "publication_required": True,
+                "publication_number": pr.get("number"),
+                "predicates": [
+                    {
+                        "code": "cleanup_unconfirmed",
+                        "satisfied": bool(current_attempts)
+                        and all(
+                            item["state"] == "finished" and item["cleanup"] == "confirmed"
+                            for item in current_attempts
+                        ),
+                        "missing_or_unknown_fact": "closed attempt cleanup",
+                        "next_action": "reconcile attempt cleanup",
+                    },
+                    {
+                        "code": "effects_unconfirmed",
+                        "satisfied": any(item["kind"] == "publish" for item in current_effects)
+                        and all(
+                            item["state"] == "complete" and item["observed_json"] is not None
+                            for item in current_effects
+                        ),
+                        "missing_or_unknown_fact": "publication and effect readback",
+                        "next_action": "reconcile effects",
+                    },
+                ],
+            }
+            assessment = require_transition(facts, supplied)
             if (
                 current is None
                 or current["request_json"] != row["request_json"]
@@ -2422,6 +2894,8 @@ class DeliveryStore:
                 ).fetchone()
             ):
                 raise ValueError("scope amendment lost its frozen run or claim")
+            if preflight:
+                return {"preflight": True, "lifecycle_assessment": assessment}
             revision = current["revision"] + 1
             db.execute(
                 """INSERT INTO delivery_scope_amendments VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -4068,9 +4542,8 @@ class DeliveryStore:
         from .delivery_phase_gates import evidence, state
         from .delivery_state_contract import gate_specs, recorded
 
-        with sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
+        with tracking_read_connection(self.config.tracking_db) as db:
             db.row_factory = sqlite3.Row
-            db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
             saved = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             if saved is None:

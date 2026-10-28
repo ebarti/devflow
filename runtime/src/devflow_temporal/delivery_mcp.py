@@ -52,7 +52,14 @@ def build_server(config_path: Path) -> FastMCP:
         def invoke() -> dict:
             return getattr(client(config_path), method)(*args)
 
-        return await asyncio.to_thread(invoke)
+        try:
+            return await asyncio.to_thread(invoke)
+        except ValueError as exc:
+            from .delivery_lifecycle import RecoveryRefused
+
+            if isinstance(exc, RecoveryRefused):
+                return {"state": "refused", "assessment": exc.assessment}
+            raise
 
     @server.tool(annotations=write)
     async def create_operation(request_json: str) -> dict:
@@ -242,6 +249,12 @@ def build_server(config_path: Path) -> FastMCP:
     async def admit_gates_only(run_id: str, request_json: str) -> dict:
         """One explicit investigation admission: same iteration, all gates, no implementation."""
         return await forward_write("admit_gates_only", run_id, json.loads(request_json))
+
+    @server.tool(annotations=read)
+    def assess_transition(run_id: str, kind: str, request_json: str) -> dict:
+        """Observe current recovery eligibility; the result grants no execution authority."""
+        return read_only_client(config_path).assess_transition(
+            run_id, kind, json.loads(request_json))
 
     @server.tool(annotations=read)
     def repair_admission_preflight(run_id: str, request_json: str) -> dict:

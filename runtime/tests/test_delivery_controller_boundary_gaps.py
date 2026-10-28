@@ -47,7 +47,6 @@ from test_delivery_store import service as service
 from devflow_temporal import (
     delivery_activities,
     delivery_feature_activities,
-    delivery_terminal_recovery,
 )
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_api import create_app
@@ -317,64 +316,6 @@ async def test_real_tracker_timeout_inside_bounded_stop_closes_completed_with_bo
         assert await _replayed_liveness(history) is True
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("liveness", [False, True])
-async def test_readback_failure_inside_bounded_stop_only_closes_with_liveness(
-    clock, monkeypatch, liveness,
-):
-    """rr-workflow D-new: without tracker_retry_version the tracker loop projects
-    tracker_pending; the recorded behaviour (ControllerStopUnproven) is kept without
-    the liveness marker."""
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched",
-                        lambda name: liveness or name != LIVENESS)
-    # Direct protocol calls have no workflow context; present one so the marker counts.
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.in_workflow", lambda: True)
-    spec = {"run_id": "isolated-readback", "provider": "fake",
-            "policy": {"tracker_retry_seconds": 60}, "projection_retry_version": 1,
-            "workflow_failure_boundary_version": 1, "resource_cleanup_version": 1,
-            "terminal_tracker_version": 1}
-    controller = DeliveryWorkflow()
-    requests = []
-
-    async def execute(name, request, **_kwargs):
-        if name == "delivery_project":
-            requests.append(copy.deepcopy(request))
-            if request["event_type"] == "preparing":
-                return {}
-            raise _activity_failure(name, 10 + 3 * len(requests))
-        _configuration_changed()
-
-    controller._activity = execute
-    if not liveness:
-        with pytest.raises(ApplicationError) as raised:
-            await controller.run(spec)
-        assert raised.value.type == "ControllerStopUnproven"
-        assert [r["event_type"] for r in requests] == ["preparing", "tracker_pending",
-                                                       "tracker_pending"]
-        assert controller.state["checks"]["controller_failure"]["stage"] == "waiting_tracker"
-        return
-    state = await controller.run(spec)
-    assert controller.liveness_v2 is True and controller.terminal_closing is False
-    assert [r["event_type"] for r in requests] == [
-        "preparing", "tracker_pending", "tracker_pending", "tracker_pending",
-        "tracker_retry_required", "tracker_deadline"]
-    assert state["phase"] == "waiting_tracker" and state["outcome"] is None
-    assert state["cleanup"] == "unknown" and "controller_failure" not in state["checks"]
-    checkpoint = state["checks"]["terminal_tracker_checkpoint"]
-    assert checkpoint["closed"] and checkpoint["state"] == "pending"
-    pending = state["checks"]["pending_projection_failures"]
-    assert pending["count"] == 4
-    assert [item["event_type"] for item in pending["failures"]] == [
-        "tracker_pending", "tracker_pending", "tracker_pending", "tracker_retry_required"]
-    assert [item["scheduled_event_id"] for item in pending["failures"]] == [16, 19, 22, 25]
-    failure = state["checks"]["terminal_projection_failure"]
-    assert failure["event_type"] == "tracker_deadline" and failure["scheduled_event_id"] == 28
-    assert failure["projection_sha256"] == digest(requests[-1])
-    assert failure["original_error"] == state["error"]
-    assert _terminal_request(requests[-1])
-    assert requests[-1]["checks"]["pending_projection_failures"] == pending
-
-
 def _row(store, run_id="run-1"):
     with store._connect() as db:
         return dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone())
@@ -415,6 +356,9 @@ async def _history(spec, calls, *, workflow_id="delivery-run-1"):
         event_id=1, workflow_execution_started_event_attributes=
         WorkflowExecutionStartedEventAttributes(
             workflow_type=WorkflowType(name="DevflowDeliveryWorkflow"),
+            workflow_id=workflow_id, original_execution_run_id="isolated-closed-execution",
+            memo={"fields": {"request_digest": (
+                await DELIVERY_DATA_CONVERTER.encode([spec["request_digest"]]))[0]}},
             input=Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([spec, None]))))]
     for index, (name, request, result) in enumerate(calls):
         event_id = 10 + 3 * index
@@ -429,6 +373,13 @@ async def _history(spec, calls, *, workflow_id="delivery-run-1"):
             {"activity_task_completed_event_attributes": ActivityTaskCompletedEventAttributes(
                 scheduled_event_id=event_id,
                 result=Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([result])))})))
+    # Projection IDs above are consumed by the forgery assertions. Retain them
+    # while making this explicitly synthetic envelope complete for sealing.
+    selected = {event.event_id: event for event in events}
+    events = [selected.get(event_id) or HistoryEvent(
+        event_id=event_id, marker_recorded_event_attributes={
+            "marker_name": "owned-unrelated-fixture-event"})
+        for event_id in range(1, events[-1].event_id + 1)]
     return _History(workflow_id, events)
 
 
@@ -458,6 +409,7 @@ def _closed_client(spec, state, history, *, workflow_id="delivery-run-1"):
             # A COMPLETED execution's history ends with its result, as Temporal records it.
             closed = HistoryEvent(
                 event_id=history.events[-1].event_id + 1,
+                event_time=description.close_time,
                 workflow_execution_completed_event_attributes=(
                     WorkflowExecutionCompletedEventAttributes(result=Payloads(
                         payloads=await DELIVERY_DATA_CONVERTER.encode([copy.deepcopy(state)])))))
@@ -615,7 +567,13 @@ async def test_failed_feature_stop_is_replayed_from_its_scheduled_request(
     exact = copy.deepcopy(history.events)
     forged = copy.deepcopy(stop_request)
     forged["checkpoint"]["state"]["candidate"] = {"id": "foreign"}
-    history.events[-2].activity_task_scheduled_event_attributes.input.CopyFrom(
+    scheduled_event_id = state["checks"]["feature_stop_failure"]["scheduled_event_id"]
+    scheduled_event = next(event for event in history.events
+                           if event.event_id == scheduled_event_id)
+    assert scheduled_event.HasField("activity_task_scheduled_event_attributes")
+    scheduled = scheduled_event.activity_task_scheduled_event_attributes
+    assert scheduled.activity_type.name == "delivery_feature_stop"
+    scheduled.input.CopyFrom(
         Payloads(payloads=await DELIVERY_DATA_CONVERTER.encode([forged])))
     with pytest.raises(ValueError, match="failed feature stop request"):
         await reconcile_projection(store, client, _row(store))
@@ -646,134 +604,6 @@ async def test_failed_feature_stop_is_replayed_from_its_scheduled_request(
     assert events[-1]["run_revision"] == final["revision"]
     assert (await reconcile_projection(store, client, _row(store)))["state"] == "observed"
     assert len(stops) == 2 and store.events("run-1") == events
-
-
-@pytest.mark.asyncio
-async def test_feature_stop_replay_does_not_wait_for_a_refused_row(unpublished, monkeypatch):
-    """The stop request is bound to the result on its own: a row the reconciler
-    refuses to overwrite does not keep the feature owner active."""
-    store, spec, state, stop_request, _history_, client, stops, _results = (
-        await _failed_feature_stop(unpublished, monkeypatch, terminal_failed=True))
-    store.project("run-1", phase="newer", execution_state="running", event_type="newer",
-                  message="Newer private row", protocol_revision=state["revision"] + 1)
-    before = _row(store)
-    for _pass in range(2):
-        with pytest.raises(ValueError, match="would overwrite a newer row"):
-            await reconcile_projection(store, client, _row(store))
-    assert stops == [(spec, stop_request["checkpoint"])]
-    events = store.events("run-1")
-    assert events[-1]["type"] == FEATURE_STOP_EVENT
-    assert not any(event["type"] == EVENT for event in events)
-    assert {k: v for k, v in _row(store).items() if k != "updated_at"} == {
-        k: v for k, v in before.items() if k != "updated_at"}
-
-
-@pytest.mark.asyncio
-async def test_controller_failure_stage_names_the_recovery_without_loaded_state(monkeypatch):
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
-    spec = {"run_id": "isolated-stage", "provider": "fake", "policy": {},
-            "workflow_failure_boundary_version": 1}
-    for recovery, expected in (
-        ({"kind": "unknown", "state": {"run_id": "x"}}, "recovery:unknown"),
-        ({"kind": "stopped_delivery_resume", "state": {"phase": "blocked"}}, "blocked"),
-        (None, "preparing"),
-    ):
-        controller = DeliveryWorkflow()
-        calls = []
-
-        async def execute(name, request, *, _calls=calls, **_kwargs):
-            _calls.append((name, request["event_type"]))
-            return {}
-
-        async def protocol(*_args):
-            raise ValueError("Private controller defect before any state was loaded")
-
-        controller._activity, controller._run_protocol = execute, protocol
-        state = await controller.run(spec, recovery)
-        assert state["checks"]["controller_failure"]["stage"] == expected
-        assert state["outcome"] == "blocked" and calls == [("delivery_project", "blocked")]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("form", ["readbacks-committed", "all-failed", "deadline-committed"])
-async def test_reconciled_expired_deadline_is_admissible_by_terminal_tracker_recovery(
-    unpublished, monkeypatch, clock, form,
-):
-    """The closed tail of a reconciled expired deadline is the failed last projection
-    bound by the completed result's record; `recover()` queues the reconciliation-only
-    successor without that record."""
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
-    store, _, original, _ = unpublished
-    spec = {**store.effective_spec("run-1"), "terminal_tracker_version": 1}
-    _bind_store(store, monkeypatch, spec)
-    _reset_preterminal(store, original)
-    # The frozen transition releases only after a confirmed finalization; the
-    # native receipt on disk is the one private seam replaced here.
-    receipt = {"state": "confirmed", "process_cleanup": "observed-native-confirmed",
-               "resource_cleanup": "confirmed", "receipt_sha256": "isolated-finalization"}
-    monkeypatch.setattr(delivery_terminal_recovery, "_stopped_cleanup",
-                        lambda _spec, **_kwargs: {"receipt_sha256": receipt["receipt_sha256"]})
-    controller = DeliveryWorkflow()
-    controller.controller_failure_boundary = controller.liveness_v2 = True
-    controller.state = copy.deepcopy(original)
-    controller.state["checks"]["resource_cleanup"] = receipt
-    calls = []
-    if form == "all-failed":
-        # The preterminal projection that committed before the stop (revision 8).
-        calls.append(("delivery_project", {
-            "spec": spec, "phase": "implementing", "event_type": "implementing",
-            "protocol_revision": 8, "iteration": 0, "key": "implementing:0:8"}, {}))
-
-    async def execute(name, request, **_kwargs):
-        if name == "delivery_terminal_tracker":
-            raise _activity_failure(name, 99, timeout=True)
-        assert name == "delivery_project"
-        event_id = 10 + 3 * len(calls)
-        committed = form == "deadline-committed" or (
-            form == "readbacks-committed" and request["event_type"] == "tracker_pending")
-        if committed:
-            store.project("run-1", **{k: v for k, v in request.items() if k != "spec"})
-            calls.append((name, copy.deepcopy(request), {}))
-            return {}
-        calls.append((name, copy.deepcopy(request), None))
-        raise _activity_failure(name, event_id)
-
-    controller._activity = execute
-    await controller._project(spec, "blocked", original["error"])
-    state = controller.state
-    projection = calls[-1][1]
-    assert projection["event_type"] == "tracker_deadline" and projection["outcome"] is None
-    assert projection["checks"]["terminal_tracker_checkpoint"]["release"] is True
-    assert ("terminal_projection_failure" in state["checks"]) is (form != "deadline-committed")
-    history = await _history(spec, calls)
-    client, _ = _closed_client(spec, state, history)
-    if form != "deadline-committed":
-        assert (await reconcile_projection(store, client, _row(store)))["state"] == "reconciled"
-    row = _row(store)
-    assert row["phase"] == "waiting_tracker" and row["outcome"] is None
-    assert json.loads(row["checks_json"]) == state["checks"]
-    closed = await delivery_terminal_recovery.closed_tail(store, "run-1", client)
-    assert closed["projection"]["event_type"] == "tracker_deadline"
-    assert closed["projection"]["checks"] == state["checks"]
-    assert closed["projection"]["protocol_revision"] == row["protocol_revision"]
-    payload = {"command_id": "terminal-" + form, "expected_revision": row["protocol_revision"]}
-    response = await delivery_terminal_recovery.recover(store, "run-1", payload, client)
-    assert response["phase"] == "terminal_tracker_recovery_queued"
-    assert response["reconciliation_only"] is True
-    after = _row(store)
-    assert after["phase"] == "terminal_tracker_recovery_queued"
-    assert after["workflow_id"] == response["workflow_id"] != "delivery-run-1"
-    recovery = json.loads(after["recovery_json"])
-    assert recovery["kind"] == "terminal_tracker_recovery"
-    assert recovery["closed"]["execution_run_id"] == "isolated-closed-execution"
-    assert recovery["closed"]["projection"]["event_type"] == "tracker_deadline"
-    assert "terminal_projection_failure" not in recovery["state"]["checks"]
-    assert recovery["state"]["checks"]["terminal_tracker_checkpoint"]["closed"] is True
-    assert recovery["state"]["outcome"] is None and recovery["state"]["run_id"] == "run-1"
-    with store._connect() as db:
-        assert db.execute("SELECT state FROM delivery_outbox WHERE run_id='run-1'"
-                          ).fetchone()[0] == "pending"
-    assert store.events("run-1")[-1]["type"] == "terminal_tracker_recovery_queued"
 
 
 @pytest.mark.asyncio

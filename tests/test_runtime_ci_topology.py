@@ -67,6 +67,10 @@ if [ \"$1 $2\" = 'python find' ]; then printf '%s\\n' \"$STUB_PYTHON\"; fi
             stub.write_text('''\
 import fcntl, json, os, sys, time
 path, key = os.environ['STUB_LOG'], sys.argv[1]
+if key.isdigit():
+    assert len(sys.argv) == 3
+    assert os.path.dirname(sys.argv[2]) == os.environ['RUNNER_TEMP']
+    assert os.path.basename(sys.argv[2]) == f'devflow-pytest-{key}.noindex'
 for event in ('start', 'end'):
     if event == 'end':
         time.sleep(.03)
@@ -82,7 +86,8 @@ if key == os.environ.get('STUB_FAIL'):
                 'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \\\n    sh ../scripts/check-install.sh': f'{runner} source-install',
                 'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \\\n      python3.12 -B -m unittest discover -s tests -p \'test_reconcile.py\' -v':
                     f'{runner} source-reconcile',
-                '.venv/bin/python runtime_ci.py --index "$index" --count 4 \\\n    --basetemp "$RUNNER_TEMP/devflow-pytest-$index"': f'{runner} "$index"',
+                '.venv/bin/python runtime_ci.py --index "$index" --count 4 \\\n    --basetemp "$RUNNER_TEMP/devflow-pytest-$index.noindex"':
+                    f'{runner} "$index" "$RUNNER_TEMP/devflow-pytest-$index.noindex"',
             }
             for original, replacement in substitutions.items():
                 self.assertIn(original, script)

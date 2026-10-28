@@ -391,3 +391,19 @@ def test_renewal_anchor_schema_migrates_existing_tracking_store(measurement_owne
             (original["run_id"],),
         ).fetchone()
     assert tuple(row) == (original["request_digest"], original["work_id"])
+
+
+def test_renewal_probe_refuses_when_anchor_table_is_absent(measurement_owner):
+    store, original, registry, _, _ = measurement_owner
+    namespace = "native-preparation-renewal"
+    root = Path(original["state_dir"]) / namespace
+    path = root / "preparation.json"
+    authority = {"original_spec": original, "command_digest": digest("original")}
+    write_private(root / "authority.json", authority)
+    _seal_probe_anchor(store.config, original, namespace, authority, original)
+    intent = {"binding_sha256": digest(authority), "preparation_attempts": []}
+    probe = probe_for((store, original, registry, intent, path))
+    with store._connect() as db:
+        db.execute("DROP TABLE delivery_native_renewal_anchors")
+    with pytest.raises(ValueError, match="native renewal has no durable probe authority"):
+        canonical_owner(probe)

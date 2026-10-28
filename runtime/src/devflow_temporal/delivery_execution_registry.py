@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json, digest
+from .delivery_lifecycle import RecoveryRefused
 from .delivery_registry_epoch import initialize as initialize_authority_epochs
 
 PREPARATION_CONTINUATION_LIMIT = 3
@@ -94,6 +95,14 @@ class OwnershipConflict(ValueError):
 
 class UnresolvedEffect(OwnershipConflict):
     """An external operation needs readback before execution can continue."""
+
+
+class FeatureHandoffRefused(RecoveryRefused, OwnershipConflict):
+    """A typed refusal retaining the existing ownership-conflict contract."""
+
+
+class FeatureEffectRefused(RecoveryRefused, UnresolvedEffect):
+    """A typed refusal retaining the existing unresolved-effect contract."""
 
 
 def now() -> str:
@@ -226,6 +235,92 @@ class ExecutionRegistry:
             raise OwnershipConflict("execution ownership changed or is no longer active")
         return row
 
+    def validate_claim(self, db, snapshot, run_id, store_path, *, maximum_repairs=10,
+                       predecessor=None):
+        """Read the exact takeover/replay prerequisites without mutating custody."""
+        if type(maximum_repairs) is not int or not 1 <= maximum_repairs <= 100:
+            raise ValueError("product repair limit must be between 1 and 100")
+        issue = snapshot["issue"]
+        if not all(isinstance(issue.get(k), str) and issue[k]
+                   for k in ("id", "url", "repository_id")):
+            raise ValueError("execution snapshot lacks a GitHub issue identity")
+        if not Path(store_path).is_absolute() or not run_id:
+            raise ValueError("execution needs its exact source store and run")
+        legacy = db.execute(
+            "SELECT receipts_json FROM execution_legacy_custody WHERE issue_url=?",
+            (issue["url"].rstrip("/").casefold(),),
+        ).fetchone()
+        if legacy:
+            raise OwnershipConflict(
+                "feature has legacy publication custody requiring explicit adoption: "
+                + legacy[0]
+            )
+        saved = db.execute(
+            "SELECT * FROM execution_snapshots WHERE store_path=? AND run_id=?",
+            (store_path, run_id),
+        ).fetchone()
+        if saved:
+            token = {
+                "issue_id": saved["issue_id"],
+                "run_id": run_id,
+                "store_path": store_path,
+                "generation": saved["generation"],
+            }
+            self.require(db, token)
+            if saved["input_digest"] != digest(snapshot):
+                raise OwnershipConflict("run is already bound to different GitHub inputs")
+            return token, None
+        old = db.execute(
+            "SELECT * FROM execution_claims WHERE issue_id=?", (issue["id"],)
+        ).fetchone()
+        generation = 1
+        if old:
+            if (
+                old["repository_id"] != issue["repository_id"]
+                or old["issue_url"] != issue["url"]
+            ):
+                raise OwnershipConflict("GitHub feature identity changed")
+            # The public observation and this owner-locked admission derive the
+            # same settlement facts. The prior observation grants no takeover.
+            from .delivery_feature_handoff import handoff_facts
+            from .delivery_lifecycle import evaluate_transition
+
+            assessment = evaluate_transition(handoff_facts(db, predecessor), {})
+            if not assessment["eligible"]:
+                codes = {item["code"] for item in assessment["blockers"]}
+                if "feature_owner_changed" in codes or "feature_owner_not_stopped" in codes:
+                    error = FeatureHandoffRefused(assessment)
+                    error.args = ("feature already has an execution; continue its owner",)
+                    raise error
+                if "feature_workers_unsettled" in codes:
+                    error = FeatureHandoffRefused(assessment)
+                    error.args = ("feature still has unfinished or unknown workers",)
+                    raise error
+                if "feature_effects_unsettled" in codes:
+                    error = FeatureEffectRefused(assessment)
+                    error.args = ("feature has an external operation awaiting readback",)
+                    raise error
+                raise FeatureHandoffRefused(assessment)
+            self._settled(db, issue["id"])
+            pending = self._pending_revision(db, issue["id"])
+            if (pending and pending.get("successor_id") != run_id
+                    and not self._preparation_successor(db, pending, predecessor, run_id)):
+                raise OwnershipConflict(
+                    "feature has a recorded plan revision in custody: revision "
+                    + str(pending.get("revision_id")) + " reserved by command "
+                    + str((pending.get("request") or {}).get("command_id"))
+                    + " on run " + str(pending.get("predecessor_run_id"))
+                    + " for successor " + str(pending.get("successor_id"))
+                    + "; replay that revise-feature-plan command to admit the successor,"
+                    " or continue-feature the successor if it exists"
+                    " (abandon_revision would permanently reject the pending revision;"
+                    " that is an owner decision, not a retry)"
+                )
+            generation = old["generation"] + 1
+        elif predecessor is not None:
+            raise OwnershipConflict("continuation predecessor is missing")
+        return None, generation
+
     def claim(
         self,
         snapshot: dict,
@@ -247,60 +342,11 @@ class ExecutionRegistry:
             raise ValueError("execution needs its exact source store and run")
         with self.serialized(issue["id"]), self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            legacy = db.execute(
-                "SELECT receipts_json FROM execution_legacy_custody WHERE issue_url=?",
-                (issue["url"].rstrip("/").casefold(),),
-            ).fetchone()
-            if legacy:
-                raise OwnershipConflict(
-                    "feature has legacy publication custody requiring explicit adoption: "
-                    + legacy[0]
-                )
-            saved = db.execute(
-                "SELECT * FROM execution_snapshots WHERE store_path=? AND run_id=?",
-                (store_path, run_id),
-            ).fetchone()
-            if saved:
-                token = {
-                    "issue_id": saved["issue_id"],
-                    "run_id": run_id,
-                    "store_path": store_path,
-                    "generation": saved["generation"],
-                }
-                self.require(db, token)
-                if saved["input_digest"] != digest(snapshot):
-                    raise OwnershipConflict("run is already bound to different GitHub inputs")
-                return token
-            old = db.execute(
-                "SELECT * FROM execution_claims WHERE issue_id=?", (issue["id"],)
-            ).fetchone()
-            generation = 1
-            if old:
-                if (
-                    old["repository_id"] != issue["repository_id"]
-                    or old["issue_url"] != issue["url"]
-                ):
-                    raise OwnershipConflict("GitHub feature identity changed")
-                if predecessor != self.token(old) or old["state"] != "stopped":
-                    raise OwnershipConflict("feature already has an execution; continue its owner")
-                self._settled(db, issue["id"])
-                pending = self._pending_revision(db, issue["id"])
-                if (pending and pending.get("successor_id") != run_id
-                        and not self._preparation_successor(db, pending, predecessor, run_id)):
-                    raise OwnershipConflict(
-                        "feature has a recorded plan revision in custody: revision "
-                        + str(pending.get("revision_id")) + " reserved by command "
-                        + str((pending.get("request") or {}).get("command_id"))
-                        + " on run " + str(pending.get("predecessor_run_id"))
-                        + " for successor " + str(pending.get("successor_id"))
-                        + "; replay that revise-feature-plan command to admit the successor,"
-                        " or continue-feature the successor if it exists"
-                        " (abandon_revision would permanently reject the pending revision;"
-                        " that is an owner decision, not a retry)"
-                    )
-                generation = old["generation"] + 1
-            elif predecessor is not None:
-                raise OwnershipConflict("continuation predecessor is missing")
+            replay, generation = self.validate_claim(
+                db, snapshot, run_id, store_path, maximum_repairs=maximum_repairs,
+                predecessor=predecessor)
+            if replay is not None:
+                return replay
             db.execute(
                 """INSERT INTO execution_claims VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(issue_id) DO UPDATE SET run_id=excluded.run_id,
@@ -479,7 +525,8 @@ class ExecutionRegistry:
         ).fetchone():
             raise OwnershipConflict("feature still has unfinished or unknown workers")
         if db.execute(
-            "SELECT 1 FROM execution_effects WHERE issue_id=? AND state='pending'", (issue_id,)
+            "SELECT 1 FROM execution_effects WHERE issue_id=? "
+            "AND (state NOT IN ('complete','absent') OR result_json IS NULL)", (issue_id,)
         ).fetchone():
             raise UnresolvedEffect("feature has an external operation awaiting readback")
 
@@ -495,7 +542,7 @@ class ExecutionRegistry:
             )
 
     @staticmethod
-    def _checkpoint(db, token, key, value):
+    def validate_checkpoint(db, token, key, value):
         old = db.execute(
             "SELECT content_digest FROM execution_checkpoints "
             "WHERE issue_id=? AND checkpoint_key=?",
@@ -503,6 +550,10 @@ class ExecutionRegistry:
         ).fetchone()
         if old and old[0] != digest(value):
             raise OwnershipConflict("checkpoint identity already records different work")
+
+    @staticmethod
+    def _checkpoint(db, token, key, value):
+        ExecutionRegistry.validate_checkpoint(db, token, key, value)
         db.execute(
             "INSERT OR IGNORE INTO execution_checkpoints VALUES (?,?,?,?,?,?)",
             (
@@ -825,53 +876,53 @@ class ExecutionRegistry:
                                      "sequence": current["sequence"], **current["runtime"]})
         return result
 
-    def renew_repair_allowance(self, token: dict, baseline: dict) -> dict:
-        """One allowance per new installed payload, admitted only by a stopped owner.
+    def plan_repair_allowance(self, db, token, baseline, current):
+        """Authenticate an allowance renewal and return the checkpoints it would add."""
+        from .delivery_feature_review_context import _git, _protected_root, _sources
 
-        The current identity is measured here, never supplied by a command. The
-        caller obtains the baseline from the predecessor's durable preparation.
-        Payload identity and an ancestor check prevent reinstalls and rollbacks
-        from creating credit; the latest receipt always selects the allowance.
-        """
-        from .delivery_feature_review_context import (
-            _git,
-            _protected_root,
-            _sources,
-            current_runtime_identity,
-        )
+        owner = self.require(db, token, active=False)
+        if owner["state"] != "stopped":
+            raise OwnershipConflict("repair renewal requires the current stopped owner")
+        self._settled(db, token["issue_id"])
+        budget = self._budget(db, token["issue_id"])
+        allowances = self._repair_allowances(db, token["issue_id"])
+        planned = []
+        if not allowances:
+            _, payload = _sources(_protected_root(), baseline.get("revision"))
+            if payload != baseline.get("runtime_payload_sha256"):
+                raise OwnershipConflict("repair allowance baseline differs from preparation")
+            initial = {"version": 1, "sequence": 0, "runtime": baseline,
+                       "lifetime_start": 0, "maximum": budget["maximum"],
+                       "owner": token, "previous": None}
+            key = "repair-allowance:" + payload
+            self.validate_checkpoint(db, token, key, initial)
+            planned.append((key, initial))
+            allowances = [(key, initial)]
+        if any(value["runtime"]["runtime_payload_sha256"]
+               == current["runtime_payload_sha256"] for _, value in allowances):
+            return planned
+        key, previous = allowances[-1]
+        _git(_protected_root(), "merge-base", "--is-ancestor",
+             previous["runtime"]["revision"], current["revision"])
+        value = {"version": 1, "sequence": previous["sequence"] + 1, "runtime": current,
+                 "lifetime_start": budget.get("lifetime_used", budget["used"]),
+                 "maximum": budget["maximum"], "owner": token,
+                 "previous": {"checkpoint_key": key, "sha256": digest(previous)}}
+        next_key = "repair-allowance:" + current["runtime_payload_sha256"]
+        self.validate_checkpoint(db, token, next_key, value)
+        planned.append((next_key, value))
+        return planned
+
+    def renew_repair_allowance(self, token: dict, baseline: dict) -> dict:
+        """Apply a freshly authenticated bounded installed-payload allowance."""
+        from .delivery_feature_review_context import current_runtime_identity
 
         current = current_runtime_identity()
         with self.serialized(token["issue_id"]), self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            owner = self.require(db, token, active=False)
-            if owner["state"] != "stopped":
-                raise OwnershipConflict("repair renewal requires the current stopped owner")
-            self._settled(db, token["issue_id"])
-            budget = self._budget(db, token["issue_id"])
-            allowances = self._repair_allowances(db, token["issue_id"])
-            if not allowances:
-                _, payload = _sources(_protected_root(), baseline.get("revision"))
-                if payload != baseline.get("runtime_payload_sha256"):
-                    raise OwnershipConflict("repair allowance baseline differs from preparation")
-                initial = {"version": 1, "sequence": 0, "runtime": baseline,
-                           "lifetime_start": 0, "maximum": budget["maximum"],
-                           "owner": token, "previous": None}
-                key = "repair-allowance:" + payload
-                self._checkpoint(db, token, key, initial)
-                allowances = [(key, initial)]
-            if any(value["runtime"]["runtime_payload_sha256"]
-                   == current["runtime_payload_sha256"] for _, value in allowances):
-                return self._budget(db, token["issue_id"])
-            key, previous = allowances[-1]
-            # Git failure (including an old or unrelated commit) grants no credit.
-            _git(_protected_root(), "merge-base", "--is-ancestor",
-                 previous["runtime"]["revision"], current["revision"])
-            value = {"version": 1, "sequence": previous["sequence"] + 1, "runtime": current,
-                     "lifetime_start": budget.get("lifetime_used", budget["used"]),
-                     "maximum": budget["maximum"], "owner": token,
-                     "previous": {"checkpoint_key": key, "sha256": digest(previous)}}
-            self._checkpoint(db, token, "repair-allowance:" + current["runtime_payload_sha256"],
-                             value)
+            planned = self.plan_repair_allowance(db, token, baseline, current)
+            for key, value in planned:
+                self._checkpoint(db, token, key, value)
             return self._budget(db, token["issue_id"])
 
     def require_unspent_budget(self, issue_id: str, recorded: dict) -> dict:

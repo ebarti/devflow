@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import subprocess
 import sys
 import time
@@ -98,8 +99,14 @@ def test_original_prevalidated_expired_fd_is_counted_and_can_act_after_abort(own
         guard.check(config, proof, fd, linked=False)
         os.link(proof["path"], proof["link"])
         guard.check(config, proof, fd, linked=True)
-        with pytest.raises(ValueError, match="foreign service-lock FDs"):
+        with pytest.raises(ValueError, match="foreign service-lock FDs") as refused:
             guard.census(fd, proof)
+        summary = re.search(r"\(count=(\d+), holders=(\d+:\d+(?:,\d+:\d+){0,7})\)",
+                            str(refused.value))
+        assert summary is not None and int(summary[1]) >= 1
+        if int(summary[1]) <= 8:
+            assert f"{child.pid}:{(root / 'validated').read_text()}" in summary[2].split(",")
+        assert str(root) not in str(refused.value)
         fresh = subprocess.run(
             [sys.executable, "-I", "-c", CHILD, str(legacy(root)), str(root), "fresh"],
             capture_output=True,
