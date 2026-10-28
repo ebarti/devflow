@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -29,6 +30,8 @@ from .delivery_feature_pass import checkpoint_key
 from .delivery_feature_pass import checkpoints as current_checkpoints
 from .delivery_feature_publication import current_record, live_members, observe_members
 from .delivery_github_contract import GitHubDelivery, ordered_chunks
+from .delivery_writer_custody import inherited_descriptors
+from .delivery_writer_custody import to_thread as writer_thread
 
 
 def _context(spec):
@@ -93,7 +96,7 @@ def open_feature(spec):
 
 @activity.defn(name="delivery_feature_open")
 async def delivery_feature_open(request):
-    return await asyncio.to_thread(open_feature, request["spec"])
+    return await writer_thread(request["spec"], open_feature, request["spec"])
 
 
 def reserve(spec, chunk_id, kind):
@@ -164,14 +167,17 @@ def reserve(spec, chunk_id, kind):
     # Published stack prerequisites stay bound to their recorded branch tips.
     prerequisite = branch if members else head
     # Ensure the exact remote object is available without moving the source working tree.
+    from .delivery_workspace_custody import source_for
+
+    source = source_for(spec)
     try:
-        _git(Path(spec["source_path"]), "fetch", "--no-tags", "origin", prerequisite)
+        _git(source, "fetch", "--no-tags", "origin", prerequisite)
     except RuntimeError as exc:
         # A failed remote query is infrastructure the coordinator may re-issue,
         # never a verdict about the assignment.
         raise BrokerReadbackUnavailable(
             "stack prerequisite fetch failed: " + str(exc)[:300]) from exc
-    if _git(Path(spec["source_path"]), "rev-parse", "FETCH_HEAD") != head:
+    if _git(source, "rev-parse", "FETCH_HEAD") != head:
         raise OwnershipConflict("stack prerequisite moved before worker admission")
     register_worker(store, spec, child)
     shared.checkpoint(
@@ -213,7 +219,8 @@ def begin_integration(spec, target):
 
 @activity.defn(name="delivery_feature_begin_integration")
 async def delivery_feature_begin_integration(request):
-    return await asyncio.to_thread(begin_integration, request["spec"], request["target"])
+    return await writer_thread(request["spec"], begin_integration,
+                               request["spec"], request["target"])
 
 
 def _paid_repair(shared, token, run_id, iteration):
@@ -365,7 +372,8 @@ def resume_worker(store, parent, child, row):
 
 @activity.defn(name="delivery_feature_reserve")
 async def delivery_feature_reserve(request):
-    return await asyncio.to_thread(reserve, request["spec"], request["chunk_id"], request["kind"])
+    return await writer_thread(request["spec"], reserve, request["spec"],
+                               request["chunk_id"], request["kind"])
 
 
 def seal_build(spec, candidate):
@@ -398,6 +406,7 @@ def seal_build(spec, candidate):
         check=True,
         capture_output=True,
         timeout=30,
+        pass_fds=inherited_descriptors(),
     ).stdout
     revision = spec.get("feature_plan_revision", {}).get("plan_revision")
     filename = (f"feature-implementation-revision-{revision}.patch" if revision
@@ -434,7 +443,7 @@ def seal_build(spec, candidate):
 
 @activity.defn(name="delivery_feature_seal_build")
 async def delivery_feature_seal_build(request):
-    return await asyncio.to_thread(seal_build, request["spec"], request["candidate"])
+    return await writer_thread(request["spec"], seal_build, request["spec"], request["candidate"])
 
 
 def apply_seed(broker):
@@ -467,6 +476,7 @@ def apply_seed(broker):
             text=True,
             timeout=30,
             check=False,
+            pass_fds=inherited_descriptors(),
         )
         if data
         else None
@@ -501,6 +511,7 @@ def integrate_previous(broker):
     pending = subprocess.run(
         ["git", "-C", str(broker.checkout), "rev-parse", "--verify", "MERGE_HEAD"],
         capture_output=True, text=True, check=False, timeout=30,
+        pass_fds=inherited_descriptors(),
     )
     if pending.returncode == 0:
         if pending.stdout.strip() != previous["head"]:
@@ -513,6 +524,7 @@ def integrate_previous(broker):
             ["git", "-C", str(broker.checkout), "-c", "core.hooksPath=/dev/null",
              "merge", "--no-commit", "--no-ff", previous["head"]],
             capture_output=True, text=True, check=False, timeout=60,
+            pass_fds=inherited_descriptors(),
         )
         diagnostic = result.stderr[-2000:]
         if result.returncode and not _git(
@@ -586,7 +598,7 @@ def finish_worker(spec, child_id):
 
 @activity.defn(name="delivery_feature_finish_worker")
 async def delivery_feature_finish_worker(request):
-    return await asyncio.to_thread(finish_worker, request["spec"], request["child_id"])
+    return await writer_thread(request["spec"], finish_worker, request["spec"], request["child_id"])
 
 
 def stop_feature(spec, checkpoint):
@@ -610,7 +622,8 @@ def stop_feature(spec, checkpoint):
 
 @activity.defn(name="delivery_feature_stop")
 async def delivery_feature_stop(request):
-    return await asyncio.to_thread(stop_feature, request["spec"], request["checkpoint"])
+    return await writer_thread(request["spec"], stop_feature,
+                               request["spec"], request["checkpoint"])
 
 
 TRANSIENT_RPC_STATUSES = frozenset({
@@ -624,7 +637,7 @@ class TemporalUnavailable(RuntimeError):
 
 @activity.defn(name="delivery_feature_worker_result")
 async def delivery_feature_worker_result(request):
-    store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
+    store, _, _, _ = await writer_thread(request["spec"], _feature_context, request["spec"])
     child_id = request["child_id"]
     with store._connect() as db:
         row = db.execute(
@@ -640,7 +653,7 @@ async def delivery_feature_worker_result(request):
                "error": row["error"], "failure": checks.get("failure"),
                "planning_defect": bool(checks.get("planning_defect"))}
     try:
-        result = await asyncio.to_thread(
+        result = await writer_thread(request["spec"],
             store._completed_temporal_result,
             child_id,
             workflow_id=store.active_workflow_id(child_id),
@@ -664,14 +677,25 @@ async def delivery_feature_worker_result(request):
 
 def _worker_wait_spec(request):
     from .delivery_config import DeliveryConfig
+    from .delivery_execution_config import load_execution_config, observation_mode
     from .delivery_store import DeliveryStore
 
-    store = DeliveryStore(DeliveryConfig.load(Path(request["config_path"])))
+    store = DeliveryStore(DeliveryConfig.load(Path(request["config_path"])), read_only=True)
     spec = store.effective_spec(request["run_id"])
     if digest(spec) != request["spec_digest"]:
         raise OwnershipConflict("feature wait no longer matches its frozen specification")
-    _, _, shared, token = _feature_context(spec)
-    with shared.connect() as db:
+    # Authenticate frozen authority without repairing or publishing configuration.
+    with observation_mode():
+        load_execution_config(spec)
+    from .delivery_execution_registry import ExecutionRegistry
+
+    token = spec["feature_delivery"]["owner"]
+    path = Path(spec["feature_delivery"]["registry"])
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+        db.row_factory = sqlite3.Row
+        current = ExecutionRegistry.require(db, token, active=False)
+        if current["state"] not in {"active", "draining"}:
+            raise OwnershipConflict("feature wait no longer has an active coordinator")
         assigned = db.execute(
             "SELECT 1 FROM execution_workers WHERE issue_id=? AND generation=? AND worker_key=?",
             (token["issue_id"], token["generation"], worker_key(request["child_id"], token)),
@@ -682,6 +706,8 @@ def _worker_wait_spec(request):
 
 
 async def _wait_worker(request):
+    # This existing read-only lookup authenticates the finite wait reference;
+    # actual worker/controller operations below use explicit admitted custody.
     spec = await asyncio.to_thread(_worker_wait_spec, request)
     deadline = time.monotonic() + 300
     while True:
@@ -716,7 +742,8 @@ async def _settle_workers(request):
 
     from .delivery_codec import DELIVERY_DATA_CONVERTER
 
-    store, _, shared, token = await asyncio.to_thread(_feature_context, request["spec"])
+    store, _, shared, token = await writer_thread(request["spec"], _feature_context,
+                                                 request["spec"])
     shared.drain(token)
     client = await Client.connect(
         store.config.temporal_address,
@@ -748,7 +775,7 @@ async def _settle_workers(request):
                 )
                 if saved is None:
                     raise OwnershipConflict("worker admission input is unconfirmed")
-                await asyncio.to_thread(register_worker, store, request["spec"], saved)
+                await writer_thread(request["spec"], register_worker, store, request["spec"], saved)
             handle = client.get_workflow_handle(store.active_workflow_id(child_id))
             try:
                 remote = await handle.describe()
@@ -785,7 +812,7 @@ async def _settle_workers(request):
                         continue
             else:
                 try:
-                    await asyncio.to_thread(finish_worker, request["spec"], child_id)
+                    await writer_thread(request["spec"], finish_worker, request["spec"], child_id)
                 except (ValueError, OwnershipConflict) as exc:
                     from temporalio.exceptions import ApplicationError
 
@@ -808,12 +835,14 @@ async def delivery_feature_merge(request):
 
     from .delivery_activities import _with_heartbeat
     from .delivery_feature_merge import StackMergeConditionUnavailable, merge
+    from .delivery_writer_custody import to_thread
 
-    store, _ = await asyncio.to_thread(_context, request["spec"])
+    store, _ = await writer_thread(request["spec"], _context, request["spec"])
     cancelled = Event()
     try:
         return await _with_heartbeat(
-            asyncio.to_thread(
+            to_thread(
+                request["spec"],
                 merge,
                 store,
                 request["spec"],
@@ -839,8 +868,8 @@ async def delivery_feature_settle_effects(request):
     from .delivery_activities import _with_heartbeat
     from .delivery_feature_readback import settle
 
-    store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
-    return await _with_heartbeat(asyncio.to_thread(settle, store, request["spec"]),
+    store, _, _, _ = await writer_thread(request["spec"], _feature_context, request["spec"])
+    return await _with_heartbeat(writer_thread(request["spec"], settle, store, request["spec"]),
                                  request, "feature_readback")
 
 
@@ -848,31 +877,31 @@ async def delivery_feature_settle_effects(request):
 async def delivery_feature_revision_request(request):
     from .delivery_feature_revisions import revision_request
 
-    await asyncio.to_thread(_feature_context, request["spec"])
-    return await asyncio.to_thread(revision_request, request["spec"])
+    await writer_thread(request["spec"], _feature_context, request["spec"])
+    return await writer_thread(request["spec"], revision_request, request["spec"])
 
 
 @activity.defn(name="delivery_feature_revision_begin")
 async def delivery_feature_revision_begin(request):
     from .delivery_feature_revisions import begin_revision
 
-    store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
-    return await asyncio.to_thread(begin_revision, store, request["spec"],
+    store, _, _, _ = await writer_thread(request["spec"], _feature_context, request["spec"])
+    return await writer_thread(request["spec"], begin_revision, store, request["spec"],
                                    request.get("diagnostic"), request.get("command_id"))
 
 
 async def _revision_role_request(request, role):
     from .delivery_feature_revisions import authenticate_revision_role
 
-    store, broker = await asyncio.to_thread(_context, request["spec"])
-    if await asyncio.to_thread(broker.candidate) != request["candidate"]:
+    store, broker = await writer_thread(request["spec"], _context, request["spec"])
+    if await writer_thread(request["spec"], broker.candidate) != request["candidate"]:
         raise OwnershipConflict("revision role candidate changed before admission")
     payload = {
         "spec": request["spec"], "role": role, "iteration": 0,
         "candidate": request["candidate"], "resume_session": None,
         "revision_context": request["context"], "findings": [],
     }
-    trusted = await asyncio.to_thread(authenticate_revision_role, store, payload)
+    trusted = await writer_thread(request["spec"], authenticate_revision_role, store, payload)
     # Evidence excerpts are authenticated derived context. Native roles cannot
     # open a child controller directory or substitute arbitrary evidence paths.
     payload["revision_context"] = {
@@ -893,7 +922,7 @@ async def delivery_feature_revision_propose(request):
         result = await _run_intake(payload)
         if result.get("status") != "plan" or result.get("cleanup") != "confirmed":
             return {**result, "status": "blocked"}
-        receipt = await asyncio.to_thread(
+        receipt = await writer_thread(request["spec"],
             record_proposal, store, request["spec"], request["context"]["revision_id"],
             result["plan"], diagnostic=result.get("diagnostic"),
         )
@@ -932,9 +961,9 @@ async def delivery_feature_revision_adopt(request):
     from .delivery_feature_revisions import settle_adoption
     from .delivery_store import DeliveryStore
 
-    config = await asyncio.to_thread(load_execution_config, request["spec"])
+    config = await writer_thread(request["spec"], load_execution_config, request["spec"])
     store = DeliveryStore(config)
-    return await asyncio.to_thread(
+    return await writer_thread(request["spec"],
         settle_adoption, store, request["spec"], request["context"]["revision_id"],
         request["proposed_plan"], request["review"],
     )
@@ -944,8 +973,8 @@ async def delivery_feature_revision_adopt(request):
 async def delivery_feature_revision_reject(request):
     from .delivery_feature_revisions import reject_revision
 
-    store, _, _, _ = await asyncio.to_thread(_feature_context, request["spec"])
-    return await asyncio.to_thread(reject_revision, store, request["spec"],
+    store, _, _, _ = await writer_thread(request["spec"], _feature_context, request["spec"])
+    return await writer_thread(request["spec"], reject_revision, store, request["spec"],
                                    request["context"]["revision_id"], request["reason"])
 
 

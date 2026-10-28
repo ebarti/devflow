@@ -252,6 +252,8 @@ class DiagnosticContext:
             return True
 
     def create_subject(self):
+        from .delivery_workspace_custody import source_for
+
         self.guard()
         if os.path.lexists(self.state):
             raise ValueError("native diagnostic generation already exists; never replace it")
@@ -279,7 +281,7 @@ class DiagnosticContext:
             "--no-hardlinks",
             "--dissociate",
             "--no-checkout",
-            self.spec["source_path"],
+            str(source_for(self.spec)),
             str(self.checkout),
         ]
         subprocess.run(clone, env=environment, check=True, capture_output=True, timeout=120)

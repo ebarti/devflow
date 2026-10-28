@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from importlib.metadata import distribution
 from pathlib import Path
 
+import pytest
 from test_delivery_store import _git, submit_before_readiness
 from test_delivery_store import service as service
 
@@ -107,6 +108,21 @@ def test_actual_native_preparation_no_launch_history_then_public_cleanup(service
     monkeypatch.setattr(store, '_completed_temporal_result', lambda *_a, **_k: closed)
     monkeypatch.setattr(DeliveryBroker, '_existing_pr', lambda *_a: {
         'number': 12, 'url': publication['url'], 'headRefOid': candidate['head']})
+    from devflow_temporal.delivery_writer_custody import Lease, shared
+
+    with store._connect() as db:
+        before = list(db.iterdump())
+    checkpoint_owner = Lease(spec, exclusive=True)
+    try:
+        with pytest.raises(ValueError, match='checkpoint-sensitive writer or checkpoint'):
+            reconcile_attempt(store, run_id='run-1', role='cleanup', iteration=3)
+    finally:
+        checkpoint_owner.close()
+    with shared(spec, read_only=True):
+        with pytest.raises(ValueError, match='read-only writer custody'):
+            reconcile_attempt(store, run_id='run-1', role='cleanup', iteration=3)
+    with store._connect() as db:
+        assert list(db.iterdump()) == before
     assert reconcile_attempt(store, run_id='run-1', role='cleanup', iteration=3)['changed']
     assert not reconcile_attempt(store, run_id='run-1', role='cleanup', iteration=3)['changed']
     assert closed == original

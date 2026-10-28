@@ -147,9 +147,11 @@ def _hash(raw, expected, *, maximum, executable=False):
 
 
 def _project(spec, project, checkout):
+    from .delivery_workspace_custody import source_for
+
     if project != "workers/automation":
         raise ValueError("Temporal prerequisite needs its explicit supported Python project")
-    source, metadata = Path(spec["source_path"]), {}
+    source, metadata = source_for(spec), {}
     for name in ("pyproject.toml", "uv.lock"):
         relative = project + "/" + name
         entry = subprocess.check_output(

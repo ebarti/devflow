@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import fcntl
 import hashlib
 import json
@@ -22,6 +21,8 @@ from .contracts import canonical_json, digest
 from .delivery_native_process import NativeProcessUnknown
 from .delivery_sandbox import _native_env, prepare_native_role, prepare_sandbox
 from .delivery_store import DeliveryStore, _now
+from .delivery_writer_custody import activity_custody, inherited_descriptors
+from .delivery_writer_custody import to_thread as writer_thread
 
 _LOG = logging.getLogger(__name__)
 # Admission polls run about once a second; a persistent deferral is recorded
@@ -262,9 +263,9 @@ class DeliverySupervisor:
                 return started
         return None
 
-    async def _acquire_capacity(self, job_key: str, *, cancelled=None) -> None:
+    async def _acquire_capacity(self, job_key: str, spec: dict, *, cancelled=None) -> None:
         """Atomically claim one shared DB slot across config overlays and workers."""
-        while not await asyncio.to_thread(self._enter_capacity, job_key, cancelled=cancelled):
+        while not await writer_thread(spec, self._enter_capacity, job_key, cancelled=cancelled):
             # Ambiguous attempts retain their slots until reconciled.
             await asyncio.sleep(1)
 
@@ -444,11 +445,15 @@ class DeliverySupervisor:
             return job_key, None
 
     async def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        async with activity_custody(request["spec"]):
+            return await self._run(request)
+
+    async def _run(self, request: dict[str, Any]) -> dict[str, Any]:
         from .delivery_preparation import require_native_execution
 
         require_native_execution(request["spec"])
-        await asyncio.to_thread(self.retained_request, request)
-        job_key, existing = await asyncio.to_thread(self._claim, request)
+        await writer_thread(request["spec"], self.retained_request, request)
+        job_key, existing = await writer_thread(request["spec"], self._claim, request)
         if existing is not None:
             return existing
         if request["spec"].get("provider") == "codex":
@@ -461,7 +466,7 @@ class DeliverySupervisor:
         start_path = folder / "start.json"
         request_path = folder / "request.json"
         request = {**request, "result_path": str(result_path), "start_path": str(start_path)}
-        await self._acquire_capacity(job_key)
+        await self._acquire_capacity(job_key, spec)
         try:
             from .delivery_dashboard import launch_steering
 
@@ -511,6 +516,7 @@ class DeliverySupervisor:
                 stderr=log,
                 env=role_env,
                 start_new_session=True,
+                pass_fds=inherited_descriptors(),
             )
             for _ in range(100):
                 if start_path.is_file() or child.returncode is not None:
@@ -540,10 +546,10 @@ class DeliverySupervisor:
             if not result_path.is_file():
                 return self._mark_unknown(job_key, "role child exited without a final receipt")
             result = json.loads(result_path.read_text(encoding="utf-8"))
-            await asyncio.to_thread(self._admit_role_output, request, result)
+            await writer_thread(spec, self._admit_role_output, request, result)
             from .delivery_resources import read_private, write_private
 
-            output_candidate = await asyncio.to_thread(self._completed_candidate, request, result)
+            output_candidate = await writer_thread(spec, self._completed_candidate, request, result)
             metadata = read_private(start_path)
             metadata.update(output_candidate=output_candidate, result_digest=digest(result))
             write_private(start_path, metadata)
@@ -743,9 +749,7 @@ class DeliverySupervisor:
 
         # Submit once, independently of the cancellable asyncio waiter. Runner
         # shutdown can cancel that task without cancelling or hiding its thread.
-        execution = asyncio.get_running_loop().run_in_executor(
-            None, contextvars.copy_context().run, monitor,
-        )
+        execution = asyncio.create_task(writer_thread(spec, monitor))
 
         async def wait_for_monitor():
             return await asyncio.shield(execution)

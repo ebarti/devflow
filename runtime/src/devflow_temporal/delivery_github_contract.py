@@ -318,6 +318,10 @@ def decode_manifest(body: str, issue: dict) -> dict:
 
 class GitHubDelivery:
     def api(self, endpoint: str, *, method: str = "GET", body=None):
+        from .delivery_writer_custody import inherited_descriptors, require_current_writer
+
+        if method not in {"GET", "HEAD"}:
+            require_current_writer()
         timeout = 60
         observation = _github_observation.get()
         if observation is not None:
@@ -347,6 +351,7 @@ class GitHubDelivery:
             capture_output=True,
             timeout=timeout,
             check=False,
+            pass_fds=inherited_descriptors(),
         )
         if observation is not None and len(result.stdout.encode()) > 2_000_000:
             raise ValueError("GitHub observation response exceeds its bounded size")

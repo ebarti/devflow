@@ -236,7 +236,13 @@ def matches(spec, path, recorded, *, current=None, directory=True):
     if current is not None and current != physical:
         return False  # An opened descriptor and its current name must still agree.
     current = physical
-    return identity_for(spec, path, current, recorded) == recorded
+    if identity_for(spec, path, current, recorded) == recorded:
+        return True
+    # A checkpoint restore is a separate, acknowledged allocation generation;
+    # it never pretends to prove historical mount continuity.
+    from .delivery_checkpoints import restored_identity
+
+    return restored_identity(spec, path, current, recorded) == recorded
 
 
 def _workflow(store, row):

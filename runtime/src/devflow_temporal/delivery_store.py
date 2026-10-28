@@ -18,7 +18,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import copy_context
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -30,7 +30,7 @@ from temporalio.service import RPCError
 
 from . import delivery_closures as closures
 from .candidate import candidate_for
-from .contracts import canonical_json, digest
+from .contracts import RUN_ID_RE, canonical_json, digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig, scope_amended_spec, scope_amendment_config
 from .delivery_continuation import (
@@ -259,6 +259,11 @@ def _observational_preflight(method):
 
 
 class DeliveryStore:
+    def _checkpoint_writer_context(self, spec):
+        from .delivery_writer_custody import CheckpointWriters
+
+        return CheckpointWriters(self, spec)
+
     def __init__(self, config: DeliveryConfig, *, read_only: bool = False) -> None:
         from .delivery_runtime_location import helper_path, require_ready
 
@@ -679,6 +684,9 @@ class DeliveryStore:
             from .delivery_ci_inventory import initialize as initialize_ci_inventory
 
             initialize_ci_inventory(db)
+            from .delivery_writer_custody import initialize as initialize_writer_custody
+
+            initialize_writer_custody(db)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -737,6 +745,7 @@ class DeliveryStore:
         event_type: str,
         message: str,
         payload: dict[str, Any] | None = None,
+        *, registry_db=None, registry_projection=None,
     ) -> int:
         timestamp = _now()
         cursor = db.execute(
@@ -756,7 +765,14 @@ class DeliveryStore:
         )
         from .delivery_features import record_projection, transition
 
-        transition(db, self.config, run_id)
+        view = None
+        if registry_db is not None:
+            from .delivery_checkpoint_registry_view import CheckpointRegistryView
+
+            request = db.execute("SELECT request_json FROM delivery_runs WHERE run_id=?",
+                                 (run_id,)).fetchone()
+            view = CheckpointRegistryView(registry_db, json.loads(request[0]), registry_projection)
+        transition(db, self.config, run_id, registry_view=view)
         record_projection(db, self.config, run_id)
         return int(cursor.lastrowid)
 
@@ -782,6 +798,7 @@ class DeliveryStore:
             if prior:
                 if prior[0] != request_digest:
                     raise ValueError("command ID already belongs to different inputs")
+                self._reconcile_admitted_workspace(db, run_id)
                 return json.loads(prior[1])
             prior_run = db.execute(
                 "SELECT request_digest,phase FROM delivery_runs WHERE run_id=?", (run_id,)
@@ -789,6 +806,7 @@ class DeliveryStore:
             if prior_run:
                 if prior_run[0] != request_digest:
                     raise ValueError("run ID already belongs to different inputs")
+                self._reconcile_admitted_workspace(db, run_id)
                 return {
                     "run_id": run_id,
                     "dashboard_url": dashboard_url,
@@ -836,6 +854,15 @@ class DeliveryStore:
 
             validate_retained_configuration(self, retained)
         admission = {}
+        manual_predecessor = None
+        temporal_result = None
+        if _automatic is None and "supersedes_run_id" in supplied:
+            manual_predecessor = self._retained_supersede_preflight(supplied)
+            if manual_predecessor is not None:
+                admission["_workspace_base"] = manual_predecessor["spec"]
+                temporal_result = manual_predecessor["closed"]
+        if _automatic is not None:
+            admission["_workspace_base"] = old
         if reference:
             admission["_base_ref"] = reference
         if retained is not None:
@@ -879,7 +906,6 @@ class DeliveryStore:
             # the write transaction checks it again.
             with self._connect() as db:
                 require_repository_access(self, db, spec["github_repo"])
-        temporal_result = None
         observed = None
         superseded = spec.get("supersedes_run_id")
         if superseded and _automatic is None:
@@ -894,7 +920,8 @@ class DeliveryStore:
                     "SELECT 1 FROM delivery_attempts WHERE run_id=? LIMIT 1", (superseded,)
                 ).fetchone()
             if has_attempt:
-                temporal_result = self._completed_temporal_result(superseded)
+                if temporal_result is None:
+                    temporal_result = self._completed_temporal_result(superseded)
                 # Git, file and GitHub observations happen before the write lock
                 # is held; the transaction repeats the same checks against them.
                 observed = {}
@@ -907,6 +934,22 @@ class DeliveryStore:
             from .delivery_feature_execution import observe_admission
 
             observed = observe_admission(self, spec)
+        if spec.get("workspace_custody_version") == 1:
+            # Admission ACK must not retain a shorter-lived setup Git owner,
+            # including while Temporal has not started its first activity.
+            # Copy local immutable ancestry before the short claim transaction.
+            if (self.config.raw.get("feature_delivery_version") == 1
+                    and "publication_base_ref" not in spec):
+                snapshot = observed
+                if snapshot is None:
+                    from .delivery_execution_registry import ExecutionRegistry
+                    from .delivery_feature_execution import registry_path
+
+                    snapshot = ExecutionRegistry(registry_path(self.config)).snapshot(
+                        spec["run_id"], str(self.config.tracking_db))
+                if snapshot is None:
+                    raise ValueError("workspace admission lacks its frozen feature snapshot")
+                spec["publication_base_ref"] = snapshot["default_branch"]
         if _feature_allowance is not None:
             from .delivery_feature_execution import _renew_repair_allowance, registry
 
@@ -914,7 +957,11 @@ class DeliveryStore:
                 raise ValueError("repair allowance requires its authenticated continuation")
             # A refused config/origin/plan/readback must not renew before admission.
             _renew_repair_allowance(self, registry(retained), _feature_allowance)
-        with self._connect() as db:
+        manual_writers = (self._checkpoint_writer_context(manual_predecessor["spec"])
+                          if manual_predecessor is not None else nullcontext())
+        from .delivery_workspace_custody import provisional_owner
+
+        with manual_writers, provisional_owner(self, spec), self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             command = db.execute(
                 "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
@@ -970,6 +1017,10 @@ class DeliveryStore:
 
                 validate_transaction(self, db, spec, _automatic)
             elif superseded:
+                if (manual_predecessor is not None
+                        and self._supersede_snapshot(db, superseded)
+                        != manual_predecessor["snapshot"]):
+                    raise ValueError("retained predecessor changed during admission; retry submit")
                 self._supersede_continuation(
                     db, spec, supplied, superseded, temporal_result, observed
                 )
@@ -1040,6 +1091,20 @@ class DeliveryStore:
                 (command_id, run_id, request_digest, canonical_json(response)),
             )
             return response
+
+    def _reconcile_admitted_workspace(self, db, run_id):
+        """Finish only an interrupted journaled allocation on a matching replay."""
+        row = db.execute("SELECT request_json FROM delivery_runs WHERE run_id=?",
+                         (run_id,)).fetchone()
+        if row is None:
+            raise ValueError("delivery command lost its admitted run")
+        spec = json.loads(row[0])
+        if (spec.get("workspace_custody_version") == 1
+                and os.path.lexists(Path(spec["state_dir"]) / "workspace-admission.json")):
+            from .delivery_workspace_custody import provisional_owner
+
+            with provisional_owner(self, spec):
+                pass
 
     def _freeze_issue_budget(self, db: sqlite3.Connection, spec: dict[str, Any]) -> None:
         """Bound autonomous retries against all admissions under the claim transaction."""
@@ -3063,6 +3128,118 @@ class DeliveryStore:
             recovery["state"]["pull_request"],
         )
         confirmed_native_cleanup(spec)
+
+    def _supersede_snapshot(self, db, run_id):
+        row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            raise ValueError("superseded run ID not found")
+        claim = self.state.claim_for(db, row["work_id"])
+        return {
+            "row": dict(row),
+            "claim": dict(claim) if claim else None,
+            "conflicts": [dict(item) for item in db.execute(
+                "SELECT * FROM delivery_events WHERE run_id=? AND type='blocked' "
+                "AND json_extract(payload_json,'$.key')=? ORDER BY sequence",
+                (run_id, "temporal-conflict:" + (row["workflow_id"] or "delivery-" + run_id)),
+            )],
+            **{table: [dict(item) for item in db.execute(
+                f"SELECT * FROM {table} WHERE run_id=? ORDER BY rowid", (run_id,)
+            )] for table in (
+                "delivery_attempts", "delivery_effects", "delivery_outbox",
+                "delivery_preparations", "delivery_execution_authority",
+            )},
+        }
+
+    def _retained_supersede_preflight(self, supplied):
+        """Authenticate a stopped predecessor before it may select physical source.
+
+        This grants no continuation or external effect. Ordinary admission still
+        verifies the requested policy, role evidence and budget; its transaction
+        repeats the exact predecessor snapshot before transferring the claim.
+        """
+        from .delivery_preparation import require_native_execution
+
+        run_id = supplied["supersedes_run_id"]
+        if (not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id)
+                or run_id == supplied.get("run_id")):
+            raise ValueError("superseded run ID is invalid")
+        with self._connect() as db:
+            db.execute("BEGIN")
+            snapshot = self._supersede_snapshot(db, run_id)
+            prior = self._spec(db, run_id)
+        if prior.get("workspace_custody_version") != 1:
+            return None  # Historical admission retains its original source contract.
+        row, claim = snapshot["row"], snapshot["claim"]
+        if (
+            self.config.raw.get("feature_delivery_version") == 1
+            or (row["work_id"], row["issue_url"], row["repository_key"])
+            != (supplied.get("work_id"), supplied.get("issue_url"),
+                supplied.get("repository_key"))
+            or any(prior.get(key) != row[key] for key in (
+                "run_id", "work_id", "issue_url", "repository_key", "request_digest"))
+            or row["outcome"] != "blocked" or row["execution_state"] != "blocked"
+            or row["pr_json"] is not None or row["cleanup"] == "unknown"
+            or claim is None or claim["owner"] != "external:devflow:" + run_id
+        ):
+            raise ValueError("retained source requires its blocked unpublished predecessor owner")
+        if prior["branch"] == supplied.get("branch"):
+            raise ValueError("superseded run retains the owned branch; choose a new branch")
+        if ("origin_thread_id" in supplied
+                and supplied["origin_thread_id"] != prior.get("origin_thread_id")):
+            raise ValueError("continuation changed the originating thread")
+        require_native_execution(prior)
+        ownership = self.execution_ownership(prior)
+        if ownership is not None:
+            raise ValueError(ownership)
+        attempts, effects = snapshot["delivery_attempts"], snapshot["delivery_effects"]
+        if (any(item["state"] != "finished" or item["cleanup"] != "confirmed"
+                for item in attempts)
+                or any(item["state"] != "complete" for item in effects)):
+            raise ValueError("retained predecessor has unfinished or unknown execution custody")
+        outbox = snapshot["delivery_outbox"]
+        authorities = snapshot["delivery_execution_authority"]
+        never_started = (
+            len(outbox) == 1 and outbox[0]["state"] == "conflict"
+            and not attempts and not effects and not snapshot["delivery_preparations"]
+            and not any(item["execution_run_id"] for item in authorities)
+        )
+        if never_started and len(snapshot["conflicts"]) != 1:
+            raise ValueError(
+                "retained predecessor lost its terminal dispatch-conflict acknowledgement"
+            )
+        closed = None
+        if not never_started:
+            closed = (self._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+                      if row["workflow_id"] else self._completed_temporal_result(run_id))
+            result = closed.get("result")
+            if (
+                closed.get("workflow_id") != (row["workflow_id"] or "delivery-" + run_id)
+                or closed.get("request_digest") != row["request_digest"]
+                or not isinstance(closed.get("execution_run_id"), str)
+                or not closed["execution_run_id"] or not closed.get("closed_at")
+                or not isinstance(result, dict)
+                or any(result.get(key) != row[key] for key in (
+                    "run_id", "phase", "outcome", "cleanup", "error"))
+                or result.get("pull_request")
+                or (not attempts and result.get("roles", []) != [])
+            ):
+                raise ValueError("retained predecessor differs from its closed Temporal execution")
+            if prior.get("execution_authority_version") == 1:
+                owner = next((item for item in authorities
+                              if item["workflow_id"] == closed["workflow_id"]), None)
+                if (owner is None or owner["request_digest"] != row["request_digest"]
+                        or owner["request_json"] != row["request_json"]
+                        or owner["recovery_json"] != row["recovery_json"]
+                        or owner["execution_run_id"] != closed["execution_run_id"]):
+                    raise ValueError("retained predecessor lost its original execution authority")
+        # A completed workflow cannot prove that an already queued Python body or
+        # native descendant has stopped. Its original witness must be available
+        # exclusively before a retained source can participate in new admission.
+        with self._checkpoint_writer_context(prior) as writers, self._connect() as db:
+            if self._supersede_snapshot(db, run_id) != snapshot:
+                raise ValueError("retained predecessor changed during custody observation")
+            writers.verify(db)
+        return {"spec": prior, "snapshot": snapshot, "closed": closed}
 
     def _supersede_continuation(
         self,

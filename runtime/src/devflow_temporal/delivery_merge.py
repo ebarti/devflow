@@ -134,8 +134,11 @@ class MergeBroker:
 
     def api(self, endpoint, *, method="GET", body=None, raw=False):
         from .delivery_merge_execution import require_api_current
+        from .delivery_writer_custody import inherited_descriptors, require_writer
 
         require_api_current(self.store, self.spec["run_id"])
+        if method not in {"GET", "HEAD"}:
+            require_writer(self.spec, store=self.store)
         if (self.cancel_event is not None and self.cancel_event.is_set()
                 or time.monotonic() >= self.deadline):
             raise RuntimeError("merge activity no longer owns a live execution boundary")
@@ -147,7 +150,8 @@ class MergeBroker:
         if body is not None:
             argv.extend(["--input", "-"])
         result = subprocess.run(argv, input=json.dumps(body).encode() if body is not None else None,
-                                capture_output=True, timeout=60, check=False)
+                                capture_output=True, timeout=60, check=False,
+                                pass_fds=inherited_descriptors())
         stdout, stderr = result.stdout.decode(), result.stderr.decode()
         write_private(self.root / (f"{_now().replace(':', '-')}-{self.sequence}.json"), {
             "at": _now(), "argv": argv, "body": body, "exit_code": result.returncode,
@@ -359,6 +363,13 @@ class MergeBroker:
 
 
 def merge_verified(store, spec, request, cancel_event=None):
+    from .delivery_writer_custody import shared
+
+    with shared(spec):
+        return _merge_verified(store, spec, request, cancel_event)
+
+
+def _merge_verified(store, spec, request, cancel_event=None):
     from .delivery_policy_recovery import work_binding
 
     followup = request.get("merge_authorization")

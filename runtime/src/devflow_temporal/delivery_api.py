@@ -517,6 +517,10 @@ def create_app(config_path: Path) -> FastAPI:
         # Retain the old response shape for clients cached before the local upgrade.
         return {"authenticated": True, "csrf_token": service.session.csrf(cookie)}
 
+    from .delivery_checkpoint_api import mount as mount_checkpoints
+
+    mount_checkpoints(app, service, _mutation, _host)
+
     @app.get("/api/session")
     async def get_session(request: Request, response: Response) -> dict[str, Any]:
         _host(request)
@@ -650,8 +654,12 @@ def create_app(config_path: Path) -> FastAPI:
     @app.post("/api/runs")
     async def submit(request: Request) -> dict[str, Any]:
         _mutation(request)
+        from .delivery_workspace_custody import WorkspaceAdmissionUnknown
+
         try:
             return await asyncio.to_thread(service.store.submit, await request.json())
+        except WorkspaceAdmissionUnknown as exc:
+            raise HTTPException(409, {"code": exc.code, "message": str(exc)}) from exc
         except (ValueError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
         except TRANSPORT_FAILURES as exc:

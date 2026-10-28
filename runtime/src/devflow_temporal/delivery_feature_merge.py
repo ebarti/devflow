@@ -255,6 +255,18 @@ def _refused(submissions):
 
 def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancelled=None,
           settlement=False):
+    from .delivery_writer_custody import shared
+
+    with shared(spec, read_only=settlement):
+        return _merge(store, spec, requested, command, gh=gh, execute=execute,
+                      cancelled=cancelled, settlement=settlement)
+
+
+def _merge(store, spec, requested, command=None, *, gh=None, execute=None, cancelled=None,
+           settlement=False):
+    from .delivery_workspace_custody import source_for
+    from .delivery_writer_custody import inherited_descriptors, require_writer
+
     gh = gh or GitHubDelivery()
     shared = registry(spec)
     token = spec["feature_delivery"]["owner"]
@@ -377,15 +389,17 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
             submissions = [*submissions, {"attempt": len(submissions) + 1, "state": "started"}]
             shared.note_effect(token, key, {"submissions": submissions})
             try:
+                require_writer(spec, store=store)
                 result = execute(
                     argv,
-                    cwd=spec["source_path"],
+                    cwd=source_for(spec),
                     env={**os.environ, "GH_REPO": spec["github_repo"],
                          "GH_PROMPT_DISABLED": "1"},
                     capture_output=True,
                     text=True,
                     timeout=540,
                     check=False,
+                    pass_fds=inherited_descriptors(),
                 )
             except (FileNotFoundError, PermissionError) as exc:
                 # The command never started, so GitHub received no merge request.
@@ -485,6 +499,8 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                 raise OwnershipConflict("merge completed; issue closure still needs reconciliation")
             close_key = key + ":close:" + child["id"]
             prior_closure = shared.effect(token["issue_id"], close_key)
+            if settlement and prior_closure is None:
+                raise UnresolvedEffect("issue closure has no original intent to settle")
             closure_request = {"issue": child["id"], "required_chunks": chunk_ids,
                                "merges": child_merges}
             if prior_closure:

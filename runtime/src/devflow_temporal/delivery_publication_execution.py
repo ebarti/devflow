@@ -146,6 +146,9 @@ class Execution:
                 in {None, "not_started"})
 
     def mutate(self, operation, function):
+        from .delivery_writer_custody import require_writer
+
+        require_writer(self.broker.spec, store=self.broker.store)
         self.require(operation)
         self._record(operation, "started")
         token = _MUTATION.set((self, operation))
@@ -191,7 +194,16 @@ def current_mutation():
 
 
 @contextmanager
-def execution(broker, iteration, candidate):
+def execution(broker, iteration, candidate, *, read_only=False):
+    from .delivery_writer_custody import shared
+
+    with shared(broker.spec, read_only=read_only):
+        with _execution(broker, iteration, candidate) as owner:
+            yield owner
+
+
+@contextmanager
+def _execution(broker, iteration, candidate):
     key = broker.publication_effect_key(iteration)
     request = {"iteration": iteration, "input_candidate_id": candidate["id"]}
     existing = current(key)
