@@ -446,8 +446,11 @@ def test_combined_prerequisites_share_one_original_finite_admission(service, mon
 async def test_composed_public_admission_actual_temporal_worker_native_sdk_and_replay(
     service, monkeypatch, kind
 ):
+    from runtime_location_scenario import observe_artifact_holder_failures
+
     from devflow_temporal.delivery_activities import delivery_checks
 
+    observe_artifact_holder_failures(monkeypatch)
     saved, observed = [], []
     execute = DeliveryBroker._run_check_list
 

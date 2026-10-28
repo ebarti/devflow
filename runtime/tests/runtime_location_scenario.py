@@ -1347,6 +1347,270 @@ def assert_native_checks_passed(result, calls, native_checks, *, state_dir=None)
         worker_failure_diagnostic(result, calls, native_checks, state_dir=state_dir), sort_keys=True
     )
 
+
+def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, entry=None,
+                                    manifest=None, journals=None, *, root_observation=False):
+    """Post-refusal observations are not atomic holder identity or cleanup authority."""
+    import re
+
+    from devflow_temporal.delivery_native_process import process_table
+
+    if root_observation:
+        from devflow_temporal import delivery_resources as resources
+
+        if (str(exc) != "predecessor has a live root user or unreadable lease"
+                or original is not resources._observe_locked_resources):
+            return None
+    elif not re.fullmatch(
+        r"disposable check artifact root has a live holder "
+        r"\(count=[1-9][0-9]{0,6}, pids=[1-9][0-9]{0,9}(?:,[1-9][0-9]{0,9}){0,7}\)",
+        str(exc),
+    ):
+        return None
+    facts = {"semantics": "post_refusal_non_atomic", "state": "unavailable"}
+    trace = exc.__traceback__
+    while trace is not None and trace.tb_frame.f_code is not original.__code__:
+        trace = trace.tb_next
+    if trace is None:
+        return facts
+    values = trace.tb_frame.f_locals
+    if root_observation:
+        registry, path, entry, manifest, journals = (
+            values.get(key) for key in ("registry", "path", "entry", "manifest", "journals"))
+        spec, users = values.get("spec"), values.get("observed")
+        if (not isinstance(registry, RunResources) or not isinstance(spec, dict)
+                or registry.spec is not spec or not isinstance(manifest, dict)
+                or not isinstance(manifest.get("roots"), dict) or not isinstance(entry, dict)
+                or not isinstance(path, Path) or not path.is_absolute()
+                or manifest["roots"].get(str(path)) is not entry
+                or registry.state != Path(spec.get("state_dir", ""))
+                or manifest.get("run_id") != spec.get("run_id")
+                or not isinstance(journals, dict) or len(journals) > 64
+                or not isinstance(manifest.get("processes"), list)
+                or len(manifest["processes"]) > 64
+                or any(not isinstance(raw, str) for raw in manifest["processes"])
+                or set(journals) != set(manifest.get("processes", []))
+                or any(not isinstance(raw, str) or not isinstance(sha, str)
+                       or not re.fullmatch(r"[0-9a-f]{64}", sha)
+                       for raw, sha in journals.items())
+                or not isinstance(users, subprocess.CompletedProcess)
+                or users.args != ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(path)]):
+            return facts
+        kind = entry.get("kind")
+        facts.update(root_kind=kind if isinstance(kind, str) and kind in {"checkout", "gate"}
+                     else "other", original_holder_count=None,
+                     inspection_returncode=users.returncode
+                     if type(users.returncode) is int and -255 <= users.returncode <= 255
+                     else None,
+                     stderr_present=bool(users.stderr) if isinstance(users.stderr, str) else None)
+        if (type(users.returncode) is not int or users.returncode not in (0, 1)
+                or not isinstance(users.stdout, str) or len(users.stdout) > 16384):
+            return facts
+    else:
+        users, observed = values.get("users"), values.get("observed")
+        if (values.get("self") is not registry or values.get("path") != path
+            or values.get("entry") is not entry or values.get("manifest") is not manifest
+            or values.get("journals") is not journals or entry.get("kind") != "check-artifacts"
+            or not isinstance(path, Path) or not path.is_relative_to(registry.state)
+            or path.name != "pytest-artifacts" or not isinstance(users, subprocess.CompletedProcess)
+            or users.args != ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(path)]
+            or type(users.returncode) is not int or users.returncode not in (0, 1)
+            or not isinstance(users.stdout, str) or len(users.stdout) > 16384
+            or not isinstance(observed, list) or not 1 <= len(observed) <= 2):
+            return facts
+    lines = users.stdout.splitlines()
+    if not lines or not all(
+        re.fullmatch(r"p[1-9][0-9]{0,9}", line) and int(line[1:]) < 2**31
+        or re.fullmatch(r"f(?:[0-9]{1,6}[rwu]?|cwd|rtd|txt|mem|DEL)"
+                        if root_observation else r"f(?:[0-9]{1,6}|cwd|rtd|txt|mem|DEL)", line)
+        for line in lines
+    ):
+        return facts
+    holders = [int(line[1:]) for line in lines if line.startswith("p")]
+    if not holders:
+        return facts
+    expected = ("disposable check artifact root has a live holder "
+                f"(count={len(holders)}, pids={','.join(map(str, holders[:8]))})")
+    if (not root_observation and str(exc) != expected) or len(set(holders)) != len(holders):
+        return facts
+    facts["original_holder_count"] = len(holders)
+    holders = holders[:8]
+    census, census_truncated, owner = {}, set(), None
+    for line in lines:
+        if line.startswith("p"):
+            owner = int(line[1:])
+        elif owner is None:
+            return facts
+        elif owner in holders:
+            value = line[1:]
+            if root_observation and re.fullmatch(r"[0-9]{1,6}[rwu]", value):
+                value = value[:-1]
+            rows = census.setdefault(owner, [])
+            if len(rows) < 8:
+                rows.append({"category": "numeric" if value.isdecimal() else value,
+                             "fd": int(value) if value.isdecimal() else None})
+            else:
+                census_truncated.add(owner)
+    fixture_pid = os.getpid()
+    births, birth_inventory_complete = {}, not root_observation
+    if root_observation:
+        raw, sha, journal = (values.get(key) for key in (
+            "journal_bytes", "journal_sha256", "value"))
+        try:
+            if (isinstance(raw, bytes) and len(raw) <= 262144 and isinstance(sha, str)
+                    and sha in journals.values() and hashlib.sha256(raw).hexdigest() == sha
+                    and isinstance(journal, dict) and json.loads(raw) == journal):
+                actors = dict(journal.get("owned", {}))
+                monitor = journal.get("monitor", {})
+                if type(monitor.get("pid")) is int:
+                    actors[str(monitor["pid"])] = monitor
+                for pid in holders:
+                    identity = actors.get(str(pid), {}).get("identity")
+                    if isinstance(identity, str) and 0 < len(identity) <= 128:
+                        births.setdefault(pid, set()).add(identity)
+                birth_inventory_complete = len(journals) == 1
+        except (ValueError, TypeError, AttributeError):
+            births = {}
+    else:
+        allowed = {path.parent / name / "native-process.json"
+                   for name in ("native", "native-retry")}
+        if (not isinstance(journals, (list, tuple)) or not 1 <= len(journals) <= 2
+                or any(not isinstance(item, dict) or not isinstance(item.get("journal"), str)
+                       or not isinstance(item.get("sha256"), str)
+                       or Path(item["journal"]) not in allowed
+                       or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                       for item in observed)
+                or set(map(Path, journals)) != {Path(item["journal"]) for item in observed}):
+            return facts
+        births = {}
+        for item in observed:
+            try:
+                raw = read_private(Path(item["journal"]), raw=True)
+                if len(raw) > 262144 or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                    continue
+                journal = json.loads(raw)
+                actors = dict(journal.get("owned", {}))
+                monitor = journal.get("monitor", {})
+                if type(monitor.get("pid")) is int:
+                    actors[str(monitor["pid"])] = monitor
+                for pid in holders:
+                    identity = actors.get(str(pid), {}).get("identity")
+                    if isinstance(identity, str) and 0 < len(identity) <= 128:
+                        births.setdefault(pid, set()).add(identity)
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+    try:
+        table = process_table()
+        process_state = "available" if isinstance(table, dict) else "unavailable"
+        if not isinstance(table, dict):
+            table = {}
+    except Exception:
+        table, process_state = {}, "unavailable"
+    descriptors = {}
+    commands = {}
+    truncated = set()
+    fd_state = "unavailable"
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", "-a", "-p", ",".join(map(str, holders)),
+             "-F", "pftc", "+D", str(path)], capture_output=True, text=True, timeout=5,
+        )
+        if (type(result.returncode) is int and result.returncode in (0, 1)
+                and isinstance(result.stdout, str) and len(result.stdout) <= 32768
+                and len(result.stdout.splitlines()) <= 1024):
+            pid, row = None, None
+            for line in result.stdout.splitlines():
+                if re.fullmatch(r"p[1-9][0-9]{0,9}", line) and int(line[1:]) in holders:
+                    pid, row = int(line[1:]), None
+                    descriptors.setdefault(pid, [])
+                elif line.startswith("c") and pid is not None:
+                    value = line[1:]
+                    family = {"node": "node", "temporal": "temporal", "java": "java",
+                              "temporal-test-server": "temporal_test_server",
+                              "temporal_test_server": "temporal_test_server"}.get(value)
+                    if re.fullmatch(r"(?:python|Python)(?:[1-9][0-9]?(?:\.[0-9]{1,2}){0,2})?",
+                                    value):
+                        family = "python"
+                    commands[pid] = family or ("other" if 0 < len(value) <= 64 else None)
+                elif line.startswith("f") and pid is not None:
+                    value = line[1:]
+                    numeric = int(value) if re.fullmatch(r"[0-9]{1,6}", value) else None
+                    numeric = numeric if numeric is not None and numeric <= 1048575 else None
+                    category = "numeric" if numeric is not None else (
+                        value if value in {"cwd", "rtd", "txt", "mem", "DEL"} else "unknown")
+                    row = {"category": category, "fd": numeric, "type": None}
+                elif line.startswith("t") and row is not None:
+                    if row["type"] is not None:
+                        raise ValueError("duplicate bounded descriptor type")
+                    row["type"] = line[1:] if line[1:] in {
+                        "REG", "DIR", "CHR", "FIFO", "IPv4", "IPv6", "unix", "KQUEUE", "PIPE"
+                    } else None
+                    if row["category"] != "unknown" and row["type"] is not None:
+                        if len(descriptors[pid]) < 8:
+                            descriptors[pid].append(dict(row))
+                        else:
+                            truncated.add(pid)
+                else:
+                    raise ValueError("unrecognized bounded descriptor record")
+            fd_state = "observed" if any(descriptors.values()) else "not_observed"
+    except Exception:
+        descriptors, commands, fd_state = {}, {}, "unavailable"
+
+    def pid_number(value):
+        return value if type(value) is int and 0 <= value < 2**31 else None
+
+    rows = []
+    categories = {"R": "running", "S": "sleeping", "I": "idle", "T": "stopped",
+                  "t": "stopped", "Z": "zombie", "U": "uninterruptible", "D": "uninterruptible"}
+    for pid in holders:
+        current = table.get(pid)
+        current = current if isinstance(current, dict) else {}
+        identity, status = current.get("identity"), current.get("stat")
+        identity = identity if isinstance(identity, str) and 0 < len(identity) <= 128 else None
+        status = status if isinstance(status, str) and re.fullmatch(
+            r"[RSDTtZIXU][<N+LsEesl-]{0,8}", status) else None
+        rows.append({"pid": pid, "ppid": pid_number(current.get("ppid")),
+                     "pgid": pid_number(current.get("pgid")),
+                     "original_census_descriptors": census.get(pid) or None,
+                     "original_census_sample_truncated": pid in census_truncated
+                     if pid in census else None,
+                     "parent_is_fixture": current["ppid"] == fixture_pid
+                     if pid_number(current.get("ppid")) is not None else None,
+                     "process_state": categories.get(status[0]) if status else None,
+                     "command_family": commands.get(pid),
+                     "recorded_birth_match": (identity in births[pid]
+                                              if birth_inventory_complete or identity in births[pid]
+                                              else None)
+                     if identity is not None and pid in births else None,
+                     "descriptors": descriptors.get(pid) or None,
+                     "descriptor_sample_truncated": pid in truncated
+                     if pid in descriptors else None})
+    facts.update(state="snapshot", fixture_pid=fixture_pid,
+                 process_snapshot=process_state, fd_snapshot=fd_state,
+                 descriptor_sample_limit=8, holders=rows)
+    return facts
+
+
+def observe_artifact_holder_failures(patch):
+    original_dispose = RunResources._dispose_check_artifacts
+
+    def dispose_with_failure_snapshot(registry, path, entry, manifest, journals):
+        try:
+            return original_dispose(registry, path, entry, manifest, journals)
+        except ValueError as exc:
+            try:
+                snapshot = artifact_holder_failure_snapshot(
+                    exc, original_dispose, registry, path, entry, manifest, journals)
+                if snapshot is not None:
+                    print(json.dumps({"scope_artifact_holder_snapshot": snapshot}, sort_keys=True),
+                          file=sys.stderr, flush=True)
+            except BaseException:
+                pass  # Diagnostic failure must preserve the original refusal and traceback.
+            raise
+
+    patch.setattr(RunResources, "_dispose_check_artifacts", dispose_with_failure_snapshot)
+
+
 async def actual_worker(case, current, recovery, response, patch):
     """Actual workflow, readback, native checks/browser/finalization and replay.
 
@@ -1368,6 +1632,7 @@ async def actual_worker(case, current, recovery, response, patch):
     from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
     from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
+    observe_artifact_holder_failures(patch)
     original_checks = DeliveryBroker._run_check_list
     native_checks = []
 
