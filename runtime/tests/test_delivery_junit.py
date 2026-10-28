@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 
 import pytest
-from runtime_location_scenario import observe_artifact_holder_failures
+from runtime_location_scenario import (
+    observe_artifact_holder_failures,
+    worker_failure_diagnostic,
+)
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 
@@ -50,7 +53,9 @@ def test_actual_broker_enforces_delegated_report_and_retains_it_after_cleanup(
     broker = DeliveryBroker(store, spec)
     candidate = broker.prepare()['candidate']
     result = broker.run_checks(0, candidate)
-    assert result['state'] == ('passed' if outcome == 'pass' else 'failed')
+    assert result['state'] == ('passed' if outcome == 'pass' else 'failed'), json.dumps(
+        worker_failure_diagnostic({}, [], [result])['checks'][0], sort_keys=True
+    )
     report = result['results'][-1]
     assert report['plan_provenance']['recipe'] == 'checks.scripts'
     assert report['test_count'] == (1 if outcome == 'pass' else 0)

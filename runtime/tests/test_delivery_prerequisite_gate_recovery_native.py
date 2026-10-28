@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from runtime_location_scenario import worker_failure_diagnostic
 from test_delivery_prerequisite_gate_recovery import stopped_prerequisite
 from test_delivery_store import service as service
 
@@ -100,7 +101,10 @@ async def test_native_published_prerequisite_reentry_runs_every_original_gate_on
         async def role(body):
             calls.append(body["role"])
             assert body["iteration"] == 3 and body["role"] in {"review", "verify"}
-            assert body["check_evidence"]["state"] == "passed"
+            assert body["check_evidence"]["state"] == "passed", json.dumps(
+                worker_failure_diagnostic({}, [], [body["check_evidence"]])["checks"][0],
+                sort_keys=True,
+            )
             assert body["check_evidence"]["candidate_id"] == recovery["candidate"]["id"]
             return {
                 "role": body["role"],
