@@ -59,6 +59,7 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
     """SDK, service and dispatcher are real; fresh-installation cutover is controlled."""
     import asyncio
     import json
+    from contextlib import AsyncExitStack
 
     from temporal_test_server import local_temporal
     from temporalio.service import RPCError, RPCStatusCode
@@ -97,8 +98,34 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
                                       .fetchone())
         # A fresh service reads the durable pause before the explicit resume.
         restarted = create_app(old.config.path)
-        from devflow_temporal import delivery_pause_dispatch
+        from devflow_temporal import delivery_pause_dispatch, delivery_pause_intake_pump
 
+        original_pump = delivery_pause_intake_pump.pump
+        original_features = restarted.state.delivery.reproject_features_once
+        dispatch_complete, intake_complete = asyncio.Event(), asyncio.Event()
+        parked = asyncio.Event()
+        final_epoch, sent_observed = None, False
+
+        async def complete_intake(store, *args, **kwargs):
+            result = await original_pump(store, *args, **kwargs)
+            if (store is restarted.state.delivery.store and final_epoch is not None
+                    and any(item.get('root_id') == 'run-1' and item.get('epoch') == final_epoch
+                            and item.get('state') == 'running' for item in result['results'])):
+                # The real activation and its joined status cleanup have returned.
+                intake_complete.set()
+                await parked.wait()
+            return result
+
+        async def complete_dispatch():
+            result = await original_features()
+            if sent_observed:
+                # All preceding real maintenance has returned before cancellation.
+                dispatch_complete.set()
+                await parked.wait()
+            return result
+
+        monkeypatch.setattr(delivery_pause_intake_pump, 'pump', complete_intake)
+        monkeypatch.setattr(restarted.state.delivery, 'reproject_features_once', complete_dispatch)
         original_send_start = delivery_pause_dispatch.send_start
         entered, release = asyncio.Event(), asyncio.Event()
         first_dispatch = True
@@ -114,7 +141,8 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
         monkeypatch.setattr(delivery_pause_dispatch, 'send_start', race_before_start)
         async with (Worker(environment.client, task_queue=restarted.state.delivery.config.queue,
                            workflow_runner=UnsandboxedWorkflowRunner(), workflows=[IntakeWorker]),
-                    restarted.router.lifespan_context(restarted)):
+                    AsyncExitStack() as service_lifetime):
+            await service_lifetime.enter_async_context(restarted.router.lifespan_context(restarted))
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=restarted),
                                          base_url=origin) as client:
                 session = await client.get('/api/session')
@@ -145,6 +173,7 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
                 with pytest.raises(RPCError) as missing:
                     await environment.client.get_workflow_handle('delivery-run-1').describe()
                 assert missing.value.status == RPCStatusCode.NOT_FOUND
+                final_epoch = status['epoch']
                 resumed = await client.post('/api/runs/run-1/resume', headers=headers,
                                             json={'command_id': 'resume-after-race',
                                                   'expected_revision': status['revision'],
@@ -155,7 +184,9 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
                         with restarted.state.delivery.store._connect() as db:
                             row = db.execute("SELECT state FROM delivery_outbox "
                                              "WHERE run_id='run-1'").fetchone()
-                        if row[0] == 'sent':
+                        sent_observed = row[0] == 'sent'
+                        if (sent_observed and dispatch_complete.is_set()
+                                and intake_complete.is_set()):
                             break
                         await asyncio.sleep(.1)
                 handle = environment.client.get_workflow_handle('delivery-run-1')
@@ -176,6 +207,13 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
                     run_after = db.execute("SELECT * FROM delivery_runs WHERE run_id='run-1'")
                     run_after = run_after.fetchone()
                     assert run_after['request_json'] == run_before['request_json']
+                late = await client.post('/api/runs/run-1/pause', headers=headers,
+                                         json={'command_id': 'late-pause',
+                                               'expected_revision': status['revision']})
+                assert late.status_code == 409
+                assert 'after start admission' in late.text
+                # Stop at pure fixture gates; dispatch finally joins its retained retry task.
+                await service_lifetime.aclose()
                 from devflow_temporal.delivery_pause_dispatch import bind_start
 
                 spec = restarted.state.delivery.store.effective_spec('run-1')
@@ -188,9 +226,4 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
                     assert db.execute("SELECT COUNT(*) FROM delivery_pause_start_receipts "
                                       "WHERE root_id='run-1'").fetchone()[0] == 1
                 assert (await handle.describe()).run_id == description.run_id
-                late = await client.post('/api/runs/run-1/pause', headers=headers,
-                                         json={'command_id': 'late-pause',
-                                               'expected_revision': status['revision']})
-                assert late.status_code == 409
-                assert 'after start admission' in late.text
                 await handle.terminate('owned fixture cleanup')
