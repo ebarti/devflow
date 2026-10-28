@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  DEVFLOW_CI_FAILURE_DIAGNOSTICS: runner-custody-v1
+
 concurrency:
   group: check-${{ github.ref }}
   cancel-in-progress: true

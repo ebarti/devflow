@@ -37,7 +37,29 @@ def stamp(info):
                                          "st_size", "st_mtime_ns", "st_ctime_ns")]
 
 
-def opened(path, *, private=False, owned=True):
+def custody_failure_diagnostic(info, private, owned, role):
+    if (os.environ.get("DEVFLOW_CI_FAILURE_DIAGNOSTICS") != "runner-custody-v1"
+            or os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("GITHUB_REPOSITORY") != "ebarti/devflow"):
+        return
+    try:
+        roles = {"site_registration", "site_support", "base_interpreter", "git_observer",
+                 "venv_configuration", "bootstrap_metadata", "source_manifest",
+                 "bootstrap_helper", "tracked_source", "registered_site"}
+        facts = {"role": role if role in roles else "unspecified",
+                 "regular_file": stat.S_ISREG(info.st_mode), "owner_required": bool(owned),
+                 "owner_matches": info.st_uid == os.getuid() if owned else None,
+                 "group_or_other_writable": bool(info.st_mode & 0o022),
+                 "private_required": bool(private),
+                 "private_mode_matches": stat.S_IMODE(info.st_mode) == 0o600 if private else None,
+                 "private_single_link": info.st_nlink == 1 if private else None,
+                 "within_size_limit": info.st_size <= 64 * 1024 * 1024}
+        print(json.dumps({"source_custody_refusal": facts}, sort_keys=True), file=sys.stderr)
+    except BaseException:
+        pass
+
+
+def opened(path, *, private=False, owned=True, role="unspecified"):
     path = Path(path)
     if not path.is_absolute() or path.resolve(strict=True) != path:
         raise ValueError("qualified source contains an alias")
@@ -48,6 +70,7 @@ def opened(path, *, private=False, owned=True):
                 or before.st_mode & 0o022 or (private and (
                     stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1))
                 or before.st_size > 64 * 1024 * 1024):
+            custody_failure_diagnostic(before, private, owned, role)
             raise ValueError("qualified source file lost its protected custody")
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             raw = stream.read(before.st_size + 1)
@@ -59,8 +82,8 @@ def opened(path, *, private=False, owned=True):
         os.close(descriptor)
 
 
-def private(path):
-    raw, _stamp = opened(path, private=True)
+def private(path, *, role="unspecified"):
+    raw, _stamp = opened(path, private=True, role=role)
     if len(raw) > LIMIT:
         raise ValueError("qualified source evidence exceeds its bound")
     return json.loads(raw), sha(raw)
@@ -92,15 +115,16 @@ def build(root, base_python, git_bin, revision, tree):
     if len(site_paths) != 1:
         raise ValueError("qualified source requires one owned site-packages directory")
     site = site_paths[0]
-    site_files = {str(file.relative_to(root)): sha(opened(file)[0]) for file in sorted(site.glob("*.pth"))}
+    site_files = {str(file.relative_to(root)): sha(opened(file, role="site_registration")[0])
+                  for file in sorted(site.glob("*.pth"))}
     for name in ("_virtualenv.py",):
         if (site / name).exists():
-            site_files[str((site / name).relative_to(root))] = sha(opened(site / name)[0])
-    base_raw, _base_stamp = opened(base_python, owned=False)
-    git_raw, _git_stamp = opened(git_bin, owned=False)
+            site_files[str((site / name).relative_to(root))] = sha(opened(site / name, role="site_support")[0])
+    base_raw, _base_stamp = opened(base_python, owned=False, role="base_interpreter")
+    git_raw, _git_stamp = opened(git_bin, owned=False, role="git_observer")
     return {"schema": SCHEMA, "root": str(root), "revision": revision, "tree": tree,
             "source": source, "site": site_files, "site_root": str(site.relative_to(root)),
-            "venv_config_sha256": sha(opened(root / "runtime/.venv/pyvenv.cfg")[0]),
+            "venv_config_sha256": sha(opened(root / "runtime/.venv/pyvenv.cfg", role="venv_configuration")[0]),
             "base_python": str(base_python), "base_python_sha256": sha(base_raw),
             "git_bin": str(git_bin), "git_sha256": sha(git_raw)}
 
@@ -120,10 +144,10 @@ def active(root):
     folder = value["owner"] / ".production-bootstraps" / (value["birth"]["revision"] + "-" + value["generation_id"])
     if not startup or startup.get("directory") != str(folder):
         raise ValueError("generation has no qualified startup manifest; prepare a supported successor")
-    metadata, metadata_sha = private(folder / "manifest.json")
-    manifest, manifest_sha = private(folder / "source.json")
+    metadata, metadata_sha = private(folder / "manifest.json", role="bootstrap_metadata")
+    manifest, manifest_sha = private(folder / "source.json", role="source_manifest")
     if (metadata_sha != startup["manifest_sha256"] or manifest_sha != metadata["source_manifest_sha256"]
-            or sha(opened(folder / "production-source.py", private=True)[0]) != metadata["source_helper_sha256"]
+            or sha(opened(folder / "production-source.py", private=True, role="bootstrap_helper")[0]) != metadata["source_helper_sha256"]
             or manifest.get("schema") != SCHEMA or manifest.get("root") != str(root)
             or manifest.get("revision") != value["birth"]["revision"]
             or manifest.get("tree") != value["birth"]["tree"]):
@@ -172,7 +196,9 @@ def source_stamps(root, manifest, *, hashing):
     for name, expected_sha in expected.items():
         file = root / name
         if hashing:
-            raw, observed = opened(file)
+            role = ("tracked_source" if name in manifest["source"] else
+                    "registered_site" if name in manifest["site"] else "venv_configuration")
+            raw, observed = opened(file, role=role)
             if sha(raw) != expected_sha:
                 raise ValueError("qualified source bytes differ from the requested Git/environment manifest: " + name)
         else:
@@ -188,8 +214,8 @@ def check_image(root):
             or git(manifest["git_bin"], root, "status", "--porcelain", "--untracked-files=normal", "--", *SCOPES).strip()):
         raise ValueError("qualified source HEAD/tree or clean state changed before imports")
     files = source_stamps(root, manifest, hashing=True)
-    base_raw, base_stamp = opened(Path(manifest["base_python"]), owned=False)
-    git_raw, git_stamp = opened(Path(manifest["git_bin"]), owned=False)
+    base_raw, base_stamp = opened(Path(manifest["base_python"]), owned=False, role="base_interpreter")
+    git_raw, git_stamp = opened(Path(manifest["git_bin"]), owned=False, role="git_observer")
     if sha(base_raw) != manifest["base_python_sha256"] or sha(git_raw) != manifest["git_sha256"]:
         raise ValueError("qualified interpreter or Git observer changed")
     return value, folder, manifest, manifest_sha, files, base_stamp, git_stamp
