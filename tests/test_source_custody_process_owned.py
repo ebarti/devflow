@@ -80,6 +80,81 @@ def release_owned_child(release, child_record, parent_record, required, *, regis
     stop_owned_child(identity['pid'], identity['birth'], required)
 
 
+def note_child_release_failure(error, required):
+    """Retain only the original refused observation on opted-in CI runners."""
+    try:
+        if (os.environ.get('DEVFLOW_CI_FAILURE_DIAGNOSTICS') != 'runner-custody-v1'
+                or os.environ.get('GITHUB_ACTIONS') != 'true'
+                or os.environ.get('GITHUB_REPOSITORY') != 'ebarti/devflow'):
+            return
+        if error.args != ('child command no longer matches the owned fixture',):
+            return
+        frames = []
+        trace = error.__traceback__
+        while trace is not None and len(frames) < 8:
+            frames.append(trace.tb_frame)
+            trace = trace.tb_next
+        if trace is not None:
+            return
+        release_frames = [index for index, frame in enumerate(frames)
+                          if frame.f_code is release_owned_child.__code__]
+        if len(release_frames) != 1:
+            return
+        frames = frames[release_frames[0]:]
+        if len(frames) == 2 and frames[1].f_code is child_identity.__code__:
+            stage = 'release_poll'
+        elif (len(frames) == 3 and frames[1].f_code is stop_owned_child.__code__
+              and frames[2].f_code is child_identity.__code__):
+            stage = 'stop_owned_child'
+        else:
+            return
+        if (type(required) is not tuple or len(required) != 5
+                or any(type(value) is not str or not 0 < len(value) <= 4096 for value in required)
+                or any(frame.f_locals.get('required') is not required for frame in frames)):
+            return
+        if any(frame.f_globals is not globals() for frame in frames):
+            return
+        identity = frames[0].f_locals.get('identity')
+        if (type(identity) is not dict or type(identity.get('pid')) is not int
+                or not 0 < identity['pid'] <= 2**31 - 1
+                or type(identity.get('birth')) is not str or not 0 < len(identity['birth']) <= 256):
+            return
+        if stage == 'stop_owned_child' and (frames[1].f_locals.get('pid') != identity['pid']
+                                           or frames[1].f_locals.get('birth') != identity['birth']):
+            return
+        observed = frames[-1].f_locals
+        result, fields = observed.get('result'), observed.get('fields')
+        if (observed.get('pid') != identity['pid'] or type(result) is not subprocess.CompletedProcess
+                or result.args != ['ps', '-ww', '-p', str(identity['pid']), '-o', 'stat=',
+                                   '-o', 'lstart=', '-o', 'command=']
+                or type(result.returncode) is not int or result.returncode != 0
+                or type(result.stdout) is not str or not 0 < len(result.stdout) <= 32768
+                or type(result.stderr) is not str or len(result.stderr) > 32768
+                or type(fields) is not list or fields != result.stdout.strip().split(None, 6)
+                or len(fields) != 7 or fields[0].startswith('Z')):
+            return
+        membership = dict(zip(('config', 'child_record', 'release', 'finished', 'ready'),
+                              (value in fields[6] for value in required)))
+        if all(membership.values()):
+            return
+        stat = fields[0]
+        category = None
+        if stat.isascii() and 0 < len(stat) <= 16:
+            category = {'R': 'running', 'S': 'sleeping', 'I': 'idle', 'T': 'stopped',
+                        'U': 'uninterruptible', 'D': 'uninterruptible', 'X': 'dead'}.get(stat[0], 'other')
+        facts = {'caller_stage': stage, 'release_requested': True,
+                 'original_exception_context_present': error.__context__ is not None,
+                 'returncode': result.returncode, 'field_count': min(len(fields), 16),
+                 'stat_category': category, 'stderr_present': bool(result.stderr.strip()),
+                 'required_role_matches': membership,
+                 'recorded_birth_match': ' '.join(fields[1:6]) == identity['birth']}
+        note = json.dumps({'source_child_release_refusal': facts}, sort_keys=True)
+        if len(note.encode('utf-8')) <= 2048:
+            error.add_note(note)
+    except BaseException:  # noqa: BLE001 - Preserve the original refusal if diagnostics fail.
+        return
+
+
 def finish_direct_process(process):
     """Bound all waits and reap this direct child even on a readiness failure."""
     try:
@@ -287,7 +362,11 @@ class SourceCustodyPublicProcesses(GenerationFixture):
             finally:
                 os.close(lock)
         finally:
-            release_owned_child(release, child_record, parent_record, required)
+            try:
+                release_owned_child(release, child_record, parent_record, required)
+            except AssertionError as error:
+                note_child_release_failure(error, required)
+                raise
         self.assertTrue(finished.exists(), error_log.read_text() if error_log.exists() else 'child did not finish')
         lock = os.open(root.parent.parent.parent / '.production-install.lock', os.O_RDWR | os.O_NOFOLLOW)
         try:
