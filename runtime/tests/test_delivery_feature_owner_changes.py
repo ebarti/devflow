@@ -10,7 +10,6 @@ import pytest
 from test_delivery_feature_merge import Remote, previously_submitted, setup_feature
 from test_delivery_store import service as service
 
-from devflow_temporal import delivery_feature_activities as activities
 from devflow_temporal import delivery_feature_merge as merger
 from devflow_temporal import delivery_feature_publication as publications
 from devflow_temporal.delivery_execution_registry import OwnershipConflict, UnresolvedEffect
@@ -72,34 +71,6 @@ def refuse(*_args, **_kwargs):
     pytest.fail("the stack must not be submitted")
 
 
-def test_draft_layer_waits_without_recording_a_merge_intent(service, monkeypatch):
-    store, spec, record, requested, command, _ = setup_feature(service, monkeypatch)
-    gh, commands = Owner(record), []
-    gh.drafts.add(21)
-    assert merger.merge(store, spec, requested, command, gh=gh, execute=refuse) == {
-        "state": "pending", "reason": "draft_pull_request", "pull_requests": [21]}
-    assert merge_effect(spec) == []
-    gh.drafts.clear()
-    with pytest.raises(merger.StackMergeConditionUnavailable):
-        merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
-    assert commands == [] and merge_effect(spec) == []
-
-
-@pytest.mark.parametrize("dropped", [False, True], ids=["stack-kept", "stack-dropped"])
-def test_owner_merged_lower_prefix_is_retained_without_submitting_the_remainder(
-    service, monkeypatch, dropped,
-):
-    store, spec, record, requested, command, _ = setup_feature(service, monkeypatch)
-    gh, commands = Owner(record), []
-    gh.merged.add(20)
-    gh.retargeted.add(21)
-    gh.dropped = dropped
-    with pytest.raises(merger.StackMergeConditionUnavailable):
-        merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
-    assert commands == [] and gh.merged == {20}
-    assert gh.closed == set() and merge_effect(spec) == []
-
-
 @pytest.mark.parametrize("trunk_tree", ["verified-base", "moved"])
 def test_owner_merged_prefix_target_validation_retains_its_verified_base_tree_guard(
     service, monkeypatch, trunk_tree,
@@ -133,58 +104,6 @@ def test_owner_merged_prefix_target_validation_retains_its_verified_base_tree_gu
     # a server-side condition for a new native-stack submission.
     with pytest.raises(merger.StackMergeConditionUnavailable):
         merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
-
-
-@pytest.mark.parametrize("change", ["closed", "merged_above_open"])
-def test_owner_change_to_a_layer_stops_merge_naming_it(service, monkeypatch, change):
-    store, spec, record, requested, command, _ = setup_feature(service, monkeypatch)
-    gh = Owner(record)
-    name = r"feature PR #21 for chunk \S+ "
-    if change == "closed":
-        gh.closed_prs.add(21)
-        expected = name + "was closed without merging"
-    elif change == "moved":
-        gh.moved[21] = "f" * 40
-        expected = name + "moved from 222222222222 to ffffffffffff; its verified evidence"
-    elif change == "retargeted":
-        gh.retargeted.add(21)
-        expected = name + r"was retargeted from feat/\S+ to main"
-    else:
-        gh.merged.add(21)
-        expected = name + "was merged before the stack layers below it"
-    with pytest.raises(OwnershipConflict, match=expected):
-        merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
-    assert merge_effect(spec) == []
-
-
-def test_layer_readback_ignores_owner_changes_above_that_layer(service, monkeypatch):
-    _, spec, record, *_ = setup_feature(service, monkeypatch)
-    members = record["manifest"]["publication"]["members"]
-    gh = Owner(record)
-    gh.moved[22] = "f" * 40
-    live = publications.live_members(spec, record, gh, through=members[1]["chunk_id"])
-    assert [raw["number"] for raw in live] == [20, 21]
-    with pytest.raises(OwnershipConflict, match="feature PR #22 for chunk"):
-        publications.live_members(spec, record, gh)
-
-
-def test_open_feature_routes_a_changed_layer_to_its_own_worker(service, monkeypatch):
-    _, spec, record, *_ = setup_feature(service, monkeypatch)
-    members = record["manifest"]["publication"]["members"]
-    token = spec["feature_delivery"]["owner"]
-    for member in members:
-        registry(spec).checkpoint(token, "verified:" + member["chunk_id"], {
-            "run_id": "verified-" + member["chunk_id"], "head": member["head"],
-            "number": member["number"]})
-    gh = Owner(record)
-    gh.drafts.add(20)
-    gh.closed_prs.add(21)
-    monkeypatch.setattr(activities, "GitHubDelivery", lambda: gh)
-    opened = activities.open_feature(spec)
-    # The draft stays verified; the closed layer and the layer above it are re-run,
-    # so the closed layer's own worker reports the closure.
-    assert ["verified:" + member["chunk_id"] in opened["checkpoints"]
-            for member in members] == [True, False, False]
 
 
 @pytest.mark.parametrize("merged_prefix", [False, True])

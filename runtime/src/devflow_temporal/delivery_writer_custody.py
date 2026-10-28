@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -673,19 +674,39 @@ def _table(db, name):
 
 def _inventory(db, run_id):
     prefix = "publish:" + run_id + ":"
-    executors = []
-    if _table(db, "delivery_publication_executors"):
-        executors = [dict(row) for row in db.execute(
-            "SELECT * FROM delivery_publication_executors "
-            "WHERE substr(effect_key,1,?)=? ORDER BY effect_key", (len(prefix), prefix))]
-    return {
-        "publication_executors": executors,
-        "merge_requests": [dict(row) for row in db.execute(
-            "SELECT * FROM delivery_merge_requests WHERE run_id=? ORDER BY run_id", (run_id,))],
-        "merge_executions": [dict(row) for row in db.execute(
-            "SELECT * FROM delivery_merge_executions WHERE run_id=? ORDER BY workflow_id",
-            (run_id,))] if _table(db, "delivery_merge_executions") else [],
-    }
+    owned = not db.in_transaction
+    if owned:
+        db.execute("BEGIN")
+    try:
+        result, count, size = {}, 0, 0
+        for name, table, where, args, order in (
+            ("publication_executors", "delivery_publication_executors",
+             "effect_key>=? AND effect_key<?", (prefix, prefix[:-1] + ";"), "effect_key"),
+            ("merge_requests", "delivery_merge_requests", "run_id=?", (run_id,), "run_id"),
+            ("merge_executions", "delivery_merge_executions", "run_id=?", (run_id,), "workflow_id"),
+        ):
+            result[name] = []
+            if not _table(db, table):
+                continue
+            columns = [row[1] for row in db.execute(f"PRAGMA table_info({table})")]
+            if (not columns or len(columns) > 64
+                    or any(not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", col) for col in columns)):
+                raise ValueError("checkpoint writer inventory schema is unsupported")
+            lengths = [f"coalesce(length(CAST({col} AS BLOB)),0)" for col in columns]
+            for largest, total in db.execute(
+                f"SELECT max({','.join(lengths)}),{'+'.join(lengths)} FROM {table} "
+                f"WHERE {where} LIMIT ?", (*args, 513 - count),
+            ):
+                count += 1
+                size += total
+                if count > 512 or largest > 256 * 1024 or size > 4 * 1024 * 1024:
+                    raise ValueError("checkpoint writer inventory exceeds its bounded snapshot")
+            result[name] = [dict(row) for row in db.execute(
+                f"SELECT * FROM {table} WHERE {where} ORDER BY {order}", args)]
+        return result
+    finally:
+        if owned:
+            db.rollback()
 
 
 class CheckpointWriters:
@@ -767,6 +788,21 @@ class CheckpointWriters:
                 raise ValueError("checkpoint publication writer lock changed")
         if self.additional is not None:
             self.additional.verify(db)
+
+    def verify_token(self, db):
+        """Physical token only; caller separately fences the captured SQL inventory."""
+        self.lease.check()
+        if self.shared_merge_lease is not None:
+            self.shared_merge_lease.verify(self.store.config)
+        for path, descriptor, identity in self.executor_locks:
+            if (_identity(os.fstat(descriptor)) != identity
+                    or _identity(path.lstat()) != identity):
+                raise ValueError("checkpoint publication writer lock changed")
+        if self.additional is not None:
+            verify = getattr(self.additional, "verify_token", None)
+            if verify is None:
+                raise ValueError("checkpoint additional writer has no bounded verification token")
+            verify(db)
 
     def __exit__(self, *args):
         return self.stack.__exit__(*args)
