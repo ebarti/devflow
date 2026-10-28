@@ -73,7 +73,9 @@ def durable_fence(store, spec, epoch=1):
 
 
 @pytest.fixture
-def stopped(service):
+def stopped(service, monkeypatch):
+    from runtime_location_scenario import observe_checkpoint_holder_failures
+
     store, request = service
     configuration = json.loads(store.config.path.read_text())
     configuration["workspace_custody_version"] = 1
@@ -81,6 +83,7 @@ def stopped(service):
     store = DeliveryStore(DeliveryConfig.load(store.config.path))
     store.submit(request)
     spec = store.effective_spec(request["run_id"])
+    observe_checkpoint_holder_failures(monkeypatch, spec)
     broker = DeliveryBroker(store, spec)
     checkout = Path(spec["checkout"])
     checkout.parent.mkdir(parents=True, mode=0o700, exist_ok=True)

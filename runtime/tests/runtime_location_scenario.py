@@ -1365,18 +1365,105 @@ def assert_native_checks_passed(result, calls, native_checks, *, state_dir=None)
     )
 
 
+def ci_failure_diagnostics():
+    return (os.environ.get("DEVFLOW_CI_FAILURE_DIAGNOSTICS") == "runner-custody-v1"
+            and os.environ.get("GITHUB_ACTIONS") == "true"
+            and os.environ.get("GITHUB_REPOSITORY") == "ebarti/devflow")
+
+
+def holder_executable_observation(pid, sampled_birth):
+    """One bounded kernel lookup; output is a label, never identity/authority."""
+    import re
+
+    if not ci_failure_diagnostics():
+        return {"state": "disabled"}
+    unavailable = {"state": "unavailable", "sample_birth_revalidated": None}
+    if (type(pid) is not int or not 0 < pid < 2**31 or not isinstance(sampled_birth, str)
+            or not 0 < len(sampled_birth) <= 128):
+        return unavailable
+    # SDK proc_bsdinfo layout: 12 uint32s, comm[16], name[32], six 32-bit
+    # values, then high-resolution start seconds/useconds. No names are read.
+    script = r'''
+import ctypes,json,os,sys,time
+value=json.load(sys.stdin)
+class BSD(ctypes.Structure):
+    _fields_=[("head",ctypes.c_uint32*12),("labels",ctypes.c_char*48),
+              ("tail",ctypes.c_uint32*6),("sec",ctypes.c_uint64),("usec",ctypes.c_uint64)]
+facts={"state":"unavailable","sample_birth_revalidated":None}
+try:
+    library=ctypes.CDLL("/usr/lib/libproc.dylib")
+    library.proc_pidinfo.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_uint64,ctypes.c_void_p,ctypes.c_int]
+    library.proc_pidpath.argtypes=[ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
+    def birth():
+        record=BSD()
+        count=library.proc_pidinfo(value["pid"],3,0,ctypes.byref(record),ctypes.sizeof(record))
+        if count!=ctypes.sizeof(record):
+            raise ValueError()
+        if record.head[3]!=value["pid"] or not record.sec:
+            raise ValueError()
+        return record.sec,record.usec
+    before=birth()
+    stamp=time.strptime(" ".join(value["birth"].split()),"%a %b %d %H:%M:%S %Y")
+    expected=int(time.mktime(stamp))
+    buffer=ctypes.create_string_buffer(4096)
+    length=library.proc_pidpath(value["pid"],buffer,len(buffer))
+    after=birth()
+    if before!=after or before[0]!=expected:
+        facts["sample_birth_revalidated"]=False
+    elif 0<length<len(buffer):
+        image=buffer.value.decode("utf-8")
+        if not os.path.isabs(image):
+            raise ValueError()
+        name=os.path.basename(image)
+        if 0<len(name)<=64 and all(32<=ord(char)<127 for char in name) and name not in {".",".."}:
+            facts={"state":"observed","basename":name,"sample_birth_revalidated":True}
+except BaseException:
+    pass
+sys.stdout.write(json.dumps(facts))
+'''
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", script],
+            input=json.dumps({"pid": pid, "birth": sampled_birth}), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+        if result.returncode != 0 or len(result.stdout) > 512:
+            return unavailable
+        value = json.loads(result.stdout)
+        if value == unavailable or value == {**unavailable, "sample_birth_revalidated": False}:
+            return value
+        if (isinstance(value, dict) and set(value) == {
+                "state", "basename", "sample_birth_revalidated"}
+                and value["state"] == "observed" and value["sample_birth_revalidated"] is True
+                and isinstance(value["basename"], str)
+                and re.fullmatch(r"[ -~]{1,64}", value["basename"])
+                and "/" not in value["basename"] and value["basename"] not in {".", ".."}):
+            return value
+    except Exception:
+        pass
+    return unavailable
+
+
 def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, entry=None,
-                                    manifest=None, journals=None, *, root_observation=False):
+                                    manifest=None, journals=None, *, root_observation=False,
+                                    checkpoint_spec=None):
     """Post-refusal observations are not atomic holder identity or cleanup authority."""
     import re
 
     from devflow_temporal.delivery_native_process import process_table
 
-    if root_observation:
+    checkpoint = checkpoint_spec is not None
+    if checkpoint:
+        from devflow_temporal.delivery_checkpoints import _openers
+
+        if (str(exc) != "checkpoint workspace still has an open actor or unknown writer"
+                or original is not getattr(_openers, "_original_custody_guard", _openers)
+                or not ci_failure_diagnostics()):
+            return None
+    elif root_observation:
         from devflow_temporal import delivery_resources as resources
 
+        observer = resources._observe_locked_resources
         if (str(exc) != "predecessor has a live root user or unreadable lease"
-                or original is not resources._observe_locked_resources):
+                or original is not getattr(observer, "_original_custody_guard", observer)):
             return None
     elif not re.fullmatch(
         r"disposable check artifact root has a live holder "
@@ -1391,7 +1478,18 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
     if trace is None:
         return facts
     values = trace.tb_frame.f_locals
-    if root_observation:
+    if checkpoint:
+        path, users = values.get("checkout"), values.get("observed")
+        if not isinstance(checkpoint_spec, dict) or not isinstance(path, Path):
+            return facts
+        homes = {Path(checkpoint_spec["state_dir"]) / "role-homes" / role
+                 for role in ("implement", "review", "verify")}
+        if (path != Path(checkpoint_spec["checkout"]) and path not in homes
+                or not isinstance(users, subprocess.CompletedProcess)
+                or users.args != ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(path)]):
+            return facts
+        facts["root_kind"] = "checkout" if path not in homes else "role_home"
+    elif root_observation:
         registry, path, entry, manifest, journals = (
             values.get(key) for key in ("registry", "path", "entry", "manifest", "journals"))
         spec, users = values.get("spec"), values.get("observed")
@@ -1414,8 +1512,10 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
                 or users.args != ["/usr/sbin/lsof", "-nP", "-F", "p", "+D", str(path)]):
             return facts
         kind = entry.get("kind")
-        facts.update(root_kind=kind if isinstance(kind, str) and kind in {"checkout", "gate"}
-                     else "other", original_holder_count=None,
+        facts["root_kind"] = (kind if isinstance(kind, str) and kind in {"checkout", "gate"}
+                              else "other")
+    if checkpoint or root_observation:
+        facts.update(original_holder_count=None,
                      inspection_returncode=users.returncode
                      if type(users.returncode) is int and -255 <= users.returncode <= 255
                      else None,
@@ -1439,7 +1539,8 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
     if not lines or not all(
         re.fullmatch(r"p[1-9][0-9]{0,9}", line) and int(line[1:]) < 2**31
         or re.fullmatch(r"f(?:[0-9]{1,6}[rwu]?|cwd|rtd|txt|mem|DEL)"
-                        if root_observation else r"f(?:[0-9]{1,6}|cwd|rtd|txt|mem|DEL)", line)
+                        if root_observation or checkpoint
+                        else r"f(?:[0-9]{1,6}|cwd|rtd|txt|mem|DEL)", line)
         for line in lines
     ):
         return facts
@@ -1448,7 +1549,8 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
         return facts
     expected = ("disposable check artifact root has a live holder "
                 f"(count={len(holders)}, pids={','.join(map(str, holders[:8]))})")
-    if (not root_observation and str(exc) != expected) or len(set(holders)) != len(holders):
+    if (not (root_observation or checkpoint) and str(exc) != expected
+            or len(set(holders)) != len(holders)):
         return facts
     facts["original_holder_count"] = len(holders)
     holders = holders[:8]
@@ -1460,7 +1562,7 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
             return facts
         elif owner in holders:
             value = line[1:]
-            if root_observation and re.fullmatch(r"[0-9]{1,6}[rwu]", value):
+            if (root_observation or checkpoint) and re.fullmatch(r"[0-9]{1,6}[rwu]", value):
                 value = value[:-1]
             rows = census.setdefault(owner, [])
             if len(rows) < 8:
@@ -1469,8 +1571,10 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
             else:
                 census_truncated.add(owner)
     fixture_pid = os.getpid()
-    births, birth_inventory_complete = {}, not root_observation
-    if root_observation:
+    births, birth_inventory_complete = {}, not (root_observation or checkpoint)
+    if checkpoint:
+        pass  # No original actor inventory is yielded by this guard.
+    elif root_observation:
         raw, sha, journal = (values.get(key) for key in (
             "journal_bytes", "journal_sha256", "value"))
         try:
@@ -1523,21 +1627,51 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
             table = {}
     except Exception:
         table, process_state = {}, "unavailable"
-    descriptors = {}
-    commands = {}
-    truncated = set()
+    descriptors, commands, truncated = {}, {}, set()
     fd_state = "unavailable"
+    extended = ci_failure_diagnostics()
+
+    def reported_role(value):
+        reported = Path(value)
+        if (not reported.is_absolute() or ".." in reported.parts
+                or not reported.is_relative_to(path)):
+            return "unknown"
+        relative = reported.relative_to(path)
+        if path.name == "pytest-artifacts" and relative.parts == ("junit.xml",):
+            return "reported_owned_junit_report"
+        if facts.get("root_kind") == "role_home":
+            if relative.parts == ("codex", "state_1.sqlite"):
+                return "reported_session_database"
+            if (len(relative.parts) == 3 and relative.parts[:2] == ("codex", "sessions")
+                    and relative.suffix == ".jsonl"):
+                return "reported_session_transcript"
+        return "reported_other_within_root"
+
     try:
         result = subprocess.run(
             ["/usr/sbin/lsof", "-nP", "-a", "-p", ",".join(map(str, holders)),
-             "-F", "pftc", "+D", str(path)], capture_output=True, text=True, timeout=5,
+             "-F", "0pftcan" if extended else "pftc", "+D", str(path)],
+            capture_output=True, text=True, timeout=5,
         )
         if (type(result.returncode) is int and result.returncode in (0, 1)
-                and isinstance(result.stdout, str) and len(result.stdout) <= 32768
-                and len(result.stdout.splitlines()) <= 1024):
+                and isinstance(result.stdout, str) and len(result.stdout) <= 32768):
+            fields = ([field.lstrip("\n") for field in result.stdout.split("\0")
+                       if field.strip("\n")]
+                      if extended else result.stdout.splitlines())
+            if len(fields) > 1024:
+                raise ValueError("bounded descriptor field count exceeded")
             pid, row = None, None
-            for line in result.stdout.splitlines():
+
+            def finish_row():
+                if row is not None and row["category"] != "unknown" and row["type"] is not None:
+                    if len(descriptors[pid]) < 8:
+                        descriptors[pid].append(dict(row))
+                    else:
+                        truncated.add(pid)
+
+            for line in fields:
                 if re.fullmatch(r"p[1-9][0-9]{0,9}", line) and int(line[1:]) in holders:
+                    finish_row()
                     pid, row = int(line[1:]), None
                     descriptors.setdefault(pid, [])
                 elif line.startswith("c") and pid is not None:
@@ -1550,25 +1684,29 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
                         family = "python"
                     commands[pid] = family or ("other" if 0 < len(value) <= 64 else None)
                 elif line.startswith("f") and pid is not None:
+                    finish_row()
                     value = line[1:]
                     numeric = int(value) if re.fullmatch(r"[0-9]{1,6}", value) else None
                     numeric = numeric if numeric is not None and numeric <= 1048575 else None
                     category = "numeric" if numeric is not None else (
                         value if value in {"cwd", "rtd", "txt", "mem", "DEL"} else "unknown")
                     row = {"category": category, "fd": numeric, "type": None}
+                    if extended:
+                        row.update(access="unknown", file_role="unknown")
                 elif line.startswith("t") and row is not None:
                     if row["type"] is not None:
                         raise ValueError("duplicate bounded descriptor type")
                     row["type"] = line[1:] if line[1:] in {
                         "REG", "DIR", "CHR", "FIFO", "IPv4", "IPv6", "unix", "KQUEUE", "PIPE"
                     } else None
-                    if row["category"] != "unknown" and row["type"] is not None:
-                        if len(descriptors[pid]) < 8:
-                            descriptors[pid].append(dict(row))
-                        else:
-                            truncated.add(pid)
+                elif extended and line.startswith("a") and row is not None:
+                    row["access"] = {"r": "read", "w": "write", "u": "read_write"}.get(
+                        line[1:], "unknown")
+                elif extended and line.startswith("n") and row is not None:
+                    row["file_role"] = reported_role(line[1:])
                 else:
                     raise ValueError("unrecognized bounded descriptor record")
+            finish_row()
             fd_state = "observed" if any(descriptors.values()) else "not_observed"
     except Exception:
         descriptors, commands, fd_state = {}, {}, "unavailable"
@@ -1605,6 +1743,11 @@ def artifact_holder_failure_snapshot(exc, original, registry=None, path=None, en
     facts.update(state="snapshot", fixture_pid=fixture_pid,
                  process_snapshot=process_state, fd_snapshot=fd_state,
                  descriptor_sample_limit=8, holders=rows)
+    if extended:
+        first = table.get(holders[0])
+        facts["executable_observation"] = holder_executable_observation(
+            holders[0], first.get("identity") if isinstance(first, dict) else None)
+        facts["descriptor_role_semantics"] = "reported_path_only_not_original_inode"
     return facts
 
 
@@ -1626,6 +1769,54 @@ def observe_artifact_holder_failures(patch):
             raise
 
     patch.setattr(RunResources, "_dispose_check_artifacts", dispose_with_failure_snapshot)
+
+
+def observe_resource_holder_failures(patch):
+    if not ci_failure_diagnostics():
+        return
+    from devflow_temporal import delivery_resources as resources
+
+    original = resources._observe_locked_resources
+
+    def observe(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except ValueError as exc:
+            try:
+                snapshot = artifact_holder_failure_snapshot(exc, original, root_observation=True)
+                if snapshot is not None:
+                    print(json.dumps({"resource_root_holder_snapshot": snapshot}, sort_keys=True),
+                          file=sys.stderr, flush=True)
+            except BaseException:
+                pass
+            raise
+
+    observe._original_custody_guard = original
+    patch.setattr(resources, "_observe_locked_resources", observe)
+
+
+def observe_checkpoint_holder_failures(patch, spec):
+    if not ci_failure_diagnostics():
+        return
+    from devflow_temporal import delivery_checkpoints as checkpoints
+
+    original = checkpoints._openers
+
+    def openers(checkout):
+        try:
+            return original(checkout)
+        except ValueError as exc:
+            try:
+                snapshot = artifact_holder_failure_snapshot(exc, original, checkpoint_spec=spec)
+                if snapshot is not None:
+                    print(json.dumps({"checkpoint_holder_snapshot": snapshot}, sort_keys=True),
+                          file=sys.stderr, flush=True)
+            except BaseException:
+                pass
+            raise
+
+    openers._original_custody_guard = original
+    patch.setattr(checkpoints, "_openers", openers)
 
 
 async def actual_worker(case, current, recovery, response, patch):

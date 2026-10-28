@@ -58,7 +58,7 @@ async def test_real_closed_sdk_late_entry_missing_foreign_and_authorized_success
         raw["temporal_address"] = env.client.service_client.config.target_host
         original.config.path.write_text(json.dumps(raw))
         configured = DeliveryStore(DeliveryConfig.load(original.config.path))
-        store, spec, _broker, row = stopped.__wrapped__((configured, request))
+        store, spec, _broker, row = stopped.__wrapped__((configured, request), monkeypatch)
         old_id = "delivery-" + spec["run_id"]
         successor_id = old_id + "-authorized-successor"
         release, finished = threading.Event(), threading.Event()

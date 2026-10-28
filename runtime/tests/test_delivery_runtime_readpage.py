@@ -104,6 +104,9 @@ def _observation(store, receipt):
 
 @pytest.fixture
 def node_heavy_page(service, monkeypatch):
+    from runtime_location_scenario import observe_resource_holder_failures
+
+    observe_resource_holder_failures(monkeypatch)
     owner, request = service
     raw = copy.deepcopy(owner.config.raw)
     for index in range(96):
