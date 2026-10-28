@@ -71,14 +71,14 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      # Two Mac hosts each run two partitions; host 0 also qualifies source tests.
+      # Two Mac hosts each qualify one source sequence before two runtime partitions.
       max-parallel: 2
       matrix:
         shard: [0, 1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # Host 0's installer fixtures require historical Git objects.
+          fetch-depth: 0 # Both hosts' source fixtures require historical Git objects.
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -108,30 +108,25 @@ jobs:
         working-directory: runtime
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
-      - name: Run assigned runtime modules and host 0 Mac source qualification
+      - name: Run assigned Mac source qualification then runtime modules
         # Four complete, disjoint partitions; at most two pytest parents per host.
         run: |
           result=0
           processes=()
+          fixture_parent="$(mktemp -d "$HOME/devflow-install-fixtures.XXXXXX")"
           if [ '${{ matrix.shard }}' = 0 ]; then
-            fixture_parent="$(mktemp -d "$HOME/devflow-install-fixtures.XXXXXX")"
-            export DEVFLOW_PRODUCTION_FIXTURE_PARENT="$fixture_parent"
-            env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-              DEVFLOW_PYTHON="$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" sh ../scripts/check-install.sh &
-            processes+=("$!")
             (
-              cd ..
+              cd .. || exit 1
               env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                DEVFLOW_PRODUCTION_FIXTURE_PARENT="$fixture_parent" \
                 "$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" -B -m unittest discover -s tests -p 'test_reconcile.py' -v
-            ) &
-            processes+=("$!")
-            for process in "${processes[@]}"; do
-              wait "$process" || result=1
-            done
-            rmdir "$fixture_parent" || result=1
-            unset DEVFLOW_PRODUCTION_FIXTURE_PARENT
-            processes=()
+            ) || result=1
+          else
+            env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              DEVFLOW_PRODUCTION_FIXTURE_PARENT="$fixture_parent" \
+              DEVFLOW_PYTHON="$DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON" sh ../scripts/check-install.sh || result=1
           fi
+          rmdir "$fixture_parent" || result=1
           for lane in 0 1; do
             index=$(( ${{ matrix.shard }} + lane * 2 ))
             .venv/bin/python runtime_ci.py --index "$index" --count 4 \
