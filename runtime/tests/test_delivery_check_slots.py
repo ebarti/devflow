@@ -497,7 +497,9 @@ async def test_temporal_cancel_or_monitor_timeout_preserves_native_slot_lifecycl
     monkeypatch.setattr(activities.activity, "in_activity", owned_checks.in_activity)
     monkeypatch.setattr(activities.activity, "heartbeat", owned_checks.heartbeat)
     owned_checks.config.raw["check_concurrency"] = 1
-    request = owned_checks.request("temporal-stopped", seconds=5, timeout=10)
+    request = owned_checks.request(
+        "temporal-stopped", seconds=2 if stop == "timeout" else 5, timeout=10,
+    )
     completion_barrier = tmp_path / "release-cancel-fixture"
     if stop == "cancel":
         request["spec"]["completion_barrier"] = str(completion_barrier)

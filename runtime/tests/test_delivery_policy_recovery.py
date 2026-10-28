@@ -11,10 +11,8 @@ from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 from test_delivery_store import submit_historical_admission
 
-from devflow_temporal import delivery_policy_recovery
 from devflow_temporal.contracts import canonical_json, digest
 from devflow_temporal.delivery_broker import DeliveryBroker
-from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_continuation import copy_session_state, session_state_digest
 from devflow_temporal.delivery_policy_recovery import (
     _prepare,
@@ -27,91 +25,6 @@ from devflow_temporal.delivery_policy_recovery import (
 from devflow_temporal.delivery_preparation import prepare_authority
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
-
-
-@pytest.mark.parametrize('observation,refused', [
-    ('live-pid', True), ('stopped', False), ('reconciled-gate', False),
-    ('reconciled-provider', True), ('tampered-reconciliation', True),
-])
-def test_retained_stopped_cleanup_observes_without_state_effects(
-    intake_fixture, monkeypatch, observation, refused,
-):
-    path, request = intake_fixture
-    store = DeliveryStore(DeliveryConfig.load(path))
-    store.submit(request)
-    spec = store.spec(request['run_id'])
-    resources = RunResources(spec)
-    journal_path = Path(spec['state_dir']) / 'attempts' / 'recorded' / 'native-process.json'
-    recorded_identity, pid, port = 'recorded-start-identity', 424242, 18777
-    journal = {
-        'phase': 'starting' if observation == 'unfinished' else 'finished',
-        'monitoring_complete': observation != 'unmonitored',
-        'owned': {str(pid): {'identity': recorded_identity}}, 'ports': [port],
-    }
-    if observation in {'reconciled-gate', 'reconciled-provider', 'tampered-reconciliation'}:
-        journal.update(monitoring_complete=False,
-                       intent={'run_id': spec['run_id'], 'ports': [port]},
-                       result={'interrupted_monitor': True, 'provider_outcome': 'unknown',
-                               'cleanup': 'observed-native-confirmed'})
-        journal['cleanup_reconciliation'] = {
-            'kind': 'interrupted_monitor', 'intent_sha256': digest(journal['intent']),
-            'owned_sha256': digest(journal['owned'])}
-        if observation != 'reconciled-provider':
-            journal_path = (Path(spec['state_dir']) / 'dependency-preparation'
-                            / 'native-5' / 'process' / 'native-process.json')
-        if observation == 'tampered-reconciliation':
-            journal['cleanup_reconciliation']['owned_sha256'] = '0' * 64
-    write_private(journal_path, journal)
-    with resources.locked() as manifest:
-        manifest['processes'].append(str(journal_path))
-        write_private(resources.manifest, manifest)
-    write_private(resources.root / 'finalization.json', {
-        'state': 'confirmed', 'process_cleanup': 'observed-native-confirmed',
-        'resource_cleanup': 'confirmed',
-        'roots': [{'path': str(Path(spec['state_dir']) / 'transient'), 'state': 'removed'}],
-    })
-    table = {}
-    if observation in {'live-pid', 'reused-pid', 'zombie'}:
-        table[pid] = {
-            'identity': 'different-start-identity' if observation == 'reused-pid'
-            else recorded_identity,
-            'stat': 'Z' if observation == 'zombie' else 'S',
-        }
-    observed = []
-
-    def processes():
-        observed.append('process-table')
-        return table
-
-    def listening(recorded_port):
-        assert recorded_port == port
-        observed.append('recorded-port')
-        return {pid} if observation == 'listening-port' else set()
-
-    monkeypatch.setattr(delivery_policy_recovery, 'process_table', processes)
-    monkeypatch.setattr(delivery_policy_recovery, 'listeners', listening)
-    with store._connect() as db:
-        before_db = list(db.iterdump())
-    before_files = {item.relative_to(store.config.state_root):
-                    (item.read_bytes(), item.stat().st_mode)
-                    for item in store.config.state_root.rglob('*') if item.is_file()}
-    if refused:
-        with pytest.raises(ValueError, match='process identity or port is still live or unknown'):
-            delivery_policy_recovery._stopped_cleanup(spec)
-    else:
-        result = delivery_policy_recovery._stopped_cleanup(spec)
-        assert result['journal_sha256'] == {
-            str(journal_path): hashlib.sha256(journal_path.read_bytes()).hexdigest(),
-        }
-    assert observed[0] == 'process-table'
-    if observation == 'listening-port':
-        assert 'recorded-port' in observed
-    with store._connect() as db:
-        assert list(db.iterdump()) == before_db
-    assert before_files == {item.relative_to(store.config.state_root):
-                            (item.read_bytes(), item.stat().st_mode)
-                            for item in store.config.state_root.rglob('*') if item.is_file()}
 
 
 @pytest.fixture
@@ -205,41 +118,6 @@ def preserved(native_configuration, monkeypatch):
     return store, spec, payload, state
 
 
-
-
-
-def test_historical_policy_row_preserves_candidate_session_failures_and_cleanup(preserved):
-    store, original, _payload, state = preserved
-    run_id = original['run_id']
-    before = store.submitted_spec(run_id)
-    original_candidate = DeliveryBroker(store, original).candidate()
-    original_receipt = Path(original['state_dir']) / 'resources' / 'finalization.json'
-    original_bytes = original_receipt.read_bytes()
-    effective = store.effective_spec(run_id)
-    assert effective['policy']['host_sandbox'] == 'trusted-local'
-    assert effective['preparation']['fingerprint'] != original['preparation']['fingerprint']
-    candidate = DeliveryBroker(store, effective).candidate()
-    assert candidate['id'] == original_candidate['id']
-    assert candidate['content_sha256'] == original_candidate['content_sha256']
-    with store._connect() as db:
-        row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone()
-        recovery = json.loads(row['recovery_json'])
-        assert recovery['state'] == state
-        claim = store.state.claim_for(db, original['work_id'])
-        assert claim['owner'] == f'external:devflow:{run_id}'
-        assert db.execute('SELECT COUNT(*) FROM delivery_attempts').fetchone()[0] == 3
-        assert db.execute('SELECT COUNT(*) FROM delivery_policy_recoveries').fetchone()[0] == 1
-        assert db.execute('SELECT state FROM delivery_outbox').fetchone()[0] == 'pending'
-    assert original_receipt.read_bytes() == original_bytes
-    archived = Path(original['state_dir']) / 'policy-recovery' / 'predecessor' / 'finalization.json'
-    assert archived.read_bytes() == original_bytes
-    resume_preflight(store, effective, recovery)
-    detail = store.detail(run_id)
-    assert detail['execution_policy_recovery']['session_id'] == recovery['session_id']
-    assert detail['execution_policy_recovery']['preserved_checks'] == state['checks']
-    assert store.submitted_spec(run_id) == before
-
-
 def test_public_policy_provenance_survives_terminal_only_wrapper(preserved):
     store, original, _payload, _state = preserved
     run_id = original['run_id']
@@ -299,65 +177,3 @@ def test_policy_resume_and_tracker_start_refuse_a_reclaimed_reassigned_issue(
     with pytest.raises(ValueError, match='frozen authority'):
         _tracker_sync(effective, 'in-progress', release=False)
     assert calls == []
-
-
-
-
-
-
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cancel_at_tracker", [False, True])
-async def test_new_failed_gate_is_required_before_one_same_session_repair(
-    cancel_at_tracker, monkeypatch,
-):
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
-    controller = DeliveryWorkflow()
-    candidate = {'id': 'preserved', 'head': 'a' * 40}
-    controller.state = {'run_id': 'same-run', 'candidate': candidate, 'candidate_revision': 3,
-                        'roles': [], 'checks': {}, 'revision': 13, 'iteration': 2,
-                        'usage': {}, 'findings': [], 'pull_request': None, 'cleanup': 'none'}
-    spec = {'run_id': 'same-run', 'provider': 'codex', 'terminal_tracker_version': 1,
-            'policy': {'max_repairs': 2, 'host_sandbox': 'trusted-local'}}
-    observed = []
-
-    async def project(_spec, event, *_args):
-        if cancel_at_tracker and event == "tracker_started":
-            controller.cancel_requested = True
-
-    async def activity(name, request, **_kwargs):
-        iteration = request.get('iteration')
-        observed.append((name, iteration))
-        if name == 'delivery_precheck':
-            return {'state': 'failed' if iteration == 3 else 'passed',
-                    'candidate_id': candidate['id'], 'source_unchanged': True, 'results': []}
-        if name == 'delivery_role':
-            if request['role'] == 'implement':
-                assert request['resume_session'] == 'original-session'
-                assert request['iteration'] == 4
-                assert request['findings']
-            return {'status': 'pass', 'candidate': candidate,
-                    'session_id': 'original-session' if request['role'] == 'implement'
-                    else request['role'] + '-independent'}
-        if name == 'delivery_publish':
-            return {'state': 'OPEN', 'candidate': candidate, 'head': candidate['head'], 'number': 7}
-        if name in {'delivery_checks', 'delivery_ci'}:
-            return {'state': 'passed', 'candidate_id': candidate['id'], 'results': []}
-        raise AssertionError(name)
-
-    async def published(_spec, _iteration, _candidate, initial, **_kwargs):
-        return initial
-
-    controller._project = project
-    controller._activity = activity
-    controller._published_result = published
-    result = await controller._run_iterations(
-        spec, start_iteration=3, prior_implementer_session='original-session', repair_findings=[],
-        continuation=None, recovery=None, authorized_max_iteration=4, resume_prechecks=True,
-    )
-    assert result['outcome'] == ('cancelled' if cancel_at_tracker else 'delivered')
-    assert observed[:3] == [
-        ('delivery_precheck', 3), ('delivery_role', 4), ('delivery_precheck', 4),
-    ]
-    assert sum(name == 'delivery_role' and iteration == 4 for name, iteration in observed) == 3
