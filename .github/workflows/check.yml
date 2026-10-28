@@ -48,7 +48,6 @@ jobs:
 
           discovered = list(cases(unittest.defaultTestLoader.discover('tests')))
           mac_modules = {'test_reconcile', 'test_production_installation',
-                         'test_source_custody_process_owned',
                          'test_service_entry_installation',
                          'test_upgrade_installation'}
           native = [test for test in discovered
