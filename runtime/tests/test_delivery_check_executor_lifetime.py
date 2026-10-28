@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 from temporalio import activity
 from test_delivery_api import api_fixture as api_fixture
+from test_delivery_store import submit_before_readiness
 
 from devflow_temporal import delivery_activities, delivery_native_process
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -132,12 +133,14 @@ async def native_case(api_fixture, tmp_path, monkeypatch):
         required_ci=["test"],
         project_url="https://github.com/users/example/projects/1",
         assignee="example",
+        readiness={"version": 1, "generation": 0, "browser_engines": [],
+                   "temporal_checks": []},
     )
     config_path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(config_path))
     runs, tasks, hearts = [], [], []
-    # Only opaque Temporal activity context is substituted. Configuration,
-    # authority/profile validation, broker, process tree and resources are real.
+    # These retained command fixtures predate readiness. Activity context is
+    # opaque; authority, broker, process tree and resource custody remain real.
     monkeypatch.setattr(activity, "in_activity", lambda: True)
     monkeypatch.setattr(
         activity,
@@ -151,13 +154,18 @@ async def native_case(api_fixture, tmp_path, monkeypatch):
             attempt=1,
             workflow_id="owned-check",
             activity_id="owned-check",
+            activity_type="delivery_checks",
             workflow_run_id="owned-check",
+            workflow_type="OwnedCheckFixture",
+            namespace="default",
+            task_queue=store.config.queue,
             heartbeat_details=(),
         ),
     )
 
     def new(name, **controls):
-        store.submit(
+        submit_before_readiness(
+            store,
             {
                 **submission,
                 "command_id": "submit-" + name,
@@ -165,7 +173,8 @@ async def native_case(api_fixture, tmp_path, monkeypatch):
                 "work_id": "work-" + name,
                 "branch": "feat/" + name,
                 "issue_url": f"https://github.com/example/fixture/issues/{len(runs) + 3}",
-            }
+            },
+            monkeypatch,
         )
         spec = prepare_authority(store, store.submitted_spec(name))
         verify_prepared_spec(spec)

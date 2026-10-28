@@ -65,6 +65,8 @@ def native_gates(api_fixture, tmp_path):
     repository.update(
         prepublish_checks=[recipe], checks=[recipe], required_ci=["test"],
         project_url="https://github.com/users/example/projects/1", assignee="example",
+        readiness={"version": 1, "generation": 0,
+                   "browser_engines": ["chromium"], "temporal_checks": []},
         browser_qa={"id": "fixture", "argv": recipe["argv"], "cwd": ".",
                     "ports": dict(zip(["QA_API_PORT", "QA_WEB_PORT"], ports, strict=True)),
                     "env": {"JOBCTRL_E2E_ISOLATED": "1"}, "read_roots": [],

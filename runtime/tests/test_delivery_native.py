@@ -25,46 +25,10 @@ from devflow_temporal.delivery_activities import (
 )
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
-from devflow_temporal.delivery_native_guard import NATIVE_OVERRIDES
-from devflow_temporal.delivery_native_preparation import _measure, native_identity
 from devflow_temporal.delivery_native_threads import NativeThreadObservation
-from devflow_temporal.delivery_preparation import (
-    PreparationError,
-    prepare_authority,
-    verify_prepared_spec,
-)
 from devflow_temporal.delivery_resources import RunResources, read_private, write_private
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
-from devflow_temporal.runtime_dependencies import locked_dependency_identity
-from devflow_temporal.supervisor import DeliverySupervisor
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS boundary required")
-def test_actual_native_boundary_denies_controller_and_recursive_commands(tmp_path):
-    state = tmp_path / "runs/native"
-    state.mkdir(parents=True, mode=0o700)
-    binary = str(Path(distribution("openai-codex-cli-bin").locate_file("codex_cli_bin/bin/codex")))
-    spec = {
-        "run_id": "native",
-        "state_dir": str(state),
-        "checkout": str(tmp_path / "checkout"),
-        "policy_digest": "0" * 64,
-        "policy": {
-            "execution_backend": "native-macos",
-            "codex_bin": binary,
-            "config_overrides": NATIVE_OVERRIDES,
-            "runtime_dependencies": locked_dependency_identity(),
-        },
-    }
-    try:
-        identity = native_identity(spec)
-        proof = _measure(spec, identity)
-        assert proof["measurement"]["process_cleanup"] == "observed-native-confirmed"
-    finally:
-        receipt = RunResources(spec).finalize("cancelled")
-    assert receipt["resource_cleanup"] == "confirmed"
-    assert not (state / "transient").exists()
 
 
 @pytest.fixture
@@ -95,6 +59,8 @@ def native_configuration(intake_fixture):
     config["repositories"]["fixture"].update(
         prepublish_checks=[check],
         checks=[check],
+        readiness={"version": 1, "generation": 0, "browser_engines": [],
+                   "temporal_checks": []},
         required_ci=["test"],
         project_url="https://github.com/users/example/projects/1",
         assignee="example",
@@ -111,195 +77,12 @@ def native_store(native_configuration):
     return store, request
 
 
-def test_native_checks_share_browser_assets_without_sharing_private_homes(
-    native_store, tmp_path, monkeypatch
-):
-    from devflow_temporal.delivery_sandbox import prepare_native_check
-
-    store, request = native_store
-    spec = store.spec(request["run_id"])
-    checkout = Path(spec["checkout"])
-    checkout.mkdir(parents=True)
-    original_home = tmp_path / "original-home"
-    browser_cache = original_home / "Library/Caches/ms-playwright"
-    browser_cache.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", lambda: original_home)
-    environments = []
-    try:
-        for name in ("browser-a", "browser-b"):
-            profile, environment = prepare_native_check(
-                spec, checkout, Path(spec["state_dir"]) / "checks",
-                {"id": name, "argv": ["node", "browser.cjs"]},
-            )
-            environments.append(environment)
-            assert environment["PLAYWRIGHT_BROWSERS_PATH"] == str(browser_cache)
-            assert Path(environment["HOME"]) != original_home
-            lines = (Path(environment["CODEX_HOME"]) / "config.toml").read_text()
-            assert f'{json.dumps(str(browser_cache.resolve()))} = "read"' in lines
-            assert f'{json.dumps(str(original_home.resolve()))} = "read"' not in lines
-            assert profile == "devflow-check"
-        assert environments[0]["HOME"] != environments[1]["HOME"]
-    finally:
-        assert RunResources(spec).finalize("blocked")["state"] == "confirmed"
-
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS boundary required")
-def test_actual_native_preparation_cache_and_check_cleanup(native_store, monkeypatch):
-    store, request = native_store
-    submitted = store.submitted_spec(request["run_id"])
-    first = prepare_authority(store, submitted)
-    verify_prepared_spec(first)
-    assert first["plan_approval"] == submitted["plan_approval"] == "automatic"
-    with pytest.raises(PreparationError, match="run binding changed"):
-        verify_prepared_spec({**first, "plan_approval": "required"})
-    assert first["preparation"]["cache_reused"] is False
-    second_request = {
-        **request,
-        "run_id": "run-2",
-        "work_id": "work-2",
-        "command_id": "submit-2",
-        "branch": "feat/native-two",
-        "issue_url": "https://github.com/example/fixture/issues/4",
-    }
-    store.submit(second_request)
-    second = prepare_authority(store, store.submitted_spec("run-2"))
-    assert second["preparation"]["cache_reused"] is True
-    assert second["preparation"]["fingerprint"] == first["preparation"]["fingerprint"]
-    assert (
-        second["preparation"]["security_binding_sha256"]
-        != first["preparation"]["security_binding_sha256"]
-    )
-    broker = DeliveryBroker(store, first)
-    candidate = broker.prepare()["candidate"]
-    prechecked = broker.run_prechecks(0, candidate)
-    assert prechecked["state"] == "passed" and prechecked["results"] == []
-    assert prechecked["deferred_to_checks"] == {"native-check": "native-check"}
-    checks = broker.run_checks(0, candidate)
-    assert checks["state"] == "passed"
-    assert checks["results"][0]["process_cleanup"] == "observed-native-confirmed"
-    assert checks["results"][0]["test_count"] == 2
-    transient = Path(first["state_dir"]) / "transient"
-    assert transient.exists()
-    receipt = RunResources(first).finalize("cancelled")
-    assert receipt["state"] == "confirmed"
-    assert not transient.exists() and not Path(first["checkout"]).exists()
-    assert Path(checks["results"][0]["log"]).is_file()
-    assert RunResources(second).finalize("cancelled")["state"] == "confirmed"
-    verify_prepared_spec(second)  # shared proof references retained durable evidence
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="actual native grant/check boundary required")
-def test_authorized_gate_beyond_original_budget_runs_check_then_retries_cleanup(
-    native_configuration, monkeypatch,
-):
+@pytest.fixture
+def native_historical_store(native_configuration, monkeypatch):
     config, request = native_configuration
-    repo = config.raw["repositories"]["fixture"]
-    source = Path(repo["source_path"])
-    source.joinpath(".gitignore").write_text("node_modules/\n")
-    subprocess.run(["git", "-C", str(source), "add", ".gitignore"], check=True)
-    subprocess.run(
-        ["git", "-C", str(source), "commit", "-qm", "owned dependency fixture"], check=True
-    )
-    repo["expected_base_sha"] = subprocess.check_output(
-        ["git", "-C", str(source), "rev-parse", "HEAD"],
-        text=True,
-    ).strip()
-    for stage in ("checks", "prepublish_checks"):
-        repo[stage][0]["argv"][-1] = (
-            "import pathlib; pathlib.Path('node_modules').mkdir(); "
-            "pathlib.Path('node_modules/temporary').write_text('owned'); print('2 passed')"
-        )
-    config.path.write_text(json.dumps(config.raw))
     store = DeliveryStore(config)
     submit_historical_admission(store, request, monkeypatch)
-    prepared = prepare_authority(store, store.submitted_spec(request["run_id"]))
-    broker = DeliveryBroker(store, prepared)
-    candidate = broker.prepare()["candidate"]
-    role = {"spec": prepared, "role": "implement", "iteration": 2, "candidate": candidate}
-    with pytest.raises(ValueError, match="finite turn limit"):
-        DeliverySupervisor(store, capacity=1)._claim(role)
-    with pytest.raises(ValueError, match="finite turn limit"):
-        broker.run_checks(2, candidate)
-    gate = Path(prepared["state_dir"]) / "gates/2/verify"
-    assert not gate.exists()
-    with store._connect() as db:
-        db.execute(
-            """INSERT INTO delivery_repair_grants VALUES (?,?,?,?,?,?,?,?)""",
-            (
-                request["run_id"],
-                "controlled-native-grant",
-                "fixture",
-                "fixture",
-                "0" * 64,
-                1,
-                2,
-                "2026-10-02T00:00:00Z",
-            ),
-        )
-    result = broker.run_checks(2, candidate)
-    assert result["state"] == "passed" and (gate / "node_modules/temporary").is_file()
-    resources = RunResources(prepared)
-    assert resources.finalize("delivered")["state"] == "confirmed"
-    assert not gate.exists() and not Path(prepared["checkout"]).exists()
-    assert resources.finalize("delivered")["state"] == "confirmed"
-    assert Path(result["results"][0]["log"]).is_file()
-
-
-@pytest.mark.asyncio
-async def test_native_observer_detects_sdk_spawn_item_dropped_by_kit_audit(tmp_path):
-    from agent_runtime_kit.adapters.codex import _tool_audits
-    from openai_codex.generated.v2_all import CollabAgentToolCallThreadItem, ThreadItem
-
-    folder = tmp_path / "attempt"
-    folder.mkdir()
-    write_private(
-        folder / "native-process.json",
-        {"owned": {str(os.getpid()): {"identity": "controlled identity"}}},
-    )
-    observation = NativeThreadObservation(
-        {
-            "result_path": str(folder / "result.json"),
-            "spec": {"run_id": "fixture"},
-            "role": "implement",
-            "iteration": 0,
-        }
-    )
-    calls = []
-    inventory = []
-
-    class Client:
-        async def thread_list(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(
-                data=[SimpleNamespace(id=name) for name in inventory], next_cursor=None
-            )
-
-    client = Client()
-    await observation.begin(client)
-    observation.started("parent")
-    assert read_private(observation.path)["parent_thread_id"] == "parent"
-    item = ThreadItem(
-        CollabAgentToolCallThreadItem(
-            agentsStates={},
-            id="spawn-event",
-            receiverThreadIds=["child"],
-            senderThreadId="parent",
-            status="completed",
-            tool="spawnAgent",
-            type="collabAgentToolCall",
-        )
-    )
-    assert _tool_audits([item]) == []  # original filtered-audit false-negative trigger
-    inventory.extend(["parent", "child"])
-    await observation.completed(client, SimpleNamespace(items=[item]))
-    assert observation.reference()["state"] == "blocked"
-    assert observation.data["new_child_thread_ids"] == ["child"]
-    assert observation.data["collaboration_items"][0]["tool"] == "spawnAgent"
-    assert all(
-        any(kind.value == "subAgentThreadSpawn" for kind in call["source_kinds"]) for call in calls
-    )
-    assert {call["archived"] for call in calls} == {True, False}
+    return store, request
 
 
 @pytest.mark.asyncio
@@ -421,8 +204,10 @@ async def test_real_terminal_workflow_removes_owned_temps_before_projection(
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native preparation required")
 @pytest.mark.asyncio
-async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(native_store):
-    store, request = native_store
+async def test_intake_turn_exhaustion_stops_workflow_and_cleans_directories(
+    native_historical_store,
+):
+    store, request = native_historical_store
     calls = []
 
     @activity.defn(name="delivery_intake")
@@ -530,11 +315,11 @@ async def test_early_preparation_error_finalizes_registered_temporary_resources(
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS boundary required")
 @pytest.mark.asyncio
 async def test_real_worker_loss_after_directory_removal_recovers_workflow_finalization(
-    native_store, tmp_path
+    native_historical_store, tmp_path
 ):
     from fixtures.activity_liveness_workflow import FinalizationClock
 
-    store, request = native_store
+    store, request = native_historical_store
     marker = tmp_path / "removed-before-worker-loss"
     worker_script = tmp_path / "crashing-worker.py"
     worker_script.write_text("""

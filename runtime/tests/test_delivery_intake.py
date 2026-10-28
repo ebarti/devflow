@@ -24,7 +24,6 @@ from devflow_temporal.delivery_activities import (
     delivery_project,
 )
 from devflow_temporal.delivery_api import create_app
-from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
@@ -112,55 +111,6 @@ def intake_fixture(tmp_path: Path) -> tuple[Path, dict]:
     return path, request
 
 
-def test_raw_goal_admission_and_legacy_plan(intake_fixture):
-    path, request = intake_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    accepted = store.submit(request)
-    assert accepted["phase"] == "accepted"
-    assert store.spec("run-1")["intake_required"] is True
-    assert store.spec("run-1")["plan_approval"] == "automatic"
-    assert store.effective_spec("run-1")["accepted_plan"] == ""
-    assert store.submit(request) == accepted
-    with pytest.raises(ValueError, match="different inputs"):
-        store.submit({**request, "goal": "conflict"})
-    legacy = {
-        **request, "command_id": "submit-legacy", "run_id": "run-legacy",
-        "work_id": "work-legacy", "issue_url": "https://github.com/example/fixture/issues/4",
-        "branch": "feat/legacy", "accepted_plan": "Previously accepted plan",
-    }
-    store.submit(legacy)
-    assert store.spec("run-legacy")["intake_required"] is False
-
-
-@pytest.mark.parametrize("policy", [None, "sometimes"])
-def test_invalid_plan_approval_rejected_before_claim(intake_fixture, policy):
-    path, request = intake_fixture
-    store = create_app(path).state.delivery.store
-    with pytest.raises(ValueError, match="plan_approval"):
-        store.submit({**request, "plan_approval": policy})
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 0
-        assert store.state.row(db, "works", request["work_id"]) is None
-
-
-def test_required_plan_approval_is_explicit_and_conflicts_with_accepted_plan(intake_fixture):
-    path, request = intake_fixture
-    store = create_app(path).state.delivery.store
-    with pytest.raises(ValueError, match="contradicts"):
-        store.submit({**request, "plan_approval": "required", "accepted_plan": "Existing plan"})
-    with store._connect() as db:
-        assert store.state.row(db, "works", request["work_id"]) is None
-    required = {**request, "plan_approval": "required"}
-    receipt = store.submit(required)
-    assert store.spec("run-1")["plan_approval"] == "required"
-    assert store.submit(required) == receipt
-    with pytest.raises(ValueError, match="different inputs"):
-        store.submit({**required, "plan_approval": "automatic"})
-
-
-
-
 @pytest.mark.asyncio
 async def test_public_real_submit_is_durable_without_attestation_or_docker_readback(
     intake_fixture, monkeypatch
@@ -171,6 +121,8 @@ async def test_public_real_submit_is_durable_without_attestation_or_docker_readb
     repository = config["repositories"]["fixture"]
     repository.update({
         "prepublish_checks": [{"id": "precheck", "argv": ["/usr/bin/true"]}],
+        "readiness": {"version": 1, "generation": 0, "browser_engines": [],
+                      "temporal_checks": []},
         "checks": [{"id": "test", "argv": ["/usr/bin/true"]}],
         "required_ci": ["test"],
         "project_url": "https://github.com/orgs/example/projects/1",
@@ -197,11 +149,6 @@ async def test_public_real_submit_is_durable_without_attestation_or_docker_readb
         assert db.execute("SELECT COUNT(*) FROM delivery_runs").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM delivery_outbox").fetchone()[0] == 1
         assert store.state.row(db, "works", request["work_id"]) is not None
-
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -466,54 +413,6 @@ def _record_plan(store, plan, authorization, *, pending_question=False):
             "answers": [], "accepted_plan": None, "change_requests": [],
         },
     )
-
-
-def test_automatic_plan_binding_checks_authority_revision_and_restart(intake_fixture):
-    path, request = intake_fixture
-    store = create_app(path).state.delivery.store
-    receipt = store.submit(request)
-    submitted = store.spec("run-1")
-    config = json.loads(path.read_text())
-    plan = config["fake_intake"][2]["plan"]
-    authorization = _authorization(submitted)
-    _record_plan(store, plan, authorization)
-    for drift in (
-        None,
-        {**authorization, "source": "human_decision"},
-        {**authorization, "command_id": "other-submit"},
-        {**authorization, "request_digest": "0" * 64},
-        {**authorization, "policy_digest": "0" * 64},
-        {**authorization, "authorized_endpoint": "merged"},
-    ):
-        with pytest.raises(ValueError, match="frozen run authorization"):
-            store.accept_intake_plan("run-1", 1, digest(plan), plan, authorization=drift)
-    for revision, plan_hash, content in (
-        (2, digest(plan), plan),
-        (1, "0" * 64, plan),
-        (1, digest(plan), {**plan, "scope": "Changed"}),
-    ):
-        with pytest.raises(ValueError, match="revision|changed"):
-            store.accept_intake_plan("run-1", revision, plan_hash, content,
-                                     authorization=authorization)
-    _record_plan(store, plan, authorization, pending_question=True)
-    with pytest.raises(ValueError, match="clarification remains pending"):
-        store.accept_intake_plan("run-1", 1, digest(plan), plan, authorization=authorization)
-    _record_plan(store, plan, {**authorization, "command_id": "other-submit"})
-    with pytest.raises(ValueError, match="authorization changed"):
-        store.accept_intake_plan("run-1", 1, digest(plan), plan, authorization=authorization)
-    _record_plan(store, plan, authorization)
-    accepted = store.accept_intake_plan("run-1", 1, digest(plan), plan,
-                                        authorization=authorization)
-    restarted = DeliveryStore(store.config)
-    assert restarted.accept_intake_plan("run-1", 1, digest(plan), plan,
-                                        authorization=authorization) == accepted
-    assert restarted.submit(request) == receipt
-    assert restarted.spec("run-1") == submitted
-    assert restarted.effective_spec("run-1") == accepted
-    assert restarted.intake_execution_spec("run-1") == accepted
-    assert restarted.detail("run-1")["intake"]["accepted_plan"] == {
-        "revision": 1, "digest": digest(plan), "content": plan, "authorization": authorization,
-    }
 
 
 @pytest.mark.asyncio

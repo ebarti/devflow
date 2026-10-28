@@ -169,19 +169,23 @@ def publication(record, *, complete=False):
 
 
 async def run_build(controller, spec, *, start_iteration=0, session=None, maximum_iteration=None,
-                    preserved=False):
+                    preserved=False, readiness_retry=None, readiness_findings=None):
     try:
-        findings = []
+        findings = list(readiness_findings or []) if readiness_retry is not None else []
         maximum = spec["policy"]["max_repairs"] if maximum_iteration is None else maximum_iteration
         # A preserved build already passed its implementation; it is only sealed.
         result = {"candidate": controller.state["candidate"]}
         for iteration in range(start_iteration, start_iteration if preserved else maximum + 1):
             if controller.cancel_requested:
                 return await controller._cancelled(spec)
+            previous_iteration = controller.state["iteration"]
             controller.state["iteration"] = iteration
             controller.state["phase"] = "implement" if iteration == 0 else "repair"
             controller.state["revision"] += 1
-            await controller._project(spec, "role_started", "Building a complete feature chunk")
+            if spec.get("readiness_version") == 1:
+                await controller._project(spec, "readiness_preparing", "Preparing chunk readiness")
+            else:
+                await controller._project(spec, "role_started", "Building a complete feature chunk")
             result = await controller._activity(
                 "delivery_role",
                 {
@@ -192,9 +196,25 @@ async def run_build(controller, spec, *, start_iteration=0, session=None, maximu
                     "candidate": controller.state["candidate"],
                     "findings": findings,
                     "resume_session": session,
+                    **({"readiness_attempt": readiness_retry["attempt"]}
+                       if readiness_retry is not None and iteration == start_iteration
+                       and readiness_retry["pending_iteration"] == iteration else {}),
                 },
             )
+            if (spec.get("readiness_version") == 1 and result.get("status") == "blocked"
+                    and result.get("readiness") is not None and result.get("session_id") is None):
+                controller.state["checks"]["readiness"] = {
+                    **result["readiness"], "pending_iteration": iteration}
+                controller.state["iteration"] = previous_iteration
+                if result.get("cleanup") == "unknown":
+                    controller.state["cleanup"] = "unknown"
+                return await controller._stop(spec, "Execution readiness failed before the role")
             controller.state["roles"].append(result)
+            if spec.get("readiness_version") == 1:
+                previous_readiness = controller.state["checks"].get("readiness")
+                controller.state["checks"]["readiness"] = {
+                    "state": "stale", "reason": "implementation may have changed the candidate",
+                    "previous": previous_readiness}
             controller.state["candidate"] = result["candidate"]
             if session is not None and result.get("session_id") != session:
                 return await controller._stop(spec, "workstream repair lost its original session")
