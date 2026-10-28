@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from runtime_location_scenario import observe_artifact_holder_failures
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
 
@@ -15,13 +16,14 @@ from devflow_temporal.delivery_check_evidence import junit_counts
 @pytest.mark.skipif(sys.platform != 'darwin', reason='actual macOS native check lifecycle required')
 @pytest.mark.parametrize('outcome', ['pass', 'skip'])
 def test_actual_broker_enforces_delegated_report_and_retains_it_after_cleanup(
-    native_configuration, outcome,
+    native_configuration, outcome, monkeypatch,
 ):
     from devflow_temporal.delivery_broker import DeliveryBroker, _git
     from devflow_temporal.delivery_preparation import prepare_authority
     from devflow_temporal.delivery_resources import RunResources
     from devflow_temporal.delivery_store import DeliveryStore
 
+    observe_artifact_holder_failures(monkeypatch)
     config, request = native_configuration
     repo = config.raw['repositories']['fixture']
     source = Path(repo['source_path'])
