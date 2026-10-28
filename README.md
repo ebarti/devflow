@@ -97,6 +97,86 @@ stopped `runtime-installation` migration; normal setup does not rewrite them.
 
 ## Upgrade
 
+Foundation-born owners can prepare an independent immutable source generation:
+
+```sh
+sh scripts/update.sh --prepare "$RELEASE_TAG"
+# Use the exact prepared.json path printed by preparation. Preflight reads only.
+sh scripts/update.sh --preflight /absolute/generation/prepared.json > request.json
+chmod 600 request.json
+sh scripts/update.sh --apply "$PWD/request.json"
+```
+
+Preparation proves the new source, independent Git storage, frozen environment,
+imports, bundled CLI and direct controller entries at their final paths. Apply
+rechecks the captured request under the installation's exclusive lifetime lease,
+preserves previous source/environment/evidence, journals registration and owner
+changes, and activates the new generation last. A process still holding the
+shared lifetime lease prevents the transition. The previous fixed-root entry
+then refuses operational startup because it no longer owns the installation.
+Normal updates after generation activation use this explicit protocol.
+
+The supported cohort is a foundation-born complete owner inventory containing
+empty stores or nonnative deliveries whose authentic closed SDK evidence grants
+only metadata projection bodies, with settled registered resources. A fake
+provider can still run accepted-plan prerequisites; every started host-capable
+activity or child remains unknown without independent body closure. Unknown stores, historical owner populations,
+native grants, existing native installation acknowledgements, feature cohorts,
+host checks and diagnostic actors remain typed refusals. A row labelled closed
+does not establish custody. Original submitted requests, configuration snapshots,
+authorization, repair budgets, candidates, start journals and histories are not
+rewritten by source rollover.
+
+An interrupted activation blocks operational starts. Its external
+`.production-update.json` records an independent retained recovery command; use
+that exact command even if the caller's checkout/interpreter has disappeared.
+`sh scripts/update.sh --rollback-generation /absolute/request.json` invokes the
+same inverse while the caller remains available. Rollback requires unchanged
+captured tracking and enrollment state, preserves foreign replacements, and
+retains both generations and each inverse object for reconciliation. Newly
+admitted or enrolled work must be reconciled before rollback.
+
+After activating a generation, a new service can receive a separate private
+writer namespace from an authorized configuration template:
+
+```sh
+sh scripts/update.sh --allocate-namespace /absolute/template-config.json
+```
+
+This command allocates a random configuration/state/tracking directory and task
+queue, bootstraps its schema through the active SDK under exclusive custody, and
+publishes a completed allocation witness. It starts no service or delivery. The
+pinned state helper requires the exact active SDK/interpreter before opening a
+writable connection to this database. Admission consumers hold `fresh_namespace_scope(config)` and revalidate
+its witness across admission, dispatch and resume. This boundary covers supported
+adapters using the allocated unedited configuration and its pinned helper;
+arbitrary independently configured legacy writers remain outside that proof.
+An existing or shared outbox cannot be declared fresh by setting a flag.
+
+Fresh namespace operations use managed starts through the installed console or
+service entry. Direct or already-running SDK processes must restart through a
+managed entry before using the namespace.
+
+Before application imports, the retained bootstrap holds the actual source
+lifetime lease, verifies the active source manifest and clean Git revision/tree,
+and checks the pinned interpreter and site registrations. Python ignores ordinary
+bytecode caches for this path. A read-only per-process descriptor binds startup
+to the source birth and held lease; API/worker children receive a fresh witness
+before their imports. Namespace scope checks bind the exact allocated config,
+state and tracking objects, original config digest, loaded SDK origins and source
+file identities. A process that imported the SDK outside this qualified path
+restarts through the installed entry before performing fresh namespace work.
+
+This contract coordinates supported loaders and updaters: generations are retained
+and never edited by an updater, and an updater needs the exclusive lifetime lease.
+Checks detect ordinary drift in the SDK, state helpers and installation helpers
+that the namespace imports. The trusted bootstrap,
+interpreter/standard library and pinned site remain platform dependencies;
+advisory locking and checks do not exclude arbitrary same-user transient edits or
+monkeypatching. Ordinary development and nonnamespace console/service operations
+retain their existing startup contract. Namespace-bound managed starts require
+source qualification and never silently fall back when qualification fails.
+
 Between tasks, select a published release and update the durable owner:
 
 ```sh

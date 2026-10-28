@@ -6,6 +6,7 @@ by the production contract. Its disposable *source* remains in OS temp storage.
 """
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -172,6 +173,18 @@ class ProductionInstallation(unittest.TestCase):
                        check=True, capture_output=True)
         subprocess.run(["git", "--git-dir", str(releases), "symbolic-ref", "HEAD", "refs/heads/fixture-candidate"],
                        check=True, capture_output=True)
+        provenance = {"fixture_class": cls.__name__,
+                      "root_head": subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip(),
+                      "fixture_head": subprocess.check_output(["git", "-C", str(cls.origin), "rev-parse", "HEAD"], text=True).strip(),
+                      "tracked_input_diff_sha256": hashlib.sha256(patch_bytes).hexdigest()}
+        cls.source_provenance = provenance
+        if os.environ.get("DEVFLOW_PRODUCTION_FIXTURE_LEDGER"):
+            descriptor = os.open(os.environ["DEVFLOW_PRODUCTION_FIXTURE_LEDGER"],
+                                 os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write(json.dumps(provenance, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
         # The controller used during setup is deliberately disposable too.
         # The installed runtime must bind to its durable base interpreter.
         setup_venv = Path(cls.setup.name) / "setup-venv"
@@ -234,6 +247,17 @@ class ProductionInstallation(unittest.TestCase):
             "roles": {key: {"model": "fixture", "effort": "low"} for key in
                 ("implement", "review", "verify")}}))
         cls.config.chmod(0o600)
+        if getattr(cls, "EMPTY_GENERATION_FIXTURE", False):
+            empty = subprocess.run([str(cls.target / "runtime/.venv/bin/python"), "-I", "-B", "-c",
+                "import pathlib,sys;from devflow_temporal.delivery_config import DeliveryConfig;"
+                "from devflow_temporal.delivery_store import DeliveryStore;"
+                "DeliveryStore(DeliveryConfig.load(pathlib.Path(sys.argv[1])))", str(cls.config)],
+                env=cls.env, text=True, capture_output=True)
+            if empty.returncode:
+                raise AssertionError(empty.stdout + "\n" + empty.stderr)
+            shutil.rmtree(cls.setup.name)
+            cls.env["DEVFLOW_PYTHON"] = str(cls.target / "runtime/.venv/bin/python")
+            return
         seed = r'''
 import json, sys
 from pathlib import Path
@@ -260,6 +284,9 @@ print(json.dumps({"spec": s.submitted_spec("owned-run"), "events": s.events("own
         # Remove the entire disposable setup ancestor before any installed reads.
         shutil.rmtree(cls.setup.name)
         cls.env["DEVFLOW_PYTHON"] = str(cls.target / "runtime/.venv/bin/python")
+
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ, HOME=str(self.home)))
 
     def test_cli_imports_and_api_restart_after_setup_checkout_removed(self):
         target = self.target

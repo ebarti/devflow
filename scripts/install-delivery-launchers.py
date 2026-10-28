@@ -156,7 +156,7 @@ def runtime(request):
     if not paths.development(request["bin_dir"], request["config_path"]):
         paths.registration_lease(ROOT)
         paths.durable(request["bin_dir"], "production launcher directory")
-        paths.runtime(ROOT)
+        paths.production_runtime(ROOT)
         paths.configuration(Path(request["config_path"]))
     def git(*args):
         return paths.git(ROOT, *args)
@@ -213,7 +213,7 @@ def wrapper(request, name):
         paths = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(paths)
         root = Path(request["runtime_dir"]).parent
-        folder = root.parent / ".production-bootstraps" / request["source_revision"]
+        folder = paths.bootstrap_directory(root, request["source_revision"])
         metadata = paths.read_json(folder / "manifest.json")
         module = "devflow_temporal.delivery_mcp" if name == "devflow-delivery-mcp" else "devflow_temporal.delivery_control"
         return paths.console_wrapper(root, folder / "production-entry.py", metadata["base_python"], module,

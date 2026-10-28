@@ -166,7 +166,7 @@
     "tests/test_delivery_ordinary_unstarted.py": 8.277,
     "tests/test_delivery_output.py": 0.276,
     "tests/test_delivery_owned_drift.py": 31.723,
-    "tests/test_delivery_owner_cwd.py": 0.691,
+    "tests/test_delivery_owner_cwd.py": 0.588,
     "tests/test_delivery_pagination.py": 3.025,
     "tests/test_delivery_patient_ci.py": 2.741,
     "tests/test_delivery_pending_publication.py": 9.644,

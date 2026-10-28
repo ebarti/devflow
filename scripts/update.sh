@@ -3,6 +3,14 @@
 set -eu
 if [ "${DEVFLOW_INSTALL_MODE:-production}" != "development" ]; then
     source_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+    case "${1:-}" in
+        --prepare|--preflight|--apply|--rollback-generation|--allocate-namespace)
+            operation=${1#--}
+            [ "$operation" != rollback-generation ] || operation=rollback
+            shift
+            exec "${DEVFLOW_PYTHON:-python3.12}" -I -S -B "$source_root/scripts/production-generation.py" "$operation" "$@"
+            ;;
+    esac
     exec "${DEVFLOW_PYTHON:-python3.12}" -B "$source_root/scripts/update-production.py" "$@"
 fi
 

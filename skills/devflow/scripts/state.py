@@ -81,6 +81,24 @@ def _durable_journal(db):
 
 def connect(path):
     path = Path(path).expanduser()
+    namespace = Path.home().resolve() / ".local/state/devflow/namespaces"
+    absolute = Path(os.path.abspath(path))
+    resolved = path.resolve(strict=False)
+    guarded_namespace = (absolute.is_relative_to(namespace) or resolved.is_relative_to(namespace))
+    namespace_proof = None
+    if guarded_namespace:
+        if (absolute != resolved or absolute.parent.parent != namespace
+                or absolute.name != "tracking.sqlite3"):
+            raise ValueError("namespace tracking path must be its canonical enrolled database without aliases")
+        try:
+            from devflow_temporal.delivery_installation_owner import require_namespace_database
+
+            namespace_proof = require_namespace_database(absolute)
+        except (ImportError, AttributeError) as exc:
+            raise ValueError("fresh namespace requires its enrolled generation tracking owner") from exc
+        if not namespace_proof:
+            raise ValueError("namespace tracking connection has no positive allocation proof")
+        path = absolute
     # umask is process-wide: even a temporary change races with other state
     # connections and unrelated subprocess launches in the delivery worker.
     missing = []
@@ -90,15 +108,20 @@ def connect(path):
         parent = parent.parent
     for parent in reversed(missing):
         parent.mkdir(mode=0o700, exist_ok=True)
-    try:
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        pass
-    else:
-        os.close(descriptor)
-    db = sqlite3.connect(path, timeout=30)
+    if not namespace_proof or namespace_proof.get("bootstrapping"):
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+    db = (sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=30)
+          if namespace_proof and not namespace_proof.get("bootstrapping")
+          else sqlite3.connect(path, timeout=30))
     db.row_factory = sqlite3.Row
     try:
+        if namespace_proof and require_namespace_database(path) != namespace_proof:
+            raise ValueError("namespace tracking custody changed before opening its connection")
         db.execute("PRAGMA foreign_keys=ON")
         # Readers must not queue behind writers: inspect the schema without a
         # transaction and reserve the write lock only when a migration is due.

@@ -160,7 +160,7 @@ def agent(args, name, config, data, state_root):
     production = not paths.development(args.launch_agents, config, state_root)
     if production:
         paths.registration_lease(runtime.parent)
-        paths.runtime(runtime.parent)
+        paths.production_runtime(runtime.parent)
         paths.configuration(config)
         paths.durable(temporal, "Temporal CLI")
         paths.durable(Path(args.launch_agents), "launch agent registration")

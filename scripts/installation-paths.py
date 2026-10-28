@@ -37,6 +37,24 @@ def identity_helper():
     return module
 
 
+def layout_helper():
+    spec = importlib.util.spec_from_file_location(
+        "production_layout", Path(__file__).with_name("production-layout.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def production_owner(root):
+    """The external namespace survives replacement of any source generation."""
+    root = Path(root)
+    expected = Path.home().resolve(strict=True) / ".local/share/devflow"
+    if root == expected / "developer-workflow":
+        return expected
+    layout_helper()._namespace(root)
+    return expected
+
+
 def node(path):
     return identity_helper().directory_identity(path)
 
@@ -46,14 +64,16 @@ def same_node(before, current):
 
 
 def registration_lease(root):
-    fd = os.open(root.parent / ".production-install.lock", os.O_RDWR | os.O_NOFOLLOW)
+    owner = production_owner(root)
+    fd = os.open(owner / ".production-install.lock", os.O_RDWR | os.O_NOFOLLOW)
     try:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        receipt = read_json(root.parent / ".production-install.json")
+        layout_helper().installed(root)
+        receipt = read_json(owner / ".production-install.json")
         if (receipt.get("managed_owner_version") != 1 or receipt.get("phase") != "verified"
                 or not same_node(receipt.get("target_identity"), node(root))):
             raise ValueError("production installation is unfinished or requires authenticated legacy cutover")
-        update = root.parent / ".production-update.json"
+        update = owner / ".production-update.json"
         if update.exists() and read_json(update).get("phase") not in {"verified", "rolled_back"}:
             raise ValueError("production update is unfinished; replay its retained recovery command")
         _REGISTRATION_LEASES.append(fd)
@@ -73,10 +93,20 @@ def console_wrapper(root, controller, python, module, arguments=()):
 
 def production_bootstrap(root, base_python, *, create=False, environment=None):
     revision = git(root, "rev-parse", "HEAD")
-    folder = root.parent / ".production-bootstraps" / revision
+    folder = bootstrap_directory(root, revision)
     controller = folder / "production-entry.py"
     manifest = folder / "manifest.json"
     wanted = (git(root, "show", revision + ":scripts/production-entry.py") + "\n").encode()
+    try:
+        layout_source = (git(root, "show", revision + ":scripts/production-layout.py") + "\n").encode()
+    except subprocess.CalledProcessError:
+        layout_source = None  # Preserve the original fixed-root bootstrap proof.
+    layout_file = folder / "production-layout.py"
+    try:
+        source_helper = (git(root, "show", revision + ":scripts/production-source.py") + "\n").encode()
+    except subprocess.CalledProcessError:
+        source_helper = None
+    source_file = folder / "production-source.py"
     if create:
         protected_directory(folder, create=True)
         if not controller.exists():
@@ -85,16 +115,56 @@ def production_bootstrap(root, base_python, *, create=False, environment=None):
                 stream.write(wanted)
                 stream.flush()
                 os.fsync(stream.fileno())
+        if layout_source is not None and not layout_file.exists():
+            descriptor = os.open(layout_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(layout_source)
+                stream.flush()
+                os.fsync(stream.fileno())
+        if source_helper is not None and not source_file.exists():
+            descriptor = os.open(source_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(source_helper)
+                stream.flush()
+                os.fsync(stream.fileno())
         data = {"revision": revision, "base_python": str(base_python), "runtime_dir": str(root / "runtime"),
                 "controller_sha256": hashlib.sha256(wanted).hexdigest()}
+        if layout_source is not None:
+            data["layout_sha256"] = hashlib.sha256(layout_source).hexdigest()
+        if source_helper is not None:
+            if read_bytes(source_file) != source_helper:
+                raise ValueError("retained source startup helper changed")
+            spec = importlib.util.spec_from_file_location("source_builder", source_file)
+            builder = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(builder)
+            git_bin = durable(Path(shutil.which("git")).resolve(strict=True), "source startup Git observer")
+            document = builder.build(root, Path(base_python), git_bin, revision, git(root, "rev-parse", "HEAD^{tree}"))
+            source_manifest = folder / "source.json"
+            if source_manifest.exists() and read_json(source_manifest) != document:
+                raise ValueError("immutable source startup manifest changed")
+            if not source_manifest.exists():
+                write_json(source_manifest, document)
+            data["source_manifest_sha256"] = hashlib.sha256(read_bytes(source_manifest)).hexdigest()
+            data["source_helper_sha256"] = hashlib.sha256(source_helper).hexdigest()
+            protected_directory(production_owner(root) / ".production-process-starts", create=True)
         if manifest.exists() and read_json(manifest) != data:
             raise ValueError("immutable production bootstrap metadata changed")
         if not manifest.exists():
             write_json(manifest, data)
     data = read_json(manifest)
     durable(Path(data["base_python"]), "production bootstrap interpreter")
-    if read_bytes(controller) != wanted or data["controller_sha256"] != hashlib.sha256(wanted).hexdigest():
+    if (read_bytes(controller) != wanted or data["controller_sha256"] != hashlib.sha256(wanted).hexdigest()
+            or (layout_source is not None and (read_bytes(layout_file) != layout_source
+                or data.get("layout_sha256") != hashlib.sha256(layout_source).hexdigest()))):
         raise ValueError("production bootstrap differs from its independent Git object")
+    if source_helper is not None:
+        document = read_json(folder / "source.json")
+        if (read_bytes(source_file) != source_helper
+                or data.get("source_helper_sha256") != hashlib.sha256(source_helper).hexdigest()
+                or data.get("source_manifest_sha256") != hashlib.sha256(read_bytes(folder / "source.json")).hexdigest()
+                or document.get("root") != str(root) or document.get("revision") != revision
+                or document.get("tree") != git(root, "rev-parse", "HEAD^{tree}")):
+            raise ValueError("production source startup manifest changed")
     env = environment or root / "runtime/.venv"
     if create:
         protected_directory(folder / "entries", create=True)
@@ -134,7 +204,22 @@ def production_bootstrap(root, base_python, *, create=False, environment=None):
 
 
 def published_entry(root, name):
-    return (root.parent / ".production-bootstraps" / git(root, "rev-parse", "HEAD") / "entries" / name)
+    return bootstrap_directory(root, git(root, "rev-parse", "HEAD")) / "entries" / name
+
+
+def bootstrap_directory(root, revision):
+    # Two generations may deliberately select the same release. Their venvs
+    # remain at different final paths and must never share launcher metadata.
+    suffix = revision if root.name != "source" else revision + "-" + root.parent.name
+    return production_owner(root) / ".production-bootstraps" / suffix
+
+
+def startup_binding(root):
+    folder = bootstrap_directory(root, git(root, "rev-parse", "HEAD"))
+    data = read_json(folder / "manifest.json")
+    if "source_manifest_sha256" not in data:
+        raise ValueError("source generation has no qualified pre-import startup manifest")
+    return {"directory": str(folder), "manifest_sha256": hashlib.sha256(read_bytes(folder / "manifest.json")).hexdigest()}
 
 
 def development(*destinations):
@@ -265,15 +350,15 @@ def read_json(path):
 
 
 def inventory_path(root, receipt=None):
-    receipt = receipt or read_json(root.parent / ".production-install.json")
+    receipt = receipt or read_json(production_owner(root) / ".production-install.json")
     generation = receipt.get("owner_generation")
     if not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{32}", generation):
         raise ValueError("production owner has no authenticated store-birth generation")
-    return root.parent / ".production-configurations" / (generation + ".json")
+    return production_owner(root) / ".production-configurations" / (generation + ".json")
 
 
 def read_inventory(root, receipt=None):
-    receipt = receipt or read_json(root.parent / ".production-install.json")
+    receipt = receipt or read_json(production_owner(root) / ".production-install.json")
     value = read_json(inventory_path(root, receipt))
     if (value.get("schema_version") != 1 or value.get("birth_protocol") != 1
             or value.get("owner_generation") != receipt.get("owner_generation")
@@ -407,6 +492,27 @@ print(json.dumps(result))
 def runtime(root, *, environment=None, allow_unpublished=False):
     if root != Path.home().resolve() / ".local/share/devflow/developer-workflow":
         raise ValueError("production runtime must use its independently owned fixed installation root")
+    return _runtime(root, environment=environment, allow_unpublished=allow_unpublished)
+
+
+def generation_runtime(root, *, allow_unpublished=False):
+    """Inspect an explicitly allocated immutable generation, not an arbitrary root."""
+    prepared = layout_helper().prepared(root)
+    proof = _runtime(root, allow_unpublished=allow_unpublished)
+    if any(proof[name] != prepared["allocation"][name] for name in ("revision", "tree")):
+        raise ValueError("prepared runtime source changed after its allocation")
+    return proof
+
+
+def production_runtime(root, *, allow_unpublished=False):
+    installed = layout_helper().installed(root)
+    if installed is None:
+        raise ValueError("runtime is not an authenticated production installation")
+    return (runtime(root, allow_unpublished=allow_unpublished) if installed["version"] == 1
+            else generation_runtime(root, allow_unpublished=allow_unpublished))
+
+
+def _runtime(root, *, environment=None, allow_unpublished=False):
     identity = source(root)
     env = environment or root / "runtime/.venv"
     protected_directory(env)
@@ -417,7 +523,7 @@ def runtime(root, *, environment=None, allow_unpublished=False):
                 raise ValueError("runtime environment contains an external linked dependency")
             durable(item.resolve(strict=True), "base Python")
     python = env / "bin/python"
-    result = subprocess.run([str(python), "-I", "-B", "-c", PROBE, str(root), str(env)],
+    result = subprocess.run([str(python), "-I", "-B", "-X", "pycache_prefix=/dev/null", "-c", PROBE, str(root), str(env)],
                             env={key: value for key, value in os.environ.items()
                                  if not key.startswith("PYTHON") and key not in {
                                      "VIRTUAL_ENV", "__PYVENV_LAUNCHER__", "LD_PRELOAD", "LD_LIBRARY_PATH",
@@ -482,7 +588,10 @@ def persistence_path(path, label):
     source_root = Path.home().resolve() / ".local/share/devflow/developer-workflow"
     mutable = [source_root, *(source_root.parent / name for name in
                (".production-environments", ".production-recovery", ".production-bootstraps",
-                ".production-configurations"))]
+                ".production-configurations", ".production-generations",
+                ".production-generation-births", ".production-transitions",
+                ".production-process-starts", ".production-transition-controllers",
+                ".production-preparations", ".production-namespace-allocations"))]
     if any(path == root or root in path.parents or path in root.parents for root in mutable):
         raise ValueError("production persistence must be separate from installation/update dependencies: " + label)
     return path
