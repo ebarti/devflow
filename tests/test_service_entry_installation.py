@@ -54,6 +54,8 @@ class ServiceEntryInstallation(unittest.TestCase):
         ROOT = source
 
     def setUp(self):
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.dict(os.environ, DEVFLOW_INSTALL_MODE="development").start()
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -63,7 +65,7 @@ class ServiceEntryInstallation(unittest.TestCase):
         self.config.write_text("foreign desktop settings unchanged\n")
         self.hooks = self.home / "hooks.json"
         self.hooks.write_text('{"hooks":{"Stop":[{"hooks":[{"command":"foreign"}]}]}}')
-        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable)
+        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development")
 
     def install(self):
         return subprocess.run(

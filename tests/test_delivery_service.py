@@ -55,7 +55,7 @@ class DeliveryService(unittest.TestCase):
         self.runtime = self.root / "source/runtime"
         self.entry = fake_executable(self.runtime / ".venv/bin/devflow-delivery")
         self.temporal = fake_executable(self.root / "tools/temporal")
-        self.env = dict(os.environ, DEVFLOW_LAUNCH_AGENTS=str(self.agents),
+        self.env = dict(os.environ, DEVFLOW_LAUNCH_AGENTS=str(self.agents), DEVFLOW_INSTALL_MODE="development",
                         GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
 
     def script(self, *args, env=None):
@@ -170,7 +170,7 @@ class DeliveryService(unittest.TestCase):
     def test_update_refuses_while_an_activated_agent_supervises_the_checkout(self):
         source = self.runtime.parent
         (source / "scripts").mkdir(parents=True)
-        for name in ("update.sh", "delivery-service.py", "delivery-workers.py"):
+        for name in ("update.sh", "delivery-service.py", "delivery-workers.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, source / "scripts" / name)
         env = dict(self.env, DEVFLOW_PYTHON=sys.executable)
         staged = self.script(*self.install_args(), env=env)

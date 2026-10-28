@@ -189,7 +189,8 @@ def plan(source, skills, home, guard):
     if skills / "devflow" in links and os.path.lexists(helper):
         reject(helper, "script-only migration destination already exists")
     return {"links": links, "pin": pin_path if pin else None, "hook": hook_path if pin else None,
-            "hooks": hooks_path, "raw": raw, "updated": updated, "helper": helper}
+            "hooks": hooks_path, "raw": raw, "updated": updated, "helper": helper,
+            "revision": pin["head"] if pin else V022}
 
 
 def apply(migration, source, skills, agents, rollback, backup):

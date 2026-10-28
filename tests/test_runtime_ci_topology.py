@@ -63,6 +63,8 @@ if [ \"$1 $2\" = 'python find' ]; then printf '%s\\n' \"$STUB_PYTHON\"; fi
         self.assertIn('--verify runtime/ci-results --count 4', workflow)
         with tempfile.TemporaryDirectory(prefix='devflow-ci-topology-') as directory:
             root = Path(directory)
+            home = root / 'home'
+            home.mkdir()
             stub = root / 'stub.py'
             stub.write_text('''\
 import fcntl, json, os, sys, time
@@ -100,7 +102,8 @@ if key == os.environ.get('STUB_FAIL'):
                     failures.extend(['source-install', 'source-reconcile'])
                 for failed_index in failures:
                     log.unlink(missing_ok=True)
-                    env = {**os.environ, 'STUB_LOG': str(log), 'RUNNER_TEMP': str(root)}
+                    env = {**os.environ, 'STUB_LOG': str(log), 'RUNNER_TEMP': str(root),
+                           'HOME': str(home)}
                     env.pop('STUB_FAIL', None)
                     if failed_index is not None:
                         env['STUB_FAIL'] = failed_index

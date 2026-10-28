@@ -107,6 +107,8 @@ jobs:
           result=0
           processes=()
           if [ '${{ matrix.shard }}' = 0 ]; then
+            fixture_parent="$(mktemp -d "$HOME/devflow-install-fixtures.XXXXXX")"
+            export DEVFLOW_PRODUCTION_FIXTURE_PARENT="$fixture_parent"
             env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
               sh ../scripts/check-install.sh &
             processes+=("$!")
@@ -119,6 +121,8 @@ jobs:
             for process in "${processes[@]}"; do
               wait "$process" || result=1
             done
+            rmdir "$fixture_parent" || result=1
+            unset DEVFLOW_PRODUCTION_FIXTURE_PARENT
             processes=()
           fi
           for lane in 0 1; do

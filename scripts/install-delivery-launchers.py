@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -149,9 +150,16 @@ def runtime(request):
     if folder != ROOT / "runtime":
         raise ValueError("use the installer in the canonical installed runtime checkout")
     directory(folder)
+    spec = importlib.util.spec_from_file_location("installation_paths", ROOT / "scripts/installation-paths.py")
+    paths = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(paths)
+    if not paths.development(request["bin_dir"], request["config_path"]):
+        paths.registration_lease(ROOT)
+        paths.durable(request["bin_dir"], "production launcher directory")
+        paths.runtime(ROOT)
+        paths.configuration(Path(request["config_path"]))
     def git(*args):
-        return subprocess.check_output(["git", "-C", str(ROOT), *args], text=True,
-                                       env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).strip()
+        return paths.git(ROOT, *args)
     if (git("rev-parse", "HEAD") != request["source_revision"]
             or git("rev-parse", "HEAD^{tree}") != request["source_tree"]
             or git("status", "--porcelain", "--untracked-files=normal")):
@@ -200,6 +208,16 @@ def validate(request):
 
 
 def wrapper(request, name):
+    if os.environ.get("DEVFLOW_INSTALL_MODE", "production") != "development":
+        spec = importlib.util.spec_from_file_location("installation_paths", ROOT / "scripts/installation-paths.py")
+        paths = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(paths)
+        root = Path(request["runtime_dir"]).parent
+        folder = root.parent / ".production-bootstraps" / request["source_revision"]
+        metadata = paths.read_json(folder / "manifest.json")
+        module = "devflow_temporal.delivery_mcp" if name == "devflow-delivery-mcp" else "devflow_temporal.delivery_control"
+        return paths.console_wrapper(root, folder / "production-entry.py", metadata["base_python"], module,
+                                     ("--config", request["config_path"]))
     entry = "devflow-delivery" if name == "devflow" else name
     return ("#!/bin/sh\n# Canonical delivery entry; devflow aliases devflow-delivery.\nexec "
             + shlex.quote(str(Path(request["runtime_dir"]) / ".venv/bin" / entry))

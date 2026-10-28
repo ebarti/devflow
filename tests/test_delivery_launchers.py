@@ -21,6 +21,9 @@ def sha(raw):
 
 class DeliveryLaunchers(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ, DEVFLOW_INSTALL_MODE="development")
+        environment.start()
+        self.addCleanup(environment.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -36,7 +39,7 @@ class DeliveryLaunchers(unittest.TestCase):
             'devflow-delivery-mcp="devflow_temporal.delivery_mcp:main"\n')
         scripts = self.source / "scripts"
         scripts.mkdir()
-        for name in ("install.sh", "install-delivery-launchers.py"):
+        for name in ("install.sh", "install-delivery-launchers.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, scripts / name)
         for name in ("devflow-delivery", "devflow-delivery-mcp"):
             entry = self.entries / name
@@ -46,7 +49,7 @@ class DeliveryLaunchers(unittest.TestCase):
         self.config = self.root / "service config.json"
         self.config.write_text('{"service":"preserved"}\n')
         self.config.chmod(0o600)
-        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable,
+        self.env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development",
                         GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
         self.git("init", "-q")
         # Git maintenance can otherwise mutate .git after the preservation snapshot.
