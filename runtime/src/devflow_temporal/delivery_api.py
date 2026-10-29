@@ -796,6 +796,15 @@ def create_app(config_path: Path) -> FastAPI:
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.get("/api/runs/{run_id}/status")
+    async def persisted_status(request: Request, run_id: str) -> dict[str, Any]:
+        _host(request)
+        try:
+            value = await asyncio.to_thread(service.store.persisted_status, run_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"version": 1, "source": "persisted_projection", "run": value}
+
     @app.get("/api/runs/{run_id}")
     async def detail(request: Request, run_id: str) -> dict[str, Any]:
         _host(request)

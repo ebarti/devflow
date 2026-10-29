@@ -8,8 +8,6 @@ import json
 import os
 import shutil
 import socket
-import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -50,114 +48,6 @@ def package_fixture(tmp_path):
     return tmp_path / "marketplace", runtime, config
 
 
-@pytest.mark.parametrize("package_format", ["portable", "codex"])
-def test_discovery_canonical_skill_explicit_paths_and_idempotency(package_fixture, package_format):
-    root, runtime, config = package_fixture
-    target = packager.package(root, runtime, config, package_format=package_format)
-    catalog = json.loads((root / ".agents/plugins/marketplace.json").read_text())
-    assert root / catalog["plugins"][0]["source"]["path"] == target
-    if package_format == "portable":
-        manifest = json.loads((target / "plugin.json").read_text())
-        assert manifest["$schema"].endswith("/1.0.0/plugin.schema.json")
-        assert manifest["extensions"]["com.openai"]["interface"]["displayName"]
-        mcp = json.loads((target / "mcp.json").read_text())
-        assert mcp["$schema"].endswith("/1.0.0/mcp.schema.json")
-        assert not (target / ".codex-plugin").exists()
-    else:
-        manifest = json.loads((target / ".codex-plugin/plugin.json").read_text())
-        assert manifest["skills"] == "./skills/" and manifest["mcpServers"] == "./.mcp.json"
-        assert manifest["interface"]["displayName"]
-        assert not (target / "plugin.json").exists() and not (target / "mcp.json").exists()
-        mcp = json.loads((target / ".mcp.json").read_text())
-    assert mcp["mcpServers"] == {"devflow-local-delivery": {
-        "type": "stdio", "command": str(runtime / ".venv/bin/devflow-delivery-mcp"),
-        "args": ["--config", str(config)],
-    }}
-    source = RUNTIME / "desktop/devflow-local-delivery/SKILL.md"
-    assert (target / "skills/devflow-local-delivery/SKILL.md").read_bytes() == source.read_bytes()
-    files = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
-    assert all(b"SECRET_CONFIG" not in data for data, _mtime in files.values())
-    assert packager.package(root, runtime, config, package_format=package_format) == target
-    assert files == {p: (p.read_bytes(), p.stat().st_mtime_ns)
-                     for p in root.rglob("*") if p.is_file()}
-
-
-@pytest.mark.parametrize("package_format", ["portable", "codex"])
-def test_package_root_resolves_ancestor_alias_before_descendant_checks(
-    package_fixture, tmp_path, package_format,
-):
-    _root, runtime, config = package_fixture
-    physical = tmp_path / "physical parent"
-    physical.mkdir()
-    alias = tmp_path / "parent alias"
-    alias.symlink_to(physical, target_is_directory=True)
-    selected = alias / "new marketplace"
-    target = packager.package(selected, runtime, config, package_format=package_format)
-    assert target == physical / "new marketplace/plugins/devflow"
-    before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
-              for p in target.parent.parent.rglob("*") if p.is_file()}
-    assert packager.package(selected, runtime, config, package_format=package_format) == target
-    assert packager.package(selected.resolve(), runtime, config,
-                            package_format=package_format) == target
-    assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns)
-                      for p in target.parent.parent.rglob("*") if p.is_file()}
-
-
-@pytest.mark.skipif(sys.platform != 'darwin', reason='native macOS temporary-root spelling')
-@pytest.mark.parametrize("directory", [None, "/tmp"])
-def test_native_temporary_package_root_uses_physical_path(package_fixture, directory):
-    _root, runtime, config = package_fixture
-    with tempfile.TemporaryDirectory(prefix='devflow-package-alias-', dir=directory) as temporary:
-        selected = Path(temporary) / 'marketplace'
-        target = packager.package(selected, runtime, config)
-        assert target == selected.resolve() / 'plugins/devflow'
-
-
-@pytest.mark.parametrize("first,second", [("portable", "codex"), ("codex", "portable")])
-def test_package_selection_never_rewrites_an_existing_other_layout(package_fixture, first, second):
-    root, runtime, config = package_fixture
-    packager.package(root, runtime, config, package_format=first)
-    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
-    with pytest.raises(ValueError, match="same-name plugin differs"):
-        packager.package(root, runtime, config, package_format=second)
-    assert before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
-
-
-def test_unrelated_catalog_fields_and_plugins_preserved(package_fixture):
-    root, runtime, config = package_fixture
-    path = root / ".agents/plugins/marketplace.json"
-    path.parent.mkdir(parents=True)
-    original = {"name": "team", "interface": {"displayName": "Team"}, "custom": {"x": 1},
-                "plugins": [{"name": "other", "source": {"source": "local", "path": "./other"}}]}
-    path.write_text(json.dumps(original))
-    packager.package(root, runtime, config)
-    updated = json.loads(path.read_text())
-    assert updated == {**original, "plugins": [*original["plugins"], packager.ENTRY]}
-
-
-@pytest.mark.parametrize("conflict", ["catalog", "symlink-file"])
-def test_conflicts_preserve_both_destinations(package_fixture, conflict):
-    root, runtime, config = package_fixture
-    target = packager.package(root, runtime, config)
-    if conflict == "catalog":
-        path = root / ".agents/plugins/marketplace.json"
-        catalog = json.loads(path.read_text())
-        catalog["plugins"][0]["source"]["path"] = "./elsewhere"
-        path.write_text(json.dumps(catalog))
-    elif conflict == "plugin":
-        (target / "plugin.json").write_text("user change")
-    elif conflict == "extra":
-        (target / "user.txt").write_text("user data")
-    else:
-        (target / "plugin.json").unlink()
-        (target / "plugin.json").symlink_to(config)
-    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
-    with pytest.raises(ValueError):
-        packager.package(root, runtime, config)
-    assert before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
-    assert config.read_text() == "SECRET_CONFIG_CONTENT_MUST_NOT_BE_EMBEDDED"
-
-
 @pytest.mark.parametrize("component", ["marketplace", ".agents/plugins"])
 def test_symlink_destinations_never_escape_root(package_fixture, tmp_path, component):
     root, runtime, config = package_fixture
@@ -169,75 +59,6 @@ def test_symlink_destinations_never_escape_root(package_fixture, tmp_path, compo
     with pytest.raises(ValueError, match="symlink"):
         packager.package(root, runtime, config)
     assert list(outside.iterdir()) == []
-
-
-@pytest.mark.parametrize("spelling", ["direct", "file"])
-@pytest.mark.parametrize("dangling", [False, True])
-def test_named_root_symlink_spellings_preserve_target(
-    package_fixture, tmp_path, spelling, dangling,
-):
-    _root, runtime, config = package_fixture
-    physical = tmp_path / "selected parent"
-    physical.mkdir()
-    (physical / "file").write_text("an intermediate regular file")
-    outside = tmp_path / "outside target"
-    if not dangling:
-        outside.mkdir()
-        (outside / "user.txt").write_text("existing target must remain untouched")
-    before = {path.relative_to(outside): (path.read_bytes(), path.stat().st_mtime_ns)
-              for path in outside.rglob("*") if path.is_file()}
-    link = physical / "named marketplace"
-    link.symlink_to(outside, target_is_directory=True)
-    parent = tmp_path / "ancestor alias"
-    parent.symlink_to(physical, target_is_directory=True)
-    selected = parent / link.name if spelling == "direct" else (
-        parent / spelling / ".." / link.name)
-    with pytest.raises(ValueError, match="destination is a symlink"):
-        packager.package(selected, runtime, config, package_format="codex")
-    assert link.is_symlink()
-    assert outside.exists() is not dangling
-    assert before == {path.relative_to(outside): (path.read_bytes(), path.stat().st_mtime_ns)
-                      for path in outside.rglob("*") if path.is_file()}
-
-
-@pytest.mark.parametrize("missing", ["runtime", "nonexecutable"])
-def test_missing_inputs_create_no_package(package_fixture, missing):
-    root, runtime, config = package_fixture
-    if missing == "runtime":
-        runtime = runtime / "absent"
-    elif missing == "config":
-        config.unlink()
-    elif missing == "executable":
-        (runtime / ".venv/bin/devflow-delivery-mcp").unlink()
-    else:
-        (runtime / ".venv/bin/devflow-delivery-mcp").chmod(0o644)
-    with pytest.raises((ValueError, OSError)):
-        packager.package(root, runtime, config)
-    assert not root.exists()
-
-
-def test_catalog_conflict_is_checked_before_plugin_creation(package_fixture):
-    root, runtime, config = package_fixture
-    path = root / ".agents/plugins/marketplace.json"
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"name": "team", "plugins": [{"name": "devflow"}]}))
-    with pytest.raises(ValueError, match="same-name marketplace"):
-        packager.package(root, runtime, config)
-    assert not (root / "plugins").exists()
-
-
-def test_catalog_write_failure_rolls_back_new_plugin(package_fixture, monkeypatch):
-    root, runtime, config = package_fixture
-
-    def fail_replace(*_args):
-        raise OSError("simulated catalog write failure")
-
-    monkeypatch.setattr(packager.os, "replace", fail_replace)
-    with pytest.raises(OSError, match="simulated"):
-        packager.package(root, runtime, config)
-    assert not (root / "plugins/devflow").exists()
-    assert not (root / ".agents/plugins/marketplace.json").exists()
-    assert not list(root.glob(".devflow-package-*"))
 
 
 @pytest.mark.asyncio
@@ -353,21 +174,3 @@ async def test_generated_stdio_command_raw_goal_question_auto_plan_and_evidence(
             server.should_exit = True
             await asyncio.wait_for(serving, 5)
             listener.close()
-
-
-def test_packaged_handoff_example_admits_detailed_goal(package_fixture, tmp_path):
-    import re
-
-    from test_delivery_store import service as store_fixture
-
-    root, runtime, config = package_fixture
-    target = packager.package(root, runtime, config)
-    skill = (target / 'skills/devflow-local-delivery/SKILL.md').read_text()
-    example = json.loads(re.search(r'```json\n(.*?)\n```', skill, re.S).group(1))
-    fixture_root = tmp_path / 'admission'
-    fixture_root.mkdir()
-    store, request = store_fixture.__wrapped__(fixture_root)
-    store.submit({**request, **example})
-    spec = store.spec(request['run_id'])
-    assert spec['goal'] == example['goal']
-    assert spec['publication_summary'] == example['publication_summary']

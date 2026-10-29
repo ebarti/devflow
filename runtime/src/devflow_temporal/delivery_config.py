@@ -839,6 +839,14 @@ def scope_amended_spec(
             effective[marker] = original[marker]
         else:
             effective.pop(marker, None)
+    # Operational controls are server-owned and remain bound to this admitted
+    # run when a frozen authorization is rehydrated for a scope amendment.
+    from .delivery_control_lineage import FIELD, control_from_spec
+
+    if control_from_spec(original) is not None:
+        effective[FIELD] = deepcopy(original[FIELD])
+    else:
+        effective.pop(FIELD, None)
     if "ci_wait_seconds" in original["policy"]:
         effective["policy"]["ci_wait_seconds"] = original["policy"]["ci_wait_seconds"]
     else:

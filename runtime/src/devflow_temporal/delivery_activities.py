@@ -520,6 +520,8 @@ async def delivery_technical_readback(request: dict[str, Any]) -> dict[str, Any]
 
 @activity.defn(name="delivery_project")
 async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
+    expected_workflow_id = activity.info().workflow_id if activity.in_activity() else None
+
     def execute() -> dict[str, Any]:
         outcome = request.get('outcome')
         terminal = (outcome in {'blocked', 'cancelled', 'delivered'}
@@ -547,6 +549,7 @@ async def delivery_project(request: dict[str, Any]) -> dict[str, Any]:
             cleanup=request.get("cleanup"),
             error=request.get("error"),
             key=request.get("key"),
+            expected_workflow_id=expected_workflow_id,
         )
         return {"revision": result["revision"], "phase": result["phase"]}
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from .contracts import digest
 from .delivery_activities import _tracker_sync
 from .delivery_broker import DeliveryBroker, _git
+from .delivery_control_lineage import inherit_delivery_control
 from .delivery_metadata_recovery import _immutable
 from .delivery_policy_recovery import gate_failed
 from .delivery_resources import (
@@ -454,12 +455,20 @@ def validate_transaction(store, db, spec, expected):
         raise ValueError('predecessor no longer eligible')
     if unavailable(store, db, old) or expected.get('stopped', lambda: False)():
         raise ValueError('predecessor is no longer the latest safe issue attempt')
-    if spec['policy'] != old['policy']:
+    # Capacity is current scheduling policy, not authority to change this
+    # delivery. Keep the admitted bytes while operational_config selects the
+    # scheduler's current limit. Every other policy field remains exact.
+    incoming_policy = {key: value for key, value in spec['policy'].items() if key != 'capacity'}
+    retained_policy = {key: value for key, value in old['policy'].items() if key != 'capacity'}
+    if incoming_policy != retained_policy:
         raise ValueError('fresh attempt changed frozen execution policy')
+    spec['policy'] = deepcopy(old['policy'])
+    spec['policy_digest'] = old['policy_digest']
     if spec['base_sha'] != expected['base_sha']:
         raise ValueError('fresh base changed after readback')
     spec['accepted_plan'] = previous['accepted_plan_text'] or old['accepted_plan']
     spec['intake_required'] = False
+    inherit_delivery_control(store, db, spec, previous, closed=expected.get("closed"))
 
 
 def retry_once(store, *, stopped=lambda: False):
@@ -542,7 +551,7 @@ def retry_once(store, *, stopped=lambda: False):
                             supersedes_run_id=spec['run_id'], branch='fix/automatic-' + identity,
                             accepted_plan=row['accepted_plan_text'] or spec['accepted_plan'])
             admitted.append(store.submit(supplied, _automatic={
-                'row': row, 'base_sha': base, 'stopped': stopped}))
+                'row': row, 'base_sha': base, 'stopped': stopped, 'closed': closed}))
         except (ValueError, KeyError, TypeError, OSError, RuntimeError,
                 subprocess.SubprocessError, sqlite3.Error) as exc:
             # Wait for conclusive fresh observations; no absence inferred from errors.
