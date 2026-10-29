@@ -240,6 +240,15 @@ acknowledges it. Authorized development continuations instead remove the active
 terminal checkpoint before their first live projection, while retaining the
 predecessor history; cancellation can then stop the newly authorized work.
 
+A cancellation whose response is unknown retains its complete original request
+across streamed run updates. The dashboard locks its reason and offers an exact
+retry even if the run has since stopped, so the API can return the original
+receipt. It does not create another cancellation. After a confirmed refusal,
+the dashboard waits for a successful fresh read displayed by the page before
+allowing an explicit retry with a new request identity and current revision,
+without editing the reason. An acknowledged cancellation remains requested while
+its resulting run state cannot be refreshed.
+
 ## Previously admitted execution-policy recoveries
 
 New execution-policy recovery admission is retired. The CLI commands

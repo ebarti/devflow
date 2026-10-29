@@ -169,6 +169,122 @@ describe('dashboard commands', () => {
     expect(cancel.mock.calls[0][1]).toMatchObject({ expected_revision: 5, reason: 'Stop this run' })
   })
 
+  it('allows cancellation after a known stale refusal without editing the reason', async () => {
+    const user = userEvent.setup()
+    const cancel = vi.spyOn(api, 'cancel')
+      .mockRejectedValueOnce(new ApiError('stale run revision', 409))
+      .mockResolvedValue(undefined)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const run = { ...mockRun, decisions: [] }
+    vi.spyOn(api, 'getRun').mockResolvedValue({ ...run, protocol_revision: 6 })
+    const { rerender } = render(<RunDetails run={run} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Cancel run' }))
+    await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('alert').textContent).toContain('Run state changed')
+
+    rerender(<RunDetails run={{ ...run, protocol_revision: 6 }} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
+    expect(cancel.mock.calls[1][1]).toMatchObject({ expected_revision: 6, reason: 'Stop this run' })
+    expect(cancel.mock.calls[1][1].command_id).not.toBe(cancel.mock.calls[0][1].command_id)
+  })
+
+  it.each([false, true])('holds a refused cancellation until a post-response detail read succeeds (refresh rejects=%s)', async rejects => {
+    const user = userEvent.setup()
+    let refuse: (error: Error) => void = () => { throw new Error('request has not started') }
+    const cancel = vi.spyOn(api, 'cancel').mockImplementationOnce(() => new Promise((_, reject) => { refuse = reject })).mockResolvedValue(undefined)
+    const run = { ...mockRun, decisions: [] }
+    const read = vi.spyOn(api, 'getRun').mockRejectedValue(new ApiError('Read unavailable', 503))
+    const refresh = rejects ? vi.fn().mockRejectedValue(new Error('Read unavailable')) : vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(<RunDetails run={run} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Cancel run' }))
+    await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    // A stream update during the pending command is not a post-response read.
+    rerender(<RunDetails run={{ ...run, protocol_revision: 6 }} onRefresh={refresh} />)
+    refuse(new ApiError('stale run revision', 409))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+    expect((screen.getByRole('button', { name: 'Request cancellation' }) as HTMLButtonElement).disabled).toBe(true)
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    expect(cancel).toHaveBeenCalledTimes(1)
+
+    read.mockResolvedValue({ ...run, protocol_revision: 7 })
+    await user.click(screen.getByRole('button', { name: 'Refresh run state' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
+    // A delayed older page read also cannot satisfy the current observation.
+    expect((screen.getByRole('button', { name: 'Request cancellation' }) as HTMLButtonElement).disabled).toBe(true)
+    rerender(<RunDetails run={{ ...run, protocol_revision: 7 }} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2))
+    expect(cancel.mock.calls[1][1]).toMatchObject({ expected_revision: 7, reason: 'Stop this run' })
+    expect(cancel.mock.calls[1][1].command_id).not.toBe(cancel.mock.calls[0][1].command_id)
+  })
+
+  it('does not offer a second cancellation after acknowledgement while detail refresh fails', async () => {
+    const user = userEvent.setup()
+    const cancel = vi.spyOn(api, 'cancel').mockResolvedValue(undefined)
+    vi.spyOn(api, 'getRun').mockRejectedValue(new ApiError('Read unavailable', 503))
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const run = { ...mockRun, decisions: [] }
+    const { rerender } = render(<RunDetails run={run} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Cancel run' }))
+    await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('status').textContent).toContain('Cancellation requested')
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
+    rerender(<RunDetails run={{ ...run, protocol_revision: 6 }} onRefresh={refresh} />)
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
+    expect(cancel).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['lost transport', new ApiError('Connection lost', 0)],
+    ['server response', new ApiError('Receipt unavailable', 503)],
+    ['unreadable response', new Error('Response could not be read')],
+  ])('freezes cancellation across a %s and streamed revision change', async (_label, failure) => {
+    const user = userEvent.setup()
+    const cancel = vi.spyOn(api, 'cancel').mockRejectedValueOnce(failure).mockResolvedValue(undefined)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const run = { ...mockRun, decisions: [] }
+    const { rerender } = render(<RunDetails run={run} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Cancel run' }))
+    await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('alert').textContent).toMatch(/outcome is unknown/i)
+    expect((screen.getByLabelText('Reason for cancellation') as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Keep run' }) as HTMLButtonElement).disabled).toBe(true)
+
+    rerender(<RunDetails run={{ ...run, protocol_revision: 9 }} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Retry cancellation request' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
+    expect(cancel.mock.calls[1]).toEqual(cancel.mock.calls[0])
+    expect(screen.queryByLabelText('Reason for cancellation')).toBeNull()
+  })
+
+  it('keeps an uncertain cancellation available for exact replay after terminal readback', async () => {
+    const user = userEvent.setup()
+    const cancel = vi.spyOn(api, 'cancel')
+      .mockRejectedValueOnce(new ApiError('Receipt unavailable', 503))
+      .mockResolvedValue(undefined)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const run = { ...mockRun, decisions: [] }
+    const { rerender } = render(<RunDetails run={run} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Cancel run' }))
+    await user.type(screen.getByLabelText('Reason for cancellation'), 'Stop this run')
+    await user.click(screen.getByRole('button', { name: 'Request cancellation' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1))
+
+    rerender(<RunDetails run={{ ...run, protocol_revision: null, phase: 'cancelled', execution_state: 'terminal', outcome: 'cancelled' }} onRefresh={refresh} />)
+    await user.click(screen.getByRole('button', { name: 'Retry cancellation request' }))
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
+    expect(cancel.mock.calls[1]).toEqual(cancel.mock.calls[0])
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).toBeNull()
+  })
+
   it('does not enable decisions or cancellation without a workflow revision', () => {
     render(<RunDetails run={{ ...mockRun, protocol_revision: null }} onRefresh={vi.fn()} />)
     expect((screen.getByRole('button', { name: 'Submit decision' }) as HTMLButtonElement).disabled).toBe(true)
