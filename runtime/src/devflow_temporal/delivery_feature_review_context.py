@@ -36,17 +36,18 @@ UNITS = {
 }
 GUARDS = (
     "contracts.py", "delivery_github_contract.py", "delivery_plan_model.py",
-    "delivery_source_scope.py",
+    "delivery_source_scope.py", "delivery_workspace_custody.py",
 )
 IMPORTS = {
     "copy", "hashlib", "json", "pathlib", "re", "subprocess", "tomllib",
     "contracts", "delivery_feature_gates", "delivery_github_contract",
-    "delivery_plan_model", "delivery_source_scope",
+    "delivery_plan_model", "delivery_source_scope", "delivery_workspace_custody",
 }
 MODULE_IMPORTS = IMPORTS | {"__future__", "delivery_execution_registry", "xml.etree.ElementTree"}
 LOCAL_IMPORTS = {
     "contracts", "delivery_execution_registry", "delivery_feature_gates",
     "delivery_github_contract", "delivery_plan_model", "delivery_source_scope",
+    "delivery_workspace_custody",
 }
 RESETS = {
     "security_binding_sha256", "environment_proof_sha256", "initial_decision_prompt",
@@ -305,7 +306,7 @@ def normalized_context(sources):
         raise ValueError("review context requires the python-ast-3.12-v1 parser schema")
     units = {name: _units(sources[name], name) for name in ROOTS}
     return {"context_sha256": digest(units), "guards": {
-        name: hashlib.sha256(_normalized(ast.parse(sources[name])).encode()).hexdigest()
+        name: hashlib.sha256(_normalized(ast.parse(sources.get(name, ""))).encode()).hexdigest()
         for name in GUARDS
     }}
 

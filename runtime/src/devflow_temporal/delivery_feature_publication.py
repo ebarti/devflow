@@ -69,6 +69,13 @@ def publication_child_binding(record, chunk_id):
 
 def publish(store, broker, request, *, reconcile=False, settlement=False):
     """Keep feature custody until both the PR and its canonical binding settle."""
+    from .delivery_writer_custody import shared
+
+    with shared(request["spec"], read_only=reconcile or settlement):
+        return _publish(store, broker, request, reconcile=reconcile, settlement=settlement)
+
+
+def _publish(store, broker, request, *, reconcile=False, settlement=False):
     spec = request["spec"]
     shared = registry(spec)
     token = shared.token(shared.current(spec["feature_delivery"]["owner"]["issue_id"]))

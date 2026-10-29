@@ -50,13 +50,16 @@ def _registry_data(value) -> None:
 def frozen_pnpm_inputs(
     spec: dict, checkout: Path, *, provenance: dict | None = None
 ) -> tuple[str, dict[str, bytes]]:
+    from .delivery_workspace_custody import source_for
+
     source_hashes = {}
+    source = source_for(spec)
 
     def blob(name: str, *, optional: bool = False) -> bytes | None:
         path = Path(name)
         if path.is_absolute() or any(p in {"..", ".git", ".codex"} for p in path.parts):
             raise ValueError("frozen PNPM input escaped the admitted Git tree")
-        prefix = ["git", "-c", "core.fsmonitor=false", "-C", spec["source_path"]]
+        prefix = ["git", "-c", "core.fsmonitor=false", "-C", str(source)]
         entry = subprocess.check_output([*prefix, "ls-tree", spec["base_sha"], "--", name])
         if not entry and optional:
             return None
@@ -192,6 +195,8 @@ def frozen_native_projects(spec: dict, checkout: Path) -> list[str]:
 
 def native_addon_authority(spec: dict, checkout: Path, projects: list[str]) -> dict | None:
     """A single registry target explicitly allowed by unchanged frozen manifests."""
+    from .delivery_workspace_custody import source_for
+
     manager, inputs = frozen_pnpm_inputs(spec, checkout)
     importers = yaml.safe_load(inputs['pnpm-lock.yaml']).get('importers', {})
     if not isinstance(importers, dict):
@@ -200,12 +205,12 @@ def native_addon_authority(spec: dict, checkout: Path, projects: list[str]) -> d
 
     def unchanged(name):
         entry = subprocess.check_output(
-            ["git", "-C", spec["source_path"], "ls-tree", spec["base_sha"], "--", name]
+            ["git", "-C", str(source_for(spec)), "ls-tree", spec["base_sha"], "--", name]
         )
         if not entry.startswith((b"100644 blob ", b"100755 blob ")):
             raise ValueError("native addon metadata is not regular frozen Git data")
         raw = subprocess.check_output(
-            ["git", "-C", spec["source_path"], "show", spec["base_sha"] + ":" + name]
+            ["git", "-C", str(source_for(spec)), "show", spec["base_sha"] + ":" + name]
         )
         path = checkout / name
         if (

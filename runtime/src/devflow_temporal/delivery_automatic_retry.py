@@ -248,6 +248,16 @@ def _tracker_closed(spec, tracker):
 
 def _close_cleanup(store, row, spec, closed, stopped, *, published=False,
                    closure=None, quarantined=None, closure_checkpoint=None):
+    """Retain actual-body writer custody through cleanup and tracker settlement."""
+    from .delivery_writer_custody import shared
+
+    with shared(spec):
+        return _close_cleanup_owned(store, row, spec, closed, stopped, published=published,
+            closure=closure, quarantined=quarantined, closure_checkpoint=closure_checkpoint)
+
+
+def _close_cleanup_owned(store, row, spec, closed, stopped, *, published=False,
+                         closure=None, quarantined=None, closure_checkpoint=None):
     """Keep historical failure immutable; record separately authenticated later cleanup.
 
     A published run keeps its branch and PR; only its native cleanup and claim
@@ -406,7 +416,9 @@ def unpublished(store, spec):
         if db.execute("SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='publish'",
                       (spec['run_id'],)).fetchone():
             raise ValueError('publication was attempted')
-    source = Path(spec['source_path'])
+    from .delivery_workspace_custody import source_for
+
+    source = source_for(spec)
     if _git(source, 'remote', 'get-url', 'origin') != spec['origin_url']:
         raise ValueError('configured origin changed')
     if _git(source, 'ls-remote', '--heads', 'origin', 'refs/heads/' + spec['branch']):
@@ -417,7 +429,9 @@ def unpublished(store, spec):
 
 def fresh_unpublished_base(store, spec):
     unpublished(store, spec)
-    source = Path(spec['source_path'])
+    from .delivery_workspace_custody import source_for
+
+    source = source_for(spec)
     branch = spec.get('publication_base_ref')
     if not branch:
         raise ValueError('fresh attempt needs an approved named publication branch')

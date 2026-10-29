@@ -282,7 +282,9 @@ def planned_junit_recipes(spec: dict, checkout: Path, evidence: Path, *,
 def _base_recipe_metadata(spec: dict) -> bytes:
     """Read the admitted source commit, never the candidate's recipe or Git refs."""
     base = spec.get('base_sha')
-    source = Path(spec.get('source_path', ''))
+    from .delivery_workspace_custody import source_for
+
+    source = source_for(spec)
     if (not isinstance(base, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', base)
             or not source.is_absolute() or source.resolve(strict=True) != source):
         raise ValueError('planned recipes require an admitted source commit')

@@ -41,6 +41,11 @@ def _native(spec, result, folder, argv, cwd, environment, timeout):
         "timeout": timeout,
         "ports": [],
     }
+    from .delivery_writer_custody import observed_native_binding
+
+    writer = observed_native_binding(spec)
+    if writer is not None:
+        intent["writer_custody"] = writer
     if (
         saved.get("phase") != "finished"
         or saved.get("result") != result

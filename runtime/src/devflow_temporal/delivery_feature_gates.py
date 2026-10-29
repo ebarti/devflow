@@ -80,7 +80,9 @@ def _git(source: Path, *args: str) -> str:
 
 
 def _base_files(spec: dict) -> list[str]:
-    base, raw = spec.get("base_sha"), spec.get("source_path")
+    from .delivery_workspace_custody import source_for
+
+    base, raw = spec.get("base_sha"), str(source_for(spec))
     if (
         not isinstance(base, str)
         or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base)
@@ -93,8 +95,10 @@ def _base_files(spec: dict) -> list[str]:
 
 
 def _base_content(spec: dict, relative: str) -> str:
+    from .delivery_workspace_custody import source_for
+
     source_path(relative)
-    source, base = Path(spec["source_path"]), spec["base_sha"]
+    source, base = source_for(spec), spec["base_sha"]
     entry = _git(source, "ls-tree", "--full-tree", base, "--", relative).split()
     if (
         len(entry) != 4
@@ -623,7 +627,9 @@ def _pytest_junit_root(
         if (relative not in frozen or config.is_symlink() or not config.is_file()
                 or config.resolve(strict=True) != config):
             return None
-        entry = _git(Path(spec["source_path"]), "ls-tree", "--full-tree",
+        from .delivery_workspace_custody import source_for
+
+        entry = _git(source_for(spec), "ls-tree", "--full-tree",
                      spec["base_sha"], "--", relative).split()
         if (len(entry) != 4 or entry[0] not in {"100644", "100755"} or entry[1] != "blob"
                 or entry[3] != relative

@@ -18,6 +18,12 @@ from .contracts import canonical_json, digest
 from .delivery_filesystem_custody import matches as same_object
 
 
+def _git_owner(spec):
+    from .delivery_workspace_custody import source_for
+
+    return str(source_for(spec))
+
+
 def private_directory(path: Path) -> None:
     if not path.parent.exists():
         private_directory(path.parent)
@@ -669,6 +675,14 @@ class RunResources:
                             for name in ('native', 'native-retry'))):
                         old['receipt'] = {'path': str(path), 'kind': kind,
                                           'state': 'already_absent', 'external_removal': True}
+                if kind == 'generated' and old.get('identity') and not os.path.lexists(path):
+                    from .delivery_checkpoint_allocations import missing_generated_reallocation
+
+                    proof = missing_generated_reallocation(self.spec, path, manifest, old)
+                    if proof is not None:
+                        old['receipt'] = {'path': str(path), 'kind': kind,
+                                          'state': 'already_absent', 'checkpoint_restore': proof}
+                        old['checkpoint_restore_allocation'] = proof
                 if (
                     kind != "checkout"
                     and not os.path.lexists(path)
@@ -1462,7 +1476,7 @@ class RunResources:
                                 [
                                     "git",
                                     "-C",
-                                    self.spec["source_path"],
+                                    _git_owner(self.spec),
                                     "worktree",
                                     "remove",
                                     str(path),
@@ -1582,7 +1596,7 @@ class RunResources:
                     if reason:
                         receipt.update(state="retained", reason=reason)
                     else:
-                        subprocess.run(["git", "-C", self.spec["source_path"], "worktree",
+                        subprocess.run(["git", "-C", _git_owner(self.spec), "worktree",
                                         "remove", str(path)], check=True, capture_output=True,
                                        timeout=30)
                         if os.path.lexists(path):
@@ -1655,7 +1669,7 @@ class RunResources:
             [
                 "git",
                 "-C",
-                self.spec["source_path"],
+                _git_owner(self.spec),
                 "ls-remote",
                 "origin",
                 "refs/heads/" + self.spec["branch"],
