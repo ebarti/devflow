@@ -1011,17 +1011,35 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
                recovery=None, pending=None, quarantined=None, historical_quarantines=(),
                typed_refusal=False, lifecycle='unknown'):
     candidate = broker.candidate()
+
+    def refuse(code, fact, action, message, *, satisfied=None):
+        if typed_refusal:
+            from .delivery_lifecycle import require_observed_predicates
+
+            require_observed_predicates(KIND, 'delivery_stopped_resume', {
+                'closed_candidate': state.get('candidate'), 'current_candidate': candidate,
+            }, [{
+                'code': code, 'satisfied': satisfied, 'missing_or_unknown_fact': fact,
+                'next_action': action, 'user_input_required': None,
+            }], lifecycle=lifecycle, owner_proof=None, legacy_message=message)
+        raise ValueError(message)
+
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
     retained_unknown = (latest is not None and pending
         and pending.get('kind') == 'unstarted_preflight'
         and digest(latest) in {p['closed_role_sha256'] for p in historical_quarantines})
     if latest and latest.get('status') != 'pass':
-        if ((latest.get('cleanup') != 'confirmed' and not (quarantined or retained_unknown))
-                or (latest.get('candidate') != candidate
-                    and not _historical_candidate(
-                        broker, state, candidate, latest, recovery, pending))):
-            raise ValueError('blocked implementation source or session is unconfirmed')
+        if latest.get('cleanup') != 'confirmed' and not (quarantined or retained_unknown):
+            refuse('stopped_implementation_cleanup_unknown',
+                   'confirmed blocked implementation cleanup or its exact quarantine',
+                   'reconcile the original implementation custody',
+                   'blocked implementation source or session is unconfirmed')
+        if (latest.get('candidate') != candidate
+                and not _historical_candidate(broker, state, candidate, latest, recovery, pending)):
+            refuse('stopped_candidate_changed', 'unchanged or authenticated historical candidate',
+                   'inspect the retained candidate and obtain fresh owner proof',
+                   'blocked implementation source or session is unconfirmed')
         matches = [a for a in attempts if a['role'] == 'implement'
                    and a['iteration'] == latest['iteration']
                    and a['session_id'] == latest['session_id']
@@ -1035,47 +1053,54 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
         # A closed Temporal activity authenticates controller-only preparation failures.
         # Every provider or supervisor prelaunch receipt must also match its durable attempt.
         if len(matches) != 1 and not no_provider and not (quarantined or retained_unknown):
-            raise ValueError('blocked implementation lacks its exact supervisor receipt')
+            refuse('stopped_implementation_receipt_unproven',
+                   'one exact supervisor receipt for the blocked implementation',
+                   'inspect the original implementation attempt and receipt',
+                   'blocked implementation lacks its exact supervisor receipt')
         if latest.get('session_id') is None and not no_provider and (
                 latest.get('finish_reason') != 'prelaunch'
                 and not (missing_rollout or input_rejection or quarantined or retained_unknown)):
-            raise ValueError('blocked implementation has no authenticated launch outcome')
+            refuse('stopped_launch_outcome_unproven',
+                   'authenticated prelaunch or provider outcome for the blocked implementation',
+                   'inspect the original launch and provider custody',
+                   'blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
-        if typed_refusal:
-            from .delivery_lifecycle import require_observed_predicates
-
-            require_observed_predicates(KIND, 'delivery_stopped_resume', {
-                'closed_candidate': state.get('candidate'), 'current_candidate': candidate,
-            }, [{
-                'code': 'stopped_candidate_changed', 'satisfied': False,
-                'missing_or_unknown_fact': 'unchanged candidate at the closed checkpoint',
-                'next_action': 'inspect the retained candidate and obtain fresh owner proof',
-                'user_input_required': None,
-            }], lifecycle=lifecycle, owner_proof=None,
-                legacy_message='stopped candidate changed after its sealed checkpoint')
-        raise ValueError('stopped candidate changed after its sealed checkpoint')
-    if (any((r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown')
-            and not (quarantined and r is latest)
-            and digest(r) not in {p['closed_role_sha256'] for p in historical_quarantines}
-            for r in state.get('roles', []))
-            or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)):
-        raise ValueError('stopped role ownership is unknown')
+        refuse('stopped_candidate_changed', 'unchanged candidate at the closed checkpoint',
+               'inspect the retained candidate and obtain fresh owner proof',
+               'stopped candidate changed after its sealed checkpoint', satisfied=False)
+    if any((r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown')
+           and not (quarantined and r is latest)
+           and digest(r) not in {p['closed_role_sha256'] for p in historical_quarantines}
+           for r in state.get('roles', [])):
+        refuse('stopped_role_cleanup_unknown', 'confirmed role cleanup or exact quarantine',
+               'reconcile the original role custody', 'stopped role ownership is unknown')
+    if any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts):
+        refuse('stopped_attempt_custody_unknown', 'finished attempts and confirmed cleanup',
+               'reconcile the original attempt custody', 'stopped role ownership is unknown')
     sessions = {r.get('session_id') for r in implementations if r.get('session_id')}
     if len(sessions) > 1:
-        raise ValueError('original implementation session changed')
+        refuse('stopped_session_conflict', 'one original implementation session',
+               'inspect the retained implementation session history',
+               'original implementation session changed', satisfied=False)
     if not sessions and any(a['role'] == 'implement' and a['session_id'] for a in attempts):
-        raise ValueError('unrecorded implementation session exists')
+        refuse('stopped_session_unrecorded', 'matching role and attempt session identity',
+               'inspect the retained role and attempt session evidence',
+               'unrecorded implementation session exists', satisfied=False)
     changed = broker._changed_paths(broker.spec['base_sha'])
     from .delivery_source_scope import outside_scope
 
     if outside_scope(broker.spec['policy'], changed, checkout=broker.checkout):
-        raise ValueError('stopped source escaped its frozen scope')
+        refuse('stopped_scope_changed', 'source paths within the original authorized scope',
+               'inspect changed paths and the original scope authority',
+               'stopped source escaped its frozen scope', satisfied=False)
     _git(broker.checkout, 'merge-base', '--is-ancestor', broker.spec['base_sha'], candidate['head'])
     if (_git(broker.checkout, 'branch', '--show-current')
             != broker.spec.get('local_branch', broker.spec['branch'])
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin')
             != broker.spec['origin_url']):
-        raise ValueError('stopped checkout branch or origin changed')
+        refuse('stopped_repository_changed', 'original checkout branch and push destination',
+               'inspect the original repository and branch authority',
+               'stopped checkout branch or origin changed', satisfied=False)
     return candidate, next(iter(sessions), None)
 
 
