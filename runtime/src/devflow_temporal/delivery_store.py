@@ -502,6 +502,8 @@ class DeliveryStore:
                     UNIQUE (run_id,decision_id,decision_revision)
                 )"""
             )
+            db.execute("CREATE INDEX IF NOT EXISTS delivery_question_pending_order "
+                       "ON delivery_question_notifications(state,updated_at,notification_id)")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS delivery_policy_recoveries (
                     run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
@@ -663,6 +665,9 @@ class DeliveryStore:
             from .delivery_execution_authority import initialize as initialize_execution_authority
 
             initialize_execution_authority(db)
+            from .delivery_pause import initialize as initialize_pause
+
+            initialize_pause(db)
             from .delivery_dashboard import initialize
 
             initialize(db)
@@ -800,6 +805,19 @@ class DeliveryStore:
                _feature_revision: dict | None = None,
                _feature_scope: dict | None = None,
                _feature_allowance: dict | None = None) -> dict[str, Any]:
+        options = {"_automatic": _automatic, "_feature_revision": _feature_revision,
+                   "_feature_scope": _feature_scope, "_feature_allowance": _feature_allowance}
+        if supplied.get("start_paused") is True:
+            from .delivery_pause_namespace import intake_namespace_scope
+
+            with intake_namespace_scope(self.config):
+                return self._submit(supplied, **options)
+        return self._submit(supplied, **options)
+
+    def _submit(self, supplied: dict[str, Any], *, _automatic: dict | None = None,
+                _feature_revision: dict | None = None,
+                _feature_scope: dict | None = None,
+                _feature_allowance: dict | None = None) -> dict[str, Any]:
         run_id = supplied.get("run_id")
         command_id = supplied.get("command_id")
         if not isinstance(run_id, str) or not isinstance(command_id, str):
@@ -1091,6 +1109,13 @@ class DeliveryStore:
                     timestamp,
                 ),
             )
+            from .delivery_pause_context import intake_enabled
+
+            if intake_enabled(spec):
+                # The root fence and queued outbox commit in the same submission.
+                db.execute("""INSERT INTO delivery_pause_control VALUES
+                    (?, 'pause_requested', 1, 1, ?, '', 1, NULL, ?)""",
+                    (run_id, "delivery-" + run_id, timestamp))
             from .delivery_dashboard import runtime_identity
 
             db.execute("INSERT INTO delivery_dashboard_state(run_id,identity_json) VALUES (?,?)",
@@ -4486,7 +4511,7 @@ class DeliveryStore:
                     f"Blocking question callback {state}",
                     {"notification_id": notification_id, "state": state})
 
-    def abandon_question_notifications(self) -> None:
+    def abandon_question_notifications(self, *, allow_intake=False) -> None:
         """Called only under exclusive sender ownership; abandoned sends are uncertain."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -4495,28 +4520,133 @@ class DeliveryStore:
                                   "WHERE state='dispatching'").fetchall():
                 if not self._owns_question_notification(db, dict(row)):
                     continue
+                from .delivery_pause_question import intake_only, pause_controlled
+
+                owner = db.execute("SELECT request_json FROM delivery_runs WHERE run_id=?",
+                                   (row["run_id"],)).fetchone()
+                try:
+                    spec = json.loads(owner[0]) if owner else None
+                except (ValueError, TypeError):
+                    continue
+                if (not isinstance(spec, dict) or (pause_controlled(spec)
+                        and (not allow_intake or not intake_only(spec)))):
+                    continue
                 self._question_notification_state(
                     db, row[0], "unknown",
                     {"reason": "sender stopped before acknowledgement was recorded"},
                 )
 
-    def claim_question_notification(self) -> dict | None:
+    def _observe_intake_question_starts(self, db: sqlite3.Connection) -> tuple[int, dict]:
+        """Bound newly introduced receipt checks outside the SQLite writer."""
+        from .delivery_pause_question import intake_started
+
+        version = db.execute("PRAGMA data_version").fetchone()[0]
+        cursor = getattr(self, "_question_receipt_cursor", None)
+        limit = db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 256 * 1024)
+        verified = {}
+        try:
+            db.execute("BEGIN")
+            indexes = db.execute("PRAGMA index_list('delivery_question_notifications')").fetchall()
+            index = [row for row in indexes if row[1] == "delivery_question_pending_order"]
+            keys = [row for row in db.execute(
+                "PRAGMA index_xinfo('delivery_question_pending_order')") if row[5]]
+            if (len(index) != 1 or index[0][2] or index[0][4]
+                    or [row[2] for row in keys] != ["state", "updated_at", "notification_id"]
+                    or any(row[3] or row[4] != "BINARY" for row in keys)):
+                db.commit()
+                return version, verified
+            rows = db.execute(
+                "SELECT notification_id,run_id,updated_at FROM delivery_question_notifications "
+                "INDEXED BY delivery_question_pending_order WHERE state='pending' "
+                "AND (updated_at,notification_id)>(?,?) "
+                "ORDER BY updated_at,notification_id LIMIT 64", cursor or ("", "")
+            ).fetchall()
+            self._question_receipt_cursor = ((rows[-1]["updated_at"], rows[-1]["notification_id"])
+                                             if len(rows) == 64 else None)
+            for selected in rows:
+                try:
+                    control = db.execute("SELECT execution_run_id FROM delivery_pause_control "
+                                         "WHERE root_id=?", (selected["run_id"],)).fetchone()
+                    if control is None or control[0] != "":
+                        continue
+                    item = db.execute("SELECT * FROM delivery_question_notifications "
+                                      "WHERE notification_id=?", (selected["notification_id"],)
+                                      ).fetchone()
+                    owner = db.execute("SELECT request_json FROM delivery_runs WHERE run_id=?",
+                                       (selected["run_id"],)).fetchone()
+                    spec = json.loads(owner[0]) if owner else None
+                    if item is not None and intake_started(db, dict(item), spec):
+                        verified[selected["notification_id"]] = selected["run_id"]
+                except (sqlite3.Error, ValueError, TypeError, KeyError):
+                    continue
+            db.commit()
+        except (sqlite3.Error, ValueError, TypeError):
+            # Unsupported receipt observations must not starve legacy sends.
+            self._question_receipt_cursor = None
+            verified.clear()
+        finally:
+            if db.in_transaction:
+                db.rollback()
+            db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, limit)
+        return version, verified
+
+    def claim_question_notification(self, *, allow_intake=False) -> dict | None:
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            for row in db.execute(
-                "SELECT * FROM delivery_question_notifications WHERE state='pending' "
-                "ORDER BY updated_at,notification_id"
-            ).fetchall():
-                item = dict(row)
-                if not self._owns_question_notification(db, item):
-                    continue
-                if self._question_command_inflight(db, item):
-                    continue
-                if not self._question_is_current(db, item):
-                    self._question_notification_state(db, item["notification_id"], "suppressed")
-                    continue
-                self._question_notification_state(db, item["notification_id"], "dispatching")
-                return item
+            # Re-observe after our own writes: SQLite data_version reports only
+            # commits made by other connections. Bound each pump's cleanup work.
+            for _ in range(8):
+                version, verified = (self._observe_intake_question_starts(db) if allow_intake
+                                     else (None, {}))
+                db.execute("BEGIN IMMEDIATE")
+                observation_current = (version is not None and version == db.execute(
+                    "PRAGMA data_version").fetchone()[0])
+                for row in db.execute(
+                    "SELECT * FROM delivery_question_notifications WHERE state='pending' "
+                    "ORDER BY updated_at,notification_id"
+                ).fetchall():
+                    item = dict(row)
+                    if not self._owns_question_notification(db, item):
+                        continue
+                    # Pause-enabled callbacks need a retained SDK event binding and
+                    # subprocess custody before their Popen can be admitted. Leave
+                    # these pending while continuing to scan unrelated runs.
+                    from .delivery_pause_question import intake_started, pause_controlled
+
+                    owner = db.execute("SELECT request_json FROM delivery_runs WHERE run_id=?",
+                                       (item["run_id"],)).fetchone()
+                    try:
+                        spec = json.loads(owner[0]) if owner else None
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(spec, dict):
+                        continue
+                    if pause_controlled(spec):
+                        if not allow_intake:
+                            continue
+                        control = db.execute("SELECT execution_run_id FROM delivery_pause_control "
+                                             "WHERE root_id=?", (item["run_id"],)).fetchone()
+                        if control is not None and control[0] == "":
+                            if (not observation_current
+                                    or verified.get(item["notification_id"]) != item["run_id"]):
+                                continue
+                        elif not intake_started(db, item, spec):
+                            continue
+                    if self._question_command_inflight(db, item):
+                        continue
+                    if not self._question_is_current(db, item):
+                        self._question_notification_state(db, item["notification_id"], "suppressed")
+                        # A write on this same connection does not increment its own
+                        # data_version. Re-observe before consuming another proof.
+                        if allow_intake:
+                            self._question_receipt_cursor = (item["updated_at"],
+                                                             item["notification_id"])
+                            db.commit()
+                            break
+                        continue
+                    self._question_notification_state(db, item["notification_id"], "dispatching")
+                    return item
+                else:
+                    return None
         return None
 
     def question_notification_current(self, item: dict) -> bool:
@@ -4958,6 +5088,8 @@ class DeliveryStore:
         )
         return {
             **compact,
+            **({"pause_intake_version": 1} if type(spec.get("pause_intake_version")) is int
+               and spec["pause_intake_version"] == 1 else {}),
             "retained_worktrees": retained_worktrees(spec),
             "run": compact,
             "phase_gates": gates,

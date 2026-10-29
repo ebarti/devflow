@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import signal
@@ -15,6 +16,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from .delivery_origin import thread_uuid
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .delivery_store import DeliveryStore
@@ -29,28 +32,32 @@ class QueueFailure(RuntimeError):
 class CodexQuestionQueue:
     """Use the installed public CLI's queue operation, with a bounded owned process."""
 
-    def send(self, binary: str, thread: str, message: str, *, timeout: float = 15) -> dict:
+    def send(self, binary: str, thread: str, message: str, *, timeout: float = 15,
+             handoff=None) -> dict:
         thread_uuid(thread)
         argv = [binary, "queue", "--thread", thread, "--message", message]
+        process = None
         try:
-            process = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-            )
-        except OSError as exc:
-            raise QueueFailure(f"queue process not launched: {type(exc).__name__}",
-                               uncertain=False) from exc
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            raise QueueFailure("queue acknowledgement timed out", uncertain=True) from exc
-        finally:
-            # Timeout and normal completion both release any owned group descendants.
-            # The shared app-server daemon is outside this process group.
+            from contextlib import nullcontext
+
+            with handoff if handoff is not None else nullcontext():
+                process = subprocess.Popen(
+                    argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                )
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise QueueFailure("queue acknowledgement timed out", uncertain=True) from exc
+        except OSError as exc:
+            raise QueueFailure(f"queue process handoff failed: {type(exc).__name__}",
+                               uncertain=process is not None) from exc
+        finally:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate(timeout=2)
         if process.returncode != 0:
             raise QueueFailure(f"queue process exited {process.returncode}", uncertain=True)
         text = stdout.decode("utf-8", errors="replace").strip()
@@ -137,29 +144,74 @@ def pump_blocking_questions(
     with _sender_lock(store) as acquired:
         if not acquired:
             return
-        # Exclusive OS ownership proves no other pump can still be dispatching.
-        # An abandoned effect may already have queued; never try it again.
-        store.abandon_question_notifications()
+        from contextlib import ExitStack
+
+        from .delivery_pause_namespace import intake_namespace_scope
+        from .delivery_pause_question import pause_controlled
+
+        # A previous send is uncertain, but intake state writes require the
+        # installation namespace. Legacy recovery remains independent.
+        try:
+            with intake_namespace_scope(store.config):
+                store.abandon_question_notifications(allow_intake=True)
+        except Exception:
+            store.abandon_question_notifications()
         for _ in range(10):
-            item = store.claim_question_notification()
-            if item is None:
-                return
+            item = None
             try:
-                spec = store.spec(item["run_id"])
-                if not store.owns_execution(spec):
-                    raise QueueFailure("configured sender authority changed", uncertain=False)
-                message = question_message(item, store.config.dashboard_url.rstrip("/"))
-                # Recheck answer/cancel/supersession after message preparation and
-                # immediately before the external effect. Destination stays frozen.
-                if not store.question_notification_current(item):
-                    continue
-                receipt = adapter.send(spec["policy"]["codex_bin"], item["thread_id"], message)
-            except QueueFailure as exc:
-                store.finish_question_notification(item["notification_id"],
-                                                   "unknown" if exc.uncertain else "failed",
-                                                   {"reason": str(exc)})
+                with ExitStack() as stack:
+                    try:
+                        stack.enter_context(intake_namespace_scope(store.config))
+                    except Exception:
+                        intake_allowed = False
+                    else:
+                        intake_allowed = True
+                    item = store.claim_question_notification(allow_intake=intake_allowed)
+                    if item is None:
+                        return
+                    intake = False
+                    try:
+                        spec = store.spec(item["run_id"])
+                        intake = pause_controlled(spec)
+                        if intake:
+                            if not intake_allowed or type(adapter) is not CodexQuestionQueue:
+                                raise QueueFailure("pause question adapter is not owned",
+                                                   uncertain=True)
+                        else:
+                            # Unrelated legacy sends do not retain namespace custody.
+                            stack.close()
+                        if not store.owns_execution(spec):
+                            raise QueueFailure("configured sender authority changed",
+                                               uncertain=False)
+                        message = question_message(item, store.config.dashboard_url.rstrip("/"))
+                        if not store.question_notification_current(item):
+                            continue
+                        if intake:
+                            from .delivery_pause_question import intake_handoff
+
+                            receipt = adapter.send(spec["policy"]["codex_bin"], item["thread_id"],
+                                message, handoff=intake_handoff(store, item, spec))
+                        else:
+                            receipt = adapter.send(spec["policy"]["codex_bin"], item["thread_id"],
+                                                   message)
+                    except QueueFailure as exc:
+                        if intake and not intake_allowed:
+                            logger.warning("Question sender intake custody unavailable")
+                            return
+                        store.finish_question_notification(item["notification_id"],
+                            "unknown" if exc.uncertain else "failed", {"reason": str(exc)})
+                    except Exception as exc:
+                        if intake and not intake_allowed:
+                            logger.warning("Question sender intake custody unavailable")
+                            return
+                        store.finish_question_notification(item["notification_id"], "unknown",
+                                                           {"reason": type(exc).__name__})
+                    else:
+                        store.finish_question_notification(item["notification_id"], "queued",
+                                                           receipt)
             except Exception as exc:
-                store.finish_question_notification(item["notification_id"], "unknown",
-                                                   {"reason": type(exc).__name__})
-            else:
-                store.finish_question_notification(item["notification_id"], "queued", receipt)
+                # Namespace exit failure cannot authorize another state write.
+                # A committed queue receipt remains recorded; an interrupted
+                # dispatch is reconciled as unknown only under later custody.
+                logger.warning("Question sender custody unavailable: %s", type(exc).__name__)
+                return

@@ -32,6 +32,7 @@ from .contracts import digest
 from .delivery_codec import DELIVERY_DATA_CONVERTER
 from .delivery_config import DeliveryConfig
 from .delivery_execution_config import transport_digest
+from .delivery_pause_context import dispatch_enabled, intake_enabled
 from .delivery_preparation import execution_retired
 from .delivery_store import DeliveryStore
 from .delivery_workflow import DeliveryWorkflow
@@ -94,7 +95,68 @@ def _dispatch_backoff_remaining(item: dict, now: float) -> float:
     return max(0.0, updated + min(600.0, 5.0 * 2 ** min(attempts, 8)) - now)
 
 
+def _intake_initial_dispatch(item, spec):
+    """Fence only the original queued intake, not an admitted later recovery."""
+    if not dispatch_enabled(spec):
+        return False
+    if (type(spec.get("execution_authority_version")) is not int
+            or spec["execution_authority_version"] != 1):
+        raise ValueError("queued intake dispatch lacks exact execution authority")
+    run_id = spec["run_id"]
+    original = "delivery-" + run_id
+    workflow_id = item["workflow_id"] or original
+    recovery = item["recovery_json"]
+    if workflow_id == original and recovery is None:
+        return True
+    if workflow_id != original and isinstance(workflow_id, str) and recovery is not None:
+        value = json.loads(recovery)
+        if isinstance(value, dict) and value:
+            return False
+    raise ValueError("queued intake dispatch has ambiguous workflow or recovery authority")
+
+
+def _record_guarded_dispatch(store, spec, function, *args, **kwargs):
+    """Keep the installation scope through a pause-fenced local projection."""
+    from .delivery_pause_dispatch_lease import record_when_running
+
+    if intake_enabled(spec):
+        from .delivery_pause_namespace import intake_namespace_scope
+
+        with intake_namespace_scope(store.config):
+            return record_when_running(store, spec, function, *args, **kwargs)
+    raise ValueError("dispatch projection lacks a supported pause scope")
+
+
 async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) -> None:
+    """Retain dispatcher custody through readback, start and acknowledgement."""
+    try:
+        intake_start = _intake_initial_dispatch(item, spec)
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning("Run %s dispatch selection unavailable (%s)", spec.get("run_id"),
+                       type(exc).__name__)
+        return
+    if not intake_start:
+        return await _dispatch_start_body(service, client, item, spec)
+    from .delivery_pause import PauseDeferred
+    from .delivery_pause_dispatch import _held
+    from .delivery_pause_dispatch_lease import DispatchBusy, dispatch_lease
+
+    try:
+        from .delivery_pause_namespace import intake_namespace_scope
+
+        async with _held(intake_namespace_scope(service.store.config)):
+            async with _held(dispatch_lease(service.store, spec, item)):
+                return await _dispatch_start_body(service, client, item, spec)
+    except (PauseDeferred, DispatchBusy):
+        return
+    except Exception as exc:
+        # A custody failure is unknown, not a start attempt or product failure.
+        logger.warning("Run %s dispatcher custody unavailable (%s)", spec["run_id"],
+                       type(exc).__name__)
+        return
+
+
+async def _dispatch_start_body(service: Any, client: Client, item: dict, spec: dict) -> None:
     """Start one queued run of ``service``; its failure never reaches the rows behind it.
 
     A row whose remote description or start is rejected deterministically
@@ -102,15 +164,18 @@ async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) 
     A module-level function: callers drive ``dispatch_once`` on stand-in
     services as well as on ``DeliveryService``.
     """
+    from .delivery_pause_async import joined_thread
+
     run_id = spec["run_id"]
     workflow_id = item["workflow_id"] or "delivery-" + run_id
     attempted = False
+    intake_start = _intake_initial_dispatch(item, spec)
     try:
         recovery = json.loads(item["recovery_json"]) if item["recovery_json"] else None
         authority = None
         if spec.get("execution_authority_version") == 1:
             from . import delivery_execution_authority as execution_authority
-            authority = await asyncio.to_thread(
+            authority = await joined_thread(
                 execution_authority.reserve, service.store, item, spec)
             spec = json.loads(authority["start_spec_json"])
         handle = client.get_workflow_handle(workflow_id)
@@ -126,24 +191,38 @@ async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) 
             if remote_digest != item["request_digest"] or remote_recovery != (
                 digest(recovery) if recovery else None
             ):
-                await asyncio.to_thread(
-                    service.store.mark_start_conflict, run_id, workflow_id,
-                    f"Temporal ID conflict: workflow {workflow_id} belongs to a "
-                    "different request",
-                )
+                reason = (f"Temporal ID conflict: workflow {workflow_id} belongs to a "
+                          "different request")
+                if intake_start:
+                    from .delivery_pause_dispatch_lease import record_when_running
+
+                    await joined_thread(record_when_running, service.store, spec,
+                                            service.store.mark_start_conflict,
+                                            run_id, workflow_id, reason)
+                else:
+                    await joined_thread(service.store.mark_start_conflict,
+                                            run_id, workflow_id, reason)
                 return
             if authority is not None:
                 await asyncio.wait_for(execution_authority.authenticate_original_start(
                     service.store, authority, description.run_id, client=client,
                     require_running=False), 15)
-                await asyncio.to_thread(
+                await joined_thread(
                     execution_authority.bind, service.store, authority, description.run_id)
-            await asyncio.to_thread(service.store.mark_start, run_id, accepted=True,
+            if intake_start:
+                from .delivery_pause_dispatch import bind_start
+
+                receipt = await bind_start(service.store, spec, workflow_id, description.run_id)
+                if isinstance(receipt, dict) and receipt.get("state") == "start_recorded":
+                    return
+            await joined_thread(service.store.mark_start, run_id, accepted=True,
                 **({"expected_workflow_id": workflow_id} if authority is not None else {}))
             return
-        attempted = True
-        try:
-            started = await client.start_workflow(
+
+        async def send():
+            nonlocal attempted
+            attempted = True
+            return await client.start_workflow(
                 DeliveryWorkflow.run,
                 args=[spec, recovery],
                 id=workflow_id,
@@ -167,32 +246,61 @@ async def _dispatch_start(service: Any, client: Client, item: dict, spec: dict) 
                     **({"recovery_digest": digest(recovery)} if recovery else {}),
                 },
             )
+        try:
+            if intake_start:
+                from .delivery_pause_dispatch import bind_start, send_start
+
+                started = await send_start(service.store, spec, workflow_id, send)
+                execution_run_id = started.first_execution_run_id or started.run_id
+                if not execution_run_id:
+                    raise ValueError("Temporal start did not identify its SDK execution")
+                receipt = await bind_start(service.store, spec, workflow_id, execution_run_id)
+                if isinstance(receipt, dict) and receipt.get("state") == "start_recorded":
+                    return
+            else:
+                started = await send()
         except WorkflowAlreadyStartedError:
             # The next dispatch inspects the durable remote memo before acking.
             return
         if authority is not None:
+            execution_run_id = started.first_execution_run_id or started.run_id
+            if not execution_run_id:
+                raise ValueError("Temporal start did not identify its SDK execution")
             await asyncio.wait_for(execution_authority.authenticate_original_start(
-                service.store, authority, started.first_execution_run_id, client=client,
+                service.store, authority, execution_run_id, client=client,
                 require_running=False), 15)
-            await asyncio.to_thread(
-                execution_authority.bind, service.store, authority, started.first_execution_run_id)
-        await asyncio.to_thread(service.store.mark_start, run_id, accepted=True,
+            await joined_thread(
+                execution_authority.bind, service.store, authority, execution_run_id)
+        await joined_thread(service.store.mark_start, run_id, accepted=True,
             **({"expected_workflow_id": workflow_id} if authority is not None else {}))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        from .delivery_pause import PauseDeferred
+
+        if isinstance(exc, PauseDeferred):
+            return  # The queued outbox remains pending behind the durable fence.
         reason = _dispatch_failure_reason(exc)
         logger.warning("Run %s dispatch failed: %s", run_id, reason)
         try:
             # A start that was sent is unknown until the remote memo is read.
-            await asyncio.to_thread(
-                service.store.record_dispatch_failure, run_id, reason, uncertain=attempted,
-                **({"expected_workflow_id": workflow_id}
-                   if spec.get("execution_authority_version") == 1 else {})
-            )
+            arguments = ({"expected_workflow_id": workflow_id}
+                         if spec.get("execution_authority_version") == 1 else {})
+            if intake_start and not attempted:
+                from .delivery_pause_dispatch_lease import record_when_running
+
+                await joined_thread(
+                    record_when_running, service.store, spec, service.store.record_dispatch_failure,
+                    run_id, reason, uncertain=False, **arguments)
+            else:
+                await joined_thread(
+                    service.store.record_dispatch_failure, run_id, reason, uncertain=attempted,
+                    **arguments)
         except Exception as recording:
             logger.warning("Run %s dispatch failure not recorded (%s)",
                            run_id, type(recording).__name__)
+
+
 
 
 class LocalSession:
@@ -297,9 +405,14 @@ class DeliveryService:
                 continue
             try:
                 # An owner must see why its own queued run never dispatches.
-                await asyncio.to_thread(
-                    self.store.record_dispatch_block, item["run_id"], spec, blocked
-                )
+                if _intake_initial_dispatch(item, spec):
+                    await asyncio.to_thread(_record_guarded_dispatch, self.store, spec,
+                                            self.store.record_dispatch_block,
+                                            item["run_id"], spec, blocked)
+                else:
+                    await asyncio.to_thread(
+                        self.store.record_dispatch_block, item["run_id"], spec, blocked)
+
             except Exception as exc:
                 logger.warning("Run %s dispatch block not recorded (%s)",
                                item["run_id"], type(exc).__name__)
@@ -324,6 +437,31 @@ class DeliveryService:
         pending = await asyncio.to_thread(pending_requests)
         if pending:
             await dispatch(self, await self.healthy_client())
+
+    async def pause_intake_loop(self) -> None:
+        """Advance intake pauses independently of delivery and cleanup pumps."""
+        from .delivery_pause_dispatch import _held
+        from .delivery_pause_intake_pump import _page, pump
+        from .delivery_pause_namespace import intake_namespace_scope
+
+        cursor = None
+        while True:
+            try:
+                roots = await asyncio.to_thread(_page, self.store, 4, cursor)
+                if roots:
+                    async with _held(intake_namespace_scope(self.config)):
+                        result = await pump(self.store, limit=4, after_root_id=cursor)
+                        cursor = result["next_cursor"]
+                else:
+                    cursor = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Intake pause reconciliation remains pending (%s)",
+                               type(exc).__name__)
+                cursor = None
+            await asyncio.sleep(1)
+
 
     async def dispatch_loop(self) -> None:
         self._retry_stopped = threading.Event()
@@ -367,10 +505,15 @@ class DeliveryService:
                             continue
                         # No row was reached: the reason is surfaced once, the
                         # rows stay queued and their backoff is untouched.
-                        await asyncio.to_thread(
-                            self.store.record_dispatch_failure, item["run_id"], reason,
-                            counted=False,
-                        )
+                        if _intake_initial_dispatch(item, spec):
+                            await asyncio.to_thread(_record_guarded_dispatch, self.store, spec,
+                                                    self.store.record_dispatch_failure,
+                                                    item["run_id"], reason, counted=False)
+                        else:
+                            await asyncio.to_thread(
+                                self.store.record_dispatch_failure, item["run_id"], reason,
+                                counted=False,
+                            )
                     except Exception:
                         # Unknown authority cannot authorize an outbox acknowledgement.
                         continue
@@ -465,11 +608,13 @@ def create_app(config_path: Path) -> FastAPI:
     async def lifespan(_app: FastAPI):
         await service.resume_pending_operations()
         service.dispatch_task = asyncio.create_task(service.dispatch_loop())
+        intake_task = asyncio.create_task(service.pause_intake_loop())
         try:
             yield
         finally:
             service.dispatch_task.cancel()
-            await asyncio.gather(service.dispatch_task, return_exceptions=True)
+            intake_task.cancel()
+            await asyncio.gather(service.dispatch_task, intake_task, return_exceptions=True)
             diagnostics = list(getattr(service, 'native_diagnostic_tasks', {}).values())
             for task in diagnostics:
                 task.cancel()
@@ -520,6 +665,9 @@ def create_app(config_path: Path) -> FastAPI:
     from .delivery_checkpoint_api import mount as mount_checkpoints
 
     mount_checkpoints(app, service, _mutation, _host)
+    from .delivery_pause_api import mount as mount_intake_pause
+
+    mount_intake_pause(app, service, _mutation, _host)
 
     @app.get("/api/session")
     async def get_session(request: Request, response: Response) -> dict[str, Any]:
