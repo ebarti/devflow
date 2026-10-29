@@ -40,7 +40,8 @@ def project(store, state):
 
 
 @pytest.mark.parametrize('drift', ['source', 'zero'])
-def test_public_resume_rejects_unowned_or_unsealed_stop(stopped, drift):
+@pytest.mark.asyncio
+async def test_public_resume_rejects_unowned_or_unsealed_stop(stopped, drift):
     store, broker, state, command = stopped
     if drift == 'source':
         (broker.checkout / 'README.md').write_text('Unsealed post-stop edit\n')
@@ -73,6 +74,27 @@ def test_public_resume_rejects_unowned_or_unsealed_stop(stopped, drift):
             assert not db.execute(
                 "SELECT 1 FROM delivery_commands WHERE command_id='resume-1'").fetchone()
             assert store.state.claim_for(db, broker.spec['work_id']) is None or drift == 'claim'
+        import httpx
+
+        from devflow_temporal.delivery_api import create_app
+
+        app = create_app(store.config.path)
+        app.state.delivery.store = store
+        host = store.config.dashboard_url
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url=host) as client:
+            token = (await client.get('/api/session')).json()['csrf_token']
+            preview = await client.post('/api/runs/run-1/assess-transition', json={
+                'kind': resume.KIND, 'request': command})
+            actual = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                       headers={'Origin': host, 'X-Devflow-CSRF': token})
+            assert preview.status_code == 200 and not preview.json()['eligible']
+            code = 'stopped_candidate_changed' if drift == 'source' else 'pending_repair_unproven'
+            assert code in {item['code'] for item in preview.json()['blockers']}
+            assert actual.status_code == 409 and actual.json()['detail'] == preview.json()
+        with store._connect() as db:
+            assert not db.execute(
+                "SELECT 1 FROM delivery_commands WHERE command_id='resume-1'").fetchone()
     finally:
         if drift == 'plan':
             monkey.undo()

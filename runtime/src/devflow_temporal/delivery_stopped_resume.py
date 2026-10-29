@@ -1008,7 +1008,8 @@ def _implementation_receipt(spec, role, attempt):
 
 
 def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection=None,
-               recovery=None, pending=None, quarantined=None, historical_quarantines=()):
+               recovery=None, pending=None, quarantined=None, historical_quarantines=(),
+               typed_refusal=False, lifecycle='unknown'):
     candidate = broker.candidate()
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
@@ -1040,6 +1041,18 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
                 and not (missing_rollout or input_rejection or quarantined or retained_unknown)):
             raise ValueError('blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
+        if typed_refusal:
+            from .delivery_lifecycle import require_observed_predicates
+
+            require_observed_predicates(KIND, 'delivery_stopped_resume', {
+                'closed_candidate': state.get('candidate'), 'current_candidate': candidate,
+            }, [{
+                'code': 'stopped_candidate_changed', 'satisfied': False,
+                'missing_or_unknown_fact': 'unchanged candidate at the closed checkpoint',
+                'next_action': 'inspect the retained candidate and obtain fresh owner proof',
+                'user_input_required': None,
+            }], lifecycle=lifecycle, owner_proof=None,
+                legacy_message='stopped candidate changed after its sealed checkpoint')
         raise ValueError('stopped candidate changed after its sealed checkpoint')
     if (any((r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown')
             and not (quarantined and r is latest)
@@ -1239,7 +1252,8 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observati
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
         input_rejection=(session_custody or {}).get('input_rejection'),
-        recovery=previous, pending=pending, quarantined=quarantined, historical_quarantines=history)
+        recovery=previous, pending=pending, quarantined=quarantined, historical_quarantines=history,
+        typed_refusal=not review_subject, lifecycle=lifecycle_from_row(row))
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
