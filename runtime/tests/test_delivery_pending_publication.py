@@ -120,3 +120,30 @@ async def test_public_pending_assessment_agrees_with_admission(pending):
         assert refused.json()['blockers'][0]['code'] == 'revision_changed'
         accepted = await client.post(path + 'recover-publication', json=request, headers=headers)
         assert accepted.status_code == 200 and not accepted.json()['implementation_authority']
+        replay = await client.post(path + 'recover-publication', json=request, headers=headers)
+        assert replay.status_code == 200 and replay.json() == accepted.json()
+        replay_preview = await client.post(path + 'assess-transition', json={
+            'kind': 'recover_publication', 'request': request})
+        conflict = {**request, 'expected_revision': request['expected_revision'] + 1}
+        conflict_preview = await client.post(path + 'assess-transition', json={
+            'kind': 'recover_publication', 'request': conflict})
+        conflict_admission = await client.post(path + 'recover-publication', json=conflict,
+                                               headers=headers)
+        assert conflict_admission.status_code == 409
+        assert conflict_admission.json()['detail'] == conflict_preview.json(), (
+            conflict_preview.json(), conflict_admission.json())
+        assert conflict_preview.json()['blockers'][0]['code'] == 'command_conflict'
+        assert replay_preview.json()['disposition'] == 'already_admitted'
+        assert replay_preview.json()['blockers'][0]['code'] == 'already_admitted'
+        with store._connect() as db:
+            assert db.execute('SELECT count(*) FROM delivery_commands WHERE command_id=?',
+                              (request['command_id'],)).fetchone()[0] == 1
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       ('{}', request['command_id']))
+        corrupt_preview = await client.post(path + 'assess-transition', json={
+            'kind': 'recover_publication', 'request': request})
+        corrupt_admission = await client.post(path + 'recover-publication', json=request,
+                                              headers=headers)
+        assert corrupt_admission.status_code == 409
+        assert corrupt_admission.json()['detail'] == corrupt_preview.json()
+        assert 'command_receipt_unknown' in {b['code'] for b in corrupt_preview.json()['blockers']}

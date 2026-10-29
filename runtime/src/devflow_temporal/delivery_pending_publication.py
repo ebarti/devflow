@@ -29,7 +29,7 @@ def _chain(recovery):
         recovery = recovery.get('original_recovery')
 
 
-def _refuse(code, fact, action, proof, *, message=None):
+def _refuse(code, fact, action, proof, *, message=None, satisfied=False):
     from .delivery_lifecycle import RecoveryRefused, require_transition
 
     try:
@@ -37,7 +37,7 @@ def _refuse(code, fact, action, proof, *, message=None):
             'operation': 'recover_publication', 'owner': 'pending_publication',
             'owner_proof': True, 'normalized_lifecycle': 'stopped', 'proof_digest': digest(proof),
             'comparisons': [], 'predicates': [{
-                'code': code, 'satisfied': False, 'missing_or_unknown_fact': fact,
+                'code': code, 'satisfied': satisfied, 'missing_or_unknown_fact': fact,
                 'next_action': action,
             }],
         }, {})
@@ -231,8 +231,18 @@ def snapshot(store, run_id, *, observation=False):
                     message='original publication executor or remote outcome remains unknown')
         from .delivery_resources import observe_completed_resources
 
-        settlement = {'publication': publication,
-                      'native_cleanup': observe_completed_resources(spec, attempts)}
+        try:
+            native_cleanup = observe_completed_resources(spec, attempts)
+        except (ValueError, OSError) as exc:
+            from .delivery_lifecycle import RecoveryRefused
+
+            if isinstance(exc, RecoveryRefused):
+                raise
+            _refuse('publication_native_custody_unknown',
+                    'settled native actors, roots and resource leases',
+                    'reconcile the original native resource custody',
+                    {'row': row, 'closed': closed}, message=str(exc), satisfied=None)
+        settlement = {'publication': publication, 'native_cleanup': native_cleanup}
     with store._connect() as db:
         binding = work_binding(store, spec, db)
     return {'row': _sealed_row(row), 'closed': closed, 'spec': spec,
@@ -257,17 +267,20 @@ def admit(store, run_id, payload, *, preflight=False):
                 r'[0-9a-f]{' + str(n) + '}', payload[k])
                 for k, n in (('expected_candidate_id', 64), ('expected_head', 40)))):
         raise ValueError('invalid pending publication retry identity')
+    from .delivery_lifecycle import command_receipt, require_same_proof, require_transition
+
     command_digest = digest({'run_id': run_id, **payload})
     with store._connect() as db:
         prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                            (payload['command_id'],)).fetchone()
     if prior:
-        if prior['request_digest'] != command_digest:
-            raise ValueError('command ID already belongs to different inputs')
+        assessment = command_receipt('recover_publication', prior, run_id, command_digest)
+        if preflight:
+            return {**json.loads(prior['response_json']), 'preflight': True,
+                    'lifecycle_assessment': assessment}
         return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, observation=preflight)
     previous = _retained_recovery(store, run_id, seal)
-    from .delivery_lifecycle import require_same_proof, require_transition
 
     assessment = require_transition({
         'operation': 'recover_publication', 'owner': 'pending_publication', 'owner_proof': True,
@@ -290,8 +303,7 @@ def admit(store, run_id, payload, *, preflight=False):
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                                (payload['command_id'],)).fetchone()
         if prior:
-            if prior['request_digest'] != command_digest:
-                raise ValueError('command ID already belongs to different inputs')
+            command_receipt('recover_publication', prior, run_id, command_digest)
             return json.loads(prior['response_json'])
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
         require_same_proof('recover_publication', 'pending_publication',

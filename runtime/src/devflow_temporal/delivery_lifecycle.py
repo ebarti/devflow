@@ -199,8 +199,10 @@ def command_receipt(operation: str, prior: Mapping[str, Any], run_id: str,
         response = json.loads(prior['response_json'])
     except (TypeError, ValueError):
         response = None
-    expected_phase = ('repair_continuation_queued' if operation == 'stopped_delivery_resume'
-                      else 'gates_retry_queued')
+    expected_phase = {
+        'stopped_delivery_resume': 'repair_continuation_queued',
+        'recover_publication': 'publication_recovery_queued',
+    }.get(operation, 'gates_retry_queued')
     intact = (same and prior['run_id'] == run_id and isinstance(response, dict)
               and response.get('run_id') == run_id and response.get('phase') == expected_phase
               and isinstance(response.get('workflow_id'), str) and bool(response['workflow_id']))

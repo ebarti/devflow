@@ -261,10 +261,13 @@ cannot use implementation resume without an accepted plan. Inspect the retained
 intake and original custody; do not treat a missing plan or unknown cleanup as a
 completed implementation or a released owner.
 
-When an exact stopped-resume or gate-retry command has already been admitted,
-assessment reports `already_admitted` rather than presenting the old receipt as
-a fresh grant. Replaying the same command returns its original receipt; reusing
-its ID with different inputs reports `command_conflict` and queues no new work.
+When an exact stopped-resume, gate-retry, or pending-publication command has
+already been admitted, assessment reports `already_admitted` rather than presenting
+the old receipt as a fresh grant. Replaying the same command returns its original
+receipt; reusing its ID with different inputs reports `command_conflict` and queues
+no new work. An unverified stored receipt remains unknown. Pending publication also
+reports unknown native resource custody when the original process, root, or lease
+cannot be proven settled; the existing observer still refuses admission.
 
 After that closure, use the public `repair-admission-preflight --id RUN --request FILE` and `continue-repair --id RUN --request FILE` route with `continuation_kind: "stopped_delivery_resume"`, a stable unique `command_id`, the closed protocol `expected_revision`, `expected_iteration`, and current `expected_candidate_id`/`expected_candidate_head`. A passed implementation stopped with exact unknown prepublication cleanup resumes at the sealed iteration's checks with `additional_iterations: 0`. Its exact durable implementation result and unchanged candidate remain mandatory; all publication, independent review, QA, verification, required CI and tracker gates still run.
 
