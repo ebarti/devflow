@@ -649,12 +649,29 @@ def test_public_revision_retains_unreviewed_prelaunch(native_configuration, monk
         ).fetchone())
     folder = Path(attempt["result_path"]).parent
     if early_prelaunch:
+        from concurrent.futures import ThreadPoolExecutor
         from datetime import UTC, datetime
+        from threading import Event
 
-        review_result, review_proof = revisions._saved_revision_role(
-            store, original, previous, prior_proposal, candidate, "review",
-            closed_at=datetime(2099, 1, 1, tzinfo=UTC),
-        )
+        from devflow_temporal.delivery_resources import RunResources
+
+        started = Event()
+
+        def read_review():
+            started.set()
+            return revisions._saved_revision_role(
+                store, original, previous, prior_proposal, candidate, "review",
+                closed_at=datetime(2099, 1, 1, tzinfo=UTC),
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            registry = RunResources(original, read_only=True)
+            with registry.locked(read_only=True, exclusive=True):
+                pending = executor.submit(read_review)
+                assert started.wait(5)
+                with pytest.raises(TimeoutError):
+                    pending.result(timeout=0.2)
+            review_result, review_proof = pending.result(timeout=15)
         assert review_proof["classification"] == "prelaunch"
         assert review_result["status"] == "blocked"
         assert list(folder.iterdir()) == []

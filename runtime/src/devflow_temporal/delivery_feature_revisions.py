@@ -1655,25 +1655,26 @@ def _private_canonical(path, expected):
 def _early_revision_prelaunch(store, spec, attempt, expected, *, closed_at=None):
     """Observe a sealed revision review that stopped before persisting its envelope."""
     from .delivery_prelaunch_cleanup import completed_prelaunch
-    from .delivery_resources import RunResources, read_private
+    from .delivery_resources import RunResources
 
     intent = {key: expected[key] for key in (
         "spec", "role", "iteration", "candidate", "resume_session", "revision_context",
         "workspace",
     )}
-    manifest = read_private(RunResources(spec).manifest)
-    with completed_prelaunch(spec, dict(attempt), {Path(spec["state_dir"]): spec}, manifest,
-                             early_revision_intent=intent) as observed:
-        with store._connect() as db:
-            current = db.execute(
-                "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
-                (spec["run_id"], attempt["job_key"]),
-            ).fetchone()
-        finished = datetime.fromisoformat(attempt["finished_at"])
-        if (not current or dict(current) != dict(attempt) or finished.tzinfo is None
-                or (closed_at is not None and finished > closed_at)):
-            raise ValueError("early revision attempt changed or did not precede closure")
-        result = json.loads(attempt["result_json"])
+    registry = RunResources(spec, read_only=True)
+    with registry.locked(read_only=True) as manifest:
+        with completed_prelaunch(spec, dict(attempt), {Path(spec["state_dir"]): spec}, manifest,
+                                 early_revision_intent=intent) as observed:
+            with store._connect() as db:
+                current = db.execute(
+                    "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                    (spec["run_id"], attempt["job_key"]),
+                ).fetchone()
+            finished = datetime.fromisoformat(attempt["finished_at"])
+            if (not current or dict(current) != dict(attempt) or finished.tzinfo is None
+                    or (closed_at is not None and finished > closed_at)):
+                raise ValueError("early revision attempt changed or did not precede closure")
+            result = json.loads(attempt["result_json"])
     return result, observed
 
 
