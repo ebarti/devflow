@@ -875,7 +875,11 @@ def _state_artifacts(spec, frozen, stage, inventory, journals, settlements=None)
             if not home.is_relative_to(state):
                 raise ValueError("checkpoint session home escaped its original run")
             _openers(home)
-            paths = session_state_paths(home, attempt["session_id"])
+            # The fixed fake provider has a synthetic session ID but writes no
+            # transcript. Preserve fixture transcripts when present; native
+            # providers must always supply their required session.
+            paths = session_state_paths(
+                home, attempt["session_id"], allow_absent=spec["provider"] == "fake")
             selected_manifest(home, paths)  # Private owned regular files, no linked ancestors.
             selected.update((home / item).relative_to(state).as_posix() for item in paths)
         elif attempt["session_id"] and spec["provider"] != "fake":
