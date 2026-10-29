@@ -615,7 +615,7 @@ def test_public_revision_retains_unreviewed_prelaunch(native_configuration, monk
     native_configuration[0].raw["execution_mode"] = "trusted-local"
     fixture = _native_rejected_fixture(native_configuration, monkeypatch,
                                        early_prelaunch=early_prelaunch)
-    store, original, shared, plan, diagnostic, _, previous, _, _, row = fixture
+    store, original, shared, plan, diagnostic, candidate, previous, prior_proposal, _, row = fixture
     command = {"command_id": "prelaunch-revision", "expected_revision": row["revision"],
                "reason": "Retry the correction after the environment refusal."}
 
@@ -649,6 +649,14 @@ def test_public_revision_retains_unreviewed_prelaunch(native_configuration, monk
         ).fetchone())
     folder = Path(attempt["result_path"]).parent
     if early_prelaunch:
+        from datetime import UTC, datetime
+
+        review_result, review_proof = revisions._saved_revision_role(
+            store, original, previous, prior_proposal, candidate, "review",
+            closed_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+        assert review_proof["classification"] == "prelaunch"
+        assert review_result["status"] == "blocked"
         assert list(folder.iterdir()) == []
 
         def refused():

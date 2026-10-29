@@ -1652,6 +1652,31 @@ def _private_canonical(path, expected):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _early_revision_prelaunch(store, spec, attempt, expected, *, closed_at=None):
+    """Observe a sealed revision review that stopped before persisting its envelope."""
+    from .delivery_prelaunch_cleanup import completed_prelaunch
+    from .delivery_resources import RunResources, read_private
+
+    intent = {key: expected[key] for key in (
+        "spec", "role", "iteration", "candidate", "resume_session", "revision_context",
+        "workspace",
+    )}
+    manifest = read_private(RunResources(spec).manifest)
+    with completed_prelaunch(spec, dict(attempt), {Path(spec["state_dir"]): spec}, manifest,
+                             early_revision_intent=intent) as observed:
+        with store._connect() as db:
+            current = db.execute(
+                "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                (spec["run_id"], attempt["job_key"]),
+            ).fetchone()
+        finished = datetime.fromisoformat(attempt["finished_at"])
+        if (not current or dict(current) != dict(attempt) or finished.tzinfo is None
+                or (closed_at is not None and finished > closed_at)):
+            raise ValueError("early revision attempt changed or did not precede closure")
+        result = json.loads(attempt["result_json"])
+    return result, observed
+
+
 def _saved_revision_role(store, spec, context, proposal, candidate, role, *, closed_at=None,
                          shared=None):
     """Authenticate the exact supervised launcher and actual completed provider."""
@@ -1692,6 +1717,13 @@ def _saved_revision_role(store, spec, context, proposal, candidate, role, *, clo
     if steering and json.loads(steering[0]):
         expected["steering"] = json.loads(steering[0])
     request_path = folder / "request.json"
+    if role == "review" and not os.path.lexists(request_path):
+        result, observed = _early_revision_prelaunch(store, spec, saved, expected,
+                                                     closed_at=closed_at)
+        return result, {"run_id": spec["run_id"], "job_key": key,
+                        "intent_sha256": observed["revision_intent_sha256"],
+                        "result_sha256": digest(result), "session_id": None,
+                        "classification": "prelaunch", "prelaunch_evidence": observed}
     if request_path.resolve(strict=True) != request_path:
         raise ValueError("historical native request left its exact owned path")
     request = read_private(request_path)
@@ -2269,32 +2301,14 @@ def _unreviewed_rejection(store, spec, context, rejected, values):
                 # attempt under its original owner lease instead.
                 if not attempt:
                     return None
-                from .delivery_prelaunch_cleanup import completed_prelaunch
-                from .delivery_resources import RunResources
-
-                intent = {key: expected[key] for key in (
-                    "spec", "role", "iteration", "candidate", "resume_session", "revision_context",
-                    "workspace",
-                )}
-                manifest = read_private(RunResources(historical).manifest)
-                with completed_prelaunch(historical, dict(attempt),
-                        {Path(historical["state_dir"]): historical}, manifest,
-                        early_revision_intent=intent) as observed:
-                    with store._connect() as db:
-                        current_attempt = db.execute(
-                            "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
-                            (owner["run_id"], key),
-                        ).fetchone()
-                    if (not current_attempt or dict(current_attempt) != dict(attempt)
-                            or datetime.fromisoformat(attempt["finished_at"]) > closed_at):
-                        return None
-                    result = json.loads(attempt["result_json"])
-                    proof = {
-                        "revision_id": revision_id, "review_job_key": key,
-                        "review_intent_digest": observed["revision_intent_sha256"],
-                        "review_result_digest": digest(result), "predecessor_closure": closure,
-                        "prelaunch_evidence": observed,
-                    }
+                result, observed = _early_revision_prelaunch(
+                    store, historical, attempt, expected, closed_at=closed_at)
+                proof = {
+                    "revision_id": revision_id, "review_job_key": key,
+                    "review_intent_digest": observed["revision_intent_sha256"],
+                    "review_result_digest": digest(result), "predecessor_closure": closure,
+                    "prelaunch_evidence": observed,
+                }
                 continue
             if request_path.resolve(strict=True) != request_path:
                 return None
