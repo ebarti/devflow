@@ -7,7 +7,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-from test_delivery_feature_merge import Remote, setup_feature
+from test_delivery_feature_merge import Remote, previously_submitted, setup_feature
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_feature_activities as activities
@@ -80,28 +80,28 @@ def test_draft_layer_waits_without_recording_a_merge_intent(service, monkeypatch
         "state": "pending", "reason": "draft_pull_request", "pull_requests": [21]}
     assert merge_effect(spec) == []
     gh.drafts.clear()
-    result = merger.merge(store, spec, requested, command, gh=gh,
-                          execute=merged_all(gh, commands))
-    assert result["state"] == "confirmed" and len(commands) == 1
+    with pytest.raises(merger.StackMergeConditionUnavailable):
+        merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
+    assert commands == [] and merge_effect(spec) == []
 
 
 @pytest.mark.parametrize("dropped", [False, True], ids=["stack-kept", "stack-dropped"])
-def test_owner_merged_lower_prefix_counts_as_progress(service, monkeypatch, dropped):
+def test_owner_merged_lower_prefix_is_retained_without_submitting_the_remainder(
+    service, monkeypatch, dropped,
+):
     store, spec, record, requested, command, _ = setup_feature(service, monkeypatch)
     gh, commands = Owner(record), []
     gh.merged.add(20)
     gh.retargeted.add(21)
     gh.dropped = dropped
-    result = merger.merge(store, spec, requested, command, gh=gh,
-                          execute=merged_all(gh, commands))
-    assert result["state"] == "confirmed"
-    assert commands == [["gh", "stack", "merge", "42", "--yes", "--squash"]]
-    assert [item["number"] for item in result["pull_requests"]] == [20, 21, 22]
-    assert gh.closed == {3, 10, 11}
+    with pytest.raises(merger.StackMergeConditionUnavailable):
+        merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
+    assert commands == [] and gh.merged == {20}
+    assert gh.closed == set() and merge_effect(spec) == []
 
 
 @pytest.mark.parametrize("trunk_tree", ["verified-base", "moved"])
-def test_owner_merged_prefix_merges_rest_only_onto_its_verified_base_tree(
+def test_owner_merged_prefix_target_validation_retains_its_verified_base_tree_guard(
     service, monkeypatch, trunk_tree,
 ):
     store, spec, record, requested, command, _ = setup_feature(service, monkeypatch)
@@ -114,7 +114,7 @@ def test_owner_merged_prefix_merges_rest_only_onto_its_verified_base_tree(
     registry(spec).checkpoint(spec["feature_delivery"]["owner"], "verified:" + chunk["id"],
                               {"run_id": child["run_id"], "head": members[1]["head"],
                                "number": 21})
-    gh, commands = Owner(record), []
+    gh = Owner(record)
     gh.merged.add(20)
     gh.retargeted.add(21)
     # The owner's squash merge of #20 is a new trunk commit.
@@ -123,12 +123,16 @@ def test_owner_merged_prefix_merges_rest_only_onto_its_verified_base_tree(
     if trunk_tree == "moved":
         with pytest.raises(OwnershipConflict,
                            match="feature PRs #20 were merged by hand and main has moved since"):
-            merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
+            merger._moved_target(store, spec, members,
+                                 publications.live_members(spec, record, gh), gh)
         assert merge_effect(spec) == []
     else:
-        result = merger.merge(store, spec, requested, command, gh=gh,
-                              execute=merged_all(gh, commands))
-        assert result["state"] == "confirmed" and len(commands) == 1
+        assert merger._moved_target(store, spec, members,
+                                    publications.live_members(spec, record, gh), gh) is None
+    # Target validation remains available for reconciliation; it cannot establish
+    # a server-side condition for a new native-stack submission.
+    with pytest.raises(merger.StackMergeConditionUnavailable):
+        merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
 
 
 @pytest.mark.parametrize("change", ["closed", "merged_above_open"])
@@ -192,21 +196,17 @@ def test_nonzero_merge_response_stays_pending_until_remote_outcome(
     service, monkeypatch, merged_prefix, stderr,
 ):
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    calls = []
-
-    def response_lost(argv, **_kwargs):
-        calls.append(argv)
-        if merged_prefix:
-            gh.merged.add(20)
-        return SimpleNamespace(returncode=1, stderr=stderr)
-
-    first = merger.merge(store, spec, requested, command, gh=gh, execute=response_lost)
-    assert first["state"] == "pending" and first["exit_code"] == 1
+    previously_submitted(store, spec, record, requested, command,
+                         state="unknown", exit_code=1, stderr=stderr)
+    if merged_prefix:
+        gh.merged.add(20)
+    first = merger.merge(store, spec, requested, command, gh=gh, execute=refuse)
+    assert first["state"] == "pending"
     for settlement in (False, True):
         observed = merger.merge(store, spec, requested, command, gh=gh,
                                 execute=refuse, settlement=settlement)
         assert observed["state"] == "pending"
-    assert len(calls) == 1 and merge_effect(spec)[0]["state"] == "pending"
+    assert merge_effect(spec)[0]["state"] == "pending"
     assert merge_effect(spec)[0]["result"]["submissions"][0]["state"] == "unknown"
     # Delayed successful readback settles the original submission without another merge.
     gh.merged.update({20, 21, 22})
@@ -218,7 +218,7 @@ def test_nonzero_merge_response_stays_pending_until_remote_outcome(
 def test_unknown_submission_is_read_back_but_unstarted_one_is_resubmitted(
     service, monkeypatch, failure,
 ):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
+    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch, single=True)
 
     def first(argv, **_kwargs):
         if failure == "timeout":

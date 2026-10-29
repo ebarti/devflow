@@ -807,7 +807,7 @@ async def delivery_feature_merge(request):
     from threading import Event
 
     from .delivery_activities import _with_heartbeat
-    from .delivery_feature_merge import merge
+    from .delivery_feature_merge import StackMergeConditionUnavailable, merge
 
     store, _ = await asyncio.to_thread(_context, request["spec"])
     cancelled = Event()
@@ -824,6 +824,12 @@ async def delivery_feature_merge(request):
             request,
             "feature_merge",
         )
+    except StackMergeConditionUnavailable as exc:
+        # Exception attributes do not survive Temporal's ActivityError wrapper.
+        # This is a known pre-effect refusal, so return its public verdict rather
+        # than making either coordinator path infer it from an SDK error string.
+        return {"state": "blocked", "reason": exc.code, "blocker": exc.blocker,
+                "instruction": str(exc)}
     finally:
         cancelled.set()
 

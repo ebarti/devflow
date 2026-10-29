@@ -19,6 +19,42 @@ from .delivery_resources import observe_finalized_resources
 from .delivery_stopped_resume import executed_specs
 
 
+class StackMergeConditionUnavailable(OwnershipConflict):
+    """The backend cannot bind a new stack mutation to every qualified member."""
+
+    code = "stack_member_head_condition_unavailable"
+
+    def __init__(self, stack_id, members):
+        self.blocker = {
+            "code": self.code,
+            "stack_id": stack_id,
+            "pull_requests": [member["number"] for member in members],
+            "required_capability": "atomic_stack_membership_and_member_heads",
+            "mutation_started": False,
+        }
+        super().__init__(
+            f"{self.code}: GitHub's stack merge API cannot condition the complete "
+            "stack membership and member heads; no merge was submitted. "
+            "The selected PR's sha condition alone does not authenticate lower members. "
+            "Publication and existing submitted-merge readback remain available."
+        )
+
+
+def _require_submission_condition(record, members):
+    """A read-time head vector is not a server-side mutation precondition.
+
+    The documented merge-async API accepts only the selected PR's ``sha``.
+    Neither the other mutable PR heads nor the stack membership can be bound.
+    Even a one-open-member suffix can acquire another lower member after a read.
+    Do not invent an unsupported expected-heads payload or submit an unbound stack.
+    """
+    stack_id = record["manifest"]["publication"]["stack_id"]
+    if stack_id is not None:
+        raise StackMergeConditionUnavailable(stack_id, members)
+    if len(members) != 1:
+        raise OwnershipConflict("a non-stack merge requires exactly one qualified PR")
+
+
 def authorize(store, spec, requested, command, *, settlement=False):
     with store._connect() as db:
         row = db.execute(
@@ -262,6 +298,9 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                 waiting = _drafts(members, live)
                 if waiting:
                     return waiting
+                # Refuse before creating a merge intent or performing target
+                # reconciliation for an unsupported irreversible mutation.
+                _require_submission_condition(record, members)
                 if not reconciling:
                     target = _moved_target(store, spec, members, live, gh)
                     if target:
@@ -311,20 +350,20 @@ def merge(store, spec, requested, command=None, *, gh=None, execute=None, cancel
                     raise OwnershipConflict(
                         _refused(submissions) + "; the trunk has moved since, so the stack "
                         "needs re-integration")
-            if record["manifest"]["publication"]["stack_id"]:
-                argv = ["gh", "stack", "merge", str(requested["stack_id"]), "--yes", "--squash"]
-            else:
-                argv = [
-                    "gh",
-                    "pr",
-                    "merge",
-                    str(members[0]["number"]),
-                    "--repo",
-                    spec["github_repo"],
-                    "--squash",
-                    "--match-head-commit",
-                    members[0]["head"],
-                ]
+            # Also fence a known-not-started historical submission before a
+            # retry. Unknown/submitted effects returned above are read-only.
+            _require_submission_condition(record, members)
+            argv = [
+                "gh",
+                "pr",
+                "merge",
+                str(members[0]["number"]),
+                "--repo",
+                spec["github_repo"],
+                "--squash",
+                "--match-head-commit",
+                members[0]["head"],
+            ]
             execute = execute or subprocess.run
             if cancelled and cancelled.is_set():
                 shared.finish_effect(

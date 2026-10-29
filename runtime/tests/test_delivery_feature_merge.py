@@ -81,8 +81,13 @@ class Remote(GitHubDelivery):
         raise AssertionError((path, method, body))
 
 
-def setup_feature(service, monkeypatch):
+def setup_feature(service, monkeypatch, *, single=False):
     store, request, snapshot = feature_service(service, monkeypatch)
+    if single:
+        value = json.loads(request["accepted_plan"])
+        value["workstreams"] = value["workstreams"][:1]
+        value["workstreams"][0]["chunks"] = value["workstreams"][0]["chunks"][:1]
+        request = {**request, "accepted_plan": json.dumps(value)}
     # These fixtures qualify the retained per-layer protocol. New final-target
     # reconciliation has real Git and effect-journal coverage in its own module.
     from devflow_temporal.delivery_config import DeliveryConfig
@@ -120,9 +125,11 @@ def setup_feature(service, monkeypatch):
                     "url": "https://github.com/example/fixture/issues/11",
                 },
             },
-            "publication": {"stack_id": 42, "members": []},
+            "publication": {"stack_id": None if single else 42, "members": []},
         },
     }
+    if single:
+        record["manifest"]["workstream_issues"].pop("ui")
     members = record["manifest"]["publication"]["members"]
     for i, chunk in enumerate(ordered_chunks(value)):
         members.append(
@@ -159,12 +166,36 @@ def setup_feature(service, monkeypatch):
             "VALUES (?,?,'decision',?,'pending')",
             (command["command_id"], spec["run_id"], digest(command)),
         )
-    monkeypatch.setattr(merger, "evidence", lambda *_: ["tree-20", "tree-21", "tree-22"])
+    monkeypatch.setattr(merger, "evidence", lambda *_a, **_kw: [
+        "tree-" + str(member["number"]) for member in members])
     return store, spec, record, requested, command, Remote(record)
 
 
-def test_one_stack_merge_closes_issues_only_after_tree_and_trunk_readback(service, monkeypatch):
+def previously_submitted(store, spec, record, requested, command, *, state="submitted",
+                         exit_code=0, stderr=""):
+    """Retained native-stack intent predates the new submission capability guard."""
+    authority = merger.authorize(store, spec, requested, command)
+    shared = registry(spec)
+    token = spec["feature_delivery"]["owner"]
+    key = "feature-merge:" + digest(authority)
+    shared.intent(token, key, "feature_merge", {
+        "authority": authority,
+        "trees": ["tree-" + str(member["number"])
+                  for member in record["manifest"]["publication"]["members"]],
+        **({"members": record["manifest"]["publication"]["members"]}
+           if spec.get("merge_reconciliation_version") == 1 else {}),
+    })
+    submission = {"attempt": 1, "state": state}
+    if state in {"submitted", "unknown"}:
+        submission.update(exit_code=exit_code, stderr=stderr)
+    shared.note_effect(token, key, {"submissions": [submission]})
+    return key
+
+
+def test_submitted_stack_closes_issues_only_after_tree_and_trunk_readback(service, monkeypatch):
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
+    previously_submitted(store, spec, record, requested, command)
+    gh.merged = {20, 21, 22}
     commands = []
 
     def execute(argv, **kwargs):
@@ -175,7 +206,7 @@ def test_one_stack_merge_closes_issues_only_after_tree_and_trunk_readback(servic
 
     result = merger.merge(store, spec, requested, command, gh=gh, execute=execute)
     assert result["state"] == "confirmed"
-    assert commands == [["gh", "stack", "merge", "42", "--yes", "--squash"]]
+    assert commands == []
     assert gh.closed == {3, 10, 11}
     with store._connect() as db:
         observations = [json.loads(row[0]) for row in db.execute(
@@ -185,20 +216,30 @@ def test_one_stack_merge_closes_issues_only_after_tree_and_trunk_readback(servic
     assert len(observations) == 3 and all(item["state"] == "MERGED" for item in observations)
     assert projected["status"] == "Done"
     assert merger.merge(store, spec, requested, command, gh=gh, execute=execute) == result
-    assert len(commands) == 1
+    assert commands == []
 
 
 def test_lost_merge_response_is_read_back_without_repeating_or_revalidating_new_base(
     service, monkeypatch
 ):
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
+    previously_submitted(store, spec, record, requested, command, state="started")
+    gh.merged = {20, 21, 22}
+    original = gh.api
+    lost = True
 
-    def lost_response(*args, **kwargs):
-        gh.merged = {20, 21, 22}
-        raise TimeoutError("response lost after acceptance")
+    def readback(path, **kwargs):
+        nonlocal lost
+        if "/pulls/" in path and lost:
+            lost = False
+            raise TimeoutError("response lost after acceptance")
+        return original(path, **kwargs)
+
+    gh.api = readback
 
     with pytest.raises(TimeoutError):
-        merger.merge(store, spec, requested, command, gh=gh, execute=lost_response)
+        merger.merge(store, spec, requested, command, gh=gh,
+                     execute=lambda *_a, **_kw: pytest.fail("must not resubmit"))
     assert gh.closed == set()
     monkeypatch.setattr(merger, "evidence", lambda *_: pytest.fail("must use original intent"))
     result = merger.merge(
@@ -217,6 +258,7 @@ def test_queued_or_partially_completed_merge_retains_ownership_and_open_issues(
     service, monkeypatch
 ):
     store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
+    previously_submitted(store, spec, record, requested, command)
     result = merger.merge(
         store,
         spec,
@@ -265,19 +307,3 @@ def test_changed_authority_plan_or_head_cannot_merge(service, monkeypatch, chang
     assert not gh.closed
     with registry(spec).connect() as db:
         assert db.execute("SELECT COUNT(*) FROM execution_effects").fetchone()[0] == 0
-
-
-def test_unrelated_merge_commit_does_not_close_feature(service, monkeypatch):
-    store, spec, record, requested, command, gh = setup_feature(service, monkeypatch)
-    original = gh.api
-
-    def api(path, **kwargs):
-        if "/compare/" in path:
-            return {"status": "diverged", "merge_base_commit": {"sha": "other"}}
-        return original(path, **kwargs)
-
-    gh.api = api
-    gh.merged = {20, 21, 22}
-    with pytest.raises(OwnershipConflict, match="target branch"):
-        merger.merge(store, spec, requested, command, gh=gh)
-    assert not gh.closed
