@@ -418,6 +418,16 @@ def policy_for_comparison(expected, actual):
 
 
 def compatible_owner(spec, frozen, live):
+    if spec.get("provider") == "fake":
+        from .delivery_installation_owner import source_successor
+
+        successor = source_successor(frozen)
+        if successor is not None and source_successor(live) is not None:
+            before, after = deepcopy(frozen.raw), deepcopy(live.raw)
+            before.pop("capacity", None)
+            after.pop("capacity", None)
+            after["helpers_dir"] = before["helpers_dir"]
+            return frozen.path == live.path and before == after
     value = _binding(spec)
     if value is None:
         return False
@@ -455,6 +465,17 @@ def _bootstrap_scope(config):
 def helper_path(config, *, read_only=False):
     if _bootstrap_scope(config):
         return source_root() / "skills/devflow/scripts/state.py"
+    from .delivery_installation_owner import source_successor
+
+    successor = source_successor(config)
+    if successor is not None:
+        root = successor["root"] / "skills/devflow/scripts"
+        from .delivery_runtime_registrations import _read
+
+        for name in ("state.py", "schema.sql"):
+            if hashlib.sha256(_read(root / name)).hexdigest() != successor["helpers"][name]:
+                raise ValueError("acknowledged source successor helper changed")
+        return root / "state.py"
     from .delivery_runtime_service_guard import GuardCustodyError
 
     try:

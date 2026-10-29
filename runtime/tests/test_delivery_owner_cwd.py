@@ -45,7 +45,7 @@ while True:
     try:
         monkeypatch.chdir(caller)
         process = control._launch(
-            SimpleNamespace(state_root=state),
+            SimpleNamespace(state_root=state, tracking_db=state / "tracking.sqlite3"),
             "cwd-probe",
             [sys.executable, "-B", "-c", child, str(state)],
         )

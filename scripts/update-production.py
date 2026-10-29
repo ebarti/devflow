@@ -123,6 +123,8 @@ def update(arguments):
     if not 1 <= len(arguments) <= 3:
         raise ValueError("usage: update.sh TAG [skills-directory] [codex-home] | --rollback")
     paths = load("installation-paths")
+    if (Path.home() / ".local/share/devflow/.production-active.json").exists():
+        raise ValueError("immutable generations require update.sh --prepare/--preflight/--apply; use the retained generation recovery command")
     clean = paths.git_environment()
     for key in tuple(os.environ):
         if key.startswith("GIT_") and key not in clean:
