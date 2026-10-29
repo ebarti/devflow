@@ -1933,9 +1933,22 @@ class DeliveryBroker:
             except PublicationUncertain as exc:
                 return {"state": "pending", "reason": "original_" + exc.operation + "_readback"}
 
+    def observe_publish(self, iteration, input_candidate, *, expected_head, expected_pr_number):
+        """Read exact original publication without creating an executor or changing its journal."""
+        from .delivery_publication_execution import observe_execution
+
+        with observe_execution(self, iteration, input_candidate) as owner:
+            if owner is None:
+                return {"state": "pending", "reason": "publication_execution_active"}
+            return self._reconcile_publish_owned(
+                iteration, input_candidate, expected_head=expected_head,
+                expected_pr_number=expected_pr_number, complete=False, owner=owner,
+                observe_only=True,
+            )
+
     def _reconcile_publish_owned(
         self, iteration, input_candidate, *, expected_head=None, expected_pr_number=None,
-        complete=True, create_missing=False, owner,
+        complete=True, create_missing=False, owner, observe_only=False,
     ):
         """Complete an existing publish effect after external readback.
 
@@ -1974,12 +1987,13 @@ class DeliveryBroker:
                 raise ValueError("original publication head has not been observed")
             # Reading a pending effect adopts it: the invocation that inserted it
             # can no longer discard the row this reconciliation depends on.
-            with self.store._connect() as db:
-                db.execute(
-                    "UPDATE delivery_effects SET updated_at=? WHERE effect_key=? "
-                    "AND state='pending'",
-                    (_now(), key),
-                )
+            if not observe_only:
+                with self.store._connect() as db:
+                    db.execute(
+                        "UPDATE delivery_effects SET updated_at=? WHERE effect_key=? "
+                        "AND state='pending'",
+                        (_now(), key),
+                    )
             if expected_head is not None and expected_head != original["head"]:
                 raise ValueError("publication expected head differs from original effect")
             if (expected_pr_number is not None and original.get("number") is not None
@@ -2018,11 +2032,13 @@ class DeliveryBroker:
             return {"state": "pending", "reason": "original_push_readback", "head": head}
         if not remote or remote.split()[0] != head:
             raise ValueError("remote feature branch differs from the published checkout")
-        owner.observed("push")
-        if saved["state"] == "pending" and self.spec.get("publication_readback_version") == 1:
+        if not observe_only:
+            owner.observed("push")
+        if (not observe_only and saved["state"] == "pending"
+                and self.spec.get("publication_readback_version") == 1):
             self._bind_pending_publication(key, head, expected_pr_number, remote_confirmed=True)
         found = self._existing_pr()
-        if found is not None:
+        if found is not None and not observe_only:
             owner.observed("create")
         if (found is None and create_missing and saved["state"] == "pending"
                 and self.spec.get("publication_readback_version") == 1
@@ -2044,7 +2060,7 @@ class DeliveryBroker:
             if (self.spec.get("publication_readback_version") == 1
                     and found["headRefOid"] not in {head, input_candidate["head"]}):
                 raise ValueError("owned PR head changed from the original publication")
-        if (found is not None and saved["state"] == "pending"
+        if (not observe_only and found is not None and saved["state"] == "pending"
                 and self.spec.get("publication_readback_version") == 1):
             self._bind_pending_publication(key, head, found["number"], remote_confirmed=True)
         if found is None or found["headRefOid"] != head:

@@ -178,16 +178,22 @@ def history_sha256(history: WorkflowHistory) -> str:
     return hashlib.sha256(history_json(history)).hexdigest()
 
 
-def _private_root(store) -> Path:
+def _private_root(store, *, read_only: bool = False) -> Path:
+    from .delivery_execution_config import is_observation_mode
+
+    read_only = read_only or is_observation_mode()
     root = Path(store.config.state_root) / "closures"
-    try:
-        root.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
+    if not read_only:
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise ValueError("sealed closure directory is not an owned directory")
     if stat.S_IMODE(info.st_mode) != 0o700:
+        if read_only:
+            raise ValueError("sealed closure directory permissions are not private")
         os.chmod(root, 0o700)
     return root
 
@@ -353,7 +359,8 @@ def seal(
 
 
 async def sealed_closure(store, workflow_id: str, *,
-                         execution_run_id: str | None = None) -> dict[str, Any] | None:
+                         execution_run_id: str | None = None,
+                         read_only: bool = False) -> dict[str, Any] | None:
     """Rebuild the closure a live describe/result would return, from the sealed copy."""
     record = sealed_record(store, workflow_id, execution_run_id=execution_run_id)
     if record is None:
@@ -362,7 +369,7 @@ async def sealed_closure(store, workflow_id: str, *,
         from .delivery_retained_closures import verify_record
 
         verify_record(store, record)
-    data = _read_sealed(_private_root(store), record["history_sha256"])
+    data = _read_sealed(_private_root(store, read_only=read_only), record["history_sha256"])
     history = WorkflowHistory.from_json(workflow_id, data.decode("utf-8"))
     facts = await closure_facts(history)
     for key in ("execution_run_id", "status", "request_digest", "recovery_digest",

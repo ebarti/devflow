@@ -1,0 +1,83 @@
+"""Feature configuration proof reuses the actual unchanged successor admission."""
+
+import hashlib
+import sqlite3
+
+import pytest
+from test_delivery_feature_revision_settlement import _stopped_feature
+
+from devflow_temporal.delivery_feature_execution import continue_feature
+from devflow_temporal.delivery_lifecycle import assess_transition
+
+pytest_plugins = ["test_delivery_feature_revision_settlement"]
+
+
+def test_stopped_successor_config_observation_and_execution(feature, monkeypatch):
+    store, spec, shared, _record, _diagnostic = feature
+    row = _stopped_feature(store, spec, shared, monkeypatch)
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_feature_closure.closed_coordinator",
+        lambda *_args, **_kwargs: {"result": {"cleanup": "confirmed"}, "workflow_id": "closed"},
+    )
+    request = {"command_id": "continue-observation", "expected_revision": row["revision"]}
+    before = hashlib.sha256(shared.path.read_bytes()).hexdigest()
+    budget = shared.budget(spec["feature_delivery"]["owner"]["issue_id"])
+    with store._connect() as db:
+        commands = db.execute("SELECT count(*) FROM delivery_commands").fetchone()[0]
+    assessment = assess_transition(store, spec["run_id"], "continue_feature", request)
+    codes = {item["code"] for item in assessment["blockers"]}
+    assert "feature_plan_authority_unknown" not in codes
+    assert "feature_submission_config_unknown" not in codes
+    assert "feature_repository_access_unknown" not in codes
+    assert "feature_work_claim_unknown" not in codes
+    assert "feature_registry_claim_unknown" not in codes
+    assert assessment["eligible"] is True
+    assert assessment["proof_digest"]
+    assert hashlib.sha256(shared.path.read_bytes()).hexdigest() == before
+    assert shared.budget(spec["feature_delivery"]["owner"]["issue_id"]) == budget
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM delivery_commands").fetchone()[0] == commands
+    result = continue_feature(store, spec["run_id"], request)
+    assert store.effective_spec(result["run_id"])["feature_delivery"]["owner"]["generation"] == 2
+    assert shared.budget(spec["feature_delivery"]["owner"]["issue_id"]) == budget
+
+
+def test_tracking_change_during_remote_observation_cannot_become_eligible(feature, monkeypatch):
+    from devflow_temporal.delivery_feature_execution import GitHubDelivery
+
+    store, spec, shared, _record, _diagnostic = feature
+    row = _stopped_feature(store, spec, shared, monkeypatch)
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_feature_closure.closed_coordinator",
+        lambda *_args, **_kwargs: {"result": {"cleanup": "confirmed"}, "workflow_id": "closed"},
+    )
+    original_snapshot = GitHubDelivery.snapshot
+
+    def changing_snapshot(*args):
+        snapshot = original_snapshot(*args)
+        # This is an independent writer, outside the observer snapshot.
+        with sqlite3.connect(store.config.tracking_db) as db:
+            db.execute("UPDATE delivery_runs SET revision=revision+1 WHERE run_id=?",
+                       (spec["run_id"],))
+        return snapshot
+
+    monkeypatch.setattr(GitHubDelivery, "snapshot", changing_snapshot)
+    request = {"command_id": "continue-raced", "expected_revision": row["revision"]}
+    budget = shared.budget(spec["feature_delivery"]["owner"]["issue_id"])
+    with store._connect() as db:
+        count = db.execute("SELECT count(*) FROM delivery_commands").fetchone()[0]
+    assessment = assess_transition(store, spec["run_id"], "continue_feature", request)
+    assert not assessment["eligible"]
+    assert assessment["proof_digest"] is None
+    assert {item["code"] for item in assessment["blockers"]} == {
+        "owner_proof_unknown", "tracking_store_unavailable"
+    }
+    assert all(item["satisfied"] is None for item in assessment["blockers"])
+    with sqlite3.connect(store.config.tracking_db) as db:
+        assert db.execute("SELECT revision FROM delivery_runs WHERE run_id=?",
+                          (spec["run_id"],)).fetchone()[0] == row["revision"] + 1
+    with pytest.raises(ValueError):
+        continue_feature(store, spec["run_id"], request)
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM delivery_commands").fetchone()[0] == count
+    assert shared.budget(spec["feature_delivery"]["owner"]["issue_id"]) == budget

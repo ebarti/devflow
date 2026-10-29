@@ -669,6 +669,7 @@ def _observe_browser_ordering(
     """Authenticate a review that ran before its required browser producer."""
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
     from datetime import UTC
 
     from . import delivery_gate_retry as gates
@@ -798,7 +799,7 @@ def _observe_browser_ordering(
         return {"history_sha256": authenticated["history_sha256"], "review": proof}
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        progress = pool.submit(lambda: asyncio.run(read())).result(35)
+        progress = pool.submit(copy_context().run, lambda: asyncio.run(read())).result(35)
     return {"cause": "browser_artifact_assessment_order", "progress": progress,
             "original_observation_sha256": digest(old), "unpassed_status": review["status"],
             "unresolved_findings": [*old["unresolved_findings"], *findings],

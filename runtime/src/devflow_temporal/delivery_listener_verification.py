@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import UTC
 from pathlib import Path
 
@@ -578,7 +579,8 @@ def _report_records(store, spec, recovery, row, attempts, effects, closed, resou
                 times[done[review_id][0]], review_input)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        history, lower, upper, review_input = pool.submit(lambda: asyncio.run(read())).result(35)
+        history, lower, upper, review_input = pool.submit(
+            copy_context().run, lambda: asyncio.run(read())).result(35)
     root, _ = _root(spec, resource_spec)
     broker = ObservationBroker(store, spec, resource_spec=resource_spec)
     _checks(spec, state, broker, root)

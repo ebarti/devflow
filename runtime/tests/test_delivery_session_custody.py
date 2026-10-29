@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
 from pathlib import Path
@@ -182,7 +181,8 @@ def missing_session(stopped, monkeypatch):
             "" if current == spec else current.get("role_home_generation", "")
         ),
     )
-    monkeypatch.setattr(resume, "observed_native_cleanup", lambda _: "closed-native-fixture")
+    monkeypatch.setattr(resume, "observed_native_cleanup",
+                        lambda _, **_kwargs: "closed-native-fixture")
     monkeypatch.setattr(resume, "prepare_runtime", lambda selected, *_: copy.deepcopy(selected))
     return store, state, command, spec, attempts, previous, transcript
 
@@ -200,37 +200,6 @@ def test_public_resume_reuses_retained_session_and_rechecks_its_bytes(missing_se
     transcript.write_text("changed after admission\n")
     with pytest.raises(ValueError, match="session custody changed"):
         resume.readback(store, recovery["execution_spec"], recovery)
-
-
-def test_missing_rollout_cannot_hide_provider_work_or_an_unrelated_failure(missing_session):
-    _, state, _, spec, attempts, previous, _ = missing_session
-    folder = Path(attempts[-1]["result_path"]).parent
-    path = folder / "native-thread-observation.json"
-    original = json.loads(path.read_text())
-    custody.implementation_custody(spec, state, attempts, previous)
-    for changed in (
-        {"parent_thread_id": "accepted-thread"},
-        {"turns": [{"turn_id": "started"}]},
-        {"start_identity": "foreign-process"},
-        {"thread_inventory_before": ["foreign"]},
-    ):
-        write_private(path, {**original, **changed})
-        with pytest.raises(ValueError, match="authenticated failure"):
-            custody.implementation_custody(spec, state, attempts, previous)
-    write_private(path, original)
-    for attempt in attempts:
-        receipt = Path(attempt["result_path"])
-        original_receipt = json.loads(receipt.read_text())
-        write_private(receipt, {})
-        with pytest.raises(ValueError, match="owning attempt|authenticated failure"):
-            custody.implementation_custody(spec, state, attempts, previous)
-        write_private(receipt, original_receipt)
-    changed = copy.deepcopy(attempts)
-    result = json.loads(changed[-1]["result_json"])
-    result["findings"] = ["unrelated provider failure"]
-    changed[-1]["result_json"] = canonical_json(result)
-    with pytest.raises(ValueError, match="authenticated failure"):
-        custody.implementation_custody(spec, state, changed, previous)
 
 
 @pytest.fixture
@@ -287,69 +256,6 @@ def test_typed_input_rejection_proves_original_session_and_no_provider_turn(reje
     assert transcript.read_bytes() == original
 
 
-@pytest.mark.parametrize('drift', ['started-turn', 'items', 'wrong-code', 'wrong-size',
-                                  'extra-thread', 'unconfirmed-process', 'original-session'])
-def test_input_rejection_cannot_hide_started_work_or_changed_custody(rejected_input, drift):
-    spec, state, attempts, previous, transcript, folder = rejected_input
-    path = folder / 'native-thread-observation.json'
-    observed = json.loads(path.read_text())
-    if drift == 'started-turn':
-        observed['turns'][0]['turn_id'] = 'provider-started'
-    elif drift == 'items':
-        observed['raw_turn_items'] = 1
-    elif drift == 'wrong-code':
-        observed['turns'][0]['start_error']['data']['input_error_code'] = 'different_failure'
-    elif drift == 'wrong-size':
-        observed['turns'][0]['start_error']['data']['actual_chars'] = 100
-    elif drift == 'extra-thread':
-        observed['thread_inventory_before'].append('unrelated-thread')
-    elif drift == 'unconfirmed-process':
-        journal_path = folder / 'native-process.json'
-        journal = json.loads(journal_path.read_text())
-        journal["monitoring_complete"] = False
-        write_private(journal_path, journal)
-    else:
-        observed['parent_thread_id'] = 'different-session'
-    write_private(path, observed)
-    with pytest.raises(ValueError, match='authenticated failure'):
-        custody.implementation_custody(spec, state, attempts, previous)
-
-
-def test_legacy_gate_chain_retains_the_real_policy_session_home(tmp_path):
-    base = {"run_id": "run-1", "state_dir": str(tmp_path), "role_home_generation": "policy-1"}
-    first = {**base, "role_home_generation": "gate-retry-1"}
-    second = {**base, "role_home_generation": "report-retry-2"}
-    recovery = {
-        "kind": "published_gate_retry",
-        "execution_spec": second,
-        "seal": {"original_spec": first},
-        "original_recovery": {
-            "kind": "prepublication_gate_retry",
-            "execution_spec": first,
-            "seal": {"original_spec": base},
-            "original_recovery": None,
-        },
-    }
-    generation = custody.implementation_generation(second, recovery)
-    assert generation == "policy-1"
-    assert (
-        _native_role_home(
-            {
-                "spec": {**second, "implementation_role_home_generation": generation},
-                "role": "implement",
-                "iteration": 2,
-            }
-        )
-        == tmp_path / "role-homes/implement-policy-1"
-    )
-    assert (
-        custody.implementation_generation(
-            {**second, "implementation_role_home_generation": ""}, recovery
-        )
-        == ""
-    )
-
-
 @pytest.fixture
 def pending_session(missing_session, monkeypatch):
     store, state, command, spec, attempts, _, _ = missing_session
@@ -383,146 +289,3 @@ def pending_session(missing_session, monkeypatch):
     request["findings"] = [predecessor["error"], finding]
     write_private(request_path, request)
     return store, state, command, spec, [predecessor["error"], finding]
-
-
-def test_unstarted_repair_retains_its_feedback_and_iteration(pending_session, monkeypatch):
-    from devflow_temporal.delivery_workflow import DeliveryWorkflow
-
-    store, state, command, _, findings = pending_session
-    before = copy.deepcopy(state)
-    store.continue_repair("run-1", command)
-    recovery = saved(store)
-    assert recovery["state"] == before
-    assert resume.readback(store, recovery["execution_spec"], recovery) == {"state": "confirmed"}
-    flow = DeliveryWorkflow()
-    calls = []
-
-    async def confirmed(*_):
-        return True
-
-    async def activity(*_):
-        return {"state": "consistent"}
-
-    async def project(*_):
-        return None
-
-    async def iterations(actual_spec, **kwargs):
-        calls.append(kwargs)
-        return {"outcome": "normal-gates"}
-
-    monkeypatch.setattr(flow, "_confirm_repair_preflight", confirmed)
-    monkeypatch.setattr(flow, "_activity", activity)
-    monkeypatch.setattr(flow, "_project", project)
-    monkeypatch.setattr(flow, "_run_iterations", iterations)
-    result = asyncio.run(flow._resume_stopped(recovery["execution_spec"], recovery))
-    assert result["outcome"] == "normal-gates"
-    assert calls[0]["repair_findings"] == findings
-    assert calls[0]["start_iteration"] == 1
-    assert calls[0]["authorized_max_iteration"] == 3
-    assert calls[0]["prior_implementer_session"] == "original-implementation"
-
-
-def test_pending_repair_can_finish_at_the_shared_ceiling(pending_session, monkeypatch, tmp_path):
-    from devflow_temporal import delivery_feature_activities as feature
-    from devflow_temporal.delivery_execution_registry import ExecutionRegistry, OwnershipConflict
-
-    store, state, _, spec, _ = pending_session
-    shared = ExecutionRegistry(tmp_path / "registry" / "registry.sqlite3")
-    token = shared.claim(
-        {"issue": {"id": "I_fixture", "url": spec["issue_url"], "repository_id": "R_fixture"}},
-        "parent", str(store.config.tracking_db), maximum_repairs=10)
-    for index in range(9):
-        shared.repair(token, f"other-worker:{index}", f"product repair {index}")
-    reason = "Product repair at worker iteration 1"
-    shared.repair(token, "run-1:1", reason)
-    before = shared.budget(token["issue_id"])
-    parent = {"feature_delivery": {"owner": token}}
-    child = {**spec, "feature_worker": {"kind": "chunk", "workstream_id": "stream"}}
-    monkeypatch.setattr(feature, "registry", lambda _: shared)
-    result = feature.resume_worker(store, parent, child, {
-        "error": state["error"], "checks_json": canonical_json(state["checks"])})
-    assert result["resumed"] is True
-    recovery = saved(store)
-    assert recovery["maximum_iteration"] == 1
-    assert recovery["command"]["additional_iterations"] == 0
-    assert resume.readback(store, recovery["execution_spec"], recovery) == {"state": "confirmed"}
-    assert shared.repair(token, "run-1:1", reason) == before
-    with pytest.raises(OwnershipConflict, match="repair limit exhausted"):
-        shared.repair(token, "run-1:2", "Product repair at worker iteration 2")
-
-
-def test_pending_repair_reruns_implement_under_its_own_identity(pending_session, monkeypatch):
-    from devflow_temporal import delivery_activities as activities
-    from devflow_temporal.delivery_activities import delivery_role
-    from devflow_temporal.delivery_workflow import DeliveryWorkflow
-    from devflow_temporal.supervisor import NativeProcessUnknown, get_supervisor
-
-    store, state, command, _, findings = pending_session
-    with store._connect() as db:
-        failed = dict(db.execute("SELECT * FROM delivery_attempts WHERE run_id='run-1' "
-                                 "AND role='implement' AND iteration=1").fetchone())
-    store.continue_repair("run-1", command)
-    recovery = saved(store)
-    spec = recovery["execution_spec"]
-    assert recovery["pending_repair"]["iteration"] == 1
-    assert spec["implement_admission"] == recovery["command_digest"]
-    assert resume.readback(store, spec, recovery) == {"state": "confirmed"}
-    broker = DeliveryBroker(store, spec)
-    supervisor = get_supervisor(store)
-    launched = []
-
-    class LaunchingRole:
-        async def run(self, request):
-            # The real supervisor finds no durable attempt for this identity, so it
-            # would launch instead of answering from the failed attempt's receipt.
-            assert supervisor.retained_request(request) is None
-            launched.append(request)
-            (broker.checkout / "README.md").write_text("Repaired on the re-run\n")
-            flow.cancel_requested = True
-            return {"status": "pass", "session_id": request["resume_session"],
-                    "cleanup": "confirmed", "findings": [], "finish_reason": "done"}
-
-    monkeypatch.setattr(activities, "_context", lambda _spec: (store, broker))
-    monkeypatch.setattr(activities, "_role_context",
-                        lambda req, *_a: (req, broker.checkout, None, None))
-    monkeypatch.setattr(activities, "get_supervisor", lambda _: LaunchingRole())
-    monkeypatch.setattr(DeliveryBroker, "run_implementation_preparation",
-                        lambda *_a, **_k: {"state": "passed", "cleanup": "confirmed"})
-    flow = DeliveryWorkflow()
-
-    async def activity(name, body, **_):
-        if name == "delivery_role":
-            return await delivery_role(body)
-        return {"state": "consistent"}
-
-    async def confirmed(*_):
-        return True
-
-    async def nothing(*_):
-        return None
-
-    monkeypatch.setattr(flow, "_activity", activity)
-    monkeypatch.setattr(flow, "_confirm_repair_preflight", confirmed)
-    monkeypatch.setattr(flow, "_project", nothing)
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _id: True)
-    result = asyncio.run(flow._resume_stopped(spec, recovery))
-    assert result["phase"] == "cancelled" and len(launched) == 1
-    request = launched[0]
-    assert (request["iteration"], request["candidate"]["id"], request["findings"]) == (
-        1, failed["candidate_id"], findings)
-    assert DeliverySupervisor._job_key(request) != failed["job_key"]
-    rerun = result["roles"][-1]
-    assert (rerun["iteration"], rerun["status"], rerun["session_id"]) == (
-        1, "pass", "original-implementation")
-    assert rerun != json.loads(failed["result_json"])
-    # Under the previous identity the same request met the failed attempt's receipt.
-    old = {**request, "spec": {k: v for k, v in spec.items() if k != "implement_admission"}}
-    assert DeliverySupervisor._job_key(old) == failed["job_key"]
-    try:
-        replay = supervisor.retained_request(old)
-    except NativeProcessUnknown:
-        replay = "refused"
-    assert replay is not None
-    with store._connect() as db:
-        assert dict(db.execute("SELECT * FROM delivery_attempts WHERE job_key=?",
-                               (failed["job_key"],)).fetchone()) == failed

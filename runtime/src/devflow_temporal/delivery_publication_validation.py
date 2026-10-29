@@ -48,7 +48,7 @@ def effective_spec(store, recovery):
     return recovery["execution_spec"]
 
 
-def _remote(spec, old, expected_head):
+def _remote(spec, old, expected_head, *, check_head=True):
     from .delivery_project_sync import GitHub
 
     gh = GitHub()
@@ -60,14 +60,24 @@ def _remote(spec, old, expected_head):
     base = spec.get("publication_base_ref")
     if (pr["state"] != "OPEN" or pr["isDraft"] or issue["state"] != "OPEN"
             or pr["url"].casefold() != old["url"].casefold()
-            or pr["headRefOid"] != expected_head or pr["headRefName"] != spec["branch"]
+            or (check_head and pr["headRefOid"] != expected_head)
+            or pr["headRefName"] != spec["branch"]
             or (base is not None and pr["baseRefName"] != base)
             or labels & HOLD):
         raise ValueError("current publication changed or has an owner hold")
     return pr
 
 
-def _checkpoint(store, run_id, payload):
+def _checkpoint(store, run_id, payload, *, observation=False):
+    from .delivery_execution_config import observation_mode
+
+    if observation:
+        with observation_mode():
+            return _checkpoint_inner(store, run_id, payload, observation=True)
+    return _checkpoint_inner(store, run_id, payload, observation=False)
+
+
+def _checkpoint_inner(store, run_id, payload, *, observation):
     spec = store.effective_spec(run_id)
     if (spec.get("feature_delivery") or spec.get("authorized_endpoint") != "published_unmerged"
             or spec.get("provider") not in {"codex", "fake"}
@@ -81,21 +91,18 @@ def _checkpoint(store, run_id, payload):
         binding = work_binding(store, spec, db)
     previous = json.loads(row["recovery_json"] or "null")
     closed = store._completed_temporal_result(
-        run_id, workflow_id=row["workflow_id"] or "delivery-" + run_id)
+        run_id, workflow_id=row["workflow_id"] or "delivery-" + run_id,
+        preserve=not observation)
     state = closed["result"]
     candidate, pr = (json.loads(row[k] or "null") for k in ("candidate_json", "pr_json"))
     if (row["outcome"] not in {"delivered", "blocked"} or row["cleanup"] != "confirmed"
             or row["execution_state"] not in {"terminal", "blocked"}
-            or row["protocol_revision"] != payload["expected_revision"]
-            or row["revision"] != payload["expected_projection_revision"]
             or closed["request_digest"] != row["request_digest"]
             or closed["recovery_digest"] != (digest(previous) if previous else None)
             or state.get("run_id") != run_id or state.get("outcome") != row["outcome"]
             or state.get("revision") != row["protocol_revision"]
             or not candidate or state.get("candidate") != candidate
-            or candidate["id"] != payload["expected_candidate_id"]
             or not pr or state.get("pull_request") != pr
-            or pr["number"] != payload["expected_pr_number"]
             or any(a["state"] != "finished" or a["cleanup"] != "confirmed" for a in attempts)
             or any(e["state"] != "complete" for e in effects)
             or (claim and claim["owner"] != "external:devflow:" + run_id)):
@@ -111,12 +118,17 @@ def _checkpoint(store, run_id, payload):
     if spec["provider"] == "codex":
         from .delivery_repair import confirmed_native_cleanup
 
-        confirmed_native_cleanup(spec)
-    remote = _remote(spec, pr, payload["expected_pr_head"])
+        if observation:
+            from .delivery_resources import observe_finalized_resources
+
+            observe_finalized_resources(spec)
+        else:
+            confirmed_native_cleanup(spec)
+    remote = _remote(spec, pr, payload["expected_pr_head"], check_head=False)
     from .delivery_project_sync import GitHub
 
     comparison = GitHub().command("api", f"repos/{spec['github_repo']}/compare/"
-                                  f"{candidate['head']}...{payload['expected_pr_head']}")
+                                  f"{candidate['head']}...{remote['headRefOid']}")
     files = comparison.get("files", [])
     paths = [f["filename"] for f in files]
     if (comparison.get("status") != "ahead"
@@ -130,7 +142,45 @@ def _checkpoint(store, run_id, payload):
             "work_binding": binding, "closed": closed, "original_spec": spec,
             "original_recovery": previous, "state": state, "candidate": candidate,
             "publication": pr, "paths": paths, "base_branch": remote["baseRefName"],
-            "session_id": implementation["session_id"]}
+            "session_id": implementation["session_id"], "remote_head": remote["headRefOid"]}
+
+
+def _assessment(seal, payload):
+    from .delivery_lifecycle import require_transition
+
+    return require_transition({
+        "operation": KIND, "owner": "publication_validation", "owner_proof": True,
+        "proof_digest": digest(seal), "normalized_lifecycle": "stopped",
+        "revision": seal["row"]["protocol_revision"],
+        "projection_revision": seal["row"]["revision"],
+        "candidate_id": seal["candidate"]["id"], "candidate_head": seal["remote_head"],
+        "publication_number": seal["publication"]["number"], "publication_required": True,
+        "comparisons": [("revision", "expected_revision", "revision_changed"),
+                        ("projection_revision", "expected_projection_revision",
+                         "projection_revision_changed"),
+                        ("candidate_id", "expected_candidate_id", "candidate_changed"),
+                        ("candidate_head", "expected_pr_head", "candidate_head_changed"),
+                        ("publication_number", "expected_pr_number", "publication_changed")],
+    }, payload)
+
+
+def assess(store, run_id, payload):
+    from .delivery_lifecycle import RecoveryRefused, evaluate_transition
+
+    try:
+        result = admit(store, run_id, payload, preflight=True)
+        if isinstance(result, dict) and isinstance(result.get("lifecycle_assessment"), dict):
+            return result["lifecycle_assessment"]
+    except RecoveryRefused as exc:
+        return exc.assessment
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+        pass
+    return evaluate_transition({"operation": KIND, "owner": "publication_validation",
+                                "comparisons": [], "predicates": [{
+        "code": "publication_validation_proof_unavailable", "satisfied": None,
+        "missing_or_unknown_fact": "settled publication owner, cleanup and current head evidence",
+        "next_action": "inspect the publication validation owner evidence",
+    }]}, {})
 
 
 def restore_checkout(store, seal, root):
@@ -216,16 +266,25 @@ def admit(store, run_id, payload, *, preflight=False):
         if prior["run_id"] != run_id or prior["request_digest"] != command_digest:
             raise ValueError("command ID already belongs to different validation inputs")
         return json.loads(prior["response_json"])
-    seal = _checkpoint(store, run_id, payload)
+    seal = _checkpoint(store, run_id, payload, observation=True)
+    assessment = _assessment(seal, payload)
     if preflight:
         return {"run_id": run_id, "preflight": True, "paths": seal["paths"],
                 "pr_number": payload["expected_pr_number"], "head": payload["expected_pr_head"],
-                "additional_iterations": 0}
+                "additional_iterations": 0, "lifecycle_assessment": assessment}
     original = seal["original_spec"]
     root = Path(original["state_dir"]) / ("publication-validation-" + payload["expected_pr_head"])
     from .delivery_preparation import _lock
 
     with _lock(root / "admission"):
+        fresh = _checkpoint(store, run_id, payload, observation=True)
+        _assessment(fresh, payload)
+        if fresh != seal:
+            raise ValueError("publication checkpoint changed before effects")
+        if original["provider"] == "codex":
+            from .delivery_repair import confirmed_native_cleanup
+
+            confirmed_native_cleanup(original)
         private_directory(root)
         from .delivery_gate_retry import prepare_runtime
         from .delivery_session_custody import implementation_generation
@@ -254,7 +313,7 @@ def admit(store, run_id, payload, *, preflight=False):
                 if tree and not tree.startswith("100644 blob "):
                     raise ValueError("documentation validation cannot adopt executable or linked "
                                      "files")
-        if digest(_checkpoint(store, run_id, payload)) != digest(seal):
+        if digest(_checkpoint(store, run_id, payload, observation=True)) != digest(seal):
             raise ValueError("publication checkpoint changed during native preparation")
         preserve_validation_resources(root, seal)
         _immutable(retained, seal)

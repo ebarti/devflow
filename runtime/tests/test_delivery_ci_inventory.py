@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import shutil
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -511,3 +512,111 @@ def test_readonly_preflight_keeps_current_installation_guard_separate_from_histo
         monkeypatch.setattr(owner, "_observe", after)
     with pytest.raises(ValueError, match="current service guard"):
         owner.preflight(readonly, "run-1", c.command)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_public_preflight_and_ack_agree_on_changed_checkpoint(ci_case):
+    c = ci_case
+    with c.store._connect() as db:
+        before = {table: [dict(row) for row in db.execute("SELECT * FROM " + table)]
+                  for table in ("delivery_runs", "delivery_events", "delivery_commands")}
+    async with public(c) as (client, headers):
+        path = "/api/runs/run-1/"
+        good = await client.post(path + "ci-inventory-preflight", json=c.command)
+        assert good.status_code == 200, good.text
+        assert good.json()["lifecycle_assessment"]["eligible"] is True
+        for field, value, code in (
+            ("expected_revision", c.command["expected_revision"] + 1, "revision_changed"),
+            ("expected_projection_revision", c.command["expected_projection_revision"] + 1,
+             "projection_revision_changed"),
+            ("expected_candidate_id", "0" * 64, "candidate_changed"),
+            ("expected_candidate_head", "0" * 40, "candidate_head_changed"),
+            ("expected_content_sha256", "0" * 64, "candidate_content_changed"),
+            ("expected_pr_number", c.command["expected_pr_number"] + 1, "publication_changed"),
+        ):
+            body = {**c.command, field: value}
+            pre = await client.post(path + "ci-inventory-preflight", json=body)
+            ack = await client.post(path + "ack-ci-inventory", headers=headers, json={
+                **body, "preflight_key": good.json()["preflight_key"],
+                "acknowledgement": owner.ACK})
+            assert pre.status_code == ack.status_code == 409
+            for response in (pre, ack):
+                detail = response.json()["detail"]
+                assert not detail["eligible"]
+                assert code in {blocker["code"] for blocker in detail["blockers"]}
+    with c.store._connect() as db:
+        for table, rows in before.items():
+            assert [dict(row) for row in db.execute("SELECT * FROM " + table)] == rows
+        assert not db.execute("SELECT 1 FROM delivery_ci_inventories").fetchone()
+
+
+@pytest.mark.asyncio
+async def test_public_preflight_absent_resource_root_is_read_only(ci_case, monkeypatch):
+    """Missing cleanup evidence must not be replaced by a new resource directory."""
+    from devflow_temporal import delivery_ci_teardown, delivery_gate_retry
+
+    c = ci_case
+    root = c.case.registry.root
+    shutil.rmtree(root)
+    assert not root.exists()
+    observations = []
+    profile_args = []
+    cleanup = delivery_gate_retry._stopped_cleanup
+
+    def no_historical_teardown(store, spec, previous, candidate, publication, profile=None):
+        profile_args.append(profile)
+        return None
+
+    def inspect_cleanup(spec, *, read_only=False):
+        observations.append(read_only)
+        return cleanup(spec, read_only=read_only)
+
+    monkeypatch.setattr(delivery_ci_teardown, "snapshot_cleanup", no_historical_teardown)
+    monkeypatch.setattr(delivery_gate_retry, "_stopped_cleanup", inspect_cleanup)
+    async with public(c) as (client, _headers):
+        response = await client.post("/api/runs/run-1/ci-inventory-preflight", json=c.command)
+    assert response.status_code == 409, response.text
+    assert len(profile_args) == 1 and profile_args[0] is not None
+    assert observations == [True]
+    assert not root.exists()
+
+
+@pytest.mark.asyncio
+async def test_public_preflight_ci_teardown_shares_tracking_snapshot(ci_case, monkeypatch):
+    """Teardown and nested resource reads must use one read-only tracking snapshot."""
+    from contextlib import contextmanager
+
+    from devflow_temporal import delivery_store
+    from devflow_temporal.delivery_execution_config import observation_scope
+
+    c = ci_case
+    tracking = c.store.config.tracking_db
+    paths = [Path(str(tracking) + suffix) for suffix in ("", "-wal", "-shm", "-journal")]
+    original = delivery_store.tracking_read_connection
+    identities = []
+    depth = 0
+    max_depth = 0
+
+    @contextmanager
+    def observed(path):
+        nonlocal depth, max_depth
+        with original(path) as db:
+            scope = observation_scope()
+            assert scope is not None
+            identity = scope.resources[("tracking", str(path))]
+            identities.append(id(identity))
+            depth += 1
+            max_depth = max(max_depth, depth)
+            try:
+                yield db
+            finally:
+                depth -= 1
+
+    monkeypatch.setattr(delivery_store, "tracking_read_connection", observed)
+    async with public(c) as (client, _headers):
+        before = {path: path.read_bytes() if path.exists() else None for path in paths}
+        response = await client.post("/api/runs/run-1/ci-inventory-preflight", json=c.command)
+        assert response.status_code == 200, response.text
+        assert len(identities) >= 2 and len(set(identities)) == 1
+        assert max_depth >= 2
+        assert {path: path.read_bytes() if path.exists() else None for path in paths} == before

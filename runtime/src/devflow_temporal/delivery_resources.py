@@ -10,7 +10,7 @@ import os
 import sqlite3
 import stat
 import subprocess
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +128,9 @@ def _gate_roots(spec: dict, *, execution_specs: dict | None = None,
                 or config.path != Path(spec['config_path'])
                 or state != config.state_root / 'runs' / spec['run_id']):
             raise ValueError('gate namespace frozen configuration changed')
-        with closing(sqlite3.connect(config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+        from .delivery_store import tracking_read_connection
+
+        with tracking_read_connection(config.tracking_db) as db:
             columns = 'request_digest,recovery_json'
             if execution_specs is not None:
                 columns += ',request_json,accepted_plan_text'
@@ -998,8 +1000,9 @@ class RunResources:
 
                     if 'config_path' in self.spec:
                         config = load_execution_config(self.spec)
-                        with closing(sqlite3.connect(
-                                config.tracking_db.as_uri() + '?mode=ro', uri=True)) as db:
+                        from .delivery_store import tracking_read_connection
+
+                        with tracking_read_connection(config.tracking_db) as db:
                             db.row_factory = sqlite3.Row
                             row = db.execute(
                                 'SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',

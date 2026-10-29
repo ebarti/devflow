@@ -59,6 +59,13 @@ def submitted_owner(spec, *, db=None):
     if Path(spec["policy"]["tracking_db"]).resolve() != current.tracking_db.resolve():
         raise ValueError("amended operational transport differs from its frozen database")
     if db is None:
+        from .delivery_execution_config import is_observation_mode
+
+        if is_observation_mode():
+            from .delivery_store import _observation_tracking_connection
+
+            with _observation_tracking_connection(current.tracking_db) as source:
+                return submitted_owner(spec, db=source)
         with closing(
             sqlite3.connect(current.tracking_db.as_uri() + "?mode=ro", uri=True)
         ) as source:

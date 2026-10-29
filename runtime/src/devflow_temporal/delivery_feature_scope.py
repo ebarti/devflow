@@ -28,14 +28,14 @@ def _binding(seal):
     }
 
 
-def amendment(store, parent, command, successor_id):
+def amendment(store, parent, command, successor_id, *, shared=None):
     """Observe authentic stopped custody before continuation can produce effects."""
     from .delivery_feature_execution import plan_for, registry, worker_key
     from .delivery_feature_pass import checkpoints
     from .delivery_feature_revisions import adopted_plan_identity, validate_diagnostic
     from .delivery_stopped_resume import review_snapshot, scope_spec
 
-    shared, token = registry(parent), parent["feature_delivery"]["owner"]
+    shared, token = shared or registry(parent), parent["feature_delivery"]["owner"]
     current = shared.current(token["issue_id"])
     if (parent.get(MARKER) or current is None or shared.token(current) != token
             or current["state"] != "stopped"
@@ -50,7 +50,8 @@ def amendment(store, parent, command, successor_id):
             != {key: identity[key] for key in ("plan_revision", "plan_digest")}):
         raise OwnershipConflict("scope continuation belongs to a superseded feature plan")
     stopped = []
-    for key, assignment in checkpoints(parent).items():
+    values = checkpoints(parent, shared=shared)
+    for key, assignment in values.items():
         if not key.startswith("assignment:") or not key.endswith(":build"):
             continue
         if assignment["store_path"] != token["store_path"]:
@@ -83,7 +84,7 @@ def amendment(store, parent, command, successor_id):
         raise OwnershipConflict("scope continuation lost its closed implementation finding")
     diagnostic = latest.get("planning_defect")
     validate_diagnostic(store, parent, diagnostic, identity=identity,
-                        candidate_id=seal["candidate"]["id"])
+                        candidate_id=seal["candidate"]["id"], shared=shared)
     if (diagnostic["candidate_id"] != seal["candidate"]["id"]
             or diagnostic != seal["state"].get("checks", {}).get("planning_defect")):
         raise OwnershipConflict("scope continuation diagnostic changed its retained candidate")
@@ -133,8 +134,11 @@ def prepare_submission(store, spec, receipt=None):
     else:
         authenticate_receipt(store, retained)
         effective = original
-    # Keep the new coordinator's identity; all execution authority comes from
-    # its frozen predecessor with exactly the recorded file permission delta.
+    apply_submission(spec, effective)
+
+
+def apply_submission(spec, effective):
+    """Apply the same frozen scope authority to a prospective or real successor."""
     identities = {key: spec[key] for key in (
         "run_id", "command_id", "request_digest", "state_dir", "checkout", "branch",
         "feature_predecessor")}
@@ -177,7 +181,14 @@ def worker_scope(store, seal, command, receipt=None):
             raise OwnershipConflict("worker scope requires its admitted feature continuation")
         config = authenticate_receipt(store, receipt)
     else:
-        predecessor = store.effective_spec(receipt["predecessor"]["run_id"])
+        from .delivery_execution_config import is_observation_mode
+
+        if is_observation_mode():
+            from .delivery_feature_handoff import readonly_feature_spec
+
+            predecessor = readonly_feature_spec(store, receipt["predecessor"]["run_id"])
+        else:
+            predecessor = store.effective_spec(receipt["predecessor"]["run_id"])
         config = _configuration(predecessor, receipt["scope"])
     if (receipt["worker_run_id"] != seal["predecessor_spec"]["run_id"]
             or receipt["scope"] != {key: command[key] for key in FIELDS}

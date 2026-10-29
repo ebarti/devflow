@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import signal
 import socket
+import sqlite3
+import stat
 import subprocess
 import sys
 import time
+from contextlib import closing
+from pathlib import Path
 
 import pytest
 from test_delivery_api import api_fixture as api_fixture
@@ -23,6 +29,147 @@ async def until(predicate):
     while not predicate():
         assert time.monotonic() < deadline, "fixture did not reach its controlled boundary"
         await asyncio.sleep(0.02)
+
+
+def provider_boundary_diagnostic(case, task, completed=()):
+    """Only finite facts from this fixture's original task and owned startup files."""
+    from runtime_location_scenario import ci_failure_diagnostics
+
+    if not ci_failure_diagnostics():
+        return None
+
+    def choice(value, allowed):
+        return value if isinstance(value, str) and value in allowed else "other"
+
+    def public_frames(frames):
+        package = Path(native.__file__).parent
+        result = []
+        for frame, line in frames:
+            module = frame.f_globals.get("__name__")
+            function = frame.f_code.co_name
+            if (not isinstance(module, str) or not re.fullmatch(
+                    r"devflow_temporal(?:\.[a-z_][a-z0-9_]*){0,3}", module)
+                    or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", function)
+                    or type(line) is not int or not 0 < line <= 100000):
+                continue
+            relative = module.removeprefix("devflow_temporal").lstrip(".")
+            expected = package / (relative.replace(".", "/") + ".py" if relative
+                                  else "__init__.py")
+            if Path(frame.f_code.co_filename) == expected:
+                result.append({"module": module, "function": function, "line": line})
+        return result[-8:]
+
+    def bounded_file(name):
+        try:
+            descriptor = os.open(case.folder / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                info = os.fstat(descriptor)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077 or info.st_size > 262144):
+                    return None
+                value = os.read(descriptor, 262145)
+                return value if len(value) <= 262144 else None
+            finally:
+                os.close(descriptor)
+        except OSError:
+            return None
+
+    types = {"ValueError", "RuntimeError", "AssertionError", "TypeError", "KeyError",
+             "OSError", "PermissionError", "FileNotFoundError", "TimeoutError",
+             "ImportError", "ModuleNotFoundError", "SyntaxError", "CancelledError",
+             "NativeProcessUnknown", "ApplicationError"}
+    facts = {"task_state": "pending", "journal": {"state": "unavailable"},
+             "attempt": {"state": "unavailable"}}
+    if completed or task.done():
+        if completed:
+            value = completed[0]
+        elif task.cancelled():
+            value = asyncio.CancelledError()
+        else:
+            value = task.exception()
+            if value is None:
+                value = task.result()
+        if isinstance(value, BaseException):
+            facts.update(task_state="cancelled" if isinstance(value, asyncio.CancelledError)
+                         else "raised", exception_type=choice(type(value).__name__, types))
+            frames, trace = [], value.__traceback__
+            while trace is not None and len(frames) < 64:
+                frames.append((trace.tb_frame, trace.tb_lineno))
+                trace = trace.tb_next
+            facts["source_frames"] = public_frames(frames)
+        else:
+            facts["task_state"] = "returned"
+            if isinstance(value, dict):
+                facts["result"] = {
+                    "status": choice(value.get("status"), {"pass", "blocked", "recovery_unknown"}),
+                    "cleanup": choice(value.get("cleanup"), {"confirmed", "unknown"}),
+                    "finish_reason": choice(value.get("finish_reason"), {
+                        "prelaunch", "fixture", "interrupted_monitor", "done", "timeout"})}
+    else:
+        frames, seen, current = [], set(), task.get_coro()
+        for _ in range(16):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            frame = getattr(current, "cr_frame", None) or getattr(current, "gi_frame", None)
+            if frame is not None:
+                frames.append((frame, frame.f_lineno))
+                # Follow only the child retained by this original public heartbeat,
+                # never an all-tasks/thread/process scan.
+                child = frame.f_locals.get("pending")
+                if (frame.f_globals.get("__name__") == "devflow_temporal.delivery_activities"
+                        and frame.f_code.co_name == "_with_heartbeat"
+                        and isinstance(child, asyncio.Task)):
+                    current = child.get_coro()
+                    continue
+            current = getattr(current, "cr_await", None) or getattr(current, "gi_yieldfrom", None)
+        facts["source_frames"] = public_frames(frames)
+    raw = bounded_file("native-process.json")
+    if raw is not None:
+        try:
+            journal = json.loads(raw)
+            result = journal.get("result") or {}
+            facts["journal"] = {
+                "state": "available", "phase": choice(journal.get("phase"), {
+                    "allocated", "authorized", "finished", "unknown"}),
+                "monitor_recorded": isinstance(journal.get("monitor"), dict),
+                "owned_count": min(len(journal["owned"]), 1000)
+                if isinstance(journal.get("owned"), dict) else None,
+                "result_state": choice(result.get("state"), {"finished", "unknown"}),
+                "exit_code": result.get("exit_code") if type(result.get("exit_code")) is int
+                and -2**31 <= result["exit_code"] < 2**31 else None}
+        except (ValueError, TypeError, AttributeError):
+            pass
+    try:
+        with closing(sqlite3.connect(case.store.config.tracking_db.as_uri() + "?mode=ro",
+                                    uri=True, timeout=0.1)) as db:
+            row = db.execute("SELECT state,cleanup FROM delivery_attempts WHERE job_key=?",
+                             (case.key,)).fetchone()
+        if row:
+            facts["attempt"] = {"state": choice(row[0], {
+                "starting", "running", "unknown", "finished"}),
+                "cleanup": choice(row[1], {"confirmed", "unknown", "none"})}
+    except (OSError, sqlite3.Error):
+        pass
+    facts["startup_logs"] = {}
+    for role, name in (("monitor", "monitor.log"), ("process", "process.log")):
+        raw = bounded_file(name)
+        marker = re.search(rb"(?:^|\n)([A-Za-z]+Error|NativeProcessUnknown):", raw) if raw else None
+        facts["startup_logs"][role] = {"bounded_private_read": raw is not None,
+            "python_exception_marker": choice(marker[1].decode("ascii"), types) if marker else None}
+    return facts
+
+
+def record_provider_boundary(error, case, task, phase, completed=()):
+    try:
+        facts = provider_boundary_diagnostic(case, task, completed)
+        if facts is not None:
+            facts["observation_phase"] = phase
+            text = json.dumps({"provider_boundary_observation": facts}, sort_keys=True)
+            error.add_note(text)
+            print(text, file=sys.stderr, flush=True)
+    except BaseException:
+        pass  # Original boundary failure and task result must remain authoritative.
 
 
 def kill_owned_monitor(journal):
@@ -71,8 +218,14 @@ async def test_sigkill_monitor_confirms_cleanup_without_promoting_provider_resul
     case = native_role
     (case.state / "hold-provider").touch()
     task = asyncio.create_task(delivery_role(case.request))
+    boundary_error = None
     try:
-        await until(lambda: (case.state / "provider-started").exists())
+        try:
+            await until(lambda: (case.state / "provider-started").exists())
+        except AssertionError as exc:
+            boundary_error = exc
+            record_provider_boundary(exc, case, task, "deadline")
+            raise
         if partial_pass:
             write_private(case.folder / "result.json", {
                 "status": "pass", "summary": "unobserved provider receipt",
@@ -96,7 +249,9 @@ async def test_sigkill_monitor_confirms_cleanup_without_promoting_provider_resul
         case.owner._mark_prelaunch_blocked(next_key, "fixture ends before launch")
     finally:
         (case.state / "release-provider").touch()
-        await asyncio.gather(task, return_exceptions=True)
+        completed = await asyncio.gather(task, return_exceptions=True)
+        if boundary_error is not None:
+            record_provider_boundary(boundary_error, case, task, "settled", completed)
 
 
 @pytest.fixture

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import subprocess
 import threading
 import time
@@ -40,6 +41,29 @@ from .delivery_workflow import DeliveryWorkflow
 TRANSPORT_FAILURES = (RuntimeError, OSError, subprocess.SubprocessError)
 
 logger = logging.getLogger(__name__)
+
+
+def _recovery_conflict_detail(exc: Exception) -> Any:
+    from .delivery_lifecycle import RecoveryRefused, evaluate_transition
+
+    if isinstance(exc, RecoveryRefused):
+        return exc.assessment
+    if isinstance(exc, sqlite3.Error):
+        from .delivery_feature_revision_subject import FeatureRegistryObservationError
+
+        feature = isinstance(exc, FeatureRegistryObservationError)
+        return evaluate_transition({"operation": "unknown",
+                                    "owner": "feature_registry" if feature else "tracking_store",
+                                    "comparisons": [], "predicates": [{
+                                        "code": ("feature_registry_proof_unknown" if feature else
+                                                 "tracking_store_unavailable"),
+                                        "satisfied": None,
+                                        "missing_or_unknown_fact": (
+                                            "stable feature registry" if feature else
+                                            "stable tracking database"),
+                                        "next_action": ("inspect the feature registry" if feature
+                                                        else "inspect the tracking store")}]}, {})
+    return str(exc)
 
 
 def _dispatch_failure_reason(exc: BaseException) -> str:
@@ -658,7 +682,7 @@ def create_app(config_path: Path) -> FastAPI:
             return await asyncio.to_thread(
                 revise_execution, service.store, run_id, await request.json())
         except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
         except TRANSPORT_FAILURES as exc:
             raise HTTPException(503, str(exc)) from exc
 
@@ -671,7 +695,7 @@ def create_app(config_path: Path) -> FastAPI:
             return await asyncio.to_thread(
                 continue_execution, service.store, run_id, await request.json())
         except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
         except TRANSPORT_FAILURES as exc:
             # Temporal, git or gh were unavailable: the command is safe to replay.
             raise HTTPException(503, str(exc)) from exc
@@ -684,17 +708,19 @@ def create_app(config_path: Path) -> FastAPI:
                 service.store.recover_publication, run_id, await request.json()
             )
         except (ValueError, RuntimeError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.get("/api/runs/{run_id}/merge-preflight")
     async def merge_preflight(request: Request, run_id: str):
         _host(request)
+        from .delivery_execution_config import observation_mode
         from .delivery_merge_followup import preflight
 
         try:
-            return await asyncio.to_thread(preflight, service.store, run_id)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+            with observation_mode():
+                return await asyncio.to_thread(preflight, service.store, run_id)
+        except (ValueError, sqlite3.Error) as exc:
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/merge")
     async def merge_run(request: Request, run_id: str):
@@ -704,7 +730,7 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(admit, service.store, run_id, await request.json())
         except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
         except TRANSPORT_FAILURES as exc:
             raise HTTPException(503, str(exc)) from exc
 
@@ -712,10 +738,14 @@ def create_app(config_path: Path) -> FastAPI:
     @app.get("/api/runs/{run_id}/gates-only-preflight")
     async def gates_only_preflight(request: Request, run_id: str) -> dict[str, Any]:
         _host(request)
+        from .delivery_execution_config import observation_mode
+
         try:
-            return await asyncio.to_thread(service.store.gates_only_preflight, run_id)
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            with observation_mode():
+                return await asyncio.to_thread(service.store.gates_only_preflight, run_id)
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/admit-gates-only")
     async def admit_gates_only(request: Request, run_id: str) -> dict[str, Any]:
@@ -725,17 +755,21 @@ def create_app(config_path: Path) -> FastAPI:
                 service.store.admit_gates_only, run_id, await request.json(),
             )
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post('/api/runs/{run_id}/ci-inventory-preflight')
     async def ci_inventory_preflight(request: Request, run_id: str):
         _host(request)
         from .delivery_ci_inventory import preflight
+        from .delivery_execution_config import observation_mode
 
         try:
-            return await asyncio.to_thread(preflight, service.store, run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            with observation_mode():
+                return await asyncio.to_thread(
+                    preflight, service.store, run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post('/api/runs/{run_id}/ack-ci-inventory')
     async def ack_ci_inventory(request: Request, run_id: str):
@@ -745,7 +779,7 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(acknowledge, service.store, run_id, await request.json())
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.get('/api/runs/{run_id}/ci-inventory')
     async def ci_inventory(request: Request, run_id: str):
@@ -755,17 +789,21 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(info, service.store, run_id)
         except (ValueError, RuntimeError, OSError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post('/api/runs/{run_id}/native-diagnostic-preflight')
     async def native_diagnostic_preflight(request: Request, run_id: str):
         _host(request)
+        from .delivery_execution_config import observation_mode
         from .delivery_native_diagnostic import preflight
 
         try:
-            return await asyncio.to_thread(preflight, service.store, run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            with observation_mode():
+                return await asyncio.to_thread(
+                    preflight, service.store, run_id, await request.json())
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post('/api/runs/{run_id}/ack-native-diagnostic')
     async def ack_native_diagnostic(request: Request, run_id: str):
@@ -775,7 +813,7 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(acknowledge, service.store, run_id, await request.json())
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.get('/api/runs/{run_id}/native-diagnostics/{command_id}')
     async def native_diagnostic(request: Request, run_id: str, command_id: str):
@@ -785,16 +823,42 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(info, service.store, run_id, command_id)
         except (ValueError, RuntimeError, OSError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/assess-transition")
+    async def assess_transition(request: Request, run_id: str) -> dict[str, Any]:
+        _host(request)
+        from .delivery_lifecycle import assess_transition as assess
+
+        payload = await request.json()
+        if (not isinstance(payload, dict) or set(payload) != {'kind', 'request'}
+                or not isinstance(payload['kind'], str)
+                or not isinstance(payload['request'], dict)):
+            raise HTTPException(400, 'expected kind and request object')
+        if payload['kind'] == 'reconcile_tracker':
+            from .delivery_terminal_recovery import assess as assess_tracker
+            from .delivery_terminal_recovery import unknown_assessment
+
+            try:
+                client = await service.client()
+            except (*TRANSPORT_FAILURES, RPCError):
+                return unknown_assessment(payload['request'])
+            return await assess_tracker(service.store, run_id, payload['request'], client)
+        return await asyncio.to_thread(assess, service.store, run_id,
+                                       payload['kind'], payload['request'])
 
     @app.post("/api/runs/{run_id}/repair-admission-preflight")
     async def repair_admission_preflight(request: Request, run_id: str) -> dict[str, Any]:
         _host(request)
+        from .delivery_execution_config import observation_mode
+
         try:
-            return await asyncio.to_thread(service.store.repair_admission_preflight,
+            with observation_mode():
+                return await asyncio.to_thread(service.store.repair_admission_preflight,
                                            run_id, await request.json())
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+        except (ValueError, RuntimeError, OSError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/continue-repair")
     async def continue_repair(request: Request, run_id: str) -> dict[str, Any]:
@@ -804,7 +868,7 @@ def create_app(config_path: Path) -> FastAPI:
                 service.store.continue_repair, run_id, await request.json()
             )
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/retry-prelaunch")
     async def retry_prelaunch(request: Request, run_id: str) -> dict[str, Any]:
@@ -814,7 +878,7 @@ def create_app(config_path: Path) -> FastAPI:
                 service.store.retry_prelaunch, run_id, await request.json()
             )
         except (ValueError, RuntimeError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.post("/api/runs/{run_id}/amend-scope")
     async def amend_scope(request: Request, run_id: str) -> dict[str, Any]:
@@ -822,7 +886,7 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             return await asyncio.to_thread(service.store.amend_scope, run_id, await request.json())
         except (ValueError, RuntimeError, OSError) as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
 
     @app.get("/api/runs/{run_id}/status")
     async def persisted_status(request: Request, run_id: str) -> dict[str, Any]:
@@ -986,7 +1050,7 @@ def create_app(config_path: Path) -> FastAPI:
                 await asyncio.to_thread(service.store.mark_mutation_unknown, command_id)
             else:
                 await asyncio.to_thread(service.store.reject_mutation, command_id, str(exc))
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409, _recovery_conflict_detail(exc)) from exc
         response = {"run_id": run_id, "phase": result["phase"], "revision": result["revision"]}
         if name == "disable_delivery_limits":
             response["delivery_limits_disabled"] = True

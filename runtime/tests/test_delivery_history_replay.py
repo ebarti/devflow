@@ -19,13 +19,23 @@ from temporalio.workflow import NondeterminismError
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
-HISTORIES = sorted(FIXTURES.glob("*.json")) + sorted((FIXTURES / "order").glob("*history.json"))
+HISTORIES = sorted(path for path in FIXTURES.glob("*.json")
+                   if not path.name.endswith(".provenance.json")) + sorted(
+                       (FIXTURES / "order").glob("*history.json"))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", HISTORIES, ids=lambda path: path.stem)
 async def test_recorded_delivery_history_replays_on_designated_artifact(path, tmp_path):
     await replay_designated_history(path, tmp_path)
+
+
+def test_publication_recovery_replay_excludes_metadata_and_keeps_history():
+    history = FIXTURES / "publication-recovery-no-proof-8ed1339.json"
+    provenance = FIXTURES / "publication-recovery-no-proof-8ed1339.provenance.json"
+    assert history in HISTORIES and provenance not in HISTORIES
+    assert hashlib.sha256(history.read_bytes()).hexdigest() == (
+        json.loads(provenance.read_text())["history_sha256"])
 
 
 def test_original_counterexample_history_bytes_remain_unchanged():

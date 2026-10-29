@@ -269,7 +269,8 @@ def bind(db, session_id, work_ids, role=None, parent_id=None, extend=False):
     return {"session_id": session_id, "work_ids": scope(db, session_id)}
 
 
-def claim_work(db, work_id, owner, source_ref=None):
+def validate_claim_work(db, work_id, owner):
+    """Read the exact claim prerequisites without writing or creating a session."""
     if not owner or not owner.strip():
         raise ValueError("owner must be the actual host task or coordinator ID")
     work = row(db, "works", work_id)
@@ -281,6 +282,12 @@ def claim_work(db, work_id, owner, source_ref=None):
         saved = dict(found)
         if (saved["work_id"], saved["owner"], saved["resource"]) != (work_id, owner, resource):
             raise ValueError("already claimed: " + encode(saved))
+    return resource, found
+
+
+def claim_work(db, work_id, owner, source_ref=None):
+    resource, found = validate_claim_work(db, work_id, owner)
+    if found:
         db.execute("UPDATE claims SET updated_at=?,source_ref=COALESCE(?,source_ref) WHERE work_id=?", (now(), source_ref, work_id))
         bind(db, owner, [work_id], "coordinator", extend=True)
         return {"replayed": True, "claim": claim_for(db, work_id)}

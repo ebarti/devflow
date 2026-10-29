@@ -12,7 +12,6 @@ import fcntl
 import hashlib
 import json
 import os
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -175,8 +174,12 @@ def census(descriptor, proof):
         raise ValueError("installation service-lock FD census cannot see its exact own descriptor")
     foreign = [item for item in records if item not in owned]
     if foreign:
+        holders = ",".join(
+            f"{str(item['pid'])[:12]}:{str(int(item['fd']))[:12]}" for item in foreign[:8]
+        )
         raise ValueError(
-            "unfinished installation: foreign service-lock FDs remain; no further "
+            "unfinished installation: foreign service-lock FDs remain "
+            f"(count={len(foreign)}, holders={holders}); no further "
             "relocation effect is authorized and prevalidated legacy lifecycle may still act"
         )
 
@@ -206,9 +209,9 @@ def _reference(config):
             return json.loads(private_bytes(path))
     if config.tracking_db.exists():
         from .delivery_runtime_location import PENDING
+        from .delivery_store import tracking_read_connection
 
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
-            db.execute("PRAGMA query_only=ON")
+        with tracking_read_connection(config.tracking_db) as db:
             if not db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_events'"
             ).fetchone():
@@ -260,8 +263,9 @@ def _receipt(config, *, stop=False, reference=None):
             receipt["owner_after_sha256"],
         }:
             raise ValueError("pending installation original owner changed")
-        with sqlite3.connect(config.tracking_db.as_uri() + "?mode=ro", uri=True) as db:
-            db.execute("PRAGMA query_only=ON")
+        from .delivery_store import tracking_read_connection
+
+        with tracking_read_connection(config.tracking_db) as db:
             for item in receipt["runs"]:
                 row = db.execute(
                     "SELECT request_digest,request_json FROM delivery_runs WHERE run_id=?",

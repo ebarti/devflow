@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -101,12 +102,19 @@ async def failed_checkpoint(history, spec, row, closed):
             'history_sha256': history_sha256(history)}
 
 
-def closed_coordinator(store, run_id):
+def closed_coordinator(store, run_id, *, preserve=True):
     try:
-        return store._completed_temporal_result(run_id)
+        if preserve:
+            return store._completed_temporal_result(run_id)
+        return store._completed_temporal_result(run_id, preserve=False)
     except FailedFeatureCoordinator as failure:
         closed = failure.closed
-    spec = store.effective_spec(run_id)
+    if preserve:
+        spec = store.effective_spec(run_id)
+    else:
+        from .delivery_feature_handoff import readonly_feature_spec
+
+        spec = readonly_feature_spec(store, run_id)
     if (not spec.get('feature_delivery') or spec.get('feature_worker')
             or not store.owns_execution(spec)
             or closed['workflow_id'] != store.active_workflow_id(run_id)):
@@ -128,7 +136,10 @@ def closed_coordinator(store, run_id):
             if not not_found(exc):
                 raise
             # Retention deleted the history; only its sealed original can stand in.
-            sealed = await sealed_closure(store, closed['workflow_id'])
+            if preserve:
+                sealed = await sealed_closure(store, closed['workflow_id'])
+            else:
+                sealed = await sealed_closure(store, closed['workflow_id'], read_only=True)
             if (sealed is None or sealed['status'] != 'FAILED'
                     or sealed['execution_run_id'] != closed['execution_run_id']
                     or sealed['closed_at'] != closed['closed_at']):
@@ -141,7 +152,8 @@ def closed_coordinator(store, run_id):
         return await failed_checkpoint(await handle.fetch_history(), spec, row, closed)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)
+        return pool.submit(copy_context().run,
+                           lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)
 
 
 def _completed_row(store, spec, row, closed, projections):
@@ -313,7 +325,12 @@ async def completed_settlement(history, store, spec, row, closed):
 
 
 async def _closed_history(store, workflow_id, closed):
-    sealed = await sealed_closure(store, workflow_id)
+    from .delivery_execution_config import is_observation_mode
+
+    if is_observation_mode():
+        sealed = await sealed_closure(store, workflow_id, read_only=True)
+    else:
+        sealed = await sealed_closure(store, workflow_id)
     if sealed is not None:
         bound = {key: sealed[key] for key in ('workflow_id', 'execution_run_id', 'closed_at',
                                             'request_digest', 'recovery_digest', 'result')}
@@ -344,7 +361,8 @@ def closed_settlement(store, run_id, *, sealed_only=False):
         return await completed_settlement(history, store, spec, row, bound)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)
+        return pool.submit(copy_context().run,
+                           lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)
 
 
 async def completed_worker(history, store, spec, row, closed):
@@ -390,8 +408,10 @@ def closed_worker(store, run_id, workflow_id, *, sealed_only=False):
         raise ValueError('closed worker workflow or service custody changed')
     with store._connect() as db:
         row = dict(db.execute('SELECT * FROM delivery_runs WHERE run_id=?', (run_id,)).fetchone())
-    closed = (None if sealed_only else
-              store._completed_temporal_result(run_id, workflow_id=workflow_id))
+    from .delivery_execution_config import is_observation_mode
+
+    closed = (None if sealed_only else store._completed_temporal_result(
+        run_id, workflow_id=workflow_id, **({"preserve": False} if is_observation_mode() else {})))
 
     async def read():
         history, bound = await _closed_history(store, workflow_id, closed)
@@ -405,4 +425,5 @@ def closed_worker(store, run_id, workflow_id, *, sealed_only=False):
         return proof
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)
+        return pool.submit(copy_context().run,
+                           lambda: asyncio.run(asyncio.wait_for(read(), timeout=30))).result(35)

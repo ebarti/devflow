@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import threading
 from contextlib import contextmanager
@@ -236,4 +237,53 @@ def execution(broker, iteration, candidate):
     finally:
         # pass_fds gives a live CLI the same lease if its Python parent dies.
         # A surviving subprocess remains an executor, not an unlocked orphan.
+        os.close(fd)
+
+
+@contextmanager
+def observe_execution(broker, iteration, candidate):
+    """Hold and authenticate an existing executor lease without creating or recording it.
+
+    Absence of its journal or lock cannot prove that a legacy publisher is idle.
+    The descriptor remains locked until the caller finishes remote readback.
+    """
+    key = broker.publication_effect_key(iteration)
+    request = canonical_json({"iteration": iteration, "input_candidate_id": candidate["id"]})
+    root = Path(broker.spec["state_dir"]) / "publication-executors"
+    path = root / (hashlib.sha256(key.encode()).hexdigest() + ".lock")
+    if not root.is_absolute() or root.resolve(strict=True) != root:
+        raise ValueError("publication executor namespace is unavailable")
+    root_info = root.lstat()
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) != 0o700):
+        raise ValueError("publication executor namespace is not private")
+    _ancestors(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        identity = _identity(os.fstat(fd))
+        if _identity(path.lstat()) != identity:
+            raise ValueError("publication executor lock identity changed")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield None
+            return
+        try:
+            with broker.store._connect() as db:
+                row = db.execute("SELECT * FROM delivery_publication_executors WHERE effect_key=?",
+                                 (key,)).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise ValueError("publication executor journal is unavailable") from exc
+        if (row is None or row["request_json"] != request
+                or json.loads(row["lock_json"]) != identity):
+            raise ValueError("publication executor evidence is unavailable or changed")
+        before = dict(row)
+        yield before
+        with broker.store._connect() as db:
+            row = db.execute("SELECT * FROM delivery_publication_executors WHERE effect_key=?",
+                             (key,)).fetchone()
+        if (row is None or dict(row) != before or _identity(os.fstat(fd)) != identity
+                or _identity(path.lstat()) != identity):
+            raise ValueError("publication executor changed during readback")
+    finally:
         os.close(fd)

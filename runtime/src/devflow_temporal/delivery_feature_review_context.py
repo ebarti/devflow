@@ -69,7 +69,7 @@ def _git(root, *args, input=None):
     }
     environment.update(
         GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
-        GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0",
+        GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
     )
     result = subprocess.run(
         ["/usr/bin/git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",

@@ -169,14 +169,24 @@ def _browser_checkpoint(actual, recorded):
     }
 
 
-def _snapshot(store, run_id, payload):
+def _snapshot(store, run_id, payload, *, observation=False):
+    from .delivery_execution_config import observation_mode
+
+    if observation:
+        with observation_mode():
+            return _snapshot_inner(store, run_id, payload, observation=True)
+    return _snapshot_inner(store, run_id, payload, observation=False)
+
+
+def _snapshot_inner(store, run_id, payload, *, observation):
     authority, bindings, failure = _authority(payload, run_id)
     spec = store.effective_spec(run_id)
     row, attempts, effects, claim = _rows(store, run_id)
     previous = json.loads(row["recovery_json"])
     parent = _parent(store, spec, previous, authority, bindings)
     readiness, controller = _readiness(store, spec, payload, authority, parent)
-    closed = store._completed_temporal_result(run_id, workflow_id=row["workflow_id"])
+    closed = store._completed_temporal_result(
+        run_id, workflow_id=row["workflow_id"], preserve=not observation)
     state = closed["result"]
     candidate = {k: v for k, v in authority["candidate"].items() if k != "revision"}
     _candidate_checkpoint(state, authority, row)
@@ -186,19 +196,15 @@ def _snapshot(store, run_id, payload):
         or row["outcome"] != "blocked"
         or row["cleanup"] != "unknown"
         or row["iteration"] != 4
-        or row["protocol_revision"] != payload["expected_revision"]
         or closed["workflow_id"] != row["workflow_id"]
         or closed["request_digest"] != spec["request_digest"]
         or closed["recovery_digest"] != digest(previous)
-        or state.get("revision") != payload["expected_revision"]
+        or state.get("revision") != row["protocol_revision"]
         or state.get("iteration") != 4
         or state.get("outcome") != "blocked"
         or state.get("cleanup") != "unknown"
         or state.get("error") != "repair limit exhausted"
         or state.get("candidate") != candidate
-        or payload["expected_candidate_id"] != candidate["id"]
-        or payload["expected_pr_head"] != candidate["head"]
-        or state.get("pull_request", {}).get("number") != payload["expected_pr_number"]
         or not _browser_checkpoint(
             state.get("checks", {}).get("browser_qa", {}), failure["browser"]
         )
@@ -245,6 +251,44 @@ def _snapshot(store, run_id, payload):
         "resources": observed,
         "readiness": {k: str(v) if isinstance(v, Path) else v for k, v in readiness.items()},
     }, readiness
+
+
+def _assessment(seal, payload, operation):
+    from .delivery_lifecycle import require_transition
+
+    state = seal["state"]
+    return require_transition({
+        "operation": operation, "owner": "resource_closure", "owner_proof": True,
+        "proof_digest": digest(seal), "normalized_lifecycle": "stopped",
+        "revision": seal["original_row"]["protocol_revision"],
+        "iteration": state.get("iteration"), "candidate_id": state["candidate"]["id"],
+        "candidate_head": state["candidate"]["head"],
+        "publication_number": state.get("pull_request", {}).get("number"),
+        "publication_required": True, "head_request_field": "expected_pr_head",
+    }, payload)
+
+
+def assess(store, run_id, kind, payload):
+    from .delivery_execution_config import observation_mode
+    from .delivery_lifecycle import RecoveryRefused, evaluate_transition
+
+    try:
+        with observation_mode():
+            result = (abandon_pending(store, run_id, payload, preflight=True)
+                      if kind == ABANDON else admit(store, run_id, payload, preflight=True))
+        if isinstance(result, dict) and isinstance(result.get("lifecycle_assessment"), dict):
+            return result["lifecycle_assessment"]
+    except RecoveryRefused as exc:
+        return exc.assessment
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+        pass
+    return evaluate_transition({"operation": kind, "owner": "resource_closure",
+                                "comparisons": [], "predicates": [{
+        "code": "resource_closure_proof_unavailable", "satisfied": None,
+        "missing_or_unknown_fact": ("original resource closure authority, custody and "
+                                    "stopped checkpoint"),
+        "next_action": "inspect the resource closure owner evidence",
+    }]}, {})
 
 
 def custody(db, recovery):
@@ -374,7 +418,9 @@ def abandon_pending(store, run_id, payload, *, preflight=False):
     if not prior or prior["state"] != "pending":
         raise ValueError("only an unqueued pending resource closure can be abandoned")
     old = json.loads(prior["intent_json"])
-    fresh, _ = _snapshot(store, run_id, {**payload, "continuation_kind": KIND})
+    fresh, _ = _snapshot(store, run_id, {**payload, "continuation_kind": KIND},
+                         observation=True)
+    assessment = _assessment(fresh, payload, ABANDON)
     if any(fresh[k] != old[k] for k in (
         "spec", "original_row", "original_recovery", "closed", "state", "attempts",
         "effects", "claim", "parent", "resources",
@@ -393,8 +439,13 @@ def abandon_pending(store, run_id, payload, *, preflight=False):
                 "archive": str(archive), "original_checkpoint_unchanged": True,
                 "additional_iterations": 0, "existing": False}
     if preflight:
-        return {**response, "preflight": True}
+        return {**response, "preflight": True, "lifecycle_assessment": assessment}
     with _lock(root.parent / "resource-closure-abandon.lock"):
+        current_fresh, _ = _snapshot(store, run_id, {**payload, "continuation_kind": KIND},
+                                     observation=True)
+        _assessment(current_fresh, payload, ABANDON)
+        if current_fresh != fresh:
+            raise ValueError("pending abandonment checkpoint changed before effects")
         with store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             current = db.execute("SELECT * FROM delivery_resource_closures WHERE run_id=?",
@@ -448,8 +499,9 @@ def admit(store, run_id, payload, *, preflight=False):
             readback(store, recovery["execution_spec"], recovery)
             return {**json.loads(prior["response_json"]), "existing": True, "preflight": preflight}
     else:
-        seal, _ = _snapshot(store, run_id, payload)
-    fresh, readiness = _snapshot(store, run_id, payload)
+        seal, _ = _snapshot(store, run_id, payload, observation=True)
+    fresh, readiness = _snapshot(store, run_id, payload, observation=True)
+    assessment = _assessment(fresh, payload, KIND)
     if fresh != seal:
         raise ValueError("resource closure pending whole request changed")
     root = Path(seal["spec"]["state_dir"]) / "resource-closure"
@@ -470,13 +522,18 @@ def admit(store, run_id, payload, *, preflight=False):
             "preflight": True,
             "precheck_sha256": digest(seal),
             "native_generation_required": readiness["required"],
+            "lifecycle_assessment": assessment,
         }
     from .delivery_preparation import _lock
 
     with _lock(root / "controller.lock"):
-        fresh, readiness = _snapshot(store, run_id, payload)
+        fresh, readiness = _snapshot(store, run_id, payload, observation=True)
+        _assessment(fresh, payload, KIND)
         if fresh != seal:
             raise ValueError("resource closure whole preflight changed before effects")
+        preserved, readiness = _snapshot(store, run_id, payload)
+        if preserved != fresh:
+            raise ValueError("resource closure changed during closure preservation")
         private_directory(root)
         with store._connect() as db:
             db.execute("BEGIN IMMEDIATE")

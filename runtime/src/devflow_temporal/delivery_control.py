@@ -916,6 +916,7 @@ _COMMANDS = (
     "reconcile-tracker",
     "recover-publication",
     "repair-admission-preflight",
+    "assess-transition",
     "native-diagnostic-preflight",
     "ack-native-diagnostic",
     "native-diagnostic",
@@ -966,6 +967,10 @@ def main() -> None:
     try:
         _run(args, parser)
     except (ValueError, OSError, RuntimeError) as exc:
+        from .delivery_lifecycle import RecoveryRefused
+
+        if isinstance(exc, RecoveryRefused):
+            parser.exit(1, json.dumps({"state": "refused", "assessment": exc.assessment}) + "\n")
         parser.exit(1, f"devflow-delivery: {exc}\n")
 
 
@@ -1017,12 +1022,19 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "adopt-runtime-location": installation.apply,
             "rollback-runtime-location": installation.rollback,
         }[args.command]
-        print(json.dumps(operation(config, supplied), sort_keys=True, indent=2))
+        if args.command == "runtime-location-preflight":
+            from .delivery_execution_config import observation_mode
+
+            with observation_mode():
+                result = operation(config, supplied)
+        else:
+            result = operation(config, supplied)
+        print(json.dumps(result, sort_keys=True, indent=2))
         return
     read_commands = {"merge-preflight",
         'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
         "runs", "run", "run-detail", "evidence", "gates-only-preflight",
-        "repair-admission-preflight",
+        "repair-admission-preflight", "assess-transition",
         'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "filesystem-custody-preflight",
     }
@@ -1057,9 +1069,19 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         try:
             store = DeliveryStore(
                 config, read_only=args.command == "filesystem-custody-preflight")
-            result = (preflight(store, args.id) if args.command == "filesystem-custody-preflight"
-                      else adopt(store, args.id, json.loads(args.request.read_text())))
+            if args.command == "filesystem-custody-preflight":
+                from .delivery_execution_config import observation_mode
+
+                with observation_mode():
+                    result = preflight(store, args.id)
+            else:
+                result = adopt(store, args.id, json.loads(args.request.read_text()))
         except (ValueError, OSError, RuntimeError) as exc:
+            from .delivery_lifecycle import RecoveryRefused
+
+            if isinstance(exc, RecoveryRefused):
+                parser.exit(1, json.dumps(
+                    {"state": "refused", "assessment": exc.assessment}) + "\n")
             parser.exit(1, f"devflow-delivery: {exc}\n")
         print(json.dumps(result, sort_keys=True, indent=2))
         return
@@ -1093,7 +1115,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "disable-limits",
         "reconcile-tracker",
         "recover-publication",
-        "repair-admission-preflight",
+        "repair-admission-preflight", "assess-transition",
         'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "gates-only-preflight",
         "admit-gates-only",
@@ -1114,7 +1136,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             "disable-limits",
             "reconcile-tracker",
             "recover-publication",
-            "repair-admission-preflight",
+            "repair-admission-preflight", "assess-transition",
             'native-diagnostic-preflight', 'ack-native-diagnostic',
             'ci-inventory-preflight', 'ack-ci-inventory',
             "admit-gates-only",
@@ -1139,7 +1161,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "disable-limits",
                 "reconcile-tracker",
                 "recover-publication",
-                "repair-admission-preflight",
+                "repair-admission-preflight", "assess-transition",
                 'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
                 'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
                 "gates-only-preflight",
@@ -1153,6 +1175,11 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             and not args.id
         ):
             parser.error("--id is required for this command")
+        if args.command == "assess-transition" and (
+            set(request) != {"kind", "request"} or not isinstance(request["kind"], str)
+            or not isinstance(request["request"], dict)
+        ):
+            parser.error("assessment request must contain kind and request object")
         if args.command == "evidence" and not args.evidence_id:
             parser.error("--evidence-id is required")
         if args.command == 'native-diagnostic' and not args.diagnostic_command_id:
@@ -1184,6 +1211,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "recover-publication": lambda: caller.recover_publication(args.id, request),
                 "repair-admission-preflight": lambda: caller.repair_admission_preflight(
                     args.id, request),
+                "assess-transition": lambda: caller.assess_transition(
+                    args.id, request["kind"], request["request"]),
                 'native-diagnostic-preflight': lambda: caller.native_diagnostic_preflight(
                     args.id, request),
                 'ci-inventory-preflight': lambda: caller.ci_inventory_preflight(args.id, request),
@@ -1201,6 +1230,11 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "amend-scope": lambda: caller.amend_scope(args.id, request),
             }[args.command]()
         except ValueError as exc:
+            from .delivery_lifecycle import RecoveryRefused
+
+            if isinstance(exc, RecoveryRefused):
+                parser.exit(1, json.dumps(
+                    {"state": "refused", "assessment": exc.assessment}) + "\n")
             parser.exit(1, f"devflow-delivery: {exc}\n")
         print(json.dumps(result, sort_keys=True, indent=2))
         return

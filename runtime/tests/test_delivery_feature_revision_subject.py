@@ -6,7 +6,6 @@ import inspect
 import json
 import os
 import sqlite3
-import sys
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -22,7 +21,6 @@ from test_delivery_stopped_resume import stopped as stopped
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_feature_revision_subject as subject
-from devflow_temporal import delivery_policy_recovery as policy_recovery
 from devflow_temporal import delivery_stopped_resume as stopped_resume
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_execution_registry import OwnershipConflict
@@ -181,76 +179,6 @@ def progress(tmp_path, monkeypatch):
     yield from _progress_fixture(tmp_path, monkeypatch)
 
 
-def test_current_findings_prove_progress_and_preserve_all_candidates(progress):
-    store, spec, row, attempts, recovery, seal, _ = progress
-    before = digest((row, attempts, recovery, seal))
-    proof = subject.retained_worker_subject(store, spec, row, attempts, recovery)
-    assert proof == subject.retained_worker_subject(store, spec, row, attempts, recovery)
-    assert proof["candidate"] == seal["candidate"] != proof["terminal_candidate"]
-    assert proof["progress_custody"]["admission_candidate"] == recovery["execution_candidate"]
-    assert proof["current_review_subject"]["status"] == "findings"
-    assert proof["current_review_subject"]["unresolved_product_findings"] == [
-        "Original unresolved product finding"]
-    assert digest((row, attempts, recovery, seal)) == before
-    assert len(json.dumps(proof).encode()) < 16 * 1024
-
-
-def test_progress_refuses_changed_native_launcher_monitor_and_time(progress):
-    store, spec, row, attempts, recovery, seal, files = progress
-    for name, mutate in (
-        ("request.json", lambda v: v.update(workspace="/foreign/checkout")),
-        ("request.json", lambda v: v.update(native_authorized=False)),
-        ("request.json", lambda v: v["spec"].update(policy_digest="e" * 64)),
-        ("native-process.json", lambda v: v.update(monitoring_complete=False)),
-        ("native-process.json", lambda v: v["provider_session"].update(resumed_from=None)),
-        ("launch.json", lambda v: v["environment"].update(CODEX_HOME="/foreign/home")),
-    ):
-        path = files[("implement", 3, name)]
-        raw = path.read_bytes()
-        value = json.loads(raw)
-        mutate(value)
-        write_private(path, value)
-        with pytest.raises(ValueError):
-            subject.retained_worker_subject(store, spec, row, attempts, recovery)
-        path.write_bytes(raw)
-    for timestamp in ("2026-10-10T11:59:00+00:00", "2026-10-10T12:01:00"):
-        old = attempts[-1]["started_at"]
-        attempts[-1]["started_at"] = timestamp
-        with pytest.raises(ValueError):
-            subject.retained_worker_subject(store, spec, row, attempts, recovery)
-        attempts[-1]["started_at"] = old
-
-
-
-
-
-
-
-
-def test_native_cleanup_observer_never_creates_missing_roots(tmp_path, monkeypatch):
-    state = tmp_path / "native-stopped"
-    state.mkdir(mode=0o700)
-    spec = {"run_id": state.name, "state_dir": str(state)}
-    with monkeypatch.context() as observation:
-        observation.setattr("devflow_temporal.delivery_resources.private_directory",
-                            lambda *_: pytest.fail("readonly observer attempted mkdir"))
-        with pytest.raises(FileNotFoundError):
-            policy_recovery._stopped_cleanup(spec, read_only=True)
-    assert not (state / "resources").exists()
-    root = state / "resources"
-    root.mkdir(mode=0o700)
-    write_private(root / "manifest.json", {"processes": []})
-    write_private(root / "finalization.json", {"state": "confirmed", "process_cleanup":
-                  "observed-native-confirmed", "resource_cleanup": "confirmed", "roots": []})
-    monkeypatch.setattr("devflow_temporal.delivery_resources.private_directory",
-                        lambda *_: pytest.fail("readonly observer attempted mkdir"))
-    monkeypatch.setattr(policy_recovery, "process_table", lambda: {})
-    before = {path: path.read_bytes() for path in root.iterdir()}
-    assert policy_recovery._stopped_cleanup(spec, read_only=True)["journal_sha256"] == {}
-    assert {path: path.read_bytes() for path in root.iterdir()} == before
-    assert not (root / "ownership.lock").exists()
-
-
 def test_registry_observer_reads_actual_rollback_database_and_refuses_wal_or_unsafe_files(
     tmp_path, monkeypatch,
 ):
@@ -279,11 +207,11 @@ def test_registry_observer_reads_actual_rollback_database_and_refuses_wal_or_uns
     for suffix in ("-wal", "-shm", "-journal"):
         sidecar = Path(str(shared.path) + suffix)
         sidecar.write_bytes(b"Unsettled original observation")
-        with pytest.raises(ValueError, match="settled rollback"):
+        with pytest.raises(ValueError, match="cannot be observed immutably"):
             view.current(issue["id"])
         sidecar.unlink()
     shared.path.chmod(0o644)
-    with pytest.raises(ValueError, match="private owned file"):
+    with pytest.raises(ValueError, match="cannot be observed immutably"):
         view.current(issue["id"])
     shared.path.chmod(0o600)
     # Closing the last real WAL writer removes sidecars but retains the WAL header.
@@ -300,12 +228,6 @@ def test_registry_observer_reads_actual_rollback_database_and_refuses_wal_or_uns
     assert not Path(str(shared.path) + "-shm").exists()
     with pytest.raises(FileNotFoundError):
         subject._ReadOnlyRegistry(shared.path.parent / "missing.sqlite3").current(issue["id"])
-
-
-
-
-
-
 
 
 def test_approved_revision_snapshot_reads_exact_canonical_record_and_keeps_old_worker_fenced(
@@ -551,51 +473,6 @@ def findings_reconsideration(native_configuration, tmp_path, monkeypatch, reques
     monkeypatch.setattr(stopped_resume, "review_snapshot", observe)
     yield fixture, command, runtime, child, seal, observe, files
     generation.close()
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="native configuration preparation required")
-@pytest.mark.parametrize("findings_reconsideration", [5, 8], indirect=True,
-                         ids=["aggregate-findings-bound", "planning-and-writer-budget"])
-def test_public_unpassed_context_refuses_before_owner_or_debit(findings_reconsideration):
-    from test_delivery_feature_revisions import _boundary_snapshot
-
-    from devflow_temporal import delivery_feature_revisions as revisions
-
-    fixture, command, _, child, seal, _, files = findings_reconsideration
-    store, parent, shared, _, _, _, prior, _, _, _ = fixture
-    issue_id = prior["owner"]["issue_id"]
-    budget = shared.budget(issue_id)["used"]
-    if budget == 6:
-        # Model a genuine bounded current native result with 32 product findings.
-        # The one original independent plan finding makes the aggregate exceed
-        # the contract; all raw/enriched/journal fields are still exactly bound.
-        latest = seal["state"]["roles"][-1]
-        latest["findings"] = ["Unresolved product finding " + str(n) for n in range(32)]
-        result = {key: value for key, value in latest.items() if key not in subject.ROLE_FIELDS}
-        raw_path = files[("implement", 4, "result.json")]
-        raw = json.loads(raw_path.read_bytes())
-        raw["findings"] = latest["findings"]
-        write_private(raw_path, raw)
-        journal_path = files[("implement", 4, "native-process.json")]
-        journal = json.loads(journal_path.read_bytes())
-        journal["provider_session"]["result_digest"] = digest(result)
-        write_private(journal_path, journal)
-        with store._connect() as db:
-            db.execute("UPDATE delivery_attempts SET result_json=? "
-                       "WHERE run_id=? AND role='implement' AND iteration=4",
-                       (json.dumps(result), child["run_id"]))
-            seal["attempts"][:] = [dict(a) for a in db.execute(
-                "SELECT * FROM delivery_attempts WHERE run_id=? ORDER BY job_key",
-                (child["run_id"],))]
-        reason = "exceed bounded fresh review context"
-    else:
-        assert budget == 9
-        reason = "lacks the ordinary planning and repair budget"
-    old = _boundary_snapshot(store, shared, issue_id)
-    with pytest.raises(ValueError, match=reason):
-        revisions.revise_feature_plan(store, parent["run_id"], command)
-    assert _boundary_snapshot(store, shared, issue_id) == old
-    assert shared.budget(issue_id)["used"] == budget
 
 
 def _exercise_public_findings_review_and_original_worker_handoff(

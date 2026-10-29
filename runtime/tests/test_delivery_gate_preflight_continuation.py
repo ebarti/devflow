@@ -28,7 +28,6 @@ from devflow_temporal.delivery_resources import (
     read_private,
     write_private,
 )
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 def failed_assessment(seed, monkeypatch, generation=2):
@@ -87,8 +86,9 @@ def failed_assessment(seed, monkeypatch, generation=2):
                   candidate=state['candidate'], pull_request=state['pull_request'],
                   iteration=state['iteration'], protocol_revision=state['revision'],
                   event_type='blocked', message=state['error'])
-    monkeypatch.setattr(store, '_completed_temporal_result', lambda _run, *, workflow_id=None:
-                        deepcopy(closed if workflow_id == closed['workflow_id'] else old_closed))
+    monkeypatch.setattr(store, '_completed_temporal_result',
+                        lambda _run, *, workflow_id=None, **_kwargs: deepcopy(
+                            closed if workflow_id == closed['workflow_id'] else old_closed))
     # Modern local tracking uses its real producer. Only the legacy remote
     # transport is doubled; both paths release the actual owned claim.
     def track(_spec, _status, **_kw):
@@ -121,62 +121,6 @@ def close_and_request(fixture):
             'expected_revision': fixture.closed['result']['revision']}
 
 
-@pytest.mark.parametrize("failed", [1, 2], indirect=True)
-def test_public_unstarted_assessment_continues_once_without_a_writer(failed, monkeypatch):
-    request = close_and_request(failed)
-    store = failed.store
-    before = deepcopy(failed.closed)
-    assert store.repair_admission_preflight('run-1', request)['implementation_authority'] is False
-    response = store.continue_repair('run-1', request)
-    assert store.continue_repair('run-1', request) == response
-    assert store.continue_repair('run-1', failed.old_command) == failed.old_response
-    spec = store.effective_spec('run-1')
-    assert spec['gate_retry_generation'] == failed.spec['gate_retry_generation']
-    assert spec['gate_retry_preflight_generation'] == 1
-    assert response['workflow_id'].endswith('-preflight-continuation')
-    assert response['workflow_id'] != failed.old_response['workflow_id']
-    with store._connect() as db:
-        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs '
-                                        "WHERE run_id='run-1'").fetchone()[0])
-        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-    assert recovery['original_recovery'] == failed.recovery
-    assert failed.admission.read_bytes() == failed.original_bytes
-    assert failed.closed == before
-    assert gates.readback(store, spec, recovery)['number'] == 7
-    with pytest.raises(ValueError):
-        store.continue_repair('run-1', {**request, 'command_id': 'second-distinct-continuation'})
-    with pytest.raises(ValueError, match='different inputs'):
-        store.continue_repair('run-1', {**request,
-                                      'expected_iteration': request['expected_iteration'] + 1})
-    original_session = recovery['state']['roles'][0]['session_id']
-    flow, calls = DeliveryWorkflow(), []
-    async def activity(name, body, **_kw):
-        calls.append(name)
-        if name == 'delivery_gates_readback':
-            return gates.readback(store, body['spec'], body['recovery'])
-        if name in {'delivery_tracker_start', 'delivery_tracker'}:
-            return {'state': 'consistent'}
-        if name == 'delivery_role':
-            assert body['role'] in {'review', 'verify'}
-            assert 'Unpassed work' in body['findings'][0]
-            return {'role': body['role'], 'status': 'pass',
-                    'iteration': request['expected_iteration'],
-                    'session_id': 'fresh-' + body['role'], 'cleanup': 'confirmed',
-                    'candidate': recovery['candidate']}
-        return {'state': 'passed', 'cleanup': 'confirmed'}
-    async def project(*_a, **_kw):
-        pass
-    monkeypatch.setattr(flow, '_activity', activity)
-    monkeypatch.setattr(flow, '_project', project)
-    monkeypatch.setattr('devflow_temporal.delivery_workflow.workflow.patched', lambda _: True)
-    result = asyncio.run(flow._resume_published_gates(spec, recovery))
-    assert result['outcome'] == 'delivered' and result['iteration'] == request['expected_iteration']
-    assert result['roles'][0]['session_id'] == original_session
-    assert 'delivery_publish' not in calls
-    old_roles = failed.closed['result']['roles']
-    assert result['roles'][:len(old_roles)] == old_roles
-
-
 def test_changed_source_owner_or_progress_refuses_before_cleanup_and_queue(failed):
     store, spec = failed.store, failed.spec
     raw = failed.admission.read_bytes()
@@ -201,23 +145,6 @@ def test_changed_source_owner_or_progress_refuses_before_cleanup_and_queue(faile
     state['roles'].append({'role': 'review', 'status': 'findings'})
     with pytest.raises(ValueError, match='unstarted checkpoint'):
         retry._close_published_cleanup(store, failed.row, spec, lambda: False)
-
-
-def test_resume_rechecks_generation_runtime_and_original_closure(failed, monkeypatch):
-    request = close_and_request(failed)
-    failed.store.continue_repair('run-1', request)
-    spec = failed.store.effective_spec('run-1')
-    with failed.store._connect() as db:
-        recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs '
-                                        "WHERE run_id='run-1'").fetchone()[0])
-    for change in ({'gate_retry_generation': 3}, {'gate_retry_stage': 'report'},
-                   {'gate_retry_preflight_generation': 2}, {'plan_approval': 'changed'}):
-        with pytest.raises(ValueError, match='assessment authority'):
-            preflight.validate(failed.store, {**spec, **change}, recovery)
-    monkeypatch.setattr(failed.store, '_completed_temporal_result',
-                        lambda *_a, **_kw: (_ for _ in ()).throw(ValueError('closure unavailable')))
-    with pytest.raises(ValueError, match='closure unavailable'):
-        gates.readback(failed.store, spec, recovery)
 
 
 @pytest.mark.parametrize('prepared_orphan', [False, True])

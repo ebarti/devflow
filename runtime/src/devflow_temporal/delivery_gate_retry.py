@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 from importlib.metadata import distribution
 from pathlib import Path
@@ -208,7 +209,7 @@ def _report_layout_closed(store, spec, row, closed, previous):
         return authenticated['history_sha256']
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(read())).result(35)
+        return pool.submit(copy_context().run, lambda: asyncio.run(read())).result(35)
 
 
 def _report_layout_evidence(spec, state, broker, *, resource_spec=None):
@@ -496,11 +497,12 @@ def _report_layout_validate(store, spec, recovery, *, resource_spec=None):
 
     historical_records(store, recovery, latest)
 
-def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None):
+def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=False):
     unpublished = kind == PREPUBLICATION_KIND
     spec = store.effective_spec(run_id)
     row, attempts, effects, claim = _rows(store, run_id)
-    closed = store._completed_temporal_result(run_id, workflow_id=row['workflow_id'])
+    closed = store._completed_temporal_result(
+        run_id, workflow_id=row['workflow_id'], **({'preserve': False} if _observation else {}))
     state = closed['result']
     previous = json.loads(row['recovery_json']) if row['recovery_json'] else None
     from .delivery_listener_verification import possible as verification_possible
@@ -858,8 +860,9 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None):
             'cleanup': (prerequisite_observation['resources'] if prerequisite_retry
                         else verification_observation['resources'] if verification_retry
                         else report_observation['resources'] if layout_report
-                        else historical_teardown or prelaunch_observation
-                        or _stopped_cleanup(spec)),
+                        else historical_teardown or prelaunch_observation or (
+                            _stopped_cleanup(spec, read_only=True) if _observation
+                            else _stopped_cleanup(spec))),
             'work_binding': binding,
             'previous_digest': digest(previous) if previous else None,
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,
@@ -935,7 +938,7 @@ def admit(store, run_id, payload, *, preflight=False):
         if prior['request_digest'] != command_digest:
             raise ValueError('command ID already belongs to different inputs')
         return json.loads(prior['response_json'])
-    seal = snapshot(store, run_id, kind)
+    seal = snapshot(store, run_id, kind, _observation=preflight)
     previous = _retained_recovery(store, run_id, seal)
     if 'verification_test_paths' in payload:
         from .delivery_plan_checks import planned_checks
@@ -947,15 +950,20 @@ def admit(store, run_id, payload, *, preflight=False):
             Path(selected['state_dir']) / 'selected-verification')
         if not seal['verification_checks']:
             raise ValueError('explicit verification selection must execute existing tests')
-    if (payload['expected_revision'] != seal['row']['protocol_revision']
-            or payload['expected_iteration'] != seal['row']['iteration']
-            or payload['expected_candidate_id'] != seal['candidate']['id']
-            or payload[head_field] != seal['candidate']['head']
-            or (not unpublished
-                and payload['expected_pr_number'] != seal['publication']['number'])):
-        raise ValueError('stale gate retry checkpoint')
+    from .delivery_lifecycle import require_same_proof, require_transition
+
+    lifecycle_assessment = require_transition({
+        'operation': kind, 'owner': 'delivery_gate_retry', 'owner_proof': True,
+        'normalized_lifecycle': 'stopped', 'proof_digest': digest(seal),
+        'revision': seal['row']['protocol_revision'],
+        'iteration': seal['row']['iteration'], 'candidate_id': seal['candidate']['id'],
+        'candidate_head': seal['candidate']['head'], 'head_request_field': head_field,
+        'publication_required': not unpublished,
+        'publication_number': None if unpublished else seal['publication']['number'],
+    }, payload)
     if preflight:
-        return {'run_id': run_id, 'preflight': True, 'implementation_authority': False,
+        return {'run_id': run_id, 'preflight': True, 'lifecycle_assessment': lifecycle_assessment,
+                'implementation_authority': False,
                 'additional_iterations': 0, 'candidate_id': seal['candidate']['id']}
     spec = seal['original_spec']
     generation = seal['generation']
@@ -1046,8 +1054,7 @@ def admit(store, run_id, payload, *, preflight=False):
             current['verification_checks'] = planned_checks(
                 selected, DeliveryBroker(store, seal['original_spec']).checkout,
                 Path(selected['state_dir']) / 'selected-verification')
-        if digest(current) != digest(seal):
-            raise ValueError('stopped gate checkpoint changed during runtime preparation')
+        require_same_proof(kind, 'delivery_gate_retry', digest(current), digest(seal))
         after = {**DeliveryBroker(store, spec).candidate(),
                  'policy_digest': execution['policy_digest']}
         if any(after[k] != seal['candidate'][k]
