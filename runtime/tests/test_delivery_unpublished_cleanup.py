@@ -157,24 +157,62 @@ def command_for(state, candidate, *, unknown=False):
             'additional_iterations': 1 if unknown else 0}
 
 
-def test_public_unpublished_cleanup_then_existing_finite_continuation(closed_unpublished):
+@pytest.mark.asyncio
+async def test_public_unpublished_cleanup_then_existing_finite_continuation(closed_unpublished):
+    import httpx
+
+    from devflow_temporal.delivery_api import create_app
+
     store, broker, state, spec, calls, _external, shape = closed_unpublished
     original = copy.deepcopy(state)
     before = broker.candidate()
+    command = command_for(state, before, unknown=shape == 'unknown')
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    host = store.config.dashboard_url
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=host) as client:
+        token = (await client.get('/api/session')).json()['csrf_token']
+        headers = {'Origin': host, 'X-Devflow-CSRF': token}
+        preview = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': resume.KIND, 'request': command})
+        refused = await client.post('/api/runs/run-1/continue-repair',
+                                    json=command, headers=headers)
+        assert preview.status_code == 200 and not preview.json()['eligible']
+        assert {'stopped_cleanup_unconfirmed', 'stopped_owner_conflict'} <= {
+            blocker['code'] for blocker in preview.json()['blockers']}
+        assert refused.status_code == 409 and refused.json()['detail'] == preview.json()
+    assert state == original and broker.candidate() == before
+    assert calls == []
     assert reconcile_attempt(store, run_id='run-1', role='cleanup', iteration=0)['changed'] is True
     assert state == original and broker.candidate() == before
     assert len(calls) == 2
     assert reconcile_attempt(store, run_id='run-1', role='cleanup', iteration=0)['changed'] is False
     assert len(calls) == 2  # No duplicate tracker effect and no successor admission.
     assert retry.retry_once(store) == []  # The sealed terminal classification remains terminal.
-    command = command_for(state, before, unknown=shape == 'unknown')
     preflight = store.repair_admission_preflight('run-1', command)
     assert preflight['authorized_through_iteration'] == command['additional_iterations']
     with store._connect() as db:
         assert store.state.claim_for(db, spec['work_id']) is None
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
         assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
-    admitted = store.continue_repair('run-1', command)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=host) as client:
+        token = (await client.get('/api/session')).json()['csrf_token']
+        headers = {'Origin': host, 'X-Devflow-CSRF': token}
+        preview = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': resume.KIND, 'request': command})
+        assert preview.status_code == 200 and preview.json()['eligible'], preview.text
+        response = await client.post('/api/runs/run-1/continue-repair',
+                                     json=command, headers=headers)
+        assert response.status_code == 200, response.text
+        replay = await client.post('/api/runs/run-1/continue-repair', json=command, headers=headers)
+        assert replay.json() == response.json()
+        admitted = response.json()
+    # Idempotent replay returns the first admission without another owner or debit.
+    assert admitted['authorized_through_iteration'] == preflight['authorized_through_iteration']
+    with store._connect() as db:
+        assert store.state.claim_for(db, spec['work_id'])['owner'] == 'external:devflow:run-1'
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
+        assert not db.execute('SELECT 1 FROM delivery_repair_grants').fetchone()
     assert store.continue_repair('run-1', command) == admitted
     with store._connect() as db:
         recovery = json.loads(db.execute('SELECT recovery_json FROM delivery_runs').fetchone()[0])

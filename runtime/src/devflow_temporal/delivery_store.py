@@ -1855,7 +1855,37 @@ class DeliveryStore:
                     or not fixed_budget_allows(original_budget,
                                               supplied.get('expected_iteration'),
                                               supplied['additional_iterations'])):
-                raise ValueError("a fixed repair budget cannot receive additional iterations")
+                from .delivery_lifecycle import require_observed_predicates
+
+                requested_kind = supplied.get('continuation_kind')
+                with self._connect() as db:
+                    observed = db.execute(
+                        'SELECT iteration,protocol_revision FROM delivery_runs WHERE run_id=?',
+                        (run_id,)).fetchone()
+                iteration_matches = (observed is not None
+                    and type(supplied.get('expected_iteration')) is int
+                    and observed['iteration'] == supplied['expected_iteration'])
+                code = ('additional_iterations_not_supported' if requested_kind != KIND else
+                        'product_budget_exhausted' if iteration_matches else
+                        'budget_checkpoint_unknown')
+                if requested_kind != KIND:
+                    fact = 'a recovery route that supports product iterations'
+                elif iteration_matches:
+                    fact = 'remaining original finite product repair allowance'
+                else:
+                    fact = 'current iteration bound to the requested budget checkpoint'
+                require_observed_predicates(
+                    requested_kind or 'repair_continuation', 'delivery_budget',
+                    {'original_authority': original_budget, 'request': supplied,
+                     'observed_iteration': observed['iteration'] if observed else None}, [{
+                        'code': code,
+                        'satisfied': False if requested_kind != KIND or iteration_matches else None,
+                        'missing_or_unknown_fact': fact,
+                        'next_action': 'inspect the original budget and recovery checkpoint',
+                        'new_authorization_required': code == 'product_budget_exhausted',
+                        'user_input_required': None,
+                    }], lifecycle='unknown',
+                    legacy_message='a fixed repair budget cannot receive additional iterations')
         if (isinstance(supplied, dict)
                 and supplied.get('continuation_kind') == 'stopped_delivery_resume'):
             from .delivery_stopped_resume import admit

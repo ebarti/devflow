@@ -201,7 +201,14 @@ def worker_allowance(spec, iteration, iterations, *, credit=None):
     owner = shared.token(current)
     shared.repair_allowance(owner, reference, current=True)
     if iterations > budget['maximum'] - budget['used'] + int(bool(credit)):
-        raise ValueError('feature product repair limit exhausted')
+        from .delivery_lifecycle import require_observed_predicates
+
+        require_observed_predicates(KIND, 'feature_registry', {'owner': owner, 'budget': budget}, [{
+            'code': 'product_budget_exhausted', 'satisfied': False,
+            'missing_or_unknown_fact': 'remaining authenticated feature product repair allowance',
+            'next_action': 'inspect the original feature repair allowance',
+            'new_authorization_required': True, 'user_input_required': None,
+        }], lifecycle='unknown', legacy_message='feature product repair limit exhausted')
     return {'run_id': spec['run_id'], 'owner': owner, 'receipt': reference,
             'start_iteration': iteration, 'maximum_iteration': iteration + iterations,
             **({'credit': credit} if credit else {})}
@@ -1108,25 +1115,64 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observati
             raise ValueError('stopped worker cleanup belongs to a different closed execution')
         cleanup_authority = authenticated
     state_checks, row_checks = closed_checks(row, state, cleanup_authority)
-    if (row['phase'] not in stopped or row['outcome'] != row['phase']
-            or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
-            or state.get('run_id') != run_id or state.get('phase') != row['phase']
-            or state.get('outcome') != row['outcome']
-            or (state.get('cleanup') != 'confirmed' and cleanup_authority is None)
-            or state.get('execution_state') != expected_execution
-            or closed.get('workflow_id') != predecessor_id
-            or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
-            or state_checks != row_checks
-            or state.get('pull_request') != json.loads(row['pr_json'] or 'null')
-            or state.get('revision') != row['protocol_revision']
-            or state.get('iteration') != row['iteration'] or state.get('error') != row['error']
-            or closed['request_digest'] != row['request_digest']
-            or closed['recovery_digest'] != (digest(previous) if previous else None)
-            or claim is not None
-            or any(e['state'] != 'complete' or e['observed_json'] is None for e in effects)):
-        raise ValueError('resume requires a closed finalized delivery with released ownership')
-    if not isinstance(spec.get('accepted_plan'), str) or not spec['accepted_plan'].strip():
-        raise ValueError('implementation resume requires an accepted plan')
+    # Keep the closed verdict immutable while reporting later custody facts
+    # separately.  These are exactly the facts checked by the original guard.
+    from .delivery_lifecycle import lifecycle_from_row, require_observed_predicates
+
+    status_matches = (row['phase'] in stopped and row['outcome'] == row['phase']
+        and row['execution_state'] == expected_execution and state.get('run_id') == run_id
+        and state.get('phase') == row['phase'] and state.get('outcome') == row['outcome']
+        and state.get('execution_state') == expected_execution)
+    cleanup_matches = (row['cleanup'] == 'confirmed'
+                       and (state.get('cleanup') == 'confirmed' or cleanup_authority is not None))
+    identity_matches = (closed.get('workflow_id') == predecessor_id
+        and closed['request_digest'] == row['request_digest']
+        and closed['recovery_digest'] == (digest(previous) if previous else None))
+    checkpoint_matches = (state.get('candidate') == json.loads(row['candidate_json'] or 'null')
+        and state_checks == row_checks
+        and state.get('pull_request') == json.loads(row['pr_json'] or 'null')
+        and state.get('revision') == row['protocol_revision']
+        and state.get('iteration') == row['iteration'] and state.get('error') == row['error'])
+    plan_available = (isinstance(spec.get('accepted_plan'), str)
+                      and bool(spec['accepted_plan'].strip()))
+    effects_settled = all(e['state'] == 'complete' and e['observed_json'] is not None
+                          for e in effects)
+    require_observed_predicates(KIND, 'delivery_stopped_resume', {'row': row, 'closed': closed}, [
+        {'code': 'stopped_state_unproven', 'satisfied': status_matches,
+         'missing_or_unknown_fact': 'matching stopped or supported terminal run state',
+         'next_action': 'inspect the retained run and closed predecessor',
+         'user_input_required': None},
+        {'code': 'stopped_cleanup_unconfirmed', 'satisfied': True if cleanup_matches else None,
+         'missing_or_unknown_fact': 'confirmed cleanup or authenticated later reconciliation',
+         'next_action': 'reconcile the original cleanup and custody',
+         'user_input_required': None},
+        {'code': 'stopped_predecessor_unproven', 'satisfied': identity_matches,
+         'missing_or_unknown_fact': 'matching workflow, admission and recovery identities',
+         'next_action': 'inspect the closed predecessor and its original admission',
+         'user_input_required': None},
+        {'code': 'stopped_checkpoint_changed', 'satisfied': checkpoint_matches,
+         'missing_or_unknown_fact': 'unchanged candidate, checks, publication and verdict',
+         'next_action': 'inspect retained checkpoint and immutable history',
+         'user_input_required': None},
+        {'code': 'stopped_owner_conflict', 'satisfied': claim is None,
+         'missing_or_unknown_fact': 'released original work claim',
+         'next_action': 'inspect and reconcile the current work owner',
+         'user_input_required': None},
+        {'code': 'stopped_effects_unsettled', 'satisfied': True if effects_settled else None,
+         'missing_or_unknown_fact': 'settled effects with observed outcomes',
+         'next_action': 'reconcile the original effects', 'user_input_required': None},
+        {'code': 'accepted_plan_unavailable', 'satisfied': plan_available,
+         'missing_or_unknown_fact': 'original accepted plan for implementation resume',
+         'next_action': 'inspect retained intake and preparation; no implementation resume '
+                        'is authorized without an accepted plan',
+         'user_input_required': None},
+    ], lifecycle=lifecycle_from_row(row), owner_proof=(
+        True if (status_matches and cleanup_matches and identity_matches and checkpoint_matches
+                 and claim is None and effects_settled) else None),
+        legacy_message=('resume requires a closed finalized delivery with released ownership'
+                        if not (status_matches and cleanup_matches and identity_matches
+                                and checkpoint_matches and claim is None and effects_settled)
+                        else 'implementation resume requires an accepted plan'))
     if spec.get('baseline_checks_version') in (1, 2):
         baseline = state.get('checks', {}).get('baseline', {})
         required = {check['id'] for check in spec['policy']['baseline_checks']}
@@ -1258,11 +1304,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     with store._connect() as db:
         pending = None if gate_only else pending_repair(seal, db=db)
     ci_findings = None if gate_only else sealed_ci_findings(seal)
-    from .delivery_lifecycle import require_same_proof, require_transition
+    from .delivery_lifecycle import lifecycle_from_row, require_same_proof, require_transition
 
     lifecycle_assessment = require_transition({
         'operation': KIND, 'owner': 'delivery_stopped_resume', 'owner_proof': True,
-        'normalized_lifecycle': 'stopped', 'proof_digest': digest(seal),
+        'normalized_lifecycle': lifecycle_from_row(seal['row']), 'proof_digest': digest(seal),
         'revision': seal['state']['revision'],
         'iteration': seal['state']['iteration'], 'candidate_id': seal['candidate']['id'],
         'candidate_head': seal['candidate']['head'],
@@ -1271,15 +1317,28 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     interrupted = None if _revision is not None or pending else interrupted_resume(seal)
     if interrupted and interrupted['additional_iterations'] != command['additional_iterations']:
         interrupted = None
-    if command['additional_iterations'] == 0 and not (pending or gate_only or interrupted):
-        raise ValueError('zero additional iterations require an authenticated pending repair '
-                         'or an interrupted iteration')
-    if seal.get('quarantined_implementation') and command['additional_iterations'] == 0:
-        raise ValueError('unknown implementation requires a separately authorized new iteration')
     maximum = continuation_maximum(seal['state']['iteration'],
                                    command['additional_iterations'], pending)
-    if maximum is None:
-        raise ValueError('unstarted preflight retains only its existing finite ceiling')
+    from .delivery_lifecycle import require_observed_predicates
+
+    require_observed_predicates(KIND, 'delivery_stopped_resume', seal, [
+        {'code': 'pending_repair_unproven',
+         'satisfied': (command['additional_iterations'] != 0
+                       or bool(pending or gate_only or interrupted)),
+         'missing_or_unknown_fact': 'authenticated pending repair or interrupted iteration',
+         'next_action': 'inspect the retained repair admission and original iteration',
+         'user_input_required': None},
+        {'code': 'unknown_implementation_requires_new_turn',
+         'satisfied': (not seal.get('quarantined_implementation')
+                       or command['additional_iterations'] != 0),
+         'missing_or_unknown_fact': 'separately authorized new implementation iteration',
+         'next_action': 'review the unknown implementation and its original allowance',
+         'new_authorization_required': True, 'user_input_required': True},
+        {'code': 'pending_repair_ceiling_changed', 'satisfied': maximum is not None,
+         'missing_or_unknown_fact': 'unchanged finite pending preflight ceiling',
+         'next_action': 'inspect the retained preflight admission and its ceiling',
+         'user_input_required': None},
+    ], lifecycle=lifecycle_from_row(seal['row']))
     credit = None
     if _revision is not None:
         from .delivery_feature_execution import registry
@@ -1299,7 +1358,13 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             and not fixed_budget_allows(budget_spec, seal['state']['iteration'],
                                         command['additional_iterations'],
                                         pending=bool(pending or gate_only or interrupted))):
-        raise ValueError('a fixed repair budget cannot receive additional iterations')
+        require_observed_predicates(KIND, 'delivery_stopped_resume', seal, [{
+            'code': 'product_budget_exhausted', 'satisfied': False,
+            'missing_or_unknown_fact': 'remaining original finite product repair allowance',
+            'next_action': 'inspect the original repair budget and retained admission',
+            'new_authorization_required': True, 'user_input_required': None,
+        }], lifecycle=lifecycle_from_row(seal['row']),
+            legacy_message='a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
     browser_amendment = None
     if BROWSER_FIELDS <= command.keys():

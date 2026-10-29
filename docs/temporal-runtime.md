@@ -238,6 +238,29 @@ For an ordinary published run stopped with `browser QA child cleanup is unknown`
 
 For an ordinary published run whose native roles have finished but whose resource cleanup remains unknown, `reconcile-attempt --id RUN --role cleanup --iteration N` authenticates the exact closed workflow and re-observes its native resources before closing its claim. An unpublished run is also eligible after it has an accepted plan and an exact completed implementation/source checkpoint. Its closure is recorded as `unpublished`, with the closed execution identity, original checks/results, current source and work binding, attempt/effect inventory, native observation and tracker acknowledgement. It independently observes the configured origin and absence of the owned remote branch/PR before finalization and again before claim release. Pre-intake runs, a newer issue owner, changed work bindings, uncertain effects or live native custody prevent closure. Repeating the command re-observes its exact acknowledged custody without starting another role, admitting a successor or rewriting the historical verdict. Dirty retained source, publication state, failure classification and original repair allowance remain intact. Workspace dependency cleanup uses the declaration recorded when the runtime acquired custody, so permitted package script edits do not invalidate deletion of those same owned folders; replacement folders and symlinks remain protected.
 
+Recovery callers can inspect a specific request before admission using
+`assess-transition --id RUN --request FILE`; the JSON file contains `kind` and the
+corresponding recovery `request`. The API accepts the same object at
+`POST /api/runs/RUN/assess-transition`. Version 1 returns a lifecycle observation,
+an advisory transition for supported routes, candidate and revision observations,
+and structured blockers. A blocker identifies its owner, the missing or unknown
+fact, a next action, and whether new authorization or user input is required.
+`user_input_required: null` means that need has not been established; it is not a
+request for approval. `satisfied: null` means the fact is unknown, while `false`
+means the observed predicate did not hold. Some older owner adapters still return
+a general unknown when they cannot authenticate a more specific fact.
+
+The lifecycle vocabulary distinguishes pending, running, stopping, stopped,
+recovering, terminal and unknown projections. A projection or successful
+assessment is not a custody grant: the owning admission rechecks the exact
+candidate, original authority, effects, cleanup and finite budget under its
+existing fences. The transition table does not choose a route. Pause states are
+reserved for the pause owner; queued pause support does not prove a running
+workflow has settled. An ordinary preparation failure before plan acceptance
+cannot use implementation resume without an accepted plan. Inspect the retained
+intake and original custody; do not treat a missing plan or unknown cleanup as a
+completed implementation or a released owner.
+
 After that closure, use the public `repair-admission-preflight --id RUN --request FILE` and `continue-repair --id RUN --request FILE` route with `continuation_kind: "stopped_delivery_resume"`, a stable unique `command_id`, the closed protocol `expected_revision`, `expected_iteration`, and current `expected_candidate_id`/`expected_candidate_head`. A passed implementation stopped with exact unknown prepublication cleanup resumes at the sealed iteration's checks with `additional_iterations: 0`. Its exact durable implementation result and unchanged candidate remain mandatory; all publication, independent review, QA, verification, required CI and tracker gates still run.
 
 A provider monitor lost after launch remains an unknown verdict. For the narrow original unpublished implementation checkpoint, public cleanup can independently authenticate finished teardown without completing monitoring or inventing a provider session. The closed role, durable supervisor result, exact private request/journal hashes, input candidate, current partial output, provider identity and unknown outcome are bound separately. A later explicit `stopped_delivery_resume` must grant one or two unused original iterations (`additional_iterations: 1` or `2`), starts at the next iteration in a fresh implementation home/session, and receives no invented model finding from the old infrastructure failure. The old result, role and monitoring state remain unchanged. Subsequent normal resumes retain only those exact historical teardown receipts through the immutable admission chain; a different unknown role, changed output/evidence or current live custody still blocks them. Unknown external effects are never replayed.

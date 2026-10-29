@@ -58,3 +58,67 @@ async def test_default_repair_public_assessment_and_admission_agree(service, mon
         assert preview.json()['blockers'][0]['code'] == 'revision_changed'
         accepted = await client.post(base + 'continue-repair', json=command, headers=headers)
         assert accepted.status_code == 200 and accepted.json()['authorized_through_iteration'] == 4
+
+
+@pytest.mark.asyncio
+async def test_preplan_stop_refuses_implementation_resume_across_restart(service, monkeypatch):
+    """A closed pre-intake preparation failure must not be resumed as implementation."""
+    import copy
+    import json
+
+    import httpx
+
+    from devflow_temporal.delivery_api import create_app
+    from devflow_temporal.delivery_config import DeliveryConfig
+    from devflow_temporal.delivery_store import DeliveryStore
+
+    initial, request = service
+    raw = copy.deepcopy(initial.config.raw)
+    raw['roles']['intake'] = {'model': 'fixture', 'effort': 'low'}
+    initial.config.path.write_text(json.dumps(raw))
+    store = DeliveryStore(DeliveryConfig.load(initial.config.path))
+    request = {key: value for key, value in request.items() if key != 'accepted_plan'}
+    store.submit(request)
+    store.mark_start('run-1', accepted=True)
+    error = 'fixture preparation failed before planning'
+    store.project('run-1', phase='blocked', execution_state='blocked', event_type='blocked',
+                  message=error, outcome='blocked', cleanup='confirmed', error=error,
+                  protocol_revision=3, iteration=0)
+    with store._connect() as db:
+        db.execute("UPDATE delivery_runs SET workflow_id='delivery-run-1' WHERE run_id='run-1'")
+        store.state.release_work(db, request['work_id'], 'external:devflow:run-1')
+        row = db.execute('SELECT * FROM delivery_runs WHERE run_id=?', ('run-1',)).fetchone()
+        saved_request = row['request_json']
+    spec = store.submitted_spec('run-1')
+    assert not spec['accepted_plan']
+    closed = {'workflow_id': 'delivery-run-1', 'execution_run_id': 'preplan-stop',
+              'request_digest': row['request_digest'], 'recovery_digest': None,
+              'result': {'run_id': 'run-1', 'phase': 'blocked', 'execution_state': 'blocked',
+                         'outcome': 'blocked', 'cleanup': 'confirmed', 'error': error,
+                         'revision': 3, 'iteration': 0, 'candidate': None,
+                         'pull_request': None, 'checks': {}}}
+    monkeypatch.setattr(DeliveryStore, '_completed_temporal_result', lambda *_a, **_k: closed)
+    command = {'continuation_kind': 'stopped_delivery_resume', 'command_id': 'preplan-resume',
+               'expected_revision': 3, 'expected_iteration': 0,
+               'expected_candidate_id': '0' * 64, 'expected_candidate_head': '0' * 40,
+               'additional_iterations': 1}
+
+    # Reopen the durable store to exercise the same boundary after a restart.
+    restarted = DeliveryStore(DeliveryConfig.load(initial.config.path))
+    app = create_app(restarted.config.path)
+    app.state.delivery.store = restarted
+    with restarted._connect() as db:
+        before = list(db.iterdump())
+    host = restarted.config.dashboard_url
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=host) as client:
+        token = (await client.get('/api/session')).json()['csrf_token']
+        preview = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': 'stopped_delivery_resume', 'request': command})
+        response = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                     headers={'Origin': host, 'X-Devflow-CSRF': token})
+        assert preview.status_code == 200 and not preview.json()['eligible']
+        assert 'accepted_plan_unavailable' in {b['code'] for b in preview.json()['blockers']}
+        assert response.status_code == 409 and response.json()['detail'] == preview.json()
+    with restarted._connect() as db:
+        assert list(db.iterdump()) == before
+        assert db.execute('SELECT request_json FROM delivery_runs').fetchone()[0] == saved_request
