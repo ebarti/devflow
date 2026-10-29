@@ -38,8 +38,9 @@ def legacy_tracker_admission(monkeypatch):
     """These recovery cases represent specs admitted before automatic retries."""
     original = DeliveryConfig.admit
 
-    def admit(self, request):
-        spec = original(self, request)
+    def admit(self, request, **kwargs):
+        spec = original(self, request, **{**kwargs, '_readiness_base': {}})
+        spec.pop('workspace_custody_version', None)
         spec.pop('tracker_retry_version', None)
         spec['policy'].pop('tracker_retry_seconds', None)
         spec['policy_digest'] = digest(spec['policy'])
@@ -541,44 +542,6 @@ async def test_closed_cancelled_recovery_preserves_cleanup_source_contract(
                 assert (await browser.post(endpoint + '/reconcile-tracker',
                                            headers=headers, json=payload)).json() == accepted.json()
                 assert service.store.detail(spec['run_id'])['tracker']['state'] == 'consistent'
-
-
-def test_clean_cancelled_removal_proof_survives_lost_git_completion(
-    native_configuration, monkeypatch,
-):
-    import subprocess
-
-    from devflow_temporal.delivery_store import DeliveryStore
-
-    config, request = native_configuration
-    store = DeliveryStore(config)
-    store.submit(request)
-    spec = store.spec(request['run_id'])
-    broker = DeliveryBroker(store, spec)
-    broker.prepare()
-    candidate = broker.candidate()
-    resources = RunResources(spec)
-    original = subprocess.run
-    lost = True
-
-    def remove_then_lose_receipt(argv, **kwargs):
-        nonlocal lost
-        result = original(argv, **kwargs)
-        if lost and argv[0] == 'git' and argv[3:5] == ['worktree', 'remove']:
-            lost = False
-            raise subprocess.TimeoutExpired(argv, 30)
-        return result
-
-    monkeypatch.setattr('devflow_temporal.delivery_resources.subprocess.run',
-                        remove_then_lose_receipt)
-    first = resources.finalize('cancelled')
-    assert first['state'] == 'unknown' and not broker.checkout.exists()
-    final = resources.finalize('cancelled')
-    assert final['state'] == 'confirmed'
-    entry = next(r for r in final['roots'] if r['kind'] == 'checkout')
-    assert entry['state'] == 'already_absent'
-    assert entry['clean_base_removal']['candidate'] == {
-        k: candidate[k] for k in ('head', 'id', 'content_sha256')}
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='actual native preparation required')

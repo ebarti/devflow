@@ -672,6 +672,7 @@ def _browser_qa_evidence(request: dict[str, Any]) -> None:
 def prepare_native_check(
     spec: dict[str, Any], checkout: Path, evidence_dir: Path, check: dict[str, Any],
     *, dependency_store: Path | None = None, resources=None, diagnostic_context=None,
+    readiness_probe: bool = False,
 ) -> tuple[str, dict[str, str]]:
     """Run candidate-controlled check commands in a separate credential-free profile."""
 
@@ -712,6 +713,13 @@ def prepare_native_check(
     cache = spec["policy"].get("package_manager_cache")
     browser_cache = Path.home() / "Library/Caches/ms-playwright"
     profile_name = "devflow-check"
+    planned_artifacts = ()
+    if (not readiness_probe and not trusted_local(spec)
+            and spec.get("readiness_version") == 1
+            and check.get("kind") == "test" and check.get("plan_provenance")):
+        # The generated report belongs to this check, not the source checkout.
+        planned_artifacts = (resources.check_artifacts(
+            evidence_dir / check["id"] / "pytest-artifacts"),)
     lines = _profile_lines(
         profile_name,
         workspace=checkout,
@@ -726,6 +734,7 @@ def prepare_native_check(
             + (browser_cache,)
             + (Path(sys.base_prefix),)
         ),
+        extra_write=planned_artifacts,
         network_domains=domains,
         protected_executables=_protected_native_commands(spec),
     )
@@ -748,7 +757,7 @@ def prepare_native_check(
             "PLAYWRIGHT_BROWSERS_PATH": str(browser_cache),
         }
     )
-    if trusted_local(spec) and check.get("kind") == "test":
+    if trusted_local(spec) and not readiness_probe and check.get("kind") == "test":
         from .delivery_temporal_prerequisites import prepare_check as prepare_temporal_check
 
         temporal_environment = prepare_temporal_check(

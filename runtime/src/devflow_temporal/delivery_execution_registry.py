@@ -965,13 +965,27 @@ class ExecutionRegistry:
                     raise OwnershipConflict("worker repair allowance was superseded")
             return matching[0][1]
 
-    def repair(self, token: dict, key: str, reason: str, *, devflow_defect: bool = False) -> dict:
+    def repair(self, token: dict, key: str, reason: str, *, devflow_defect: bool = False,
+               worker_assignment: dict | None = None, require_existing: bool = False) -> dict:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if key.startswith("plan-revision:"):
                 self.require_settlement(db, token)
             else:
                 self.require(db, token)
+            if worker_assignment is not None:
+                if (not isinstance(worker_assignment, dict)
+                        or worker_assignment.get("issue_id") != token["issue_id"]
+                        or worker_assignment.get("generation") != token["generation"]
+                        or worker_assignment.get("state") not in {"reserved", "running"}
+                        or not isinstance(worker_assignment.get("worker_key"), str)):
+                    raise OwnershipConflict("repair lacks an active worker assignment")
+                row = db.execute(
+                    "SELECT * FROM execution_workers WHERE issue_id=? AND worker_key=?",
+                    (token["issue_id"], worker_assignment["worker_key"]),
+                ).fetchone()
+                if row is None or dict(row) != worker_assignment:
+                    raise OwnershipConflict("worker assignment changed before repair debit")
             budget = self._budget(db, token["issue_id"])
             old = db.execute(
                 "SELECT * FROM execution_repairs WHERE issue_id=? AND repair_key=?",
@@ -1003,6 +1017,8 @@ class ExecutionRegistry:
                 return budget
             if old and old["reason"] != reason:
                 raise OwnershipConflict("repair identity changed")
+            if require_existing and not old:
+                raise OwnershipConflict("retained worker turn has no original repair debit")
             if not old and not devflow_defect:
                 if budget["used"] >= budget["maximum"]:
                     raise OwnershipConflict("feature product repair limit exhausted")

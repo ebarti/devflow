@@ -837,6 +837,12 @@ class DeliveryStore:
             admission["_base_ref"] = reference
         if retained is not None:
             admission["_feature_base"] = retained
+        elif _automatic is not None:
+            # The retry transaction rechecks this exact closed predecessor row.
+            admission["_readiness_base"] = json.loads(_automatic["row"]["request_json"])
+        elif supplied.get("supersedes_run_id"):
+            # Later continuation admission authenticates this predecessor again.
+            admission["_readiness_base"] = self.submitted_spec(supplied["supersedes_run_id"])
         from .delivery_limits import require_supported_admission_limits
 
         if (retained is None and _automatic is None and _feature_revision is None

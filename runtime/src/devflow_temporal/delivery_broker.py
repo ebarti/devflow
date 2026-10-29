@@ -692,7 +692,8 @@ class DeliveryBroker:
                                 or isolated_python.resolve() != isolated_python):
                             raise ValueError('locked Python environment left controller ownership')
                         environment['UV_PROJECT_ENVIRONMENT'] = str(isolated_python)
-                    if preserve_workspace_dependencies and '/store' in argv:
+                    if (preserve_workspace_dependencies and '/store' in argv
+                            and self.spec['policy'].get('host_sandbox') == 'trusted-local'):
                         require_prepared_source(check['id'])
                         if self.candidate() != candidate:
                             raise ValueError('implementation dependency source changed')
@@ -1335,7 +1336,9 @@ class DeliveryBroker:
         except (ValueError, OSError) as exc:
             raise CheckPreparationFailure('native-generated-output-custody', exc) from exc
 
-    def run_implementation_preparation(self, iteration: int, candidate: dict) -> dict:
+    def run_implementation_preparation(
+        self, iteration: int, candidate: dict, *, readiness_attempt: int | None = None,
+    ) -> dict:
         """Pin configured output and prepare accepted locked dependencies before role probes."""
         if self.candidate() != candidate:
             raise ValueError("implementation preparation candidate is stale")
@@ -1343,6 +1346,11 @@ class DeliveryBroker:
         from .delivery_plan_checks import planned_checks
 
         folder = self.evidence_dir / "implementation-preparation" / str(iteration)
+        if readiness_attempt is not None:
+            from .delivery_readiness import plan_evidence_folder
+
+            folder = plan_evidence_folder(self.spec, self.evidence_dir, iteration, candidate,
+                                          readiness_attempt)
         planned = planned_checks(self.spec, self.checkout, folder, preparation=True)
         dependencies = [c for c in planned if c['id'].startswith('planned-python-dependencies-')]
         dependencies = implementation_prerequisites(self.spec) + dependencies

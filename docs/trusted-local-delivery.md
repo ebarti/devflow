@@ -93,6 +93,44 @@ controller check. Existing PR titles must also be conventional. Invalid already
 published history is refused; the read-only publication recovery command cannot
 rewrite it or reuse gate evidence for a different head.
 
+New native Codex admissions use readiness version 1. For supported static checks (Ruff and `git diff --check`) without browser QA,
+admission derives an empty backend declaration. A repository with browser QA, a
+test recipe, or an unrecognized check must explicitly configure its requirements
+before admission, for example:
+
+```json
+"readiness": {
+  "version": 1,
+  "generation": 0,
+  "browser_engines": ["chromium"],
+  "temporal_checks": []
+}
+```
+
+List the actual browser engines in sorted order. An empty `temporal_checks` list
+states that the frozen test recipes do not require Temporal. For a supported
+pinned Temporal test, name its local check ID and add `temporal_provenance` with
+`check_id`, `python_project`, absolute `provenance_path`, and the corresponding
+`provenance_sha256`. Temporal readiness currently supports the admitted locked
+SDK and tool provenance for the native platform; unsupported bindings block the
+run. The declaration is frozen with the run. Existing admitted histories and
+their technical successors retain their original readiness version; adding a
+configuration does not rewrite active runs.
+
+Readiness prepares and probes the isolated environment before product roles and
+rechecks its candidate and resource binding before checks. A failed or unknown
+observation stops dispatch without allocating a new product repair turn. A pass
+is environmental evidence only: candidate checks and browser QA remain required.
+Plan-generated checks require their execution tool and owned dependency closure
+to be available in the prepared environment. Unsupported or unprobeable recipes
+stop with unknown readiness. A tool probe does not claim a product check passed.
+
+For a readiness-versioned feature worker, a new product repair also requires the
+versioned repair-reservation controller. Until that controller is available and
+authenticated, an unpaid repair stops before launch; a previously paid repair
+keeps its original key. The readiness declaration alone does not enable repair
+accounting.
+
 Repositories can select `baseline_check_ids` from their existing
 `prepublish_checks`, in recipe order, for shared project prerequisites such as
 dependency installation, docs build and rendered browser regressions. New

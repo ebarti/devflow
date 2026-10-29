@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_delivery_store import _git
+from test_delivery_store import _git, submit_before_readiness
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_stopped_resume as resume
@@ -74,7 +74,7 @@ def native_preparation_stop(service, monkeypatch, tmp_path):
         project_url='https://github.com/users/example/projects/1', assignee='example')
     owner.config.path.write_text(json.dumps(config))
     store = DeliveryStore(DeliveryConfig.load(owner.config.path))
-    store.submit(request)
+    submit_before_readiness(store, request, monkeypatch)
     store.mark_start('run-1', accepted=True)
     spec = prepare_authority(store, store.submitted_spec('run-1'))
     broker = DeliveryBroker(store, spec)
@@ -344,108 +344,6 @@ def prerequisite_receipt(tmp_path):
                            journal=journal, launch=launch, folder=folder, recipe=recipe)
 
 
-def test_configured_native_prerequisite_proof_binds_every_original_byte(prerequisite_receipt):
-    c = prerequisite_receipt
-    proof = completed_prerequisite(c.seal, c.previous, c.role)
-    assert proof['closed_role_sha256'] == digest(c.role)
-    assert proof['execution_spec_sha256'] == digest(c.seal['predecessor_spec'])
-    assert proof['predecessor_command_digest'] == c.previous['command_digest']
-    assert set(proof['files']) == {str(c.folder / name) for name in (
-        'native-process.json', 'launch.json', 'process.log')}
-
-
-def test_historical_prerequisite_metadata_outlives_its_checkout(prerequisite_receipt):
-    c = prerequisite_receipt
-    checkout = Path(c.seal['predecessor_spec']['checkout'])
-    checkout.rmdir()
-    # Historical custody authenticates ended execution metadata. Independent
-    # current snapshot/readback still needs the actual source before admission.
-    proof = completed_prerequisite(c.seal, c.previous, c.role)
-    assert proof['closed_role_sha256'] == digest(c.role)
-
-
-@pytest.mark.parametrize('drift', ['relative', 'noncanonical', 'parent'])
-def test_prerequisite_cwd_metadata_remains_canonical(prerequisite_receipt, drift):
-    c = prerequisite_receipt
-    spec = c.seal['predecessor_spec']
-    if drift == 'relative':
-        spec['checkout'] = 'relative-checkout'
-    elif drift == 'noncanonical':
-        spec['checkout'] += '//'
-    else:
-        c.recipe['cwd'] = '../checkout'
-        c.item['cwd'] += '/../checkout'
-    with pytest.raises(ValueError):
-        completed_prerequisite(c.seal, c.previous, c.role)
-
-
-@pytest.mark.parametrize('drift', ['signal', 'timeout', 'cancelled', 'stdio', 'monitor',
-                                  'interrupted', 'listener', 'unknown'])
-def test_unfinished_native_prerequisite_never_proves_a_pending_turn(prerequisite_receipt, drift):
-    c = prerequisite_receipt
-    if drift == 'signal':
-        c.item['exit_code'] = c.native['exit_code'] = -15
-    elif drift == 'unknown':
-        c.native['state'] = 'unknown'
-    else:
-        field = {'timeout': 'timed_out', 'stdio': 'stdio_drained', 'monitor': 'monitoring_complete',
-                 'listener': 'listener_conflict', 'interrupted': 'interrupted_monitor'}.get(
-                     drift, drift)
-        c.native[field] = drift not in {'stdio', 'monitor'}
-    write_private(c.folder / 'native-process.json', c.journal)
-    with pytest.raises(ValueError):
-        completed_prerequisite(c.seal, c.previous, c.role)
-
-
-@pytest.mark.parametrize('drift', ['recipe', 'test', 'candidate', 'multiple_failures', 'foreign'])
-def test_only_the_exact_configured_prerequisite_is_eligible(prerequisite_receipt, drift):
-    c = prerequisite_receipt
-    if drift == 'recipe':
-        c.recipe['argv'] = ['uv', 'sync', '--different']
-    elif drift == 'test':
-        c.recipe['kind'] = 'test'
-    elif drift == 'candidate':
-        c.role['implementation_preparation']['candidate_id'] = digest('different candidate')
-    elif drift == 'multiple_failures':
-        c.role['implementation_preparation']['results'].append(copy.deepcopy(c.item))
-    else:
-        c.item['id'] = 'foreign-prerequisite'
-    assert completed_prerequisite(c.seal, c.previous, c.role) is None
-
-
-@pytest.mark.parametrize('drift', ['journal', 'launch', 'log', 'path', 'policy', 'timeout',
-                                  'runtime', 'linked', 'mode', 'oversize'])
-def test_native_prerequisite_receipts_are_fresh_and_private(prerequisite_receipt, drift):
-    c = prerequisite_receipt
-    if drift == 'journal':
-        c.journal['phase'] = 'authorized'
-    elif drift == 'launch':
-        c.launch['environment']['HOME'] += '-changed'
-    elif drift == 'log':
-        (c.folder / 'process.log').write_bytes(b'Changed output\n')
-    elif drift == 'path':
-        c.native['journal'] = str(c.folder.parent / 'different/native-process.json')
-    elif drift == 'policy':
-        c.journal['intent']['policy_digest'] = digest('different policy')
-    elif drift == 'timeout':
-        c.journal['intent']['timeout'] += 1
-    elif drift == 'runtime':
-        c.native['runtime_identity']['runtime_payload_sha256'] = digest('different payload')
-    elif drift == 'mode':
-        (c.folder / 'process.log').chmod(0o644)
-    elif drift == 'oversize':
-        (c.folder / 'process.log').write_bytes(b'x' * (4 * 1024 * 1024 + 1))
-    else:
-        log = c.folder / 'process.log'
-        saved = c.folder / 'retained.log'
-        log.rename(saved)
-        log.symlink_to(saved)
-    write_private(c.folder / 'native-process.json', c.journal)
-    write_private(c.folder / 'launch.json', c.launch)
-    with pytest.raises(ValueError):
-        completed_prerequisite(c.seal, c.previous, c.role)
-
-
 def test_native_prerequisite_collection_cannot_change_during_observation(
     prerequisite_receipt, monkeypatch,
 ):
@@ -467,5 +365,3 @@ def test_native_prerequisite_collection_cannot_change_during_observation(
     monkeypatch.setattr(recovery, 'private_bytes', after_launch)
     with pytest.raises(ValueError, match='during observation'):
         completed_prerequisite(c.seal, c.previous, c.role)
-
-

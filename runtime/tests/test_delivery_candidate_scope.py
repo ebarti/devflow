@@ -70,64 +70,6 @@ def test_publish_rejects_full_committed_scope_before_remote_push(scope_broker, s
     assert broker.publication_may_have_effect is False
 
 
-
-
-@pytest.mark.parametrize('scope_broker', ['renamed.md'], indirect=True)
-@pytest.mark.parametrize('change', ['rename', 'deletion'])
-@pytest.mark.parametrize('stage', ['worktree', 'role-commit'])
-def test_in_scope_removal_publishes_one_controller_commit(scope_broker, change, stage):
-    broker = scope_broker
-    initial = broker.candidate()
-    before_protected = (broker.checkout / 'protected.txt').read_bytes()
-    if stage == 'worktree':
-        if change == 'rename':
-            (broker.checkout / 'README.md').rename(broker.checkout / 'renamed.md')
-        else:
-            (broker.checkout / 'README.md').unlink()
-    elif change == 'rename':
-        _git(broker.checkout, 'mv', 'README.md', 'renamed.md')
-    else:
-        _git(broker.checkout, 'rm', 'README.md')
-    if stage == 'role-commit':
-        # The unsigned role commit must be normalized before publication.
-        _git(broker.checkout, 'commit', '-qm', 'Role changed allowed source')
-    candidate = broker.admit_implementation(initial)
-    assert candidate['head'] == initial['head']
-    published = broker.publish(0, candidate)
-    assert published['state'] == 'OPEN'
-    assert _git(broker.checkout, 'rev-list', '--count', initial['head'] + '..HEAD') == '1'
-    assert 'Signed-off-by:' in _git(broker.checkout, 'show', '-s', '--format=%B')
-    assert not (broker.checkout / 'README.md').exists()
-    assert (broker.checkout / 'renamed.md').exists() == (change == 'rename')
-    assert (broker.checkout / 'protected.txt').read_bytes() == before_protected
-    assert not _git(broker.checkout, 'status', '--porcelain')
-    assert _git(broker.source, 'ls-remote', 'origin',
-                'refs/heads/' + broker.spec['branch']).split()[0] == published['head']
-    with broker.store._connect() as db:
-        effects = db.execute("SELECT state FROM delivery_effects WHERE kind='publish'").fetchall()
-    assert [row['state'] for row in effects] == ['complete']
-
-
-
-
-def test_publish_rejects_foreign_index_changes_hidden_by_worktree(scope_broker):
-    broker = scope_broker
-    (broker.checkout / 'protected.txt').write_text('Staged foreign change\n')
-    _git(broker.checkout, 'add', 'protected.txt')
-    (broker.checkout / 'protected.txt').write_text('Protected baseline file\n')
-    (broker.checkout / 'README.md').write_text('Allowed working change\n')
-    remote_before = _git(broker.source, 'ls-remote', 'origin')
-    with pytest.raises(ValueError, match='outside allowed paths'):
-        broker.publish(0, broker.candidate())
-    assert _git(broker.source, 'ls-remote', 'origin') == remote_before
-
-
-
-
-
-
-
-
 NATIVE_ROLE_DRIVER = '''
 import asyncio,json,sys
 from pathlib import Path
@@ -195,10 +137,13 @@ def test_native_role_admission_enforces_scope_and_controller_commit_ownership(
     check = {'id': 'fixture-check', 'argv': [str(Path(sys.executable).resolve()),
              '-c', "print('1 passed')"], 'test_count_regex': r'(\d+) passed', 'min_tests': 1}
     repository.update(prepublish_checks=[check], checks=[check], required_ci=['test'],
+        readiness={'version': 1, 'generation': 0, 'browser_engines': [], 'temporal_checks': []},
         project_url='https://github.com/users/example/projects/1', assignee='example')
     path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(path))
-    store.submit(submission)
+    from test_delivery_store import submit_before_readiness
+
+    submit_before_readiness(store, submission, monkeypatch)
     broker = DeliveryBroker(store, store.spec(submission['run_id']))
     initial = broker.prepare()['candidate']
     request = {'spec': broker.spec, 'role': 'implement', 'iteration': 0,

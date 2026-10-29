@@ -385,7 +385,8 @@ class DeliveryWorkflow:
                 )
             }
         elif (name in {'delivery_intake', 'delivery_role', 'delivery_checks',
-                       'delivery_precheck', 'delivery_baseline_checks', 'delivery_browser_qa'}
+                       'delivery_precheck', 'delivery_baseline_checks', 'delivery_browser_qa',
+                       'delivery_environment_readiness'}
               and request['spec'].get('policy', {}).get('execution_backend') == 'native-macos'
               and workflow.patched('delivery-activity-liveness-v1')):
             options = {
@@ -505,7 +506,7 @@ class DeliveryWorkflow:
             options["schedule_to_close_timeout"] = timeout
         if name in {
             "delivery_checks", "delivery_browser_qa", "delivery_precheck",
-            "delivery_baseline_checks",
+            "delivery_baseline_checks", "delivery_environment_readiness",
         } and workflow.patched("delivery-check-slots-v1"):
             options["heartbeat_timeout"] = timedelta(seconds=30)
             options["cancellation_type"] = (
@@ -520,7 +521,8 @@ class DeliveryWorkflow:
                 seconds=60 if attempts > 1 else 0)
         if (name in {"delivery_intake", "delivery_role", "delivery_checks",
                      "delivery_precheck", "delivery_baseline_checks", "delivery_browser_qa",
-                     "delivery_feature_revision_propose", "delivery_feature_revision_review"}
+                     "delivery_environment_readiness", "delivery_feature_revision_propose",
+                     "delivery_feature_revision_review"}
                 and request["spec"].get("policy", {}).get("execution_backend") == "native-macos"
                 and workflow.patched("delivery-capacity-wait-v1")):
             # This deadline bounds a monitor attempt, not time spent waiting for
@@ -1565,6 +1567,25 @@ class DeliveryWorkflow:
             return await self._cancelled(spec)
         self.state["candidate"] = prepared["candidate"]
         self.state["candidate_revision"] += 1
+        if spec.get("readiness_version") == 1:
+            self.state["revision"] += 1
+            await self._project(spec, "readiness_preparing", "Preparing execution readiness")
+            try:
+                readiness = await self._activity("delivery_environment_readiness", {
+                    "spec": spec, "candidate": prepared["candidate"], "iteration": 0,
+                })
+            except Exception as exc:
+                return await self._stop(
+                    spec, f"execution readiness unresolved: {type(exc).__name__}", cause=exc)
+            self.state["checks"]["readiness"] = readiness
+            if readiness.get("state") != "passed":
+                if any(item.get("cleanup") == "unknown"
+                       for item in readiness.get("observations", {}).values()):
+                    self.state["cleanup"] = "unknown"
+                if readiness.get("state") == "cancelled":
+                    return await self._cancelled(spec)
+                return await self._stop(
+                    spec, readiness.get("reason") or "Execution readiness is unavailable")
         # Frozen legacy inputs omit this marker, preserving recorded histories.
         # Legacy v1 stops before roles; fresh raw-goal v2 can diagnose fully
         # observed regressions without approving the baseline or spending a turn.
@@ -1973,6 +1994,13 @@ class DeliveryWorkflow:
                     return await self._cancelled(spec)
                 result = await self._activity(name, request)
                 self.state["checks"][stage] = result
+                if (spec.get("readiness_version") == 1
+                        and result.get("failure_kind") == "readiness_preparation"
+                        and result.get("launched") is False):
+                    self.state["checks"]["readiness"] = result.get("readiness")
+                    if result.get("cleanup") == "unknown":
+                        self.state["cleanup"] = "unknown"
+                    return await self._stop(spec, "execution readiness prevented metadata checks")
                 if result.get("state") != "passed" or result.get("cleanup") == "unknown":
                     self.state["findings"].extend(
                         _broker_findings(stage, result, iteration=self.state["iteration"])
@@ -2203,6 +2231,37 @@ class DeliveryWorkflow:
         self.state['revision'] += 1
         await self._project(spec, 'stopped_resume_started',
                             'Resuming original delivery with earlier failures retained')
+        readiness_retry = recovery.get("readiness_retry")
+        if readiness_retry is not None:
+            if (spec.get("readiness_version") != 1 or not isinstance(readiness_retry, dict)
+                    or set(readiness_retry) != {"version", "attempt", "pending_iteration",
+                                                "predecessor_receipt_sha256"}
+                    or readiness_retry.get("version") != 1
+                    or type(readiness_retry.get("attempt")) is not int
+                    or not 1 <= readiness_retry["attempt"] <= 2
+                    or type(readiness_retry.get("pending_iteration")) is not int
+                    or readiness_retry["pending_iteration"] < 0
+                    or not isinstance(readiness_retry.get("predecessor_receipt_sha256"), str)
+                    or len(readiness_retry["predecessor_receipt_sha256"]) != 64
+                    or any(c not in "0123456789abcdef"
+                           for c in readiness_retry["predecessor_receipt_sha256"])):
+                return await self._stop(spec, "Readiness retry authority is malformed")
+            if spec.get("feature_worker", {}).get("kind") == "build":
+                from .delivery_feature_workflow import run_build
+
+                return await run_build(
+                    self, spec, start_iteration=readiness_retry["pending_iteration"],
+                    session=recovery["session_id"], maximum_iteration=recovery["maximum_iteration"],
+                    readiness_retry=readiness_retry,
+                    readiness_findings=(recovery.get("pending_repair") or {}).get("findings", []))
+            return await self._run_iterations(
+                spec, start_iteration=readiness_retry["pending_iteration"],
+                prior_implementer_session=recovery["session_id"],
+                repair_findings=list((recovery.get("pending_repair") or {}).get("findings")
+                                     or recovery.get("findings") or []),
+                continuation=None, recovery=None,
+                authorized_max_iteration=recovery["maximum_iteration"],
+                allow_first_session=recovery["session_id"] is None, readiness_retry=readiness_retry)
         if spec.get("feature_worker", {}).get("kind") == "build":
             from .delivery_feature_workflow import run_build
 
@@ -2567,6 +2626,7 @@ class DeliveryWorkflow:
         recovery: dict[str, Any] | None,
         authorized_max_iteration: int | None = None,
         attempt_generation: int = 0,
+        readiness_retry: dict[str, Any] | None = None,
         allow_first_session: bool = False,
         resume_prechecks: bool = False,
         published_checkpoint: bool = False,
@@ -2645,13 +2705,18 @@ class DeliveryWorkflow:
                         }
                     self.state["checks"] = {
                         key: value for key, value in self.state["checks"].items()
-                        if key == "baseline"
+                        if key == "baseline" or (spec.get("readiness_version") == 1
+                                                  and key == "readiness")
                     }
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     self.state["phase"] = "implement" if iteration == 0 else "repair"
                     self.state["revision"] += 1
-                    await self._project(spec, "role_started", self.state["phase"] + " role started")
+                    if spec.get("readiness_version") == 1:
+                        await self._project(spec, "readiness_preparing", "Preparing role readiness")
+                    else:
+                        await self._project(
+                            spec, "role_started", self.state["phase"] + " role started")
                     try:
                         implementation = await self._activity(
                             "delivery_role",
@@ -2674,6 +2739,9 @@ class DeliveryWorkflow:
                                 "attempt_generation": (
                                     attempt_generation if iteration == start_iteration else 0
                                 ),
+                                **({"readiness_attempt": readiness_retry["attempt"]}
+                                   if readiness_retry is not None and iteration == start_iteration
+                                   and readiness_retry["pending_iteration"] == iteration else {}),
                             },
                         )
                     except Exception as exc:
@@ -2681,7 +2749,23 @@ class DeliveryWorkflow:
                             spec, f"implementer activity failed: {type(exc).__name__}",
                             cause=exc,
                         )
+                    if (spec.get("readiness_version") == 1
+                            and implementation.get("status") == "blocked"
+                            and implementation.get("readiness") is not None
+                            and implementation.get("session_id") is None):
+                        self.state["checks"]["readiness"] = {
+                            **implementation["readiness"], "pending_iteration": iteration}
+                        self.state["iteration"] = evidence_iteration
+                        if implementation.get("cleanup") == "unknown":
+                            self.state["cleanup"] = "unknown"
+                        return await self._stop(spec, "Execution readiness failed before the role")
                     self.state["roles"].append(implementation)
+                    if spec.get("readiness_version") == 1:
+                        previous_readiness = self.state["checks"].get("readiness")
+                        self.state["checks"]["readiness"] = {
+                            "state": "stale",
+                            "reason": "implementation may have changed the candidate",
+                            "previous": previous_readiness}
                     self.state["usage"][f"implement:{iteration}"] = implementation.get("usage")
                     if self.cancel_requested:
                         return await self._cancelled(spec)
@@ -2710,7 +2794,8 @@ class DeliveryWorkflow:
                 else:
                     self.state["checks"] = {
                         key: value for key, value in self.state["checks"].items()
-                        if key == "baseline"
+                        if key == "baseline" or (spec.get("readiness_version") == 1
+                                                  and key == "readiness")
                     }
                     if self.cancel_requested:
                         return await self._cancelled(spec)
@@ -2738,6 +2823,14 @@ class DeliveryWorkflow:
                         cause=exc,
                     )
                 self.state["checks"]["prepublish"] = prechecked
+                if spec.get("readiness_version") == 1 and prechecked.get("readiness"):
+                    self.state["checks"]["readiness"] = prechecked["readiness"]
+                if (spec.get("readiness_version") == 1
+                        and prechecked.get("failure_kind") == "readiness_preparation"
+                        and prechecked.get("launched") is False):
+                    if prechecked.get("cleanup") == "unknown":
+                        self.state["cleanup"] = "unknown"
+                    return await self._stop(spec, "execution readiness prevented prepublication")
                 if prechecked.get("state") == "unknown" or prechecked.get("cleanup") == "unknown":
                     if self.launch_window_v1 and prechecked.get("cleanup") == "confirmed":
                         return await self._stop(spec, "prepublication gate produced no verdict")
@@ -2842,6 +2935,14 @@ class DeliveryWorkflow:
                             cause=exc,
                         )
                     self.state["checks"]["local"] = checked
+                    if spec.get("readiness_version") == 1 and checked.get("readiness"):
+                        self.state["checks"]["readiness"] = checked["readiness"]
+                    if (spec.get("readiness_version") == 1
+                            and checked.get("failure_kind") == "readiness_preparation"
+                            and checked.get("launched") is False):
+                        if checked.get("cleanup") == "unknown":
+                            self.state["cleanup"] = "unknown"
+                        return await self._stop(spec, "execution readiness prevented local checks")
                     if collect_assessments and checked.get("source_unchanged") is False:
                         return await self._stop(spec, "local checks changed the assessed source")
                     if checked.get("state") == "unknown" or checked.get("cleanup") == "unknown":
@@ -2887,6 +2988,14 @@ class DeliveryWorkflow:
                             cause=exc,
                         )
                     self.state["checks"]["browser_qa"] = browser_qa
+                    if spec.get("readiness_version") == 1 and browser_qa.get("readiness"):
+                        self.state["checks"]["readiness"] = browser_qa["readiness"]
+                    if (spec.get("readiness_version") == 1
+                            and browser_qa.get("failure_kind") == "readiness_preparation"
+                            and browser_qa.get("launched") is False):
+                        if browser_qa.get("cleanup") == "unknown":
+                            self.state["cleanup"] = "unknown"
+                        return await self._stop(spec, "execution readiness prevented browser QA")
                     if self.cancel_requested:
                         return await self._cancelled(spec)
                     if browser_qa.get("cleanup") == "unknown":

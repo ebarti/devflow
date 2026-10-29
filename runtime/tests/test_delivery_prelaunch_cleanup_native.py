@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from importlib.metadata import distribution
 from pathlib import Path
 
-from test_delivery_store import _git
+from test_delivery_store import _git, submit_before_readiness
 from test_delivery_store import service as service
 
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -49,7 +49,7 @@ def test_actual_native_preparation_no_launch_history_then_public_cleanup(service
             'test_count_regex': r'(\d+) passed', 'min_tests': 1})
     owner.config.path.write_text(json.dumps(config))
     store = DeliveryStore(DeliveryConfig.load(owner.config.path))
-    store.submit(submission)
+    submit_before_readiness(store, submission, monkeypatch)
     store.mark_start('run-1', accepted=True)
     spec = prepare_authority(store, store.submitted_spec('run-1'))
     broker = DeliveryBroker(store, spec)

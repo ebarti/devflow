@@ -320,12 +320,16 @@ class DeliverySupervisor:
         enriched = {'native_authorized', 'result_path', 'start_path', 'role_evidence_key',
                     'artifact_directory', 'artifact_write_root', 'receipt_handoff', 'steering',
                     'review_diff', 'issue_context'}
+        if request['spec'].get('readiness_version') == 1:
+            enriched.add('readiness_worker_assignment')
         for name in saved.keys() | request.keys():
             if name in enriched and name not in request:
                 continue
             old, new = saved.get(name), request.get(name)
             if name == 'evidence_context':
                 generated = {'implementation_preparation', 'previous_iterations'}
+                if request['spec'].get('readiness_version') == 1:
+                    generated.add('readiness')
                 old = {k: v for k, v in (old or {}).items() if k not in generated}
                 new = {k: v for k, v in (new or {}).items() if k not in generated}
             if old != new:

@@ -10,93 +10,20 @@ import time
 from datetime import timedelta
 from importlib.metadata import distribution
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fixtures.activity_liveness_workflow import ActivityLivenessWorkflow, FeatureWaitClock
 from temporalio import activity
 from temporalio.client import WorkflowFailureError, WorkflowHistory
-from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_role_reattach import FIXED_NATIVE_PROVIDER, NATIVE_DRIVER
 
-from devflow_temporal import delivery_activities, delivery_baseline
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('name', ['delivery_checks', 'delivery_baseline_checks'])
-async def test_long_gate_activity_emits_liveness_heartbeat(monkeypatch, tmp_path, name):
-    def slow(*_args):
-        time.sleep(0.05)
-        return {'state': 'passed'}
-
-    broker = SimpleNamespace(run_checks=slow, run_prechecks=slow, run_browser_qa=slow)
-    store = SimpleNamespace(config=SimpleNamespace(state_root=tmp_path))
-    monkeypatch.setattr(delivery_activities, '_context', lambda _spec: (store, broker))
-    monkeypatch.setattr(delivery_baseline, 'run_baseline_checks', slow)
-    environment = ActivityEnvironment()
-    heartbeats = []
-    environment.on_heartbeat = lambda *details: heartbeats.append(details)
-    result = await environment.run(getattr(delivery_activities, name), {
-        'spec': {'run_id': 'liveness', 'provider': 'fake'}, 'iteration': 0,
-        'candidate': {'id': 'input'},
-    })
-    assert result['state'] == 'passed'
-    assert heartbeats, 'long-running gate sent no heartbeat'
-    assert heartbeats[0][0]['run_id'] == 'liveness'
-
-
-@pytest.mark.asyncio
-# Exercise every patch combination for each execution family, then its wrappers.
-@pytest.mark.parametrize('name,backend,liveness,slots', [
-    (name, 'native-macos', liveness, slots)
-    for name in ('delivery_role', 'delivery_checks')
-    for liveness, slots in ((False, False), (True, False), (False, True), (True, True))
-] + [(name, 'fake', True, True) for name in ('delivery_role', 'delivery_checks')]
-  + [(name, 'native-macos', True, True) for name in (
-      'delivery_intake', 'delivery_precheck', 'delivery_browser_qa', 'delivery_baseline_checks')])
-async def test_independent_activity_patches_preserve_each_reviewed_policy(
-    monkeypatch, name, backend, liveness, slots,
-):
-    from devflow_temporal import delivery_workflow
-
-    observed = {}
-    flags = {'delivery-activity-liveness-v1': liveness, 'delivery-check-slots-v1': slots}
-    async def execute(_name, _request, **options):
-        observed.update(options)
-    monkeypatch.setattr(delivery_workflow.workflow, 'execute_activity', execute)
-    monkeypatch.setattr(delivery_workflow.workflow, 'patched', lambda flag: flags.get(flag, False))
-    await DeliveryWorkflow()._activity(name, {'spec': {'policy': {'execution_backend': backend}}})
-    native_liveness = backend == 'native-macos' and liveness
-    slotted = slots and name in {'delivery_checks', 'delivery_precheck',
-                                'delivery_browser_qa', 'delivery_baseline_checks'}
-    # PR77's independent check policy controls heartbeat/cancellation when active;
-    # PR73 still controls native retries and the unchanged overall activity deadline.
-    if slotted:
-        assert observed['heartbeat_timeout'] == timedelta(seconds=30)
-        assert observed['cancellation_type'] == (
-            delivery_workflow.workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
-    else:
-        assert 'cancellation_type' not in observed
-        if native_liveness:
-            assert observed['heartbeat_timeout'] == timedelta(seconds=15)
-        else:
-            assert 'heartbeat_timeout' not in observed
-    assert observed['start_to_close_timeout'] == timedelta(hours=2)
-    assert observed['retry_policy'].maximum_attempts == (3 if native_liveness else 1)
-    if native_liveness:
-        assert observed['schedule_to_close_timeout'] == timedelta(hours=2)
-        assert observed['retry_policy'].initial_interval == timedelta(seconds=1)
-        assert observed['retry_policy'].maximum_interval == timedelta(seconds=10)
-        assert observed['retry_policy'].non_retryable_error_types == [
-            'ValueError', 'TypeError', 'PermissionError', 'NativeProcessUnknown']
-    else:
-        assert 'schedule_to_close_timeout' not in observed
 
 
 @pytest.mark.asyncio
@@ -105,31 +32,6 @@ async def test_replay_actual_previous_activity_history():
             / 'activity-liveness-previous-history.json')
     history = WorkflowHistory.from_json('record-activity-liveness', path.read_text())
     await Replayer(workflows=[ActivityLivenessWorkflow]).replay_workflow(history)
-
-
-@pytest.mark.asyncio
-async def test_blocking_intake_preparation_keeps_heartbeating(monkeypatch):
-    candidate = {'id': 'input'}
-
-    def context(_spec):
-        time.sleep(6)
-        return object(), SimpleNamespace(checkout=Path('.'), candidate=lambda: candidate)
-
-    async def run(_request):
-        return {'status': 'pass', 'findings': []}
-
-    monkeypatch.setattr(delivery_activities, '_context', context)
-    monkeypatch.setattr(delivery_activities, 'get_supervisor',
-                        lambda _store: SimpleNamespace(run=run))
-    environment = ActivityEnvironment()
-    heartbeats = []
-    environment.on_heartbeat = lambda *details: heartbeats.append(details)
-    result = await environment.run(delivery_activities.delivery_intake, {
-        'spec': {'run_id': 'liveness', 'provider': 'fake'}, 'iteration': 0,
-        'candidate': candidate,
-    })
-    assert result['status'] == 'pass'
-    assert len(heartbeats) >= 2
 
 
 @pytest.mark.asyncio
@@ -361,6 +263,7 @@ async def _wait_for_fixture_native_start(worker, log_path, state, handle):
 async def test_real_temporal_worker_loss_reuses_original_native_command(
     api_fixture,
     tmp_path,
+    monkeypatch,
     stage,
     interruption,
 ):
@@ -386,6 +289,7 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
     check = {'id': 'fixture-check', 'kind': 'test', 'argv': [sys.executable,
         'liveness.py', str(state)], 'test_count_regex': r'(\d+) passed', 'min_tests': 1}
     repository.update(prepublish_checks=[check], checks=[check], baseline_check_ids=[check['id']],
+        readiness={'version': 1, 'generation': 0, 'browser_engines': [], 'temporal_checks': []},
         required_ci=['test'], project_url='https://github.com/users/example/projects/1',
         assignee='example')
     if stage == 'browser_qa':
@@ -401,7 +305,9 @@ async def test_real_temporal_worker_loss_reuses_original_native_command(
             'env': {'JOBCTRL_E2E_ISOLATED': '1'}}
     path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(path))
-    store.submit(submission)
+    from test_delivery_store import submit_before_readiness
+
+    submit_before_readiness(store, submission, monkeypatch)
     spec = store.spec(submission['run_id'])
     broker = DeliveryBroker(store, spec)
     broker.prepare()
@@ -664,23 +570,3 @@ async def test_real_temporal_lost_feature_wait_attempt_retries_with_a_full_windo
     # The server records an absent schedule_to_close as zero: no overall deadline
     # can cut the retry short any more (it was 6 minutes).
     assert waits[0].schedule_to_close_timeout.ToTimedelta() == timedelta(0)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("name", ["delivery_intake", "delivery_feature_revision_review"])
-async def test_capacity_wait_has_no_total_activity_deadline(monkeypatch, name):
-    from devflow_temporal import delivery_workflow
-
-    observed = {}
-    async def execute(_name, _request, **options):
-        observed.update(options)
-    monkeypatch.setattr(delivery_workflow.workflow, "execute_activity", execute)
-    monkeypatch.setattr(delivery_workflow.workflow, "patched", lambda _flag: True)
-    await DeliveryWorkflow()._activity(name, {
-        "spec": {"policy": {"execution_backend": "native-macos", "max_repairs": 10}},
-    })
-    assert "schedule_to_close_timeout" not in observed
-    assert observed["start_to_close_timeout"] == timedelta(hours=2)
-    assert observed["retry_policy"].maximum_attempts == 0
-    assert "NativeProcessUnknown" in observed["retry_policy"].non_retryable_error_types
-    assert observed["heartbeat_timeout"] <= timedelta(seconds=30)

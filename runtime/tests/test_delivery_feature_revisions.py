@@ -224,7 +224,14 @@ def _native_rejected_fixture(native_configuration, monkeypatch, *, prior_cycles=
     )
     empty = DeliveryStore(config)
     migrate([config])
-    store, original, shared, record, diagnostic = feature.__wrapped__((empty, request), monkeypatch)
+    # This retained revision/accounting fixture was admitted before readiness.
+    # Its synthetic role receipts do not qualify a fresh execution environment.
+    admit = type(config).admit
+    with monkeypatch.context() as historical:
+        historical.setattr(type(config), "admit", lambda self, body, **options:
+            admit(self, body, **{**options, "_readiness_base": {}}))
+        store, original, shared, record, diagnostic = feature.__wrapped__(
+            (empty, request), monkeypatch)
     original = prepare_authority(store, original)
     owner = original["feature_delivery"]["owner"]
     if retain_worker:

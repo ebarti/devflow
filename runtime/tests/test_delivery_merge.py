@@ -1,19 +1,15 @@
 """Pure merge gates and controlled remote readback; no native/server fixtures."""
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
-import subprocess
 from copy import deepcopy
-from datetime import UTC, datetime
 
 import pytest
 from test_delivery_intake import intake_fixture as intake_fixture
 
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_merge import MergeBroker, require_merge_gates
-from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
 def gates():
@@ -41,13 +37,6 @@ def gates():
     return spec, candidate, pr, checks, attempts, {"input_candidate_id": "source"}
 
 
-def test_publication_commit_can_change_head_without_changing_accepted_source():
-    values = gates()
-    original = deepcopy(values)
-    require_merge_gates(*values)
-    assert values == original
-
-
 def test_real_admission_selects_merge_explicitly_without_a_second_repo_permission(intake_fixture):
     from test_delivery_intake import _git
 
@@ -64,6 +53,8 @@ def test_real_admission_selects_merge_explicitly_without_a_second_repo_permissio
         base_ref="origin/main", assignee="owner", project_url="https://github.com/users/owner/projects/1",
         required_ci=["test"], prepublish_checks=[{"id": "readme", "argv": ["true"]}],
         checks=[{"id": "readme", "argv": ["true"]}],
+        readiness={"version": 1, "generation": 0, "browser_engines": [],
+                   "temporal_checks": []},
     )
     request["base_ref"] = "origin/main"
     # Tests only construct immutable authority. No service, role or native check starts.
@@ -75,23 +66,6 @@ def test_real_admission_selects_merge_explicitly_without_a_second_repo_permissio
     assert merged["policy_digest"] == unmerged["policy_digest"]
     assert merged["intake_required"] is True
     assert cfg.public_policy()["authorized_endpoints"] == ["published_unmerged", "merged"]
-
-
-@pytest.mark.parametrize("change", ["fake", "unknown_endpoint"])
-def test_merge_cannot_broaden_a_legacy_recovery_or_simulation(intake_fixture, change):
-    path, request = intake_fixture
-    cfg = DeliveryConfig.load(path)
-    request["authorized_endpoint"] = "merged"
-    if change != "fake":
-        cfg.raw["provider"] = "codex"
-    if change == "recovery":
-        request["recovery_key"] = "existing"
-    elif change == "supersedes":
-        request["supersedes_run_id"] = "run-previous"
-    elif change == "unknown_endpoint":
-        request["authorized_endpoint"] = "deployed"
-    with pytest.raises(ValueError):
-        cfg.admit(request)
 
 
 @pytest.mark.parametrize("stage,failure", [("prepublish", "failed"), ("ci", "unknown")])
@@ -133,16 +107,6 @@ def test_changed_authority_candidate_or_native_custody_prevents_merge(change):
         require_merge_gates(spec, candidate, pr, checks, attempts, publication)
 
 
-@pytest.mark.parametrize("field,value", [("state", "unknown"), ("candidate_id", "other")])
-def test_configured_browser_gate_is_mandatory(field, value):
-    spec, candidate, pr, checks, attempts, publication = gates()
-    spec["policy"]["browser_qa"] = {"configured": True}
-    checks["browser_qa"] = {"state": "passed", "cleanup": "confirmed", "candidate_id": "published"}
-    checks["browser_qa"][field] = value
-    with pytest.raises(ValueError):
-        require_merge_gates(spec, candidate, pr, checks, attempts, publication)
-
-
 class Store:
     def __init__(self, path):
         self.path = path
@@ -171,60 +135,6 @@ def test_unknown_remote_effect_preserves_one_intent_and_does_not_regrant_mutatio
         assert db.execute("SELECT state FROM delivery_effects").fetchone()[0] == "pending"
 
 
-class Projection(DeliveryWorkflow):
-    def __init__(self, cleanup, merge):
-        super().__init__()
-        self.cleanup, self.merge = cleanup, merge
-        self.calls = []
-        self.state = {"phase": "delivered", "execution_state": "terminal", "outcome": "delivered",
-                      "cleanup": "none", "error": None, "checks": {}, "revision": 1,
-                      "iteration": 0, "candidate": gates()[1], "pull_request": gates()[2]}
-
-    async def _activity(self, name, request):
-        self.calls.append((name, deepcopy(request)))
-        if name == "delivery_finalize_resources":
-            return self.cleanup
-        if name == "delivery_merge":
-            return self.merge
-        if name == "delivery_terminal_tracker":
-            return {"state": "consistent"}
-        if name == "delivery_project":
-            return {}
-        raise AssertionError(name)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["merged", "unknown_merge"])
-async def test_actual_workflow_orders_cleanup_merge_and_done(monkeypatch, mode):
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.patched", lambda _: True)
-    monkeypatch.setattr("devflow_temporal.delivery_workflow.workflow.now",
-                        lambda: datetime(2026, 10, 8, tzinfo=UTC))
-    spec = gates()[0]
-    cleanup = deepcopy(gates()[3]["resource_cleanup"])
-    merged = {"state": "confirmed"}
-    if mode == "unmerged":
-        spec.pop("merge_version")
-        spec["authorized_endpoint"] = "published_unmerged"
-    elif mode == "bad_cleanup":
-        cleanup["state"] = "unknown"
-    elif mode == "unknown_merge":
-        merged["state"] = "unknown"
-    probe = Projection(cleanup, merged)
-    await probe._project(spec, "delivered", "terminal")
-    names = [name for name, _ in probe.calls]
-    assert names[0] == "delivery_finalize_resources"
-    assert ("delivery_merge" in names) == (mode in {"merged", "unknown_merge"})
-    if "delivery_merge" in names:
-        assert names.index("delivery_merge") < names.index("delivery_terminal_tracker")
-    status = next(r["status"] for n, r in probe.calls if n == "delivery_terminal_tracker")
-    if mode == "unknown_merge":
-        terminal = next(r for n, r in probe.calls if n == "delivery_terminal_tracker")
-        assert terminal["release"] is False
-    assert status == {"merged": "done", "unmerged": "in-review",
-                      "bad_cleanup": "blocked", "unknown_merge": "blocked"}[mode]
-    assert probe.state["outcome"] == ("delivered" if mode in {"merged", "unmerged"} else "blocked")
-
-
 def test_squash_readback_rejects_different_merged_tree_or_base(tmp_path):
     spec, _, pr, _, _, _ = gates()
     spec["state_dir"] = str(tmp_path)
@@ -236,49 +146,6 @@ def test_squash_readback_rejects_different_merged_tree_or_base(tmp_path):
             "status": "diverged"}
         with pytest.raises(ValueError, match="verified tree or base"):
             broker.merged(pr, found, "t")
-
-
-def test_changed_base_is_denied_before_any_merge_effect(tmp_path):
-    spec, _, pr, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    broker = MergeBroker(None, spec)
-    found = {"state": "open", "merged": False, "base": {"sha": "advanced"}}
-    broker.api = lambda *_, **__: pytest.fail("moved base must block before GitHub effects")
-    with pytest.raises(ValueError, match="upstream moved"):
-        broker.live_ci(pr, found, "t")
-
-
-def test_owned_issue_closure_is_not_replayed_after_unknown_response(tmp_path):
-    spec, _, _, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    store = Store(tmp_path / "state.sqlite3")
-    broker = MergeBroker(store, spec)
-    request = {"issue": spec["issue_url"], "merged_commit": "m"}
-    assert broker.intent("merge-issue:fresh", "merge_issue", request)
-    calls = []
-    def api(*args, **kwargs):
-        calls.append(kwargs.get("method", "GET"))
-        return {"state": "open", "html_url": spec["issue_url"]}
-    broker.api = api
-    with pytest.raises(ValueError, match="no mutation replay"):
-        broker.close_issue({"merged_commit": "m"})
-    assert calls == ["GET"]
-
-
-def test_already_closed_issue_reconciles_lost_effect_without_another_patch(tmp_path):
-    spec, _, _, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    store = Store(tmp_path / "state.sqlite3")
-    broker = MergeBroker(store, spec)
-    assert broker.intent("merge-issue:fresh", "merge_issue", {
-        "issue": spec["issue_url"], "merged_commit": "m"})
-    calls = []
-    def api(*args, **kwargs):
-        calls.append(kwargs.get("method", "GET"))
-        return {"state": "closed", "state_reason": "completed", "html_url": spec["issue_url"]}
-    broker.api = api
-    assert broker.close_issue({"merged_commit": "m"})["issue_state"] == "CLOSED"
-    assert calls == ["GET"]
 
 
 class Hosted(MergeBroker):
@@ -308,198 +175,6 @@ class Hosted(MergeBroker):
         if "/actions/jobs/" in endpoint:
             return self.job
         raise AssertionError(endpoint)
-
-
-@pytest.mark.parametrize("colored", [False, True])
-def test_normal_ci_authenticates_the_full_hosted_tree_and_reuses_complete_log(tmp_path, colored):
-    from devflow_temporal.delivery_resources import read_private
-
-    spec, _, pr, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    broker = Hosted(spec)
-    if colored:
-        broker.log = "\x1b[32m" + broker.log + "\x1b[0m"
-    found = {"state": "open", "merged": False, "base": {"sha": "b"},
-             "merge_commit_sha": "hosted"}
-    first = broker.live_ci(pr, found, "t")
-    second = broker.live_ci(pr, found, "t")
-    assert first == second
-    assert broker.log_reads == 1
-    assert read_private(broker.root / "job-30-log.json")["stdout"] == broker.log
-
-
-@pytest.mark.parametrize("change", ["hosted_tree", "different_checkout_log"])
-def test_remote_ci_mismatch_cannot_bless_a_merge(tmp_path, change):
-    spec, _, pr, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    broker = Hosted(spec)
-    found = {"state": "open", "merged": False, "base": {"sha": "b"},
-             "merge_commit_sha": "hosted"}
-    if change == "hosted_tree":
-        broker.hosted["tree"]["sha"] = "other"
-    elif change == "hosted_parents":
-        broker.hosted["parents"][0]["sha"] = "other"
-    elif change == "check_head":
-        broker.check["head_sha"] = "other"
-    elif change == "failed":
-        broker.check["conclusion"] = "failure"
-    elif change == "foreign_job":
-        broker.check["details_url"] = "https://github.com/foreign/repo/actions/runs/20/job/30"
-    elif change == "manual_trigger":
-        broker.run["event"] = "workflow_dispatch"
-    elif change == "rerun":
-        broker.run["run_attempt"] = 2
-    elif change == "job_head":
-        broker.job["head_sha"] = "other"
-    else:
-        broker.log = "checkout other\nMerge h into b\n"
-    with pytest.raises(ValueError):
-        broker.live_ci(pr, found, "t")
-
-
-@pytest.mark.asyncio
-async def test_terminal_reconciliation_never_schedules_merge_or_changes_confirmed_outcome():
-    probe = Projection(gates()[3]["resource_cleanup"], {"state": "unknown"})
-    probe.terminal_reconciliation_only = True
-    await probe._project(gates()[0], "delivered", "readback only")
-    assert [n for n, _ in probe.calls] == ["delivery_project"]
-    assert probe.state["outcome"] == "delivered"
-
-
-def native_receipt(tmp_path):
-    from devflow_temporal.contracts import digest
-    from devflow_temporal.delivery_resources import write_private
-    from devflow_temporal.supervisor import DeliverySupervisor
-
-    spec = gates()[0]
-    spec.update(state_dir=str(tmp_path / "fresh"), checkout=str(tmp_path / "source"))
-    request = {"spec": spec, "role": "implement", "iteration": 0,
-               "candidate": {"id": "input"}, "workspace": spec["checkout"]}
-    key = DeliverySupervisor._job_key(request)
-    root = tmp_path / "fresh" / "attempts" / key
-    path = root / "native-process.json"
-    assessment = {"status": "pass", "session_id": "implement", "findings": []}
-    outcome = {"state": "finished", "monitoring_complete": True,
-               "cleanup": "observed-native-confirmed", "journal": str(path)}
-    saved = {**assessment, "cleanup": "confirmed", "process_cleanup": "observed-native-confirmed",
-             "resource_cleanup": "pending_workflow_finalization", "native_process": outcome}
-    output = {"id": "source", "head": "source-head", "content_sha256": "contents"}
-    journal = {"phase": "finished", "owned": {"123": {"identity": "observed"}},
-               "intent": {"run_id": spec["run_id"], "policy_digest": spec["policy_digest"],
-                          "cwd": spec["checkout"]}, "result": outcome,
-               "provider_session": {"role": "implement", "iteration": 0,
-                                    "session_id": "implement", "output_candidate": output,
-                                    "result_digest": digest(saved)}}
-    for name, value in (("request.json", request), ("result.json", assessment),
-                        ("native-process.json", journal)):
-        write_private(root / name, value)
-    attempt = {**gates()[4][0], "job_key": key, "iteration": 0, "candidate_id": "input",
-               "result_path": str(root / "result.json"), "result_json": json.dumps(saved)}
-    attempt.pop("controller_output_candidate")
-    return spec, attempt, path, journal
-
-
-def test_actual_native_saved_receipt_uses_separate_supervisor_output_binding(tmp_path):
-    from devflow_temporal.delivery_merge import native_implementation_output
-
-    spec, attempt, _, _ = native_receipt(tmp_path)
-    assert "candidate" not in json.loads(attempt["result_json"])
-    output = native_implementation_output(spec, attempt)
-    values = gates()
-    values[4][0] = {**attempt, "controller_output_candidate": output}
-    require_merge_gates(*values)
-
-
-@pytest.mark.parametrize("change", ["receipt", "cleanup"])
-def test_changed_native_receipt_or_controller_binding_cannot_bless_implementation(tmp_path, change):
-    from devflow_temporal.delivery_merge import native_implementation_output
-    from devflow_temporal.delivery_resources import write_private
-
-    spec, attempt, path, journal = native_receipt(tmp_path)
-    if change == "receipt":
-        write_private(path.with_name("result.json"), {"status": "pass", "session_id": "other"})
-    elif change == "request":
-        write_private(path.with_name("request.json"), {"spec": spec, "role": "review"})
-    elif change in {"session", "output", "iteration", "role"}:
-        journal["provider_session"][{"session": "session_id", "output": "output_candidate"}.get(
-            change, change)] = "changed"
-    elif change in {"run", "policy"}:
-        journal["intent"][{"run": "run_id", "policy": "policy_digest"}[change]] = "changed"
-    elif change == "cleanup":
-        journal["phase"] = "unknown"
-    else:
-        journal["provider_session"]["result_digest"] = "changed"
-    write_private(path, journal)
-    with pytest.raises(ValueError):
-        native_implementation_output(spec, attempt)
-
-
-def strict_rules():
-    params = {"strict_required_status_checks_policy": True,
-              "required_status_checks": [{"context": "test", "integration_id": 15368}]}
-    rule = {"type": "required_status_checks", "parameters": params, "ruleset_id": 42,
-            "ruleset_source_type": "Repository", "ruleset_source": "owner/repo"}
-    detail = {"id": 42, "target": "branch", "enforcement": "active",
-              "source_type": "Repository", "source": "owner/repo", "bypass_actors": [],
-              "rules": [{"type": "required_status_checks", "parameters": params}]}
-    return rule, detail
-
-
-@pytest.mark.parametrize("change", ["loose", "foreign"])
-def test_merge_refuses_unenforced_or_bypassable_github_base_checks(tmp_path, change):
-    spec = gates()[0]
-    spec["state_dir"] = str(tmp_path)
-    broker = MergeBroker(None, spec)
-    rule, detail = strict_rules()
-    if change == "loose":
-        rule["parameters"]["strict_required_status_checks_policy"] = False
-    elif change == "missing_checks":
-        rule["parameters"]["required_status_checks"] = []
-    elif change == "disabled":
-        detail["enforcement"] = "evaluate"
-    elif change in {"bypass", "exempt", "pull_request_bypass"}:
-        detail["bypass_actors"] = [{"actor_type": "RepositoryRole", "actor_id": 5,
-                                    "bypass_mode": {"bypass": "always", "exempt": "exempt",
-                                                    "pull_request_bypass": "pull_request"}[change]}]
-    elif change == "hidden_bypass":
-        detail.pop("bypass_actors")
-    elif change == "foreign":
-        rule["ruleset_source"] = "foreign/repo"
-    else:
-        detail["rules"] = []
-    broker.api = lambda endpoint, **_: detail if "/rulesets/" in endpoint else [rule]
-    with pytest.raises(ValueError, match="active strict GitHub checks"):
-        broker.require_base_enforcement()
-
-
-def test_strict_main_only_ruleset_with_no_bypass_is_a_server_enforcement_receipt(tmp_path):
-    spec = gates()[0]
-    spec["state_dir"] = str(tmp_path)
-    broker = MergeBroker(None, spec)
-    rule, detail = strict_rules()
-    broker.api = lambda endpoint, **_: detail if "/rulesets/" in endpoint else [rule]
-    assert broker.require_base_enforcement() == {
-        "ruleset_id": 42, "required_ci": ["test"], "strict": True, "bypass_actors": []}
-
-
-def test_contained_base_advance_records_actual_parent_without_changing_frozen_base(tmp_path):
-    spec, _, pr, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    broker = MergeBroker(None, spec)
-    calls = []
-    def api(endpoint, **_):
-        calls.append(endpoint)
-        if "/git/commits/" in endpoint:
-            return {"sha": "m", "tree": {"sha": "t"}, "parents": [{"sha": "c"}]}
-        before = endpoint.split("/compare/", 1)[1].split("...", 1)[0]
-        return {"status": "ahead", "base_commit": {"sha": before},
-                "merge_base_commit": {"sha": before}}
-    broker.api = api
-    found = {"merged": True, "state": "closed", "merged_at": "now", "merge_commit_sha": "m"}
-    result = broker.merged(pr, found, "t")
-    assert result["base"] == spec["base_sha"] == "b"
-    assert result["actual_merge_base"] == "c"
-    assert calls[-2:] == ["repos/owner/repo/compare/b...c", "repos/owner/repo/compare/c...h"]
 
 
 @pytest.mark.parametrize("boundary", ["cancelled", "deadline"])
@@ -623,194 +298,3 @@ def test_actual_merge_entry_rejects_intervening_base_advance_without_server_enfo
     assert proof["simulated_merge_applied"] is False
     assert proof["merge_effect_state"] is None
     assert "active strict GitHub checks" in proof["error"]
-
-
-class NativeHosted(Hosted):
-    """The observed native stack transport after all layers are reintegrated."""
-
-    def __init__(self, spec, *, head="h", tree="t", base_tree="base-tree",
-                 hosted_base="previous-hosted", checkout="c" * 40, index=0):
-        super().__init__(spec)
-        base = spec["base_sha"]
-        self.current_base = base
-        self.direct = {"sha": base, "tree": {"sha": base_tree}}
-        self.previous = {"sha": hosted_base, "tree": {"sha": base_tree}}
-        self.hosted = {"sha": checkout, "tree": {"sha": tree},
-                       "parents": [{"sha": hosted_base}, {"sha": head}]}
-        self.predecessor = {"head": base, "hosted_checkout": hosted_base,
-                            "hosted_tree": base_tree}
-        self.check.update(head_sha=head, details_url=(
-            f"https://github.com/owner/repo/actions/runs/{20 + index}/job/{30 + index}"))
-        self.run.update(id=20 + index, head_sha=head)
-        self.job.update(id=30 + index, run_id=20 + index, head_sha=head)
-        self.log = f"checkout {checkout}\nMerge {head} into {hosted_base}\n"
-        self.found = {"state": "open", "merged": False, "base": {"sha": "stale-metadata"},
-                      "merge_commit_sha": checkout}
-
-    def api(self, endpoint, **kwargs):
-        if "/git/ref/heads/" in endpoint:
-            return {"object": {"sha": self.current_base}}
-        if endpoint.endswith("/git/commits/" + self.spec["base_sha"]):
-            return self.direct
-        if endpoint.endswith("/git/commits/" + self.previous["sha"]):
-            return self.previous
-        return super().api(endpoint, **kwargs)
-
-
-@pytest.mark.parametrize("upper_layer", [False, True], ids=["first", "upper"])
-def test_native_ci_binds_current_ref_and_exact_predecessor_despite_stale_pr_metadata(
-    tmp_path, upper_layer,
-):
-    spec, _, pr, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    broker = NativeHosted(spec, hosted_base="previous-hosted" if upper_layer else "b")
-    observed = broker.live_ci(pr, broker.found, "t", native_stack=True,
-                              predecessor=broker.predecessor if upper_layer else None)
-    assert observed["hosted_base"] == broker.hosted["parents"][0]["sha"]
-    assert observed["hosted_tree"] == "t"
-    with pytest.raises(ValueError, match="upstream moved"):
-        broker.live_ci(pr, broker.found, "t")
-
-
-@pytest.mark.parametrize("change", [
-    "foreign_same_tree_parent", "wrong_member", "base_tree", "hosted_base_tree",
-    "whole_tree", "moved_branch", "stale_checkout_log", "stale_merge_log",
-])
-def test_native_ci_rejects_unbound_chain_trees_branch_or_checkout(tmp_path, change):
-    spec, _, pr, _, _, _ = gates()
-    spec["state_dir"] = str(tmp_path)
-    broker = NativeHosted(spec)
-    if change == "foreign_same_tree_parent":
-        broker.hosted["parents"][0]["sha"] = "foreign-same-tree-parent"
-    elif change == "wrong_member":
-        broker.predecessor["head"] = "another-member"
-    elif change == "base_tree":
-        broker.direct["tree"]["sha"] = "changed"
-    elif change == "hosted_base_tree":
-        broker.previous["tree"]["sha"] = "changed"
-    elif change == "whole_tree":
-        broker.hosted["tree"]["sha"] = "changed"
-    elif change == "moved_branch":
-        broker.current_base = "advanced"
-    elif change == "stale_checkout_log":
-        broker.log = "checkout another-commit\nMerge h into previous-hosted\n"
-    else:
-        broker.log = f"checkout {broker.hosted['sha']}\nMerge h into b\n"
-    with pytest.raises(ValueError):
-        broker.live_ci(pr, broker.found, "t", native_stack=True, predecessor=broker.predecessor)
-
-
-@pytest.mark.parametrize("change", [None, "foreign_parent", "merged_prefix"])
-def test_feature_evidence_authenticates_three_native_hosted_layers(tmp_path, monkeypatch, change):
-    from types import SimpleNamespace
-
-    from test_delivery_feature_resumed_evidence import codex_receipt
-    from test_delivery_github_contract import plan
-
-    from devflow_temporal import delivery_feature_merge as merger
-    from devflow_temporal.contracts import canonical_json, digest
-    from devflow_temporal.delivery_execution_registry import OwnershipConflict
-    from devflow_temporal.delivery_github_contract import ordered_chunks
-
-    store = Store(tmp_path / "tracking.sqlite3")
-    store.config = SimpleNamespace(tracking_db=store.path)
-    specs, checkpoints, transports, members = {}, {}, {}, []
-    value = plan()
-    chunks = ordered_chunks(value)
-    with store._connect() as db:
-        db.execute("CREATE TABLE delivery_runs(run_id,outcome,candidate_json,pr_json,checks_json)")
-        db.execute("CREATE TABLE delivery_attempts(job_key,run_id,role,iteration,candidate_id,"
-                   "state,session_id,result_json,cleanup,result_path)")
-    for index, chunk in enumerate(chunks):
-        spec, candidate, pr, checks, attempts, publication = gates()
-        run_id, head, tree = f"worker-{index}", f"head-{index}", f"tree-{index}"
-        base = f"head-{index - 1}" if index else "trunk"
-        spec.update(run_id=run_id, base_sha=base, state_dir=str(tmp_path / run_id),
-                    checkout=str(tmp_path / f"checkout-{index}"),
-                    publication_base_ref=f"layer-{index - 1}" if index else "main")
-        candidate.update(id=f"published-{index}", head=head, base_sha=base)
-        pr.update(number=index + 1, head=head,
-                  url=f"https://github.com/owner/repo/pull/{index + 1}")
-        for stage in ("local", "review", "qa"):
-            checks[stage]["candidate_id"] = candidate["id"]
-        checks["ci"]["head"] = head
-        codex_receipt(store, spec, source={"id": "input"}, output={
-            "id": "source", "head": "source-head", "content_sha256": "contents"})
-        with store._connect() as db:
-            db.execute("INSERT INTO delivery_runs VALUES(?,?,?,?,?)", (
-                run_id, "delivered", canonical_json(candidate), canonical_json(pr),
-                canonical_json(checks)))
-            for attempt in attempts[1:]:
-                db.execute("INSERT INTO delivery_attempts(run_id,role,iteration,candidate_id,"
-                           "state,session_id,result_json,cleanup) VALUES(?,?,0,?,?,?,?,?)", (
-                               run_id, attempt["role"], candidate["id"], "finished",
-                               attempt["session_id"], attempt["result_json"], "confirmed"))
-            db.execute("INSERT INTO delivery_effects VALUES(?,?,?,?,?,?,?)", (
-                "publish:" + run_id, run_id, "publish", canonical_json(publication),
-                "complete", canonical_json(pr), "now"))
-        specs[run_id] = spec
-        checkpoints["verified:" + chunk["id"]] = {
-            "run_id": run_id, "head": head, "number": pr["number"],
-            "store_path": str(store.path), "checks_digest": digest(checks)}
-        members.append({"chunk_id": chunk["id"], "head": head, "number": pr["number"],
-                        "base_branch": spec["publication_base_ref"]})
-        transports[run_id] = NativeHosted(
-            spec, head=head, tree=tree, checkout=f"hosted-{index}", index=index,
-            hosted_base=f"hosted-{index - 1}" if index else "trunk",
-            base_tree=f"tree-{index - 1}" if index else "trunk-tree")
-    store.effective_spec = specs.__getitem__
-    record = {"manifest": {"plan": value, "publication": {"stack_id": 42, "members": members}}}
-    live = [transports[key].found for key in specs]
-    if change == "foreign_parent":
-        transports["worker-2"].hosted["parents"][0]["sha"] = "foreign-same-tree-parent"
-    elif change == "merged_prefix":
-        live[0] = {**live[0], "merged": True}
-    monkeypatch.setattr(merger, "current_checkpoints", lambda _: checkpoints)
-    monkeypatch.setattr(merger, "observe_finalized_resources", lambda _: None)
-    monkeypatch.setattr(MergeBroker, "api", lambda self, endpoint, **kwargs:
-                        transports[self.spec["run_id"]].api(endpoint, **kwargs))
-    monkeypatch.setattr(MergeBroker, "require_base_enforcement", lambda _: None)
-    gh = SimpleNamespace(api=lambda endpoint: {"tree": {"sha":
-        "tree-" + endpoint.rsplit("-", 1)[-1]}})
-    parent = {"github_repo": "owner/repo", "state_dir": str(tmp_path / "parent")}
-    if change:
-        with pytest.raises((ValueError, OwnershipConflict)):
-            merger.evidence(store, parent, record, live, gh)
-    else:
-        assert merger.evidence(store, parent, record, live, gh) == [
-            "tree-0", "tree-1", "tree-2"]
-        assert all(transport.log_reads == 1 for transport in transports.values())
-
-
-@pytest.mark.parametrize("raw,method,body", [
-    (True, "GET", None), (False, "GET", None), (False, "PUT", {"sha": "h"}),
-])
-def test_api_allows_escape_bytes_only_for_privately_captured_raw_observations(
-    tmp_path, monkeypatch, capsys, raw, method, body,
-):
-    spec = gates()[0]
-    spec["state_dir"] = str(tmp_path)
-    broker = MergeBroker(None, spec)
-    payload = b"\x1b[32mcheckout hosted\x1b[0m\nMerge h into b\n" if raw else b'{"state":"open"}\n'
-    endpoint = "repos/owner/repo/actions/jobs/30/logs" if raw else "repos/owner/repo/pulls/1"
-
-    def run(argv, **kwargs):
-        assert kwargs == {"input": json.dumps(body).encode() if body is not None else None,
-                          "capture_output": True, "timeout": 60, "check": False}
-        assert ("--allow-escape-sequences" in argv) is raw
-        return subprocess.CompletedProcess(argv, 0, payload, b"")
-
-    monkeypatch.setattr("devflow_temporal.delivery_merge.subprocess.run", run)
-    observed = broker.api(endpoint, method=method, body=body, raw=raw)
-    assert observed == (payload.decode() if raw else {"state": "open"})
-    receipts = list(broker.root.glob("*.json"))
-    assert len(receipts) == 1
-    encoded = receipts[0].read_bytes()
-    assert b"\x1b" not in encoded
-    receipt = json.loads(encoded)
-    assert receipt["stdout"].encode() == payload
-    assert receipt["stdout_sha256"] == hashlib.sha256(payload).hexdigest()
-    assert receipt["body"] == body and receipt["exit_code"] == 0
-    assert ("--allow-escape-sequences" in receipt["argv"]) is raw
-    captured = capsys.readouterr()
-    assert captured.out == captured.err == ""

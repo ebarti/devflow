@@ -24,8 +24,8 @@ def pending(service, monkeypatch):
     store, _request = service
     original_admit = type(store.config).admit
 
-    def historical_admit(config, request):
-        spec = original_admit(config, request)
+    def historical_admit(config, request, **kwargs):
+        spec = original_admit(config, request, **kwargs)
         spec.pop('publication_readback_version')
         spec.pop('publication_readback_seconds')
         return spec
