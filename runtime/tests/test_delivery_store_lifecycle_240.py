@@ -57,6 +57,39 @@ async def test_default_repair_public_assessment_and_admission_agree(service, mon
         assert actual.status_code == 409 and actual.json()['detail'] == preview.json()
         assert preview.json()['blockers'][0]['code'] == 'revision_changed'
         with store._connect() as db:
+            original_owner = db.execute('SELECT owner FROM claims WHERE work_id=?',
+                                        (request['work_id'],)).fetchone()[0]
+            original_repository = db.execute('SELECT repository FROM works WHERE id=?',
+                                             (request['work_id'],)).fetchone()[0]
+            db.execute("UPDATE claims SET owner='external:devflow:another' WHERE work_id=?",
+                       (request['work_id'],))
+        owner_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        owner_admission = await client.post(base + 'continue-repair', json=command,
+                                            headers=headers)
+        assert owner_admission.status_code == 409
+        assert owner_admission.json()['detail'] == owner_preview.json()
+        assert 'repair_owner_conflict' in {b['code'] for b in owner_preview.json()['blockers']}
+        with store._connect() as db:
+            assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
+                                  (command['command_id'],)).fetchone()
+            db.execute('UPDATE claims SET owner=? WHERE work_id=?',
+                       (original_owner, request['work_id']))
+            db.execute("UPDATE works SET repository='github.com/example/other' WHERE id=?",
+                       (request['work_id'],))
+        work_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        work_admission = await client.post(base + 'continue-repair', json=command,
+                                           headers=headers)
+        assert work_admission.status_code == 409
+        assert work_admission.json()['detail'] == work_preview.json()
+        assert 'repair_work_binding_unproven' in {
+            b['code'] for b in work_preview.json()['blockers']}
+        with store._connect() as db:
+            assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
+                                  (command['command_id'],)).fetchone()
+            db.execute('UPDATE works SET repository=? WHERE id=?',
+                       (original_repository, request['work_id']))
             db.execute("UPDATE delivery_attempts SET state='running' WHERE role='implement'")
         attempt_preview = await client.post(base + 'assess-transition', json={
             'kind': 'repair_continuation', 'request': command})

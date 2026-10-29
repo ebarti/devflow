@@ -254,7 +254,9 @@ The lifecycle vocabulary distinguishes pending, running, stopping, stopped,
 recovering, terminal and unknown projections. A projection or successful
 assessment is not a custody grant: the owning admission rechecks the exact
 candidate, original authority, effects, cleanup and finite budget under its
-existing fences. The transition table does not choose a route. Pause states are
+existing fences. Historical ordinary repair also checks the original work, issue
+and repository binding in both preview and admission. The transition table does
+not choose a route. Pause states are
 reserved for the pause owner; queued pause support does not prove a running
 workflow has settled. An ordinary preparation failure before plan acceptance
 cannot use implementation resume without an accepted plan. Inspect the retained

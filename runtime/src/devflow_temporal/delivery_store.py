@@ -2174,6 +2174,8 @@ class DeliveryStore:
         if finalized:
             recovery.update(original_recovery=previous_recovery, predecessor_spec=spec,
                             finalized_checkpoint=True, cleanup_digest=cleanup_digest)
+        from .delivery_policy_recovery import work_binding
+
         def observe_admission(db):
             """Check the same frozen inventory before preview and under admission custody."""
             current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
@@ -2238,15 +2240,28 @@ class DeliveryStore:
             ], lifecycle='stopped', owner_proof=(
                 True if (checkpoint and grant is None and owner and attempt_custody
                          and effect_custody) else None),
-                legacy_message='repair continuation lost its frozen run or ownership')
+                legacy_message=('repair preflight claim authority changed'
+                                if preflight and not owner
+                                else 'repair continuation lost its frozen run or ownership'))
+            try:
+                work_binding(self, spec, db)
+            except ValueError as exc:
+                from .delivery_lifecycle import RecoveryRefused
+
+                if isinstance(exc, RecoveryRefused):
+                    raise
+                require_observed_predicates('repair_continuation', 'repair_admission', {
+                    'row': dict(row), 'current': dict(current), 'claim': claim,
+                }, [{
+                    'code': 'repair_work_binding_unproven', 'satisfied': None,
+                    'missing_or_unknown_fact': 'original work, issue and repository binding',
+                    'next_action': 'inspect the original work and repository authority',
+                }], lifecycle='stopped', owner_proof=None, legacy_message=str(exc))
             return current
 
         if preflight:
-            from .delivery_policy_recovery import work_binding
-
             with self._connect() as db:
                 db.execute("BEGIN")
-                work_binding(self, spec, db)
                 observe_admission(db)
             return {**response, "preflight": True, "diagnostics": findings,
                     "lifecycle_assessment": assessment, "title_constraint_sha256": None}
