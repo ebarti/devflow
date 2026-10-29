@@ -37,7 +37,7 @@ async def test_default_repair_public_assessment_and_admission_agree(service, mon
     from devflow_temporal.delivery_api import create_app
 
     store, request = service
-    _spec, _state, command = _failed_published_repair_fixture(store, request, monkeypatch)
+    _spec, state, command = _failed_published_repair_fixture(store, request, monkeypatch)
     app = create_app(store.config.path)
     app.state.delivery.store = store
     host = store.config.dashboard_url
@@ -56,8 +56,90 @@ async def test_default_repair_public_assessment_and_admission_agree(service, mon
         actual = await client.post(base + 'continue-repair', json=stale, headers=headers)
         assert actual.status_code == 409 and actual.json()['detail'] == preview.json()
         assert preview.json()['blockers'][0]['code'] == 'revision_changed'
+        with store._connect() as db:
+            db.execute("UPDATE delivery_attempts SET state='running' WHERE role='implement'")
+        attempt_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        attempt_admission = await client.post(base + 'continue-repair', json=command,
+                                              headers=headers)
+        assert not attempt_preview.json()['eligible'], (attempt_preview.json(),
+                                                         attempt_admission.json())
+        assert attempt_admission.status_code == 409
+        assert attempt_admission.json()['detail'] == attempt_preview.json()
+        assert 'repair_attempt_custody_unknown' in {
+            b['code'] for b in attempt_preview.json()['blockers']}
+        with store._connect() as db:
+            assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
+                                  (command['command_id'],)).fetchone()
+            db.execute("UPDATE delivery_attempts SET state='finished' WHERE role='implement'")
+            db.execute("UPDATE delivery_effects SET state='unknown' WHERE kind='publish'")
+        effect_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        effect_admission = await client.post(base + 'continue-repair', json=command,
+                                             headers=headers)
+        assert not effect_preview.json()['eligible'] and effect_admission.status_code == 409
+        assert effect_admission.json()['detail'] == effect_preview.json()
+        assert 'repair_effects_unsettled' in {
+            b['code'] for b in effect_preview.json()['blockers']}
+        with store._connect() as db:
+            db.execute("UPDATE delivery_effects SET state='complete' WHERE kind='publish'")
+        state['roles'][0]['cleanup'] = 'unknown'
+        custody_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        custody_admission = await client.post(base + 'continue-repair', json=command,
+                                              headers=headers)
+        assert custody_admission.status_code == 409
+        assert custody_admission.json()['detail'] == custody_preview.json(), (
+            custody_preview.json(), custody_admission.json())
+        assert 'repair_role_custody_unknown' in {
+            b['code'] for b in custody_preview.json()['blockers']}
+        state['roles'][0]['cleanup'] = 'confirmed'
+        state['checks']['local'] = {'state': 'unknown'}
+        check_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        check_admission = await client.post(base + 'continue-repair', json=command,
+                                            headers=headers)
+        assert check_admission.status_code == 409
+        assert check_admission.json()['detail'] == check_preview.json()
+        assert 'repair_check_outcome_unknown' in {
+            b['code'] for b in check_preview.json()['blockers']}
+        del state['checks']['local']
         accepted = await client.post(base + 'continue-repair', json=command, headers=headers)
         assert accepted.status_code == 200 and accepted.json()['authorized_through_iteration'] == 4
+        replay = await client.post(base + 'continue-repair', json=command, headers=headers)
+        assert replay.status_code == 200 and replay.json() == accepted.json()
+        replay_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        assert replay_preview.json()['disposition'] == 'already_admitted'
+        conflict = {**command, 'expected_revision': command['expected_revision'] + 1}
+        conflict_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': conflict})
+        conflict_admission = await client.post(base + 'continue-repair', json=conflict,
+                                               headers=headers)
+        assert conflict_admission.status_code == 409
+        assert conflict_admission.json()['detail'] == conflict_preview.json()
+        assert conflict_preview.json()['blockers'][0]['code'] == 'command_conflict'
+        another = {**command, 'command_id': 'another-repair-grant'}
+        grant_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': another})
+        grant_admission = await client.post(base + 'continue-repair', json=another, headers=headers)
+        assert grant_admission.status_code == 409
+        assert grant_admission.json()['detail'] == grant_preview.json()
+        assert 'repair_grant_consumed' in {b['code'] for b in grant_preview.json()['blockers']}
+        with store._connect() as db:
+            assert db.execute('SELECT count(*) FROM delivery_commands WHERE command_id=?',
+                              (command['command_id'],)).fetchone()[0] == 1
+            assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
+                                  (another['command_id'],)).fetchone()
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       ('{}', command['command_id']))
+        corrupt_preview = await client.post(base + 'assess-transition', json={
+            'kind': 'repair_continuation', 'request': command})
+        corrupt_admission = await client.post(base + 'continue-repair', json=command,
+                                              headers=headers)
+        assert corrupt_admission.status_code == 409
+        assert corrupt_admission.json()['detail'] == corrupt_preview.json()
+        assert 'command_receipt_unknown' in {b['code'] for b in corrupt_preview.json()['blockers']}
 
 
 @pytest.mark.asyncio

@@ -261,8 +261,9 @@ cannot use implementation resume without an accepted plan. Inspect the retained
 intake and original custody; do not treat a missing plan or unknown cleanup as a
 completed implementation or a released owner.
 
-When an exact stopped-resume, gate-retry, or pending-publication command has
-already been admitted, assessment reports `already_admitted` rather than presenting
+When an exact ordinary repair, stopped-resume, gate-retry, or pending-publication
+command has already been admitted, assessment reports `already_admitted` rather
+than presenting
 the old receipt as a fresh grant. Replaying the same command returns its original
 receipt; reusing its ID with different inputs reports `command_conflict` and queues
 no new work. An unverified stored receipt remains unknown. Pending publication also

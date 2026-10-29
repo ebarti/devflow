@@ -1951,6 +1951,11 @@ class DeliveryStore:
                     return json.loads(prior["response_json"])
             raise ValueError("repair continuation fields do not match the contract")
         from .delivery_broker import DeliveryBroker
+        from .delivery_lifecycle import (
+            command_receipt,
+            require_observed_predicates,
+            require_transition,
+        )
         from .delivery_repair import (
             confirmed_native_cleanup,
             failed_gate_diagnostics,
@@ -1983,12 +1988,14 @@ class DeliveryStore:
         command_digest = digest({"run_id": run_id, **supplied})
         with self._connect() as db:
             prior = db.execute(
-                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
-                (command_id,),
+                "SELECT run_id,request_digest,response_json FROM delivery_commands "
+                "WHERE command_id=?", (command_id,),
             ).fetchone()
             if prior:
-                if prior["request_digest"] != command_digest:
-                    raise ValueError("command ID already belongs to different inputs")
+                receipt = command_receipt('repair_continuation', prior, run_id, command_digest)
+                if preflight:
+                    return {**json.loads(prior["response_json"]), "preflight": True,
+                            "lifecycle_assessment": receipt}
                 return json.loads(prior["response_json"])
             row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
             granted = db.execute(
@@ -1997,7 +2004,13 @@ class DeliveryStore:
         if row is None:
             raise ValueError("run ID not found")
         if granted:
-            raise ValueError("this run already received its one repair grant")
+            require_observed_predicates('repair_continuation', 'repair_admission',
+                {'row': dict(row), 'grant_present': True}, [{
+                    'code': 'repair_grant_consumed', 'satisfied': False,
+                    'missing_or_unknown_fact': 'unused original repair grant',
+                    'next_action': 'inspect the original repair admission',
+                }], lifecycle='unknown',
+                legacy_message='this run already received its one repair grant')
         spec = self.effective_spec(run_id)
         finalized = (spec.get("resource_cleanup_version") == 1
                      and row["cleanup"] == "confirmed")
@@ -2016,8 +2029,6 @@ class DeliveryStore:
         roles = state.get("roles")
         checks = state.get("checks")
         iteration = state.get("iteration")
-        from .delivery_lifecycle import require_transition
-
         facts = {
             "operation": "repair_continuation", "owner": "repair_admission",
             "owner_proof": True, "normalized_lifecycle": "stopped",
@@ -2085,22 +2096,47 @@ class DeliveryStore:
                 for role in roles
             )
         ):
-            raise ValueError("original implementer session or role cleanup is unconfirmed")
+            require_observed_predicates('repair_continuation', 'repair_admission',
+                {'row': dict(row), 'closed': closed}, [{
+                    'code': 'repair_role_custody_unknown', 'satisfied': None,
+                    'missing_or_unknown_fact': 'passed implementation session and confirmed '
+                                               'role cleanup',
+                    'next_action': 'inspect the original implementation and role custody',
+                }], lifecycle='stopped', owner_proof=None,
+                legacy_message='original implementer session or role cleanup is unconfirmed')
         for key in ("prepublish", "local", "browser_qa"):
             result = checks.get(key)
             if result is None:
                 continue
             if not isinstance(result, dict) or result.get("state") == "unknown":
-                raise ValueError("a check has an unknown outcome")
+                require_observed_predicates('repair_continuation', 'repair_admission',
+                    {'row': dict(row), 'closed': closed}, [{
+                        'code': 'repair_check_outcome_unknown', 'satisfied': None,
+                        'missing_or_unknown_fact': f'known {key} check outcome',
+                        'next_action': 'inspect the original check outcome',
+                    }], lifecycle='stopped', owner_proof=None,
+                    legacy_message='a check has an unknown outcome')
             if result.get("cleanup") == "unknown" or (
                 key == "browser_qa" and result.get("cleanup") != "confirmed"
             ):
-                raise ValueError("a check has unconfirmed cleanup")
+                require_observed_predicates('repair_continuation', 'repair_admission',
+                    {'row': dict(row), 'closed': closed}, [{
+                        'code': 'repair_check_cleanup_unknown', 'satisfied': None,
+                        'missing_or_unknown_fact': f'confirmed {key} check cleanup',
+                        'next_action': 'reconcile the original check cleanup',
+                    }], lifecycle='stopped', owner_proof=None,
+                    legacy_message='a check has unconfirmed cleanup')
             if any(
                 not isinstance(item, dict) or item.get("cleanup") != "confirmed"
                 for item in result.get("results", [])
             ):
-                raise ValueError("a check child has unconfirmed cleanup")
+                require_observed_predicates('repair_continuation', 'repair_admission',
+                    {'row': dict(row), 'closed': closed}, [{
+                        'code': 'repair_check_child_cleanup_unknown', 'satisfied': None,
+                        'missing_or_unknown_fact': f'confirmed {key} check child cleanup',
+                        'next_action': 'reconcile the original check child custody',
+                    }], lifecycle='stopped', owner_proof=None,
+                    legacy_message='a check child has unconfirmed cleanup')
         findings = failed_gate_diagnostics(state, spec)
         if not findings:
             raise ValueError("failed gate supplied no repair diagnostics")
@@ -2138,15 +2174,80 @@ class DeliveryStore:
         if finalized:
             recovery.update(original_recovery=previous_recovery, predecessor_spec=spec,
                             finalized_checkpoint=True, cleanup_digest=cleanup_digest)
+        def observe_admission(db):
+            """Check the same frozen inventory before preview and under admission custody."""
+            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            claim = self.state.claim_for(db, spec["work_id"])
+            attempts = db.execute(
+                "SELECT role,iteration,state,session_id,cleanup "
+                "FROM delivery_attempts WHERE run_id=?", (run_id,),
+            ).fetchall()
+            effects = db.execute(
+                "SELECT kind,state,observed_json FROM delivery_effects WHERE run_id=?", (run_id,),
+            ).fetchall()
+            grant = db.execute(
+                "SELECT 1 FROM delivery_repair_grants WHERE run_id=?", (run_id,),
+            ).fetchone()
+            checkpoint = (current is not None
+                and current["request_json"] == row["request_json"]
+                and current["workflow_id"] == row["workflow_id"]
+                and current["recovery_json"] == row["recovery_json"]
+                and current["phase"] == "blocked" and current["outcome"] == "blocked"
+                and current["execution_state"] == "blocked"
+                and current["cleanup"] in ({"none", "confirmed"} if stopped_claim else {"none"})
+                and current["error"] == state["error"]
+                and current["protocol_revision"] == state["revision"]
+                and current["iteration"] == iteration
+                and json.loads(current["candidate_json"] or "null") == candidate
+                and json.loads(current["pr_json"] or "null") == pr
+                and json.loads(current["checks_json"] or "{}") == checks)
+            owner = (claim is None if stopped_claim else
+                     claim is not None and claim["owner"] == f"external:devflow:{run_id}")
+            attempt_custody = (len(attempts) == len(roles)
+                and all(item["state"] == "finished" and item["cleanup"] == "confirmed"
+                        for item in attempts)
+                and sorted((item["role"], item["iteration"], item["session_id"])
+                           for item in attempts)
+                    == sorted((item["role"], item["iteration"], item["session_id"])
+                              for item in roles))
+            effect_custody = (any(item["kind"] == "publish" for item in effects)
+                and all(item["state"] == "complete" and item["observed_json"] is not None
+                        for item in effects))
+            require_observed_predicates('repair_continuation', 'repair_admission', {
+                'row': dict(row), 'current': dict(current) if current else None, 'claim': claim,
+                'attempts': [dict(item) for item in attempts],
+                'effects': [dict(item) for item in effects], 'grant_present': grant is not None,
+            }, [
+                {'code': 'repair_checkpoint_changed', 'satisfied': checkpoint,
+                 'missing_or_unknown_fact': 'unchanged stopped run and closed checkpoint',
+                 'next_action': 'inspect the retained run and closed predecessor'},
+                {'code': 'repair_grant_consumed', 'satisfied': grant is None,
+                 'missing_or_unknown_fact': 'unused original repair grant',
+                 'next_action': 'inspect the original repair admission'},
+                {'code': 'repair_owner_conflict', 'satisfied': owner,
+                 'missing_or_unknown_fact': 'original or released work claim',
+                 'next_action': 'inspect the current work owner'},
+                {'code': 'repair_attempt_custody_unknown',
+                 'satisfied': True if attempt_custody else None,
+                 'missing_or_unknown_fact': 'finished matching attempts and confirmed cleanup',
+                 'next_action': 'reconcile the original attempt custody'},
+                {'code': 'repair_effects_unsettled',
+                 'satisfied': True if effect_custody else None,
+                 'missing_or_unknown_fact': 'settled original publication and other effects',
+                 'next_action': 'reconcile the original effects'},
+            ], lifecycle='stopped', owner_proof=(
+                True if (checkpoint and grant is None and owner and attempt_custody
+                         and effect_custody) else None),
+                legacy_message='repair continuation lost its frozen run or ownership')
+            return current
+
         if preflight:
             from .delivery_policy_recovery import work_binding
 
             with self._connect() as db:
+                db.execute("BEGIN")
                 work_binding(self, spec, db)
-                claim = self.state.claim_for(db, spec["work_id"])
-                if (claim is not None if stopped_claim else
-                        claim is None or claim["owner"] != f"external:devflow:{run_id}"):
-                    raise ValueError("repair preflight claim authority changed")
+                observe_admission(db)
             return {**response, "preflight": True, "diagnostics": findings,
                     "lifecycle_assessment": assessment, "title_constraint_sha256": None}
         if finalized:
@@ -2171,66 +2272,13 @@ class DeliveryStore:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             prior = db.execute(
-                "SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?",
-                (command_id,),
+                "SELECT run_id,request_digest,response_json FROM delivery_commands "
+                "WHERE command_id=?", (command_id,),
             ).fetchone()
             if prior:
-                if prior["request_digest"] != command_digest:
-                    raise ValueError("command ID already belongs to different inputs")
+                command_receipt('repair_continuation', prior, run_id, command_digest)
                 return json.loads(prior["response_json"])
-            current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-            claim = self.state.claim_for(db, spec["work_id"])
-            attempts = db.execute(
-                "SELECT role,iteration,state,session_id,cleanup "
-                "FROM delivery_attempts WHERE run_id=?",
-                (run_id,),
-            ).fetchall()
-            effects = db.execute(
-                "SELECT kind,state,observed_json FROM delivery_effects WHERE run_id=?",
-                (run_id,),
-            ).fetchall()
-            if (
-                current is None
-                or current["request_json"] != row["request_json"]
-                or current["workflow_id"] != row["workflow_id"]
-                or current["recovery_json"] != row["recovery_json"]
-                or current["phase"] != "blocked"
-                or current["outcome"] != "blocked"
-                or current["execution_state"] != "blocked"
-                or current["cleanup"] not in (
-                    {"none", "confirmed"} if stopped_claim else {"none"}
-                )
-                or current["error"] != state["error"]
-                or current["protocol_revision"] != state["revision"]
-                or current["iteration"] != iteration
-                or json.loads(current["candidate_json"] or "null") != candidate
-                or json.loads(current["pr_json"] or "null") != pr
-                or json.loads(current["checks_json"] or "{}") != checks
-                or db.execute(
-                    "SELECT 1 FROM delivery_repair_grants WHERE run_id=?", (run_id,)
-                ).fetchone()
-                or (claim is not None if stopped_claim else
-                    claim is None or claim["owner"] != f"external:devflow:{run_id}")
-                or len(attempts) != len(roles)
-                or any(
-                    item["state"] != "finished" or item["cleanup"] != "confirmed"
-                    for item in attempts
-                )
-                or sorted(
-                    (item["role"], item["iteration"], item["session_id"])
-                    for item in attempts
-                )
-                != sorted(
-                    (item["role"], item["iteration"], item["session_id"])
-                    for item in roles
-                )
-                or not any(item["kind"] == "publish" for item in effects)
-                or any(
-                    item["state"] != "complete" or item["observed_json"] is None
-                    for item in effects
-                )
-            ):
-                raise ValueError("repair continuation lost its frozen run or ownership")
+            current = observe_admission(db)
             if stopped_claim:
                 from .delivery_policy_recovery import work_binding
 

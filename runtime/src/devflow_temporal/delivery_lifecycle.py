@@ -201,6 +201,7 @@ def command_receipt(operation: str, prior: Mapping[str, Any], run_id: str,
         response = None
     expected_phase = {
         'stopped_delivery_resume': 'repair_continuation_queued',
+        'repair_continuation': 'repair_continuation_queued',
         'recover_publication': 'publication_recovery_queued',
     }.get(operation, 'gates_retry_queued')
     intact = (same and prior['run_id'] == run_id and isinstance(response, dict)
