@@ -169,7 +169,7 @@ class GitHub:
         owner_type = "user" if parts[0] == "users" else "organization"
         selected = self.graphql(parsed.netloc, """query($owner:String!,$number:Int!){
             OWNER(login:$owner){projectV2(number:$number){id closed field(name:"Status"){
-            ... on ProjectV2SingleSelectField{id options{id name color description}}}}}}"""
+            ... on ProjectV2SingleSelectField{id options{id name}}}}}}"""
             .replace("OWNER", owner_type), owner=parts[1], number=int(parts[3]))
         project = (selected.get(owner_type) or {}).get("projectV2")
         if not project or project["closed"] or not project.get("field"):
@@ -178,17 +178,13 @@ class GitHub:
         option = next((item for item in field["options"]
                        if item["name"].casefold() == feature["status"].casefold()), None)
         if option is None:
-            # GitHub replaces this entire list. IDs preserve existing item values.
-            options = [{key: item[key] for key in ("id", "name", "color", "description")}
-                       for item in field["options"]]
-            options.append({"name": feature["status"], "color": "GRAY", "description": ""})
-            fence()
-            result = self.graphql(parsed.netloc, """mutation($input:UpdateProjectV2FieldInput!){
-                updateProjectV2Field(input:$input){projectV2Field{
-                ... on ProjectV2SingleSelectField{id options{id name}}}}}""",
-                input={"fieldId": field["id"], "singleSelectOptions": options})
-            option = next(item for item in result["updateProjectV2Field"]["projectV2Field"][
-                "options"] if item["name"] == feature["status"])
+            # Adding an option replaces the entire remote list. A local feature
+            # fence cannot protect another actor's concurrent schema changes.
+            raise ValueError(
+                f"Project {project_url} lacks configured Status option {feature['status']!r}; "
+                "configure that option in GitHub before retrying synchronization. "
+                "Item mirroring does not change Project schema."
+            )
         issue = self.command("issue", "view", feature["issue"], "--json", "id,url,state,assignees")
         if issue_key(issue["url"]) != feature["issue"]:
             raise ValueError("issue readback changed the feature binding")
