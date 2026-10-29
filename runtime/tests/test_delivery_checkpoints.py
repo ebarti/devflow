@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -9,7 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import httpx
@@ -521,7 +522,55 @@ def test_selected_session_bytes_survive_source_deletion(stopped):
 
 @pytest.mark.asyncio
 async def test_public_checkpoint_routes_require_csrf_and_return_verified_readback(stopped):
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_continuation import session_state_digest
+
     store, spec, broker, row = stopped
+    # A passed fake implementation has an unpublished commit, then separate
+    # staged, unstaged and untracked work when a check stops the delivery.
+    git(broker.checkout, "commit", "-qm", "Owned unpublished implementation")
+    (broker.checkout / "README.md").write_text("staged after implementation\n")
+    git(broker.checkout, "add", "README.md")
+    (broker.checkout / "README.md").write_text("staged plus unfinished work\n")
+    candidate = broker.candidate()
+    staged = git(broker.checkout, "diff", "--cached")
+    assert candidate["head"] != spec["base_sha"]
+    assert not git(Path(spec["origin_url"]), "for-each-ref", "refs/heads/" + spec["branch"])
+
+    state = Path(spec["state_dir"])
+    session_id = "owned-implementation-session"
+    home = state / "role-homes/implement"
+    sessions = home / "codex/sessions"
+    sessions.mkdir(parents=True, mode=0o700)
+    transcript = sessions / (session_id + ".jsonl")
+    transcript.write_text('{"fixture":"implementation transcript"}\n')
+    transcript.chmod(0o600)
+    (home / "codex/auth.json").write_text("private fixture credential")
+    session_digest = session_state_digest(home, session_id)
+    evidence = state / "evidence" / "stopped-check.xml"
+    evidence.parent.mkdir(mode=0o700)
+    evidence.write_text("<testsuite failures='1'/>\n")
+    evidence.chmod(0o600)
+    evidence_sha256 = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    job_key = digest({"owned": "passed-implementation"})
+    request = {"spec": spec, "role": "implement", "iteration": 1, "candidate": candidate}
+    write_private(state / "attempts" / job_key / "request.json", request)
+    result = {"role": "implement", "iteration": 1, "status": "pass", "candidate": candidate,
+              "session_id": session_id, "cleanup": "confirmed"}
+    checks = {"prepublish": {"state": "failed", "candidate_id": candidate["id"],
+                             "results": [{"id": "owned-check", "passed": False,
+                                          "cleanup": "confirmed", "path": str(evidence),
+                                          "sha256": evidence_sha256}]}}
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_attempts "
+                   "(job_key,run_id,role,iteration,candidate_id,state,session_id,result_json,"
+                   "cleanup) VALUES (?,?,'implement',1,?,'finished',?,?,'confirmed')",
+                   (job_key, spec["run_id"], candidate["id"], session_id, json.dumps(result)))
+        db.execute("UPDATE delivery_runs SET candidate_json=?,checks_json=? WHERE run_id=?",
+                   (json.dumps(candidate), json.dumps(checks), spec["run_id"]))
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                              (spec["run_id"],)).fetchone())
+        claim = dict(store.state.claim_for(db, spec["work_id"]))
     app = create_app(store.config.path)
     url = store.config.dashboard_url.rstrip("/")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=url) as client:
@@ -534,8 +583,12 @@ async def test_public_checkpoint_routes_require_csrf_and_return_verified_readbac
         assert response.status_code == 200, response.text
         receipt = response.json()
         assert (await client.get(path + "/" + receipt["checkpoint_id"])).json()["resumable"]
+        checkpoint = state / "checkpoints" / receipt["checkpoint_id"]
+        assert not list(checkpoint.rglob("auth.json"))
         shutil.rmtree(Path(spec["source_path"]))
         shutil.rmtree(broker.checkout)
+        shutil.rmtree(home)
+        evidence.unlink()
         response = await client.post(
             path + "/" + receipt["checkpoint_id"] + "/restore",
             json={"command_id": "http-restore", "expected_revision": row["revision"]},
@@ -543,6 +596,289 @@ async def test_public_checkpoint_routes_require_csrf_and_return_verified_readbac
         )
         assert response.status_code == 200, response.text
         assert response.json()["execution_started"] is False
+        assert response.json()["candidate"] == candidate_for(broker.checkout)
+        assert broker.candidate() == candidate
+        assert git(broker.checkout, "diff", "--cached") == staged
+        assert (broker.checkout / "README.md").read_text() == "staged plus unfinished work\n"
+        assert (broker.checkout / "owned-untracked.txt").read_text() == "recover me\n"
+        assert session_state_digest(home, session_id) == session_digest
+        assert hashlib.sha256(evidence.read_bytes()).hexdigest() == evidence_sha256
+        assert not (home / "codex/auth.json").exists()
+        with store._connect() as db:
+            assert dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                                   (spec["run_id"],)).fetchone()) == row
+            assert dict(store.state.claim_for(db, spec["work_id"])) == claim
+
+
+@pytest.mark.asyncio
+async def test_public_recovery_continues_restored_stopped_gate(stopped, monkeypatch):
+    """Recovery must use the same stopped candidate after both fixture checkouts vanish."""
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_resource_maintenance import prune
+
+    store, spec, broker, _row = stopped
+    # Keep this continuation inside its admitted source scope. The fake role and
+    # closed workflow are fixtures; source, cleanup, checkpoint and public
+    # recovery admission use their actual implementations.
+    (broker.checkout / "owned-untracked.txt").unlink()
+    (broker.checkout / ".gitignore").unlink()
+    (broker.checkout / "auth.json").unlink()
+    git(broker.checkout, "commit", "-qm", "Fixture unpublished implementation")
+    (broker.checkout / "README.md").write_text("Unfinished implementation\n")
+    candidate = broker.candidate()
+    state_dir = Path(spec["state_dir"])
+    session_id = "owned-implementation-session"
+    home = state_dir / "role-homes/implement"
+    sessions = home / "codex/sessions"
+    sessions.mkdir(mode=0o700, parents=True)
+    transcript = sessions / (session_id + ".jsonl")
+    transcript.write_text('{"owned":"fixture"}\n')
+    transcript.chmod(0o600)
+    job_key = digest({"owned": "implementation"})
+    request = {"spec": spec, "role": "implement", "iteration": 1, "candidate": candidate}
+    write_private(state_dir / "attempts" / job_key / "request.json", request)
+    implementation = {"role": "implement", "iteration": 1, "status": "pass",
+                      "session_id": session_id, "cleanup": "confirmed", "candidate": candidate}
+    cleanup = RunResources(spec).finalize("blocked")
+    assert cleanup["state"] == "confirmed", cleanup
+    checks = {"prepublish": {"state": "failed", "source_unchanged": True,
+                             "candidate_id": candidate["id"], "results": [
+                                 {"id": "packaging", "passed": False,
+                                  "cleanup": "confirmed", "exit_code": 1}]},
+              "resource_cleanup": cleanup}
+    state = {"run_id": spec["run_id"], "revision": 9, "iteration": 1, "phase": "blocked",
+             "execution_state": "blocked", "outcome": "blocked", "cleanup": "confirmed",
+             "error": "prepublication repair limit exhausted", "candidate": candidate,
+             "pull_request": None, "candidate_revision": 2, "roles": [implementation],
+             "checks": checks, "usage": {"tokens": 419, "wall_seconds": 12},
+             "findings": ["Historical packaging failure"]}
+    store.project(spec["run_id"], phase="blocked", execution_state="blocked",
+                  event_type="blocked", message=state["error"], candidate=candidate,
+                  checks=checks, usage=state["usage"], iteration=1, protocol_revision=9,
+                  outcome="blocked", cleanup="confirmed", error=state["error"])
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_attempts "
+                   "(job_key,run_id,role,iteration,candidate_id,state,session_id,result_json,"
+                   "cleanup) VALUES (?,?,'implement',1,?,'finished',?,?,'confirmed')",
+                   (job_key, spec["run_id"], candidate["id"], session_id,
+                    json.dumps(implementation)))
+        db.execute("UPDATE delivery_runs SET workflow_id=? WHERE run_id=?",
+                   ("delivery-" + spec["run_id"], spec["run_id"]))
+        store.state.release_work(db, spec["work_id"], "external:devflow:" + spec["run_id"])
+        row = dict(db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                              (spec["run_id"],)).fetchone())
+    closed = {"workflow_id": "delivery-" + spec["run_id"], "execution_run_id": "closed-original",
+              "request_digest": spec["request_digest"], "recovery_digest": None,
+              "result": state, "closed_at": "2026-01-01T00:00:00+00:00"}
+    monkeypatch.setattr(store, "_completed_temporal_result", lambda *_args, **_kw: closed)
+    monkeypatch.setattr(store, "_ensure_no_remote_pr", lambda *_: None)
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    url = store.config.dashboard_url.rstrip("/")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=url) as client:
+        headers = {"origin": url, "x-devflow-csrf": (await client.get("/api/session")).json()[
+            "csrf_token"]}
+        path = "/api/runs/" + spec["run_id"] + "/checkpoints"
+        saved = await client.post(path, headers=headers, json={
+            "command_id": "integration-save", "expected_revision": row["revision"]})
+        assert saved.status_code == 200, saved.text
+        pruned = prune(store, spec["run_id"])
+        assert any(item["path"] == str(broker.checkout) and item["state"] == "retained"
+                   for item in pruned["roots"])
+        retained = await client.get(path + "/" + saved.json()["checkpoint_id"])
+        assert retained.status_code == 200 and retained.json()["resumable"]
+        assert retained.json()["manifest_sha256"] == saved.json()["manifest_sha256"]
+        shutil.rmtree(Path(spec["source_path"]))
+        shutil.rmtree(broker.checkout)
+        shutil.rmtree(home)
+        restored = await client.post(path + "/" + saved.json()["checkpoint_id"] + "/restore",
+                                     headers=headers, json={"command_id": "integration-restore",
+                                                            "expected_revision": row["revision"]})
+        assert restored.status_code == 200, restored.text
+        assert broker.candidate() == candidate and transcript.read_text() == '{"owned":"fixture"}\n'
+        command = {"continuation_kind": "stopped_delivery_resume", "command_id": "resume-1",
+                   "expected_revision": 9, "expected_iteration": 1,
+                   "expected_candidate_id": candidate["id"],
+                   "expected_candidate_head": candidate["head"], "additional_iterations": 1}
+        admitted = await client.post("/api/runs/" + spec["run_id"] + "/continue-repair",
+                                     headers=headers, json=command)
+        assert admitted.status_code == 200, admitted.text
+        assert admitted.json()["run_id"] == spec["run_id"]
+        assert admitted.json()["authorized_through_iteration"] == 2
+        replay = await client.post("/api/runs/" + spec["run_id"] + "/continue-repair",
+                                   headers=headers, json=command)
+        assert replay.status_code == 200 and replay.json() == admitted.json()
+    with store._connect() as db:
+        current = db.execute("SELECT * FROM delivery_runs WHERE run_id=?",
+                             (spec["run_id"],)).fetchone()
+        recovery = json.loads(current["recovery_json"])
+        assert recovery["session_id"] == session_id
+        assert recovery["state"]["checks"] == checks
+        assert recovery["state"]["usage"] == state["usage"]
+        assert recovery["candidate"] == candidate
+        assert db.execute("SELECT count(*) FROM delivery_runs").fetchone()[0] == 1
+        assert store.state.claim_for(db, spec["work_id"])["owner"] == (
+            "external:devflow:" + spec["run_id"])
+        assert not db.execute("SELECT 1 FROM delivery_effects WHERE kind='publish'").fetchone()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["budget", "authority", "owner", "workspace_owner", "resource",
+                                  "writer", "branch", "source", "index"])
+async def test_public_readback_refuses_stale_custody_without_rewriting_ack(stopped, drift):
+    """A historical ACK must not advertise recovery after its current proof diverges."""
+    from devflow_temporal.delivery_writer_custody import shared
+
+    store, spec, broker, row = stopped
+    if drift == "branch":
+        git(broker.checkout, "commit", "-qm", "Owned unpublished fixture")
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    url = store.config.dashboard_url.rstrip("/")
+    path = "/api/runs/" + spec["run_id"] + "/checkpoints"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=url) as client:
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        headers = {"origin": url, "x-devflow-csrf": token}
+        saved = await client.post(path, headers=headers, json={
+            "command_id": "current-custody-save", "expected_revision": row["revision"]})
+        assert saved.status_code == 200, saved.text
+        receipt = saved.json()
+        checkpoint_path = path + "/" + receipt["checkpoint_id"]
+        assert (await client.get(checkpoint_path)).json()["resumable"]
+        if drift == "budget":
+            with store._connect() as db:
+                db.execute("UPDATE delivery_runs SET usage_json=? WHERE run_id=?",
+                           ('{"tokens":420}', spec["run_id"]))
+            reason = "checkpoint_run_state_changed"
+        elif drift == "authority":
+            with store._connect() as db:
+                db.execute("UPDATE delivery_runs SET accepted_plan_text=? WHERE run_id=?",
+                           ("A different accepted plan", spec["run_id"]))
+            reason = "checkpoint_authority_changed"
+        elif drift == "owner":
+            with store._connect() as db:
+                store.state.release_work(db, spec["work_id"], "external:devflow:" + spec["run_id"])
+            reason = "checkpoint_execution_owner_changed"
+        elif drift == "workspace_owner":
+            owner = Path(spec["state_dir"]) / "workspace-owner.git"
+            owner.rename(owner.with_name("fixture-owner-unavailable.git"))
+            reason = "checkpoint_workspace_owner_unknown"
+        elif drift == "resource":
+            registry = RunResources(spec, read_only=True)
+            resources = read_private(registry.manifest)
+            resources["roots"][str(broker.checkout)]["generation"] = 42
+            write_private(registry.manifest, resources)
+            reason = "checkpoint_resource_custody_unknown"
+        elif drift == "branch":
+            git(broker.checkout, "update-ref", "refs/heads/" + spec["branch"], spec["base_sha"])
+            reason = "checkpoint_candidate_branch_changed"
+        elif drift == "source":
+            (broker.checkout / "README.md").write_text("new unsaved stopped progress\n")
+            reason = "checkpoint_retained_source_unverified"
+        elif drift == "index":
+            git(broker.checkout, "update-index", "--assume-unchanged", "README.md")
+            reason = "checkpoint_retained_source_unverified"
+        else:
+            reason = "checkpoint_writer_custody_unknown"
+
+        with shared(spec) if drift == "writer" else nullcontext():
+            if drift == "writer":
+                (broker.checkout / "README.md").write_text("new unsaved writer progress\n")
+            observed = await client.get(checkpoint_path)
+            assert observed.status_code == 200, observed.text
+            readback = observed.json()
+            assert readback["acknowledged_resumable"] is True
+            assert readback["resumable"] is False
+            assert reason in {item["reason"] for item in readback["resume_blockers"]}
+            assert readback["manifest_sha256"] == receipt["manifest_sha256"]
+            if drift == "writer":
+                refused = await client.post(path, headers=headers, json={
+                    "command_id": "live-writer", "expected_revision": row["revision"]})
+                assert refused.status_code == 409
+        if drift == "writer":
+            assert (broker.checkout / "README.md").read_text() == "new unsaved writer progress\n"
+            return
+        if drift in {"source", "index"}:
+            assert broker.checkout.exists()
+            if drift == "source":
+                assert (broker.checkout / "README.md").read_text() == (
+                    "new unsaved stopped progress\n")
+            return
+        shutil.rmtree(broker.checkout)
+        restored = await client.post(checkpoint_path + "/restore", headers=headers, json={
+            "command_id": "stale-custody-restore", "expected_revision": row["revision"]})
+        assert restored.status_code == 409
+        assert not broker.checkout.exists()
+        with store._connect() as db:
+            assert db.execute(
+                "SELECT count(*) FROM delivery_commands WHERE command_id=?",
+                ("checkpoint-restore:stale-custody-restore",),
+            ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_public_historical_checkpoint_refuses_new_native_custody(stopped):
+    """An older ACK remains evidence when current native closure is unknown."""
+    store, spec, broker, row = stopped
+    receipt = create_checkpoint(store, spec["run_id"], "before-native", row["revision"])
+    registry = RunResources(spec, read_only=True)
+    resources = read_private(registry.manifest)
+    # Model a newly registered native journal after an existing acknowledgement.
+    resources["processes"].append(str(Path(spec["state_dir"]) / "native-process.json"))
+    write_private(registry.manifest, resources)
+    app = create_app(store.config.path)
+    url = store.config.dashboard_url.rstrip("/")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=url) as client:
+        path = "/api/runs/" + spec["run_id"] + "/checkpoints"
+        token = (await client.get("/api/session")).json()["csrf_token"]
+        headers = {"origin": url, "x-devflow-csrf": token}
+        readback = (await client.get(path + "/" + receipt["checkpoint_id"])).json()
+        assert readback["acknowledged_resumable"] is True
+        assert readback["resumable"] is False
+        assert "native_checkpoint_custody_unknown" in {
+            item["reason"] for item in readback["resume_blockers"]}
+        shutil.rmtree(broker.checkout)
+        response = await client.post(path + "/" + receipt["checkpoint_id"] + "/restore",
+                                     headers=headers, json={"command_id": "native-restore",
+                                                            "expected_revision": row["revision"]})
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "native_checkpoint_custody_unknown"
+    assert not broker.checkout.exists()
+    assert not list(broker.checkout.parent.glob(".checkpoint-restore-*"))
+    with store._connect() as db:
+        assert db.execute("SELECT 1 FROM delivery_mutations WHERE command_id=?",
+                          ("checkpoint-restore:native-restore",)).fetchone() is None
+
+
+def test_fenced_checkpoint_preserves_unknown_effect_without_restoration(stopped):
+    """A trusted fence can retain an uncertain effect but cannot replay it."""
+    store, spec, broker, row = stopped
+    with store._connect() as db:
+        db.execute("INSERT INTO delivery_effects VALUES (?,?,?,?,'pending',NULL,'now')",
+                   ("unknown-publish", spec["run_id"], "publish", "{}"))
+    fence = durable_fence(store, spec)
+    with pytest.raises(ValueError, match="authenticated pause fence"):
+        create_checkpoint(store, spec["run_id"], "unknown-without-fence", row["revision"],
+                          allow_unresolved_effects=True)
+    receipt = create_checkpoint(store, spec["run_id"], "unknown-with-fence", row["revision"],
+                                fence=fence, allow_unresolved_effects=True)
+    assert not receipt["resumable"]
+    assert receipt["resume_blockers"] == [{"scope": "delivery",
+        "reason": "external_outcome_unknown", "effect_key": "unknown-publish",
+        "kind": "publish", "state": "pending"}]
+    readback = read_checkpoint(store, spec["run_id"], receipt["checkpoint_id"])
+    assert not readback["resumable"] and readback["pending_effects"]
+    shutil.rmtree(broker.checkout)
+    with pytest.raises(ValueError, match="require reconciliation"):
+        restore_checkpoint(store, spec["run_id"], receipt["checkpoint_id"], "unknown-restore",
+                           row["revision"], fence=fence)
+    assert not broker.checkout.exists()
+    with store._connect() as db:
+        effect = db.execute("SELECT state,observed_json FROM delivery_effects "
+                            "WHERE effect_key='unknown-publish'").fetchone()
+        assert tuple(effect) == ("pending", None)
+        assert db.execute("SELECT 1 FROM delivery_mutations WHERE command_id=?",
+                          ("checkpoint-restore:unknown-restore",)).fetchone() is None
 
 
 @pytest.mark.asyncio
