@@ -766,46 +766,85 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
         raise ValueError('gate retry requires the existing trusted native execution policy')
     unpublished_error = (state.get('error') if prepublication_preparation_failed(state)
                          else 'prepublication repair limit exhausted')
-    if ((kind == PRELAUNCH_KIND and not prelaunch)
-            or (previous is not None and not (
-                renewed or published_after_recovery or prelaunch
-                or report_retry or ci_only or transient_retry or attribution_retry
-                or verification_retry or browser_artifact_retry or prerequisite_retry))
-            or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
-            or row['execution_state'] != 'blocked'
-            or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
-            or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
-            or (prelaunch and state.get('cleanup') != 'unknown')
-            or (not prelaunch and state.get('cleanup') != 'confirmed' and reconciled is None)
-            or row['error'] != state.get('error')
-            or (not (transient_retry or transient_ci or masked_exhaustion)
-                and state.get('error') not in ({'repair limit exhausted',
-                                          'required CI did not confirm this PR head'}
-                                        if report_retry
-                                        else {'required CI did not confirm this PR head'
-                                              if ci_only
-                                      else 'browser QA child cleanup is unknown'
-                                      if browser_prelaunch else
-                                      'local check process cleanup is unknown' if prelaunch
-                                      else unpublished_error
-                                      if unpublished else state.get('error')
-                                      if (controller_only or attribution_retry
-                                          or browser_artifact_retry or prerequisite_retry)
-                                      else 'repair limit exhausted'}))
-            or row['protocol_revision'] != state.get('revision')
-            or row['iteration'] != state.get('iteration')
-            or closed['request_digest'] != row['request_digest']
-            or closed['recovery_digest'] != (digest(previous) if previous else None)
-            or not implementation or (implementation.get('status') != 'pass'
-                                      and not (controller_only or attribution_retry
-                                               or browser_artifact_retry
-                                               or layout_report or verification_retry))
-            or not failed_gate
-            or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
-            or any((e['state'] != 'complete' or not e['observed_json'])
-                   and e != (browser_observation or {}).get('pending_effect') for e in effects)
-            or (claim is not None and not prelaunch)):
-        raise ValueError('gate retry requires a closed, finalized failed gate and released claim')
+    # Report the original guard's independent facts through the shared
+    # evaluator. The same snapshot is used for observation and
+    # admission, so neither surface needs to interpret English error strings.
+    from .delivery_lifecycle import lifecycle_from_row, require_observed_predicates
+
+    checkpoint_matches = not (
+        (kind == PRELAUNCH_KIND and not prelaunch)
+        or (previous is not None and not (
+            renewed or published_after_recovery or prelaunch or report_retry or ci_only
+            or transient_retry or attribution_retry or verification_retry
+            or browser_artifact_retry or prerequisite_retry))
+        or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
+        or row['execution_state'] != 'blocked'
+        or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
+        or row['error'] != state.get('error')
+        or row['protocol_revision'] != state.get('revision')
+        or row['iteration'] != state.get('iteration')
+        or closed['request_digest'] != row['request_digest']
+        or closed['recovery_digest'] != (digest(previous) if previous else None))
+    cleanup_matches = (row['cleanup'] == ('unknown' if prelaunch else 'confirmed')
+                       and ((state.get('cleanup') == 'unknown') if prelaunch else
+                            (state.get('cleanup') == 'confirmed' or reconciled is not None)))
+    verdict_matches = (
+        (transient_retry or transient_ci or masked_exhaustion
+         or state.get('error') in ({'repair limit exhausted',
+                                    'required CI did not confirm this PR head'} if report_retry
+             else {'required CI did not confirm this PR head' if ci_only
+                   else 'browser QA child cleanup is unknown' if browser_prelaunch
+                   else 'local check process cleanup is unknown' if prelaunch
+                   else unpublished_error if unpublished
+                   else state.get('error') if (controller_only or attribution_retry
+                       or browser_artifact_retry or prerequisite_retry)
+                   else 'repair limit exhausted'}))
+        and bool(implementation)
+        and (implementation.get('status') == 'pass' or controller_only or attribution_retry
+             or browser_artifact_retry or layout_report or verification_retry)
+        and failed_gate)
+    frozen_candidate = json.loads(row['candidate_json'] or 'null')
+    candidate_matches = (isinstance(frozen_candidate, dict)
+                         and not any(candidate.get(k) != frozen_candidate.get(k) for k in candidate)
+                         and frozen_candidate == state.get('candidate'))
+    attempts_settled = all(a['state'] == 'finished' and a['cleanup'] == 'confirmed'
+                           for a in attempts)
+    effects_settled = all((e['state'] == 'complete' and bool(e['observed_json']))
+                          or e == (browser_observation or {}).get('pending_effect')
+                          for e in effects)
+    released = claim is None or prelaunch
+    require_observed_predicates(kind, 'delivery_gate_retry', {'row': row, 'closed': closed}, [
+        {'code': 'gate_checkpoint_unproven', 'satisfied': checkpoint_matches,
+         'missing_or_unknown_fact': 'matching stopped run and closed predecessor',
+         'next_action': 'inspect the closed run and its retained recovery history',
+         'user_input_required': None},
+        {'code': 'gate_cleanup_unconfirmed', 'satisfied': True if cleanup_matches else None,
+         'missing_or_unknown_fact': 'confirmed cleanup or authenticated later reconciliation',
+         'next_action': 'reconcile the original cleanup and custody',
+         'user_input_required': None},
+        {'code': 'gate_candidate_changed', 'satisfied': candidate_matches,
+         'missing_or_unknown_fact': 'unchanged candidate matching the closed checkpoint',
+         'next_action': 'inspect the retained candidate and obtain fresh owner proof',
+         'user_input_required': None},
+        {'code': 'failed_gate_unproven', 'satisfied': verdict_matches,
+         'missing_or_unknown_fact': 'failed gate and its original implementation verdict',
+         'next_action': 'inspect the retained gate and implementation evidence',
+         'user_input_required': None},
+        {'code': 'gate_attempts_unsettled', 'satisfied': True if attempts_settled else None,
+         'missing_or_unknown_fact': 'finished attempts and confirmed cleanup',
+         'next_action': 'reconcile the original attempt custody',
+         'user_input_required': None},
+        {'code': 'gate_effects_unsettled', 'satisfied': True if effects_settled else None,
+         'missing_or_unknown_fact': 'settled effects with observed outcomes',
+         'next_action': 'reconcile the original effects', 'user_input_required': None},
+        {'code': 'gate_owner_conflict', 'satisfied': released,
+         'missing_or_unknown_fact': 'released work claim or allowed prelaunch custody',
+         'next_action': 'inspect and reconcile the current work owner',
+         'user_input_required': None},
+    ], lifecycle=lifecycle_from_row(row), owner_proof=(
+        True if (checkpoint_matches and cleanup_matches and candidate_matches
+                 and attempts_settled and effects_settled and released) else None),
+        legacy_message='gate retry requires a closed, finalized failed gate and released claim')
     frozen = json.loads(row['candidate_json'])
     publication = json.loads(row['pr_json'] or 'null')
     remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
@@ -822,14 +861,32 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
         and remote and remote.split()[0] == candidate['head']
         and not _git(broker.checkout, 'status', '--porcelain', '--untracked-files=no')
     )
-    if (any(candidate.get(k) != frozen.get(k) for k in candidate)
-            or frozen != state.get('candidate') or not publication_matches
-            or _git(broker.checkout, 'branch', '--show-current')
-            != (spec.get('local_branch', spec['branch']) if unpublished else spec['branch'])
-            or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
-            or _git(broker.source, 'remote', 'get-url', 'origin') != spec['origin_url']
-            or outside_scope(spec['policy'], broker._changed_paths(), checkout=broker.checkout)):
-        raise ValueError('gate retry lost unchanged owned source or exact published PR head')
+    candidate_unchanged = (not any(candidate.get(k) != frozen.get(k) for k in candidate)
+                           and frozen == state.get('candidate'))
+    repository_unchanged = (
+        _git(broker.checkout, 'branch', '--show-current')
+        == (spec.get('local_branch', spec['branch']) if unpublished else spec['branch'])
+        and _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') == spec['origin_url']
+        and _git(broker.source, 'remote', 'get-url', 'origin') == spec['origin_url']
+        and not outside_scope(spec['policy'], broker._changed_paths(), checkout=broker.checkout))
+    require_observed_predicates(kind, 'delivery_gate_retry', {
+        'row': row, 'closed': closed, 'candidate': candidate, 'publication': publication,
+    }, [
+        {'code': 'gate_candidate_changed', 'satisfied': candidate_unchanged,
+         'missing_or_unknown_fact': 'unchanged candidate matching the closed checkpoint',
+         'next_action': 'inspect the retained candidate and obtain fresh owner proof',
+         'user_input_required': None},
+        {'code': 'gate_publication_unconfirmed', 'satisfied': bool(publication_matches),
+         'missing_or_unknown_fact': 'exact unpublished or published branch and PR identity',
+         'next_action': 'reconcile the original publication and branch',
+         'user_input_required': None},
+        {'code': 'gate_repository_authority_changed', 'satisfied': repository_unchanged,
+         'missing_or_unknown_fact': 'original branch, destination and authorized source scope',
+         'next_action': 'inspect the retained repository authority and changed paths',
+         'user_input_required': None},
+    ], lifecycle=lifecycle_from_row(row), owner_proof=(
+        True if candidate_unchanged and publication_matches and repository_unchanged else None),
+        legacy_message='gate retry lost unchanged owned source or exact published PR head')
     load_execution_config(spec)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
@@ -935,8 +992,12 @@ def admit(store, run_id, payload, *, preflight=False):
         prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                            (payload['command_id'],)).fetchone()
     if prior:
-        if prior['request_digest'] != command_digest:
-            raise ValueError('command ID already belongs to different inputs')
+        from .delivery_lifecycle import command_receipt
+
+        assessment = command_receipt(kind, prior, run_id, command_digest)
+        if preflight:
+            return {**json.loads(prior['response_json']), 'preflight': True,
+                    'lifecycle_assessment': assessment}
         return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, kind, _observation=preflight)
     previous = _retained_recovery(store, run_id, seal)
@@ -986,8 +1047,9 @@ def admit(store, run_id, payload, *, preflight=False):
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                                (payload['command_id'],)).fetchone()
         if prior:
-            if prior['request_digest'] != command_digest:
-                raise ValueError('command ID already belongs to different inputs')
+            from .delivery_lifecycle import command_receipt
+
+            command_receipt(kind, prior, run_id, command_digest)
             return json.loads(prior['response_json'])
         prepared = None
         if preflight_generation == 1:

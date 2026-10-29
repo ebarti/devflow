@@ -246,3 +246,110 @@ def missing_report(stopped, monkeypatch):
         closed.update(workflow_id=workflow.fetchone()[0], recovery_digest=digest(previous))
     return store, broker, state, closed, {**request, 'command_id': 'missing-report-reassessment',
                                         'expected_revision': 23}, previous, reference
+
+
+@pytest.mark.asyncio
+async def test_public_gate_retry_rechecks_candidate_and_owner(unpublished, monkeypatch):
+    """A valid preview cannot authorize changed source or a competing owner."""
+    import copy
+
+    import httpx
+
+    from devflow_temporal import delivery_gate_retry
+    from devflow_temporal.contracts import digest
+    from devflow_temporal.delivery_api import create_app
+
+    store, broker, state, command = unpublished
+    def renew(spec, *_args):
+        renewed = copy.deepcopy(spec)
+        renewed['policy']['measured_runtime'] = 'renewed'
+        renewed['policy_digest'] = digest(renewed['policy'])
+        return renewed
+    monkeypatch.setattr(delivery_gate_retry, 'prepare_runtime', renew)
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    host = store.config.dashboard_url
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=host) as client:
+        token = (await client.get('/api/session')).json()['csrf_token']
+        headers = {'Origin': host, 'X-Devflow-CSRF': token}
+        async def assess():
+            return await client.post('/api/runs/run-1/assess-transition', json={
+                'kind': PREPUBLICATION_KIND, 'request': command})
+        assert (await assess()).json()['eligible']
+        path = broker.checkout / 'README.md'
+        original = path.read_bytes()
+        path.write_text('Changed after preflight\n')
+        changed = await assess()
+        response = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                     headers=headers)
+        assert not changed.json()['eligible']
+        assert 'gate_candidate_changed' in {b['code'] for b in changed.json()['blockers']}
+        assert response.status_code == 409 and response.json()['detail'] == changed.json()
+        path.write_bytes(original)
+        with store._connect() as db:
+            store.state.claim_work(db, broker.spec['work_id'], 'external:other', 'fixture')
+        owned = await assess()
+        response = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                     headers=headers)
+        assert not owned.json()['eligible']
+        assert 'gate_owner_conflict' in {b['code'] for b in owned.json()['blockers']}
+        assert owned.json()['proof_digest'] is None
+        assert response.status_code == 409 and response.json()['detail'] == owned.json()
+        # A diagnostic that observes this stopped subject owns a different route.
+        from devflow_temporal import delivery_native_diagnostic as diagnostic
+
+        monkeypatch.setattr(diagnostic, '_readonly', lambda value: value)
+        diagnostic_request = {
+            'command_id': 'diagnostic', 'expected_revision': state['revision'],
+            'expected_projection_revision': 0, 'expected_iteration': state['iteration'],
+            'expected_candidate_id': command['expected_candidate_id'],
+            'expected_candidate_head': command['expected_candidate_head'],
+            'expected_content_sha256': '0' * 64, 'expected_pr_number': 1,
+            'expected_pr_head': '0' * 40, 'check_id': diagnostic.CHECK_ID,
+            'expected_check_sha256': diagnostic.CHECK_SHA256,
+        }
+        diagnostic_result = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': diagnostic.KIND, 'request': diagnostic_request})
+        assert not diagnostic_result.json()['eligible']
+        assert diagnostic_result.json()['operation'] == diagnostic.KIND
+        with store._connect() as db:
+            assert not db.execute('SELECT 1 FROM delivery_gate_admissions').fetchone()
+            store.state.release_work(db, broker.spec['work_id'], 'external:other')
+        assert (await assess()).json()['eligible']
+        accepted = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                     headers=headers)
+        assert accepted.status_code == 200, accepted.text
+        replay = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                   headers=headers)
+        assert replay.json() == accepted.json()
+        replay_preview = (await assess()).json()
+        assert not replay_preview['eligible']
+        assert replay_preview['disposition'] == 'already_admitted'
+        assert replay_preview['blockers'][0]['code'] == 'already_admitted'
+        replay_preflight = await client.post('/api/runs/run-1/repair-admission-preflight',
+                                             json=command, headers=headers)
+        assert replay_preflight.json()['workflow_id'] == accepted.json()['workflow_id']
+        assert replay_preflight.json()['additional_iterations'] == 0
+        changed_command = {**command, 'expected_revision': command['expected_revision'] + 1}
+        conflict = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': PREPUBLICATION_KIND, 'request': changed_command})
+        rejected = await client.post('/api/runs/run-1/continue-repair', json=changed_command,
+                                     headers=headers)
+        assert conflict.json()['blockers'][0]['code'] == 'command_conflict'
+        assert rejected.status_code == 409 and rejected.json()['detail'] == conflict.json()
+        with store._connect() as db:
+            saved = db.execute('SELECT response_json FROM delivery_commands WHERE command_id=?',
+                               (command['command_id'],)).fetchone()[0]
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       ('{}', command['command_id']))
+        corrupt = await assess()
+        refused = await client.post('/api/runs/run-1/continue-repair',
+                                    json=command, headers=headers)
+        assert 'command_receipt_unknown' in {b['code'] for b in corrupt.json()['blockers']}
+        assert refused.status_code == 409 and refused.json()['detail'] == corrupt.json()
+        with store._connect() as db:
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       (saved, command['command_id']))
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_gate_admissions').fetchone()[0] == 1
+    assert state['error'] == 'prepublication repair limit exhausted'

@@ -5,12 +5,52 @@ The evaluator is pure and can be called again when the owner holds its lock.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from functools import partial
 from typing import Any
 
 VERSION = 1
+
+# These are observations, not ownership or execution grants.  Pause is reserved
+# for the pause owner; an unknown state never establishes safe custody.
+LIFECYCLE_STATES = frozenset({
+    'pending', 'running', 'stopping', 'stopped', 'recovering', 'terminal', 'unknown',
+})
+PAUSE_EXTENSION_STATES = frozenset({'pausing', 'paused', 'resuming'})
+
+# Route identities are explicit.  Each owner authenticates the full source
+# checkpoint and rechecks it when acquiring admission custody.  The table does
+# not infer a route from an error or authorize a transition by itself.
+TRANSITION_TABLE = {
+    kind: {'from': ('stopped',), 'to': 'recovering'} for kind in (
+        'repair_continuation', 'stopped_delivery_resume', 'published_gate_retry',
+        'prepublication_gate_retry', 'published_check_prelaunch_retry',
+        'published_ci_retry', 'published_controller_retry', 'recover_publication',
+        'retry_prelaunch', 'stopped_resource_closure', 'abandon_pending_resource_closure',
+        'published_head_validation', 'investigation_gates_only', 'amend_scope',
+    )
+}
+# Cancelled feature workers and revision-owned completed workers can be resumed
+# only when their owner supplies the additional historical authority.
+TRANSITION_TABLE['stopped_delivery_resume']['from'] = ('stopped', 'terminal')
+
+
+def lifecycle_from_row(row: Mapping[str, Any]) -> str:
+    """Describe a persisted projection without treating it as a custody proof."""
+    phase, execution, outcome = (row.get(key) for key in ('phase', 'execution_state', 'outcome'))
+    if execution == 'blocked' and phase == outcome == 'blocked':
+        return 'stopped'
+    if execution == 'terminal' and outcome in {'delivered', 'cancelled', 'failed'}:
+        return 'terminal'
+    if execution in {'stopping', 'cancelling'}:
+        return 'stopping'
+    if execution in {'queued', 'pending', 'running'}:
+        if row.get('recovery_json'):
+            return 'recovering'
+        return 'running' if execution == 'running' else 'pending'
+    return 'unknown'
 
 # Public command names only; this table never selects a recovery route or grants it.
 _NEXT_ACTIONS = {
@@ -61,7 +101,7 @@ def evaluate_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) ->
     def block(code, fact, action, authorization=False, satisfied=None):
         blockers.append({'code': code, 'owner': owner, 'missing_or_unknown_fact': fact,
                          'next_action': action, 'new_authorization_required': authorization,
-                         'satisfied': satisfied})
+                         'satisfied': satisfied, 'user_input_required': None})
 
     if facts.get('owner_proof') is not True:
         block('owner_proof_unknown', 'authenticated owner and custody proof',
@@ -97,11 +137,15 @@ def evaluate_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) ->
                 'next_action': predicate['next_action'],
                 'new_authorization_required': predicate.get('new_authorization_required', False),
                 'satisfied': predicate.get('satisfied'),
+                'user_input_required': predicate.get('user_input_required'),
             })
+    transition = TRANSITION_TABLE.get(operation)
     observed = {key: facts.get(key) for key in (
         'revision', 'iteration', 'candidate_id', 'candidate_head', 'publication_number')}
     return {'version': VERSION, 'operation': operation,
             'normalized_lifecycle': facts.get('normalized_lifecycle', 'unknown'),
+            'transition': ({'from': list(transition['from']), 'to': transition['to']}
+                           if transition is not None else None),
             'eligible': not blockers, 'observed_revision': observed['revision'],
             'candidate': {'id': observed['candidate_id'], 'head': observed['candidate_head']},
             'publication': ({'number': observed['publication_number']}
@@ -118,6 +162,75 @@ def require_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) -> 
     assessment = evaluate_transition(facts, request)
     if not assessment['eligible']:
         raise RecoveryRefused(assessment)
+    return assessment
+
+
+def require_observed_predicates(operation: str, owner: str, proof: Any,
+                                predicates: list[dict[str, Any]], *,
+                                lifecycle: str = 'unknown', owner_proof: bool | None = True,
+                                legacy_message: str | None = None
+                                ) -> dict[str, Any]:
+    """Refuse exact observed predicates in both preflight and owner admission.
+
+    This helper never substitutes a digest for custody: callers must establish
+    the authenticated observation and all owner-specific predicates themselves.
+    """
+    from .contracts import digest
+
+    try:
+        return require_transition({
+            'operation': operation, 'owner': owner, 'owner_proof': owner_proof,
+            'normalized_lifecycle': lifecycle, 'proof_digest': digest(proof),
+            'comparisons': [], 'predicates': predicates,
+        }, {})
+    except RecoveryRefused as exc:
+        if legacy_message is not None:
+            exc.args = (legacy_message,)
+        raise
+
+
+def command_receipt(operation: str, prior: Mapping[str, Any], run_id: str,
+                    request_digest: str) -> dict[str, Any]:
+    """Describe one intact prior admission; conflicting or corrupt receipts refuse."""
+    from .contracts import digest
+
+    same = prior['request_digest'] == request_digest
+    try:
+        response = json.loads(prior['response_json'])
+    except (TypeError, ValueError):
+        response = None
+    expected_phase = {
+        'stopped_delivery_resume': 'repair_continuation_queued',
+        'repair_continuation': 'repair_continuation_queued',
+        'recover_publication': 'publication_recovery_queued',
+    }.get(operation, 'gates_retry_queued')
+    intact = (same and prior['run_id'] == run_id and isinstance(response, dict)
+              and response.get('run_id') == run_id and response.get('phase') == expected_phase
+              and isinstance(response.get('workflow_id'), str) and bool(response['workflow_id']))
+    code = ('already_admitted' if intact else 'command_conflict' if not same
+            else 'command_receipt_unknown')
+    fact = ('an existing admission for these exact inputs' if intact else
+            'a command ID bound to these exact inputs' if not same else
+            'an intact saved admission receipt for this run')
+    assessment = evaluate_transition({
+        'operation': operation, 'owner': 'delivery_commands',
+        'owner_proof': True if intact or not same else None,
+        'proof_digest': digest({'run_id': prior['run_id'], 'prior': prior['request_digest'],
+                                'response': prior['response_json'], 'request': request_digest}),
+        'comparisons': [], 'predicates': [{
+            'code': code, 'satisfied': False if intact or not same else None,
+            'missing_or_unknown_fact': fact,
+            'next_action': ('inspect the existing admission' if intact else
+                            'inspect the saved command and obtain a fresh assessment'),
+            'user_input_required': False if intact else None,
+        }],
+    }, {})
+    assessment['disposition'] = code
+    if not intact:
+        exc = RecoveryRefused(assessment)
+        exc.args = ('command ID already belongs to different inputs' if not same else
+                    'stored command receipt is unavailable',)
+        raise exc
     return assessment
 
 

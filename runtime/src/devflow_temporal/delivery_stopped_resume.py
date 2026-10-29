@@ -201,7 +201,14 @@ def worker_allowance(spec, iteration, iterations, *, credit=None):
     owner = shared.token(current)
     shared.repair_allowance(owner, reference, current=True)
     if iterations > budget['maximum'] - budget['used'] + int(bool(credit)):
-        raise ValueError('feature product repair limit exhausted')
+        from .delivery_lifecycle import require_observed_predicates
+
+        require_observed_predicates(KIND, 'feature_registry', {'owner': owner, 'budget': budget}, [{
+            'code': 'product_budget_exhausted', 'satisfied': False,
+            'missing_or_unknown_fact': 'remaining authenticated feature product repair allowance',
+            'next_action': 'inspect the original feature repair allowance',
+            'new_authorization_required': True, 'user_input_required': None,
+        }], lifecycle='unknown', legacy_message='feature product repair limit exhausted')
     return {'run_id': spec['run_id'], 'owner': owner, 'receipt': reference,
             'start_iteration': iteration, 'maximum_iteration': iteration + iterations,
             **({'credit': credit} if credit else {})}
@@ -1001,19 +1008,38 @@ def _implementation_receipt(spec, role, attempt):
 
 
 def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection=None,
-               recovery=None, pending=None, quarantined=None, historical_quarantines=()):
+               recovery=None, pending=None, quarantined=None, historical_quarantines=(),
+               typed_refusal=False, lifecycle='unknown'):
     candidate = broker.candidate()
+
+    def refuse(code, fact, action, message, *, satisfied=None):
+        if typed_refusal:
+            from .delivery_lifecycle import require_observed_predicates
+
+            require_observed_predicates(KIND, 'delivery_stopped_resume', {
+                'closed_candidate': state.get('candidate'), 'current_candidate': candidate,
+            }, [{
+                'code': code, 'satisfied': satisfied, 'missing_or_unknown_fact': fact,
+                'next_action': action, 'user_input_required': None,
+            }], lifecycle=lifecycle, owner_proof=None, legacy_message=message)
+        raise ValueError(message)
+
     implementations = [r for r in state.get('roles', []) if r.get('role') == 'implement']
     latest = implementations[-1] if implementations else None
     retained_unknown = (latest is not None and pending
         and pending.get('kind') == 'unstarted_preflight'
         and digest(latest) in {p['closed_role_sha256'] for p in historical_quarantines})
     if latest and latest.get('status') != 'pass':
-        if ((latest.get('cleanup') != 'confirmed' and not (quarantined or retained_unknown))
-                or (latest.get('candidate') != candidate
-                    and not _historical_candidate(
-                        broker, state, candidate, latest, recovery, pending))):
-            raise ValueError('blocked implementation source or session is unconfirmed')
+        if latest.get('cleanup') != 'confirmed' and not (quarantined or retained_unknown):
+            refuse('stopped_implementation_cleanup_unknown',
+                   'confirmed blocked implementation cleanup or its exact quarantine',
+                   'reconcile the original implementation custody',
+                   'blocked implementation source or session is unconfirmed')
+        if (latest.get('candidate') != candidate
+                and not _historical_candidate(broker, state, candidate, latest, recovery, pending)):
+            refuse('stopped_candidate_changed', 'unchanged or authenticated historical candidate',
+                   'inspect the retained candidate and obtain fresh owner proof',
+                   'blocked implementation source or session is unconfirmed')
         matches = [a for a in attempts if a['role'] == 'implement'
                    and a['iteration'] == latest['iteration']
                    and a['session_id'] == latest['session_id']
@@ -1027,35 +1053,54 @@ def _candidate(broker, state, attempts, *, missing_rollout=None, input_rejection
         # A closed Temporal activity authenticates controller-only preparation failures.
         # Every provider or supervisor prelaunch receipt must also match its durable attempt.
         if len(matches) != 1 and not no_provider and not (quarantined or retained_unknown):
-            raise ValueError('blocked implementation lacks its exact supervisor receipt')
+            refuse('stopped_implementation_receipt_unproven',
+                   'one exact supervisor receipt for the blocked implementation',
+                   'inspect the original implementation attempt and receipt',
+                   'blocked implementation lacks its exact supervisor receipt')
         if latest.get('session_id') is None and not no_provider and (
                 latest.get('finish_reason') != 'prelaunch'
                 and not (missing_rollout or input_rejection or quarantined or retained_unknown)):
-            raise ValueError('blocked implementation has no authenticated launch outcome')
+            refuse('stopped_launch_outcome_unproven',
+                   'authenticated prelaunch or provider outcome for the blocked implementation',
+                   'inspect the original launch and provider custody',
+                   'blocked implementation has no authenticated launch outcome')
     elif candidate != state.get('candidate'):
-        raise ValueError('stopped candidate changed after its sealed checkpoint')
-    if (any((r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown')
-            and not (quarantined and r is latest)
-            and digest(r) not in {p['closed_role_sha256'] for p in historical_quarantines}
-            for r in state.get('roles', []))
-            or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)):
-        raise ValueError('stopped role ownership is unknown')
+        refuse('stopped_candidate_changed', 'unchanged candidate at the closed checkpoint',
+               'inspect the retained candidate and obtain fresh owner proof',
+               'stopped candidate changed after its sealed checkpoint', satisfied=False)
+    if any((r.get('cleanup') != 'confirmed' or r.get('finish_reason') == 'recovery_unknown')
+           and not (quarantined and r is latest)
+           and digest(r) not in {p['closed_role_sha256'] for p in historical_quarantines}
+           for r in state.get('roles', [])):
+        refuse('stopped_role_cleanup_unknown', 'confirmed role cleanup or exact quarantine',
+               'reconcile the original role custody', 'stopped role ownership is unknown')
+    if any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts):
+        refuse('stopped_attempt_custody_unknown', 'finished attempts and confirmed cleanup',
+               'reconcile the original attempt custody', 'stopped role ownership is unknown')
     sessions = {r.get('session_id') for r in implementations if r.get('session_id')}
     if len(sessions) > 1:
-        raise ValueError('original implementation session changed')
+        refuse('stopped_session_conflict', 'one original implementation session',
+               'inspect the retained implementation session history',
+               'original implementation session changed', satisfied=False)
     if not sessions and any(a['role'] == 'implement' and a['session_id'] for a in attempts):
-        raise ValueError('unrecorded implementation session exists')
+        refuse('stopped_session_unrecorded', 'matching role and attempt session identity',
+               'inspect the retained role and attempt session evidence',
+               'unrecorded implementation session exists', satisfied=False)
     changed = broker._changed_paths(broker.spec['base_sha'])
     from .delivery_source_scope import outside_scope
 
     if outside_scope(broker.spec['policy'], changed, checkout=broker.checkout):
-        raise ValueError('stopped source escaped its frozen scope')
+        refuse('stopped_scope_changed', 'source paths within the original authorized scope',
+               'inspect changed paths and the original scope authority',
+               'stopped source escaped its frozen scope', satisfied=False)
     _git(broker.checkout, 'merge-base', '--is-ancestor', broker.spec['base_sha'], candidate['head'])
     if (_git(broker.checkout, 'branch', '--show-current')
             != broker.spec.get('local_branch', broker.spec['branch'])
             or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin')
             != broker.spec['origin_url']):
-        raise ValueError('stopped checkout branch or origin changed')
+        refuse('stopped_repository_changed', 'original checkout branch and push destination',
+               'inspect the original repository and branch authority',
+               'stopped checkout branch or origin changed', satisfied=False)
     return candidate, next(iter(sessions), None)
 
 
@@ -1108,25 +1153,75 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observati
             raise ValueError('stopped worker cleanup belongs to a different closed execution')
         cleanup_authority = authenticated
     state_checks, row_checks = closed_checks(row, state, cleanup_authority)
-    if (row['phase'] not in stopped or row['outcome'] != row['phase']
-            or row['execution_state'] != expected_execution or row['cleanup'] != 'confirmed'
-            or state.get('run_id') != run_id or state.get('phase') != row['phase']
-            or state.get('outcome') != row['outcome']
-            or (state.get('cleanup') != 'confirmed' and cleanup_authority is None)
-            or state.get('execution_state') != expected_execution
-            or closed.get('workflow_id') != predecessor_id
-            or state.get('candidate') != json.loads(row['candidate_json'] or 'null')
-            or state_checks != row_checks
-            or state.get('pull_request') != json.loads(row['pr_json'] or 'null')
-            or state.get('revision') != row['protocol_revision']
-            or state.get('iteration') != row['iteration'] or state.get('error') != row['error']
-            or closed['request_digest'] != row['request_digest']
-            or closed['recovery_digest'] != (digest(previous) if previous else None)
-            or claim is not None
-            or any(e['state'] != 'complete' or e['observed_json'] is None for e in effects)):
-        raise ValueError('resume requires a closed finalized delivery with released ownership')
-    if not isinstance(spec.get('accepted_plan'), str) or not spec['accepted_plan'].strip():
-        raise ValueError('implementation resume requires an accepted plan')
+    # Keep the closed verdict immutable while reporting later custody facts
+    # separately.  These are exactly the facts checked by the original guard.
+    from .delivery_lifecycle import (
+        RecoveryRefused,
+        lifecycle_from_row,
+        require_observed_predicates,
+    )
+
+    status_matches = (row['phase'] in stopped and row['outcome'] == row['phase']
+        and row['execution_state'] == expected_execution and state.get('run_id') == run_id
+        and state.get('phase') == row['phase'] and state.get('outcome') == row['outcome']
+        and state.get('execution_state') == expected_execution)
+    cleanup_matches = (row['cleanup'] == 'confirmed'
+                       and (state.get('cleanup') == 'confirmed' or cleanup_authority is not None))
+    identity_matches = (closed.get('workflow_id') == predecessor_id
+        and closed['request_digest'] == row['request_digest']
+        and closed['recovery_digest'] == (digest(previous) if previous else None))
+    checkpoint_matches = (state.get('candidate') == json.loads(row['candidate_json'] or 'null')
+        and state_checks == row_checks
+        and state.get('pull_request') == json.loads(row['pr_json'] or 'null')
+        and state.get('revision') == row['protocol_revision']
+        and state.get('iteration') == row['iteration'] and state.get('error') == row['error'])
+    plan_available = (isinstance(spec.get('accepted_plan'), str)
+                      and bool(spec['accepted_plan'].strip()))
+    effects_settled = all(e['state'] == 'complete' and e['observed_json'] is not None
+                          for e in effects)
+    try:
+        require_observed_predicates(
+            KIND, 'delivery_stopped_resume', {'row': row, 'closed': closed}, [
+            {'code': 'stopped_state_unproven', 'satisfied': status_matches,
+             'missing_or_unknown_fact': 'matching stopped or supported terminal run state',
+             'next_action': 'inspect the retained run and closed predecessor',
+             'user_input_required': None},
+            {'code': 'stopped_cleanup_unconfirmed', 'satisfied': True if cleanup_matches else None,
+             'missing_or_unknown_fact': 'confirmed cleanup or authenticated later reconciliation',
+             'next_action': 'reconcile the original cleanup and custody',
+             'user_input_required': None},
+            {'code': 'stopped_predecessor_unproven', 'satisfied': identity_matches,
+             'missing_or_unknown_fact': 'matching workflow, admission and recovery identities',
+             'next_action': 'inspect the closed predecessor and its original admission',
+             'user_input_required': None},
+            {'code': 'stopped_checkpoint_changed', 'satisfied': checkpoint_matches,
+             'missing_or_unknown_fact': 'unchanged candidate, checks, publication and verdict',
+             'next_action': 'inspect retained checkpoint and immutable history',
+             'user_input_required': None},
+            {'code': 'stopped_owner_conflict', 'satisfied': claim is None,
+             'missing_or_unknown_fact': 'released original work claim',
+             'next_action': 'inspect and reconcile the current work owner',
+             'user_input_required': None},
+            {'code': 'stopped_effects_unsettled', 'satisfied': True if effects_settled else None,
+             'missing_or_unknown_fact': 'settled effects with observed outcomes',
+             'next_action': 'reconcile the original effects', 'user_input_required': None},
+            {'code': 'accepted_plan_unavailable', 'satisfied': plan_available,
+             'missing_or_unknown_fact': 'original accepted plan for implementation resume',
+             'next_action': 'inspect retained intake and preparation; no implementation resume '
+                            'is authorized without an accepted plan',
+             'user_input_required': None},
+        ], lifecycle=lifecycle_from_row(row), owner_proof=(
+            True if (status_matches and cleanup_matches and identity_matches and checkpoint_matches
+                     and claim is None and effects_settled) else None),
+            legacy_message=('resume requires a closed finalized delivery with released ownership'
+                            if not (status_matches and cleanup_matches and identity_matches
+                                    and checkpoint_matches and claim is None and effects_settled)
+                            else 'implementation resume requires an accepted plan'))
+    except RecoveryRefused as exc:
+        if review_subject:
+            # Other owners must report their own operation, not a resume refusal.
+            raise ValueError(str(exc)) from exc
+        raise
     if spec.get('baseline_checks_version') in (1, 2):
         baseline = state.get('checks', {}).get('baseline', {})
         required = {check['id'] for check in spec['policy']['baseline_checks']}
@@ -1182,7 +1277,8 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observati
     candidate, session = _candidate(
         broker, state, attempts, missing_rollout=(session_custody or {}).get('missing_rollout'),
         input_rejection=(session_custody or {}).get('input_rejection'),
-        recovery=previous, pending=pending, quarantined=quarantined, historical_quarantines=history)
+        recovery=previous, pending=pending, quarantined=quarantined, historical_quarantines=history,
+        typed_refusal=not review_subject, lifecycle=lifecycle_from_row(row))
     publication = state.get('pull_request')
     if publication:
         published_identity(broker, candidate, publication)
@@ -1243,12 +1339,16 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         raise ValueError('stopped resume requires a finite exact-checkpoint command')
     command_digest = digest({'run_id': run_id, **command})
     with store._connect() as db:
-        prior = db.execute('SELECT request_digest,response_json FROM delivery_commands '
+        prior = db.execute('SELECT run_id,request_digest,response_json FROM delivery_commands '
                            'WHERE command_id=?', (command['command_id'],)).fetchone()
     if prior:
-        if prior[0] != command_digest:
-            raise ValueError('command ID already belongs to different inputs')
-        return json.loads(prior[1])
+        from .delivery_lifecycle import command_receipt
+
+        assessment = command_receipt(KIND, prior, run_id, command_digest)
+        if preflight:
+            return {**json.loads(prior['response_json']), 'preflight': True,
+                    'lifecycle_assessment': assessment}
+        return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, _revision=_revision, _observation=preflight)
     gate_only = None
     if _revision is not None:
@@ -1258,11 +1358,11 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     with store._connect() as db:
         pending = None if gate_only else pending_repair(seal, db=db)
     ci_findings = None if gate_only else sealed_ci_findings(seal)
-    from .delivery_lifecycle import require_same_proof, require_transition
+    from .delivery_lifecycle import lifecycle_from_row, require_same_proof, require_transition
 
     lifecycle_assessment = require_transition({
         'operation': KIND, 'owner': 'delivery_stopped_resume', 'owner_proof': True,
-        'normalized_lifecycle': 'stopped', 'proof_digest': digest(seal),
+        'normalized_lifecycle': lifecycle_from_row(seal['row']), 'proof_digest': digest(seal),
         'revision': seal['state']['revision'],
         'iteration': seal['state']['iteration'], 'candidate_id': seal['candidate']['id'],
         'candidate_head': seal['candidate']['head'],
@@ -1271,15 +1371,28 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     interrupted = None if _revision is not None or pending else interrupted_resume(seal)
     if interrupted and interrupted['additional_iterations'] != command['additional_iterations']:
         interrupted = None
-    if command['additional_iterations'] == 0 and not (pending or gate_only or interrupted):
-        raise ValueError('zero additional iterations require an authenticated pending repair '
-                         'or an interrupted iteration')
-    if seal.get('quarantined_implementation') and command['additional_iterations'] == 0:
-        raise ValueError('unknown implementation requires a separately authorized new iteration')
     maximum = continuation_maximum(seal['state']['iteration'],
                                    command['additional_iterations'], pending)
-    if maximum is None:
-        raise ValueError('unstarted preflight retains only its existing finite ceiling')
+    from .delivery_lifecycle import require_observed_predicates
+
+    require_observed_predicates(KIND, 'delivery_stopped_resume', seal, [
+        {'code': 'pending_repair_unproven',
+         'satisfied': (command['additional_iterations'] != 0
+                       or bool(pending or gate_only or interrupted)),
+         'missing_or_unknown_fact': 'authenticated pending repair or interrupted iteration',
+         'next_action': 'inspect the retained repair admission and original iteration',
+         'user_input_required': None},
+        {'code': 'unknown_implementation_requires_new_turn',
+         'satisfied': (not seal.get('quarantined_implementation')
+                       or command['additional_iterations'] != 0),
+         'missing_or_unknown_fact': 'separately authorized new implementation iteration',
+         'next_action': 'review the unknown implementation and its original allowance',
+         'new_authorization_required': True, 'user_input_required': True},
+        {'code': 'pending_repair_ceiling_changed', 'satisfied': maximum is not None,
+         'missing_or_unknown_fact': 'unchanged finite pending preflight ceiling',
+         'next_action': 'inspect the retained preflight admission and its ceiling',
+         'user_input_required': None},
+    ], lifecycle=lifecycle_from_row(seal['row']))
     credit = None
     if _revision is not None:
         from .delivery_feature_execution import registry
@@ -1299,7 +1412,13 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
             and not fixed_budget_allows(budget_spec, seal['state']['iteration'],
                                         command['additional_iterations'],
                                         pending=bool(pending or gate_only or interrupted))):
-        raise ValueError('a fixed repair budget cannot receive additional iterations')
+        require_observed_predicates(KIND, 'delivery_stopped_resume', seal, [{
+            'code': 'product_budget_exhausted', 'satisfied': False,
+            'missing_or_unknown_fact': 'remaining original finite product repair allowance',
+            'next_action': 'inspect the original repair budget and retained admission',
+            'new_authorization_required': True, 'user_input_required': None,
+        }], lifecycle=lifecycle_from_row(seal['row']),
+            legacy_message='a fixed repair budget cannot receive additional iterations')
     amended = scope_spec(store, seal, command)
     browser_amendment = None
     if BROWSER_FIELDS <= command.keys():
@@ -1350,12 +1469,14 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     with _lock(Path(spec['state_dir']) / 'stopped-resumes' / 'controller.lock'):
         with store._connect() as db:
             prior = db.execute(
-                'SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?',
+                'SELECT run_id,request_digest,response_json FROM delivery_commands '
+                'WHERE command_id=?',
                 (command['command_id'],)).fetchone()
         if prior:
-            if prior[0] != command_digest:
-                raise ValueError('command ID already belongs to different inputs')
-            return json.loads(prior[1])
+            from .delivery_lifecycle import command_receipt
+
+            command_receipt(KIND, prior, run_id, command_digest)
+            return json.loads(prior['response_json'])
         # Recheck all stopped readbacks after lock acquisition, before any native work.
         require_same_proof(KIND, 'delivery_stopped_resume',
                            digest(snapshot(store, run_id, _revision=_revision)), digest(seal))
