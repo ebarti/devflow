@@ -41,7 +41,20 @@ from .delivery_store import DeliveryStore, _private_directory
 from .delivery_temporal_retention import ensure_namespace_retention
 from .delivery_workflow import DeliveryWorkflow
 from .payload import payload_digest
+from .supervisor import ProcessObservationUnknown
 from .supervisor import _process_identity as _local_identity
+
+
+class ServiceObservationUnknown(ProcessObservationUnknown):
+    """A mixed stop retained custody while reporting each observed member."""
+
+    def __init__(self, results: dict[str, str], errors: dict[str, str]):
+        self.results = results
+        self.errors = errors
+        super().__init__(
+            "service stop is pending; ownership remains unknown for "
+            + ", ".join(errors)
+        )
 
 
 def _config(path: str) -> DeliveryConfig:
@@ -207,7 +220,7 @@ def _lifecycle_lock(config: DeliveryConfig, deadline: float, *, pending_stop: bo
 
 def _process_identity(pid: int) -> str | None:
     """A member's start identity, independent of the controller's locale and zone."""
-    identity = _local_identity(pid, canonical=True)
+    identity = _local_identity(pid, canonical=True, require_observation=True)
     if identity is None:
         return None
     # A different launcher may own the exited child and not have reaped it yet.
@@ -231,19 +244,28 @@ def _process_identity(pid: int) -> str | None:
 def _owned(process: dict) -> bool:
     if not isinstance(process, dict) or not isinstance(process.get("pid"), int):
         return False
-    try:
-        # Reap a directly launched child if it exited, including after SIGKILL.
-        os.waitpid(process["pid"], os.WNOHANG)
-    except ChildProcessError:
-        pass
     recorded = process.get("identity")
     if not recorded:
         return False
     live = _process_identity(process["pid"])
+    # A zombie leader still authenticates its live group descendants. Reaping
+    # it before that observation would erase the only recorded start identity.
+    observed = (live if live is not None else _local_identity(
+        process["pid"], canonical=True, require_observation=True
+    ))
     # Manifests written before identities were canonical hold the local form.
-    return live is not None and (
-        live == recorded or _local_identity(process["pid"]) == recorded
+    matched = observed is not None and (
+        observed == recorded or _local_identity(
+            process["pid"], require_observation=True
+        ) == recorded
     )
+    if live is None and matched:
+        try:
+            # Reap only a matched, settled leader after its group is observed.
+            os.waitpid(process["pid"], os.WNOHANG)
+        except ChildProcessError:
+            pass
+    return live is not None and matched
 
 
 def _free(host: str, port: int) -> bool:
@@ -302,18 +324,46 @@ def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
         raise
 
 
+def _owned_process_group(process: dict) -> int | None:
+    """Observe the group without treating a zombie's getpgid ESRCH as exit."""
+    try:
+        return os.getpgid(process["pid"])
+    except OSError:
+        # macOS getpgid cannot inspect a zombie that ps can still identify.
+        # Its group can retain live descendants, so absence needs reconciliation.
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(process["pid"]), "-o", "pgid="],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        # Recheck generation after the fallback read, before granting a signal.
+        if not _owned(process):
+            return None
+        if (result is not None and result.returncode == 0 and not result.stderr.strip()
+                and re.fullmatch(r"[1-9][0-9]*", result.stdout.strip())):
+            return int(result.stdout.strip())
+        raise ProcessObservationUnknown(
+            f"process {process['pid']} group observation is unavailable; ownership remains unknown"
+        ) from None
+
+
 def _terminate(name: str, process: dict) -> str:
     """Stop one owned member by its process group, escalating only after a grace period."""
     if not _owned(process):
         return "already_stopped_or_changed"
+    group = _owned_process_group(process)
+    if group is None:
+        return "already_stopped_or_changed"
+    if group != process["pid"]:
+        raise ValueError(
+            f"owned {name} is not its process group leader; refusing to stop it"
+        )
     try:
-        if os.getpgid(process["pid"]) != process["pid"]:
-            raise ValueError(
-                f"owned {name} is not its process group leader; refusing to stop it"
-            )
         os.killpg(process["pid"], signal.SIGTERM)
     except ProcessLookupError:
-        return "already_stopped"
+        return "termination_pending" if _owned(process) else "already_stopped"
     for _ in range(30):
         if not _owned(process):
             break
@@ -342,17 +392,35 @@ def _stop(config: DeliveryConfig, manifest: dict) -> dict:
     if recorded is None:
         recorded = _recorded_deployment(_read_manifest(config) or {})
     results = {}
+    unknown = {}
     for name in ("api", "worker", "temporal"):
         process = manifest.get("processes", {}).get(name)
         if process is None:
             continue
-        results[name] = _terminate(name, process)
-    if all(not _owned(process) for process in manifest.get("processes", {}).values()):
+        try:
+            results[name] = _terminate(name, process)
+        except ProcessObservationUnknown as exc:
+            results[name] = "observation_unknown"
+            unknown[name] = str(exc)
+    settled = not unknown
+    for name, process in manifest.get("processes", {}).items():
+        if name in unknown:
+            continue
+        try:
+            if _owned(process):
+                settled = False
+        except ProcessObservationUnknown as exc:
+            results[name] = "observation_unknown"
+            unknown[name] = str(exc)
+            settled = False
+    if settled:
         if recorded is None:
             _manifest(config).unlink(missing_ok=True)
         else:
             _write_manifest(config, {}, deployment=recorded)
         (config.state_root / "worker-ready.json").unlink(missing_ok=True)
+    if unknown:
+        raise ServiceObservationUnknown(results, unknown)
     return results
 
 
@@ -363,13 +431,13 @@ def _stopped_marker(config: DeliveryConfig) -> Path:
 
 def service_stop(config: DeliveryConfig) -> dict:
     with _lifecycle_lock(config, _deadline(config), pending_stop=True):
-        results = _stop(config, _read_manifest(config) or {"processes": {}})
-        # A supervisor's periodic start must not undo this; the next explicit
-        # start, restart or write-triggered start lifts it.
+        # Keep the owner's intent even if observation fails after a member has
+        # stopped. This marker requests a stop; it does not prove settlement.
+        # The next explicit start, restart or write-triggered start lifts it.
         descriptor = os.open(_stopped_marker(config), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump({"command": "stop", "stopped_at": time.time()}, stream)
-        return results
+            json.dump({"command": "stop", "requested_at": time.time()}, stream)
+        return _stop(config, _read_manifest(config) or {"processes": {}})
 
 
 def _registered_worker(config: DeliveryConfig, processes: dict) -> dict | None:
@@ -1123,20 +1191,37 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     manifest = _read_manifest(config)
     if args.command == "status":
+        processes = {}
+        unknown = []
+        for name, process in (manifest or {}).get("processes", {}).items():
+            try:
+                processes[name] = {**process, "running": _owned(process)}
+            except ProcessObservationUnknown as exc:
+                processes[name] = {
+                    **process, "running": None, "observation": "unknown", "error": str(exc),
+                }
+                unknown.append(name)
         print(
             json.dumps(
                 {
                     "dashboard_url": config.dashboard_url,
-                    "processes": {
-                        name: {**process, "running": _owned(process)}
-                        for name, process in (manifest or {}).get("processes", {}).items()
-                    },
+                    "processes": processes,
                 },
                 sort_keys=True,
             )
         )
+        if unknown:
+            raise ProcessObservationUnknown(
+                "service observation is incomplete; ownership remains unknown for "
+                + ", ".join(unknown)
+            )
         return
-    print(json.dumps(service_stop(config), sort_keys=True))
+    try:
+        result = service_stop(config)
+    except ServiceObservationUnknown as exc:
+        print(json.dumps(exc.results, sort_keys=True))
+        raise
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
