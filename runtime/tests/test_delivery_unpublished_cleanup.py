@@ -206,6 +206,36 @@ async def test_public_unpublished_cleanup_then_existing_finite_continuation(clos
         assert response.status_code == 200, response.text
         replay = await client.post('/api/runs/run-1/continue-repair', json=command, headers=headers)
         assert replay.json() == response.json()
+        replay_preview = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': resume.KIND, 'request': command})
+        assert replay_preview.json()['disposition'] == 'already_admitted'
+        assert replay_preview.json()['blockers'][0]['code'] == 'already_admitted'
+        replay_preflight = await client.post('/api/runs/run-1/repair-admission-preflight',
+                                             json=command, headers=headers)
+        assert replay_preflight.json()['workflow_id'] == response.json()['workflow_id']
+        assert replay_preflight.json()['authorized_through_iteration'] == (
+            response.json()['authorized_through_iteration'])
+        conflicting = {**command, 'expected_revision': command['expected_revision'] + 1}
+        preview_conflict = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': resume.KIND, 'request': conflicting})
+        conflict = await client.post('/api/runs/run-1/continue-repair', json=conflicting,
+                                     headers=headers)
+        assert preview_conflict.json()['blockers'][0]['code'] == 'command_conflict'
+        assert conflict.status_code == 409 and conflict.json()['detail'] == preview_conflict.json()
+        with store._connect() as db:
+            saved = db.execute('SELECT response_json FROM delivery_commands WHERE command_id=?',
+                               (command['command_id'],)).fetchone()[0]
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       ('{}', command['command_id']))
+        corrupt = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': resume.KIND, 'request': command})
+        rejected = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                     headers=headers)
+        assert 'command_receipt_unknown' in {b['code'] for b in corrupt.json()['blockers']}
+        assert rejected.status_code == 409 and rejected.json()['detail'] == corrupt.json()
+        with store._connect() as db:
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       (saved, command['command_id']))
         admitted = response.json()
     # Idempotent replay returns the first admission without another owner or debit.
     assert admitted['authorized_through_iteration'] == preflight['authorized_through_iteration']

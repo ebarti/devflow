@@ -322,6 +322,34 @@ async def test_public_gate_retry_rechecks_candidate_and_owner(unpublished, monke
         replay = await client.post('/api/runs/run-1/continue-repair', json=command,
                                    headers=headers)
         assert replay.json() == accepted.json()
+        replay_preview = (await assess()).json()
+        assert not replay_preview['eligible']
+        assert replay_preview['disposition'] == 'already_admitted'
+        assert replay_preview['blockers'][0]['code'] == 'already_admitted'
+        replay_preflight = await client.post('/api/runs/run-1/repair-admission-preflight',
+                                             json=command, headers=headers)
+        assert replay_preflight.json()['workflow_id'] == accepted.json()['workflow_id']
+        assert replay_preflight.json()['additional_iterations'] == 0
+        changed_command = {**command, 'expected_revision': command['expected_revision'] + 1}
+        conflict = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': PREPUBLICATION_KIND, 'request': changed_command})
+        rejected = await client.post('/api/runs/run-1/continue-repair', json=changed_command,
+                                     headers=headers)
+        assert conflict.json()['blockers'][0]['code'] == 'command_conflict'
+        assert rejected.status_code == 409 and rejected.json()['detail'] == conflict.json()
+        with store._connect() as db:
+            saved = db.execute('SELECT response_json FROM delivery_commands WHERE command_id=?',
+                               (command['command_id'],)).fetchone()[0]
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       ('{}', command['command_id']))
+        corrupt = await assess()
+        refused = await client.post('/api/runs/run-1/continue-repair',
+                                    json=command, headers=headers)
+        assert 'command_receipt_unknown' in {b['code'] for b in corrupt.json()['blockers']}
+        assert refused.status_code == 409 and refused.json()['detail'] == corrupt.json()
+        with store._connect() as db:
+            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                       (saved, command['command_id']))
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_gate_admissions').fetchone()[0] == 1
     assert state['error'] == 'prepublication repair limit exhausted'

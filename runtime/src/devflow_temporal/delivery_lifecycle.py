@@ -5,6 +5,7 @@ The evaluator is pure and can be called again when the owner holds its lock.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from functools import partial
@@ -186,6 +187,48 @@ def require_observed_predicates(operation: str, owner: str, proof: Any,
         if legacy_message is not None:
             exc.args = (legacy_message,)
         raise
+
+
+def command_receipt(operation: str, prior: Mapping[str, Any], run_id: str,
+                    request_digest: str) -> dict[str, Any]:
+    """Describe one intact prior admission; conflicting or corrupt receipts refuse."""
+    from .contracts import digest
+
+    same = prior['request_digest'] == request_digest
+    try:
+        response = json.loads(prior['response_json'])
+    except (TypeError, ValueError):
+        response = None
+    expected_phase = ('repair_continuation_queued' if operation == 'stopped_delivery_resume'
+                      else 'gates_retry_queued')
+    intact = (same and prior['run_id'] == run_id and isinstance(response, dict)
+              and response.get('run_id') == run_id and response.get('phase') == expected_phase
+              and isinstance(response.get('workflow_id'), str) and bool(response['workflow_id']))
+    code = ('already_admitted' if intact else 'command_conflict' if not same
+            else 'command_receipt_unknown')
+    fact = ('an existing admission for these exact inputs' if intact else
+            'a command ID bound to these exact inputs' if not same else
+            'an intact saved admission receipt for this run')
+    assessment = evaluate_transition({
+        'operation': operation, 'owner': 'delivery_commands',
+        'owner_proof': True if intact or not same else None,
+        'proof_digest': digest({'run_id': prior['run_id'], 'prior': prior['request_digest'],
+                                'response': prior['response_json'], 'request': request_digest}),
+        'comparisons': [], 'predicates': [{
+            'code': code, 'satisfied': False if intact or not same else None,
+            'missing_or_unknown_fact': fact,
+            'next_action': ('inspect the existing admission' if intact else
+                            'inspect the saved command and obtain a fresh assessment'),
+            'user_input_required': False if intact else None,
+        }],
+    }, {})
+    assessment['disposition'] = code
+    if not intact:
+        exc = RecoveryRefused(assessment)
+        exc.args = ('command ID already belongs to different inputs' if not same else
+                    'stored command receipt is unavailable',)
+        raise exc
+    return assessment
 
 
 def require_same_proof(operation: str, owner: str, observed_digest: str,

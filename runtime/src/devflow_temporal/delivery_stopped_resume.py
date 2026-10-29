@@ -1300,12 +1300,16 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
         raise ValueError('stopped resume requires a finite exact-checkpoint command')
     command_digest = digest({'run_id': run_id, **command})
     with store._connect() as db:
-        prior = db.execute('SELECT request_digest,response_json FROM delivery_commands '
+        prior = db.execute('SELECT run_id,request_digest,response_json FROM delivery_commands '
                            'WHERE command_id=?', (command['command_id'],)).fetchone()
     if prior:
-        if prior[0] != command_digest:
-            raise ValueError('command ID already belongs to different inputs')
-        return json.loads(prior[1])
+        from .delivery_lifecycle import command_receipt
+
+        assessment = command_receipt(KIND, prior, run_id, command_digest)
+        if preflight:
+            return {**json.loads(prior['response_json']), 'preflight': True,
+                    'lifecycle_assessment': assessment}
+        return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, _revision=_revision, _observation=preflight)
     gate_only = None
     if _revision is not None:
@@ -1426,12 +1430,14 @@ def admit(store, run_id, command, *, preflight=False, _revision=None):
     with _lock(Path(spec['state_dir']) / 'stopped-resumes' / 'controller.lock'):
         with store._connect() as db:
             prior = db.execute(
-                'SELECT request_digest,response_json FROM delivery_commands WHERE command_id=?',
+                'SELECT run_id,request_digest,response_json FROM delivery_commands '
+                'WHERE command_id=?',
                 (command['command_id'],)).fetchone()
         if prior:
-            if prior[0] != command_digest:
-                raise ValueError('command ID already belongs to different inputs')
-            return json.loads(prior[1])
+            from .delivery_lifecycle import command_receipt
+
+            command_receipt(KIND, prior, run_id, command_digest)
+            return json.loads(prior['response_json'])
         # Recheck all stopped readbacks after lock acquisition, before any native work.
         require_same_proof(KIND, 'delivery_stopped_resume',
                            digest(snapshot(store, run_id, _revision=_revision)), digest(seal))
