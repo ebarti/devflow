@@ -7,10 +7,11 @@ import hashlib
 import json
 import subprocess
 import sys
+from contextlib import AsyncExitStack
 
 import httpx
 import pytest
-from temporalio.service import RPCError, RPCStatusCode
+from temporal_test_server import local_temporal
 from test_delivery_api import api_fixture as api_fixture
 
 from devflow_temporal.contracts import canonical_json, digest
@@ -83,42 +84,56 @@ async def test_startup_preserves_retired_outbox_before_any_temporal_call(
             )
 
     class Temporal:
-        described = []
-        started = []
+        def __init__(self, client):
+            self.client = client
+            self.described = []
+            self.started = []
+            self.execution_run_id = None
 
-        def get_workflow_handle(self, workflow_id):
+        def get_workflow_handle(self, workflow_id, **kwargs):
             assert workflow_id == "delivery-native-next"
-            self.described.append(workflow_id)
-            return self
+            if not kwargs:
+                self.described.append(workflow_id)
+            return self.client.get_workflow_handle(workflow_id, **kwargs)
 
-        async def describe(self):
-            raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
-
-        async def start_workflow(self, _workflow, **kwargs):
+        async def start_workflow(self, workflow, **kwargs):
             assert kwargs["args"][0]["policy"]["execution_backend"] == "native-macos"
+            handle = await self.client.start_workflow(workflow, **kwargs)
             self.started.append(kwargs["id"])
+            self.execution_run_id = handle.first_execution_run_id
+            return handle
 
-    temporal = Temporal()
     health_calls = []
+    async with AsyncExitStack() as stack:
+        environment = (
+            await stack.enter_async_context(local_temporal()) if with_native_pending else None
+        )
+        temporal = Temporal(environment.client) if environment else None
 
-    async def healthy():
-        assert with_native_pending, "retired outbox queried Temporal health"
-        health_calls.append(True)
-        return temporal
+        async def healthy():
+            assert with_native_pending, "retired outbox queried Temporal health"
+            health_calls.append(True)
+            return temporal
 
-    monkeypatch.setattr(service, "healthy_client", healthy)
-    await service.dispatch_once()
-    assert _historical_rows(store, request["run_id"]) == before
-    assert health_calls == ([True] if with_native_pending else [])
-    assert temporal.described == (["delivery-native-next"] if with_native_pending else [])
-    assert temporal.started == (["delivery-native-next"] if with_native_pending else [])
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM delivery_mutations").fetchone()[0] == 0
-        if with_native_pending:
-            assert db.execute(
-                "SELECT state FROM delivery_outbox WHERE run_id='native-next'"
-            ).fetchone()[0] == "sent"
+        monkeypatch.setattr(service, "healthy_client", healthy)
+        await service.dispatch_once()
+        assert _historical_rows(store, request["run_id"]) == before
+        assert health_calls == ([True] if with_native_pending else [])
+        if temporal is not None:
+            assert temporal.described == ["delivery-native-next"]
+            assert temporal.started == ["delivery-native-next"]
+        with store._connect() as db:
+            assert db.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 0
+            assert db.execute("SELECT COUNT(*) FROM delivery_mutations").fetchone()[0] == 0
+            if temporal is not None:
+                assert db.execute(
+                    "SELECT state FROM delivery_outbox WHERE run_id='native-next'"
+                ).fetchone()[0] == "sent"
+                bound = db.execute(
+                    "SELECT execution_run_id FROM delivery_execution_authority "
+                    "WHERE run_id='native-next'"
+                ).fetchone()[0]
+                assert bound and bound == temporal.execution_run_id
 
 
 @pytest.mark.asyncio

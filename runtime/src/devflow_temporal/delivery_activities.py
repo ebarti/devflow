@@ -66,6 +66,21 @@ def database_contention(exc: BaseException) -> bool:
 class _DatabaseContentionInbound(ActivityInboundInterceptor):
     async def execute_activity(self, input: ExecuteActivityInput) -> Any:
         try:
+            # Only fresh ordinary histories opt in; legacy and merge workflows
+            # retain their existing protocols. SDK context selects the execution.
+            from . import delivery_execution_authority as authority
+            info = activity.info()
+            request = input.args[0] if input.args else None
+            spec = request.get("spec") if isinstance(request, dict) else None
+            if (info.workflow_type == "DevflowDeliveryWorkflow" and isinstance(spec, dict)
+                    and spec.get(authority.VERSION) == 1):
+                store = DeliveryStore(load_execution_config(spec))
+                proof = await authority.authenticate_activity(store, spec)
+                token = authority._ACTIVITY_AUTHORITY.set(proof)
+                try:
+                    return await super().execute_activity(input)
+                finally:
+                    authority._ACTIVITY_AUTHORITY.reset(token)
             return await super().execute_activity(input)
         except sqlite3.OperationalError as exc:
             if not database_contention(exc):

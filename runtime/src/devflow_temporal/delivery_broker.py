@@ -173,6 +173,9 @@ class DeliveryBroker:
         serialized = canonical_json(request)
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            from .delivery_execution_authority import require_activity_current
+
+            require_activity_current(db, self.spec["run_id"])
             saved = db.execute(
                 """SELECT kind,request_json,state,observed_json
                    FROM delivery_effects WHERE effect_key=?""",
@@ -197,6 +200,9 @@ class DeliveryBroker:
 
         with self.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            from .delivery_execution_authority import require_activity_current
+
+            require_activity_current(db, self.spec["run_id"])
             if owner := current(key):
                 owner.check(db)
             db.execute(
