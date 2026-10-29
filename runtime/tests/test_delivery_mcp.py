@@ -35,6 +35,9 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             run_operations=lambda run_id: {"operations_for": run_id},
             create_operation=lambda request: {"created": request},
             reconcile_operation=lambda operation_id: {"reconciled": operation_id},
+            pause_control=lambda run_id: {"root_id": run_id, "scope": "before_start"},
+            pause=lambda run_id, request: {"root_id": run_id, **request},
+            resume=lambda run_id, request: {"root_id": run_id, **request},
         )
 
     monkeypatch.setattr("devflow_temporal.delivery_mcp.client", lambda path: client(path, "write"))
@@ -43,6 +46,9 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
     async with create_connected_server_and_client_session(build_server(config)) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
         assert set(tools) == {
+            "get_pause_control",
+            "pause_run",
+            "resume_run",
             "get_service",
             "start_service",
             "submit_run",
@@ -71,6 +77,7 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             "continue_repair",
         }
         for name in (
+            "get_pause_control",
             "get_service",
             "list_runs",
             "get_run",
@@ -87,6 +94,8 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
             assert tools[name].annotations.destructiveHint is False
             assert tools[name].annotations.openWorldHint is False
         for name in (
+            "pause_run",
+            "resume_run",
             "start_service",
             "create_operation",
             "reconcile_operation",
@@ -162,9 +171,26 @@ async def test_official_mcp_discovery_annotations_and_service_forwarding(monkeyp
         ):
             result = await session.call_tool(name, arguments)
             assert not result.isError and json.loads(result.content[0].text) == expected
+        for name, arguments, expected in (
+            ("get_pause_control", {"run_id": "same-run"},
+             {"root_id": "same-run", "scope": "before_start"}),
+            ("pause_run", {"run_id": "same-run", "request_json":
+                           '{"operation_id":"op-pause","command_id":"pause",'
+                           '"expected_revision":1}'},
+             {"root_id": "same-run", "operation_id": "op-pause", "command_id": "pause",
+              "expected_revision": 1}),
+            ("resume_run", {"run_id": "same-run", "request_json":
+                            '{"operation_id":"op-resume","command_id":"resume",'
+                            '"expected_revision":3,"epoch":1}'},
+             {"root_id": "same-run", "operation_id": "op-resume", "command_id": "resume",
+              "expected_revision": 3, "epoch": 1}),
+        ):
+            result = await session.call_tool(name, arguments)
+            assert not result.isError and json.loads(result.content[0].text) == expected
         assert seen == [(factory, config) for factory in (
             "read", "write", "write", "write", "read", "write", "read",
             "read", "read", "read", "read", "read", "read",
+            "read", "read", "read",
         )]
 
 

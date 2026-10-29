@@ -44,6 +44,8 @@ KINDS = {
     "amend-scope": ("amend_scope", "admission"),
     "decision": ("decision", "execution"),
     "cancel": ("cancel", "execution"),
+    "pause": ("request_pause", "execution"),
+    "resume": ("request_resume", "execution"),
     "disable-limits": ("disable_delivery_limits", "execution"),
     "reconcile-tracker": ("reconcile_tracker", "execution"),
 }
@@ -65,6 +67,8 @@ NO_START = {
 def _domain_namespaces(kind):
     # These are the existing owners' command journals. A preflight is never
     # bound here, so its ID may be reused by its distinct acknowledgement.
+    if kind in {"pause", "resume"}:
+        return {"pause-commands"}
     if kind == "issue-context":
         return {"issue-context"}
     if kind in {"decision", "cancel", "disable-limits"}:
@@ -131,6 +135,9 @@ def _row(row) -> dict:
         "refused": "inspect_error",
         "failed": "inspect_error",
     }[value["state"]]
+    if (value["kind"] == "resume" and value["state"] == "pending"
+            and value["progress"] == "explicit resume required after restart"):
+        value["next_action"] = "resubmit_same_operation"
     return value
 
 
@@ -399,14 +406,22 @@ def register_operations(app, service, hostguard, mutationguard):
 
     async def resume_pending():
         with service.store._connect() as db:
+            # A resume queued but not admitted before restart must not
+            # open a pause without another explicit submission of the same
+            # operation. Running/unknown commands still reconcile by receipt.
+            db.execute(
+                "UPDATE delivery_operations SET progress=?,updated_at=? "
+                "WHERE kind='resume' AND state='pending'",
+                ("explicit resume required after restart", now()),
+            )
             rows = db.execute(
-                "SELECT operation_id,state FROM delivery_operations "
+                "SELECT operation_id,state,kind FROM delivery_operations "
                 "WHERE state IN ('pending','running')"
             ).fetchall()
         for row in rows:
-            if row["state"] == "pending":
+            if row["state"] == "pending" and row["kind"] != "resume":
                 dispatch(row["operation_id"])
-            else:
+            elif row["state"] == "running":
                 await asyncio.to_thread(_recover_abandoned, service.store, row["operation_id"])
 
     service.resume_pending_operations = resume_pending

@@ -25,6 +25,39 @@ def receipt(store, operation):
     command_id = payload.get("command_id")
     if not isinstance(command_id, str):
         return None
+    if kind in {"pause", "resume"}:
+        # A stored acknowledgement is historical evidence of intent, not a
+        # fresh observation that settlement or activation has completed.
+        keys = {"command_id", "expected_revision"} | ({"epoch"} if kind == "resume" else set())
+        revision = payload.get("expected_revision")
+        epoch = payload.get("epoch")
+        if (set(payload) != keys or not command_id or len(command_id) > 512
+                or operation.get("domain_command_id") != command_id
+                or operation.get("request_digest") != digest({
+                    "run_id": run_id, "kind": kind, "request": payload})
+                or type(revision) is not int or revision < 0
+                or (kind == "resume" and (type(epoch) is not int or epoch < 1))):
+            return None
+        expected = {"action": kind, "root_id": run_id, "expected_revision": revision}
+        if kind == "resume":
+            expected["epoch"] = epoch
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT root_id,request_digest,response_json FROM delivery_pause_commands "
+                "WHERE command_id=?", (command_id,),
+            ).fetchone()
+        if row is None or row["root_id"] != run_id or row["request_digest"] != digest(expected):
+            return None
+        response = json.loads(row["response_json"])
+        state = "pause_requested" if kind == "pause" else "resuming"
+        if (not isinstance(response, dict)
+                or set(response) != {"root_id", "state", "revision", "epoch"}
+                or response["root_id"] != run_id or response["state"] != state
+                or type(response["revision"]) is not int or response["revision"] != revision + 1
+                or type(response["epoch"]) is not int or response["epoch"] < 1
+                or (kind == "resume" and response["epoch"] != epoch)):
+            return None
+        return response
     if kind == "issue-context":
         if set(payload) != {"command_id"}:
             return None
