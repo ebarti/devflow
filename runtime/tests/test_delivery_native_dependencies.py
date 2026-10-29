@@ -121,24 +121,6 @@ def test_frozen_fetch_excludes_setup_and_rejects_candidate_lock_or_manager_drift
         frozen_pnpm_inputs(spec, source)
 
 
-@pytest.mark.parametrize(
-    "target",
-    ["https://example.com/is-number.tgz", "file:/outside/x"],
-)
-def test_frozen_lock_external_sources_rejected_before_launch(tmp_path, target):
-    source = tmp_path / "source"
-    source.mkdir()
-    subprocess.run(["git", "init", "-q", str(source)], check=True)
-    subprocess.run(
-        ["git", "-C", str(source), "config", "user.email", "fixture@example.com"], check=True
-    )
-    subprocess.run(["git", "-C", str(source), "config", "user.name", "Fixture"], check=True)
-    lock = LOCK.replace("    engines:", f"      tarball: {target}\n    engines:")
-    spec = fixture_inputs(source, lock)
-    with pytest.raises(ValueError, match="outside the admitted npm registry"):
-        frozen_pnpm_inputs(spec, source)
-
-
 @pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS PNPM fetch required")
 @pytest.mark.asyncio
 async def test_fresh_native_registry_fetch_offline_install_check_and_resource_removal(

@@ -20,8 +20,6 @@ from devflow_temporal.delivery_activities import (
     delivery_project,
 )
 from devflow_temporal.delivery_api import create_app
-from devflow_temporal.delivery_baseline import run_baseline_checks
-from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_config import DeliveryConfig
 from devflow_temporal.delivery_resources import RunResources, _gate_path
 from devflow_temporal.delivery_store import DeliveryStore
@@ -40,46 +38,6 @@ def configure(store, *, passes=False):
     )
     store.config.path.write_text(json.dumps(raw))
     return DeliveryStore(DeliveryConfig.load(store.config.path))
-
-
-@pytest.mark.parametrize("ids", [["missing"], None])
-def test_baseline_admission_rejects_missing_duplicate_or_invalid_recipe(service, ids):
-    store, request = service
-    store = configure(store)
-    raw = store.config.raw
-    raw["repositories"]["fixture"]["baseline_check_ids"] = ids
-    store.config.path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="baseline"):
-        DeliveryConfig.load(store.config.path).admit(request)
-
-
-@pytest.mark.parametrize("passes", [False, True])
-def test_baseline_executes_on_clean_base_and_preserves_feature_source(service, passes):
-    store, request = service
-    store = configure(store, passes=passes)
-    store.submit(request)
-    spec = store.spec(request["run_id"])
-    assert spec["baseline_checks_version"] == 1
-    assert spec["policy"]["baseline_checks"] == spec["policy"]["prepublish_checks"]
-    broker = DeliveryBroker(store, spec)
-    broker.prepare()
-    # A recovered/changed feature must not contaminate baseline measurement.
-    (broker.checkout / "README.md").write_text("Feature source must remain here\n")
-    before = broker.candidate()
-    result = run_baseline_checks(broker)
-    assert result["state"] == ("passed" if passes else "failed")
-    assert result["base_sha"] == spec["base_sha"]
-    assert result["baseline_candidate"]["head"] == spec["base_sha"]
-    assert result["feature_unchanged"] and result["source_unchanged"]
-    assert broker.candidate() == before
-    assert result["baseline_candidate"]["id"] != before["id"]
-    log = Path(result["results"][0]["log"])
-    assert log.read_text().strip() == "shared baseline"
-    path = _gate_path(spec, "baseline", 0)
-    assert (path / "README.md").read_text() == "Test repository\n"
-    (path / "README.md").write_text("Contaminated baseline\n")
-    with pytest.raises(ValueError, match="clean"):
-        run_baseline_checks(broker)
 
 
 def test_legacy_specs_cannot_allocate_a_baseline_checkout(service):

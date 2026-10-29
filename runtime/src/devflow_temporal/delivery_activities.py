@@ -1429,55 +1429,67 @@ async def delivery_merge(request):
 async def delivery_merge_followup(request):
     from threading import Event
 
+    from .delivery_merge_execution import activity_scope, authenticate_activity, to_thread
     from .delivery_merge_followup import step
 
     store, _ = await asyncio.to_thread(_context, request["spec"])
-    cancelled = Event()
-    try:
-        return await _with_heartbeat(asyncio.to_thread(
-            step, store, request["spec"], request["merge_authorization"], cancelled),
-            request, "merge")
-    finally:
-        cancelled.set()
+    await authenticate_activity(store, request)
+    with activity_scope(store, request):
+        cancelled = Event()
+        try:
+            return await _with_heartbeat(to_thread(
+                store, request["spec"], step, store, request["spec"],
+                request["merge_authorization"], cancelled),
+                request, "merge")
+        finally:
+            cancelled.set()
 
 
 @activity.defn(name="delivery_merge_followup_failed")
 async def delivery_merge_followup_failed(request):
+    from .delivery_merge_execution import activity_scope, authenticate_activity, to_thread
     from .delivery_merge_followup import failed
 
     store, _ = await asyncio.to_thread(_context, request["spec"])
-    return await asyncio.to_thread(failed, store, request["spec"],
-                                  request["merge_authorization"], request["reason"])
+    await authenticate_activity(store, request)
+    with activity_scope(store, request):
+        return await to_thread(store, request["spec"], failed, store, request["spec"],
+                               request["merge_authorization"], request["reason"])
 
 
 @activity.defn(name="delivery_resolve_merge_conflicts")
 async def delivery_resolve_merge_conflicts(request):
+    from .delivery_merge_execution import activity_scope, authenticate_activity, to_thread
     from .delivery_merge_followup import failed
     from .delivery_merge_resolution import resolve
 
     store, _ = await asyncio.to_thread(_context, request["spec"])
-    try:
-        return await _with_heartbeat(
-            resolve(store, request["spec"], request["merge_authorization"], request["conflict"]),
-            request, "merge_resolution",
-        )
-    except Exception as exc:
-        if isinstance(exc, (OSError, RuntimeError)):
-            with store._connect() as db:
-                pending = db.execute(
-                    "SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='merge_reconcile' "
-                    "AND state!='complete'", (request["spec"]["run_id"],),
-                ).fetchone()
-            if pending:
-                from .delivery_merge_followup import record
+    await authenticate_activity(store, request)
+    with activity_scope(store, request):
+        try:
+            return await _with_heartbeat(
+                resolve(store, request["spec"], request["merge_authorization"],
+                        request["conflict"]),
+                request, "merge_resolution",
+            )
+        except Exception as exc:
+            if isinstance(exc, (OSError, RuntimeError)):
+                with store._connect() as db:
+                    pending = db.execute(
+                        "SELECT 1 FROM delivery_effects WHERE run_id=? AND kind='merge_reconcile' "
+                        "AND state!='complete'", (request["spec"]["run_id"],),
+                    ).fetchone()
+                if pending:
+                    from .delivery_merge_followup import record
 
-                result = {"state": "pending", "reason": "resolved_target_update_readback"}
-                await asyncio.to_thread(record, store, request["spec"], "unknown", result,
-                                        f"{type(exc).__name__}: {str(exc)[:500]}")
-                return result
-        return await asyncio.to_thread(failed, store, request["spec"],
-                                      request["merge_authorization"],
-                                      f"{type(exc).__name__}: {str(exc)[:500]}")
+                    result = {"state": "pending", "reason": "resolved_target_update_readback"}
+                    await to_thread(store, request["spec"], record, store, request["spec"],
+                                    "unknown", result,
+                                    f"{type(exc).__name__}: {str(exc)[:500]}")
+                    return result
+            return await to_thread(store, request["spec"], failed, store, request["spec"],
+                                   request["merge_authorization"],
+                                   f"{type(exc).__name__}: {str(exc)[:500]}")
 
 
 @activity.defn(name="delivery_terminal_preflight")

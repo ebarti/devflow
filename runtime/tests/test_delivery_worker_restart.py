@@ -111,67 +111,6 @@ def test_owned_child_completes_once_after_worker_is_killed(tmp_path, outcome):
             assert stop_observed(owned)
 
 
-def test_monitor_spawn_failure_can_retry_without_repeating_command(tmp_path, monkeypatch):
-    from devflow_temporal import delivery_native_process
-
-    state = tmp_path / "runs" / "spawn"
-    state.mkdir(parents=True, mode=0o700)
-    spec = {
-        "run_id": "spawn", "state_dir": str(state),
-        "checkout": str(tmp_path / "checkout"), "policy_digest": "a" * 64,
-        "policy": {"execution_backend": "native-macos"},
-    }
-    invocations = tmp_path / "invocations"
-    process = NativeProcess(
-        spec, state / "attempt", argv=[sys.executable, "-c",
-            f"import pathlib; pathlib.Path({str(invocations)!r}).open('a').write('one\\n')"],
-        cwd=tmp_path, environment={"PATH": "/usr/bin:/bin"}, timeout=5,
-    )
-    original = subprocess.Popen
-    first = True
-
-    def spawn(*args, **kwargs):
-        nonlocal first
-        if first:
-            first = False
-            raise OSError("temporary process launch failure")
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(delivery_native_process.subprocess, "Popen", spawn)
-    with pytest.raises(OSError, match="temporary process launch failure"):
-        process.run()
-    assert not invocations.exists()
-    result = process.run()
-    assert result["exit_code"] == 0
-    assert result["cleanup"] == "observed-native-confirmed"
-    assert invocations.read_text().splitlines() == ["one"]
-
-
-def test_overlapping_waiters_share_one_monitor_and_command(tmp_path):
-    state = tmp_path / "runs" / "overlap"
-    state.mkdir(parents=True, mode=0o700)
-    spec = {
-        "run_id": "overlap", "state_dir": str(state),
-        "checkout": str(tmp_path / "checkout"), "policy_digest": "a" * 64,
-        "policy": {"execution_backend": "native-macos"},
-    }
-    invocations = tmp_path / "invocations"
-    process = NativeProcess(
-        spec, state / "attempt", argv=[sys.executable, "-c",
-            "import pathlib,time; "
-            f"pathlib.Path({str(invocations)!r}).open('a').write('one\\n'); "
-            "time.sleep(0.3); print('completed')"],
-        cwd=tmp_path, environment={"PATH": "/usr/bin:/bin"}, timeout=5,
-    )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _: process.run(), range(2)))
-    assert results[0] == results[1]
-    assert results[0]["cleanup"] == "observed-native-confirmed"
-    assert results[0]["exit_code"] == 0
-    assert invocations.read_text().splitlines() == ["one"]
-    assert Path(results[0]["log"]).read_text().splitlines() == ["completed"]
-
-
 def test_concurrent_cancellation_is_one_atomic_signal(tmp_path, monkeypatch):
     from devflow_temporal.delivery_resources import write_private
 

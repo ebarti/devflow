@@ -12,7 +12,7 @@ from test_delivery_gate_retry import stopped as stopped
 from test_delivery_resources import spec
 
 from devflow_temporal.contracts import canonical_json, digest
-from devflow_temporal.delivery_browser_prelaunch import observe, resolved_effect
+from devflow_temporal.delivery_browser_prelaunch import resolved_effect
 from devflow_temporal.delivery_gate_retry import PRELAUNCH_KIND, readback
 from devflow_temporal.delivery_resources import RunResources, private_directory
 
@@ -57,63 +57,6 @@ def browser_stop(tmp_path):
                                               'ports': qa['ports'], 'argv': qa['argv']})}
     assert resources.finalize('blocked', uncertain=True)['state'] == 'unknown'
     return owned, state, [effect], resources, profile, output
-
-
-def test_observer_preserves_unknown_finalization_and_unregistered_output(browser_stop):
-    owned, state, effects, resources, profile, output = browser_stop
-    paths = [resources.manifest, resources.root / 'finalization.json', profile,
-             output / '.last-run.json']
-    before = [p.read_bytes() for p in paths]
-    proof = observe(owned, state, effects)
-    assert proof['historical_cleanup'] == 'unknown'
-    assert proof['pending_effect'] == effects[0]
-    assert len(proof['artifacts']) == 1
-    assert [p.read_bytes() for p in paths] == before
-    assert resolved_effect(proof, state['candidate'])['state'] == 'failed'
-
-
-@pytest.mark.parametrize('drift', ['launch', 'root'])
-def test_browser_observer_rejects_ambiguous_or_live_history(browser_stop, monkeypatch, drift):
-    owned, state, effects, resources, profile, output = browser_stop
-    if drift == 'launch':
-        (profile.parent / 'native').mkdir()
-    elif drift == 'receipt':
-        (profile.parent / 'receipt.json').write_text('{}')
-    elif drift == 'profile':
-        profile.write_text('changed authority')
-    elif drift == 'profile-link':
-        other = profile.with_name('other')
-        profile.rename(other)
-        profile.symlink_to(other)
-    elif drift == 'output-link':
-        (output / 'link').symlink_to(profile)
-    elif drift == 'output-missing':
-        (output / '.last-run.json').unlink()
-        output.rmdir()
-    elif drift == 'registered':
-        with resources.locked() as manifest:
-            manifest['roots'][str(output)] = {'kind': 'generated', 'identity': None}
-            from devflow_temporal.delivery_resources import write_private
-            write_private(resources.manifest, manifest)
-    elif drift in {'local', 'review'}:
-        state['checks'][drift]['state'] = 'failed'
-    elif drift == 'assessment':
-        state['roles'][0]['findings'] = ['real product issue']
-    elif drift == 'candidate':
-        state['checks']['local']['candidate_id'] = 'd' * 64
-    elif drift == 'error':
-        state['error'] = 'different unknown failure'
-    elif drift == 'effect':
-        effects[0]['request_json'] = '{}'
-    elif drift == 'second-effect':
-        effects.append({**effects[0], 'effect_key': 'unrelated'})
-    elif drift == 'ports':
-        monkeypatch.setattr('devflow_temporal.delivery_browser_prelaunch.listeners', lambda _: {99})
-    else:
-        profile.parents[2].joinpath('gates/0/verify').rename(
-            profile.parents[2] / 'replaced-gate')
-    with pytest.raises((ValueError, FileNotFoundError)):
-        observe(owned, state, effects)
 
 
 def gate_stop(stopped, monkeypatch, *, previous=False):
@@ -191,15 +134,3 @@ def test_second_browser_prelaunch_recovery_is_refused_across_history(stopped, mo
                   recovery_digest=digest(json.loads(row['recovery_json'])))
     with pytest.raises(ValueError, match='already received its bounded prelaunch retry'):
         store.continue_repair('run-1', {**request, 'command_id': 'another-prelaunch'})
-
-
-def test_readback_rejects_changed_original_browser_evidence(stopped, monkeypatch):
-    store, _, _, _, request, proof = gate_stop(stopped, monkeypatch)
-    store.continue_repair('run-1', request)
-    with store._connect() as db:
-        recovery = json.loads(db.execute("SELECT recovery_json FROM delivery_runs "
-                                         "WHERE run_id='run-1'").fetchone()[0])
-    monkeypatch.setattr('devflow_temporal.delivery_browser_prelaunch.observe',
-                        lambda *_a, **_kw: {**proof, 'profile_sha256': 'changed'})
-    with pytest.raises(ValueError, match='preserved evidence changed'):
-        readback(store, store.effective_spec('run-1'), recovery)

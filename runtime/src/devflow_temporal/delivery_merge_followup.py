@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import ExitStack
 
 from .contracts import canonical_json, digest
 from .delivery_merge import (
@@ -45,6 +46,9 @@ _FIELDS = (
 
 
 def initialize(db):
+    from .delivery_merge_execution import initialize as initialize_executions
+
+    initialize_executions(db)
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_merge_requests (
         run_id TEXT PRIMARY KEY REFERENCES delivery_runs(run_id),
         command_id TEXT UNIQUE NOT NULL, grant_json TEXT NOT NULL,
@@ -66,8 +70,9 @@ def _continuable(saved):
         return False
     reason = result.get("reason")
     return ((saved["phase"] == "decision_required" and reason == "conflicting_upstream_changes")
-            or (saved["phase"] == "unknown" and reason
-                == "RuntimeError: merge resolution native cleanup remains unconfirmed")
+            or (saved["phase"] == "unknown" and reason in {
+                "RuntimeError: merge resolution native cleanup remains unconfirmed",
+                "RuntimeError: merge native role was blocked before provider launch"})
             or (saved["phase"] == "blocked" and reason
                 == "ValueError: predecessor process/root custody is unconfirmed"))
 
@@ -319,7 +324,7 @@ def evidence(store, spec):
     }
 
 
-def _exclusive(store, db, row, *, retained_owner=None):
+def _exclusive(store, db, row, *, retained_owner=None, prelaunch=None):
     spec = json.loads(row["request_json"])
     work_binding(store, spec, db)
     issue = store.state.issue_resource(row["issue_url"])
@@ -331,13 +336,20 @@ def _exclusive(store, db, row, *, retained_owner=None):
         ),
         None,
     )
+    unsettled = db.execute(
+        "SELECT 1 FROM delivery_effects WHERE run_id=? AND state!='complete'", (row['run_id'],)
+    ).fetchone()
+    if prelaunch is not None:
+        from .delivery_merge_native_preparation import _PrelaunchProofs
+
+        if not isinstance(prelaunch, _PrelaunchProofs):
+            raise ValueError('merge exclusivity requires its leased prelaunch observation')
+        unsettled = prelaunch.unsettled(db, row['run_id'])
     if (
         latest != row["run_id"]
         or (store.state.claim_for(db, row["work_id"]) is not None
             and store.state.claim_for(db, row["work_id"])["owner"] != retained_owner)
-        or db.execute(
-            "SELECT 1 FROM delivery_effects WHERE run_id=? AND state!='complete'", (row["run_id"],)
-        ).fetchone()
+        or unsettled
         or db.execute(
             "SELECT 1 FROM delivery_mutations WHERE run_id=? AND state IN ('pending','unknown')",
             (row["run_id"],),
@@ -352,9 +364,27 @@ def _exclusive(store, db, row, *, retained_owner=None):
 def preflight(store, run_id):
     spec = store.effective_spec(run_id)
     proof = evidence(store, spec)
-    with store._connect() as db:
-        row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-        _exclusive(store, db, row)
+    with ExitStack() as leases:
+        with store._connect() as db:
+            saved = current(db, run_id)
+        if saved:
+            if not _continuable(saved):
+                raise ValueError("merge already owns a request; read its current result")
+            from .delivery_merge_execution import existing_lease, predecessor_closure
+
+            leases.enter_context(existing_lease(store.config, exclusive=True))
+            predecessor_closure(store, spec, saved)
+        prelaunch = None
+        if saved and _continuable(saved) and saved['phase'] == 'unknown':
+            from .delivery_merge_resolution import prelaunch_receipts
+
+            prelaunch = leases.enter_context(prelaunch_receipts(store, spec, saved))
+        with store._connect() as db:
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            _exclusive(store, db, row, prelaunch=prelaunch,
+                       retained_owner='external:devflow:' + run_id if prelaunch else None)
+        if prelaunch:
+            prelaunch.recheck()
     return {
         "candidate_id": proof["candidate"]["id"],
         "head": proof["pull_request"]["head"],
@@ -365,10 +395,14 @@ def preflight(store, run_id):
 
 def admit(store, run_id, request):
     from .delivery_interrupted_recovery import installation_recovery_lease
+    from .delivery_merge_execution import existing_lease
 
     # Closed-run maintenance holds the shared installation fence throughout its
     # finalization. Admission must not overlap its last historical projection.
-    with installation_recovery_lease(store.config, exclusive=True):
+    with store._connect() as db:
+        previous = current(db, run_id)
+    lease = existing_lease if previous else installation_recovery_lease
+    with lease(store.config, exclusive=True):
         return _admit(store, run_id, request)
 
 
@@ -468,73 +502,92 @@ def _admit(store, run_id, request):
             raise ValueError("merge continuation changed its original delivered evidence")
         grant = original
         response["grant_sha256"] = digest(original)
-    prelaunch = []
-    if previous_merge and previous_merge["phase"] == "unknown":
-        from .delivery_merge_resolution import prelaunch_receipts
+        from .delivery_merge_execution import predecessor_closure
 
-        prelaunch = prelaunch_receipts(store, spec, previous_merge)
-    with store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        prior = db.execute(
-            "SELECT * FROM delivery_commands WHERE command_id=?", (request["command_id"],)
-        ).fetchone()
-        if prior:
-            if prior["run_id"] != run_id or prior["request_digest"] != bound:
-                raise ValueError("merge command ID belongs to different inputs")
-            return json.loads(prior["response_json"])
-        row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
-        if (
-            _snapshot(row) != proof["row"]
-            or current(db, run_id) != previous_merge
-            or digest(store.effective_spec(run_id)) != grant["spec_sha256"]
-        ):
-            raise ValueError("merge authority changed during admission")
-        for receipt in prelaunch:
-            found = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
-                               (receipt["effect_key"],)).fetchone()
-            if found["request_json"] != receipt["request_json"] or found["state"] == "complete":
-                raise ValueError("merge prelaunch effect changed during continuation")
-            db.execute("UPDATE delivery_effects SET state='complete',observed_json=?,updated_at=? "
-                       "WHERE effect_key=?",
-                       (canonical_json(receipt), _now(), receipt["effect_key"]))
-        _exclusive(store, db, row,
-                   retained_owner="external:devflow:" + run_id if prelaunch else None)
-        if store.state.claim_for(db, spec["work_id"]) is None:
-            store.state.claim_work(
-                db, spec["work_id"], "external:devflow:" + run_id,
-                store.config.dashboard_url + "/runs/" + run_id,
-            )
-        if previous_merge:
+        response["predecessor_merge"] = predecessor_closure(store, spec, previous_merge)
+    with ExitStack() as leases:
+        prelaunch = []
+        if previous_merge and previous_merge["phase"] == "unknown":
+            from .delivery_merge_resolution import prelaunch_receipts
+
+            prelaunch = leases.enter_context(prelaunch_receipts(store, spec, previous_merge))
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute(
+                "SELECT * FROM delivery_commands WHERE command_id=?", (request["command_id"],)
+            ).fetchone()
+            if prior:
+                if prior["run_id"] != run_id or prior["request_digest"] != bound:
+                    raise ValueError("merge command ID belongs to different inputs")
+                return json.loads(prior["response_json"])
+            row = db.execute("SELECT * FROM delivery_runs WHERE run_id=?", (run_id,)).fetchone()
+            if (
+                _snapshot(row) != proof["row"]
+                or current(db, run_id) != previous_merge
+                or digest(store.effective_spec(run_id)) != grant["spec_sha256"]
+            ):
+                raise ValueError("merge authority changed during admission")
+            if prelaunch:
+                _exclusive(store, db, row, prelaunch=prelaunch,
+                           retained_owner="external:devflow:" + run_id)
+                prelaunch.recheck()
+            for receipt in prelaunch:
+                attempt = db.execute('SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?',
+                                     (receipt['job_key'], run_id)).fetchone()
+                if not attempt or digest(dict(attempt)) != receipt['attempt_sha256']:
+                    raise ValueError('merge prelaunch attempt changed before settlement')
+                found = db.execute("SELECT * FROM delivery_effects WHERE effect_key=?",
+                                   (receipt["effect_key"],)).fetchone()
+                if found["request_json"] != receipt["request_json"] or found["state"] == "complete":
+                    raise ValueError("merge prelaunch effect changed during continuation")
+                db.execute("UPDATE delivery_effects SET state='complete',"
+                           "observed_json=?,updated_at=? "
+                           "WHERE effect_key=?",
+                           (canonical_json(receipt), _now(), receipt["effect_key"]))
+            _exclusive(store, db, row,
+                       retained_owner="external:devflow:" + run_id if prelaunch else None)
+            if store.state.claim_for(db, spec["work_id"]) is None:
+                store.state.claim_work(
+                    db, spec["work_id"], "external:devflow:" + run_id,
+                    store.config.dashboard_url + "/runs/" + run_id,
+                )
+            if previous_merge:
+                db.execute(
+                    "UPDATE delivery_merge_requests SET workflow_id=?,phase='queued',dispatched=0,"
+                    "result_json=NULL,error=NULL,updated_at=? WHERE run_id=?",
+                    (workflow_id, _now(), run_id),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO delivery_merge_requests "
+                    "(run_id,command_id,grant_json,workflow_id,phase,created_at,updated_at) "
+                    "VALUES (?,?,?,?,'queued',?,?)",
+                    (run_id, request["command_id"], canonical_json(grant), workflow_id,
+                     _now(), _now()),
+                )
             db.execute(
-                "UPDATE delivery_merge_requests SET workflow_id=?,phase='queued',dispatched=0,"
-                "result_json=NULL,error=NULL,updated_at=? WHERE run_id=?",
-                (workflow_id, _now(), run_id),
+                "INSERT INTO delivery_commands VALUES (?,?,?,?)",
+                (request["command_id"], run_id, bound, canonical_json(response)),
             )
-        else:
-            db.execute(
-                "INSERT INTO delivery_merge_requests "
-                "(run_id,command_id,grant_json,workflow_id,phase,created_at,updated_at) "
-                "VALUES (?,?,?,?,'queued',?,?)",
-                (run_id, request["command_id"], canonical_json(grant), workflow_id, _now(), _now()),
+            store._event(
+                db,
+                run_id,
+                row["revision"],
+                "merge_continued" if previous_merge else "merge_requested",
+                ("Continuing conflict resolution under the existing merge authorization"
+                 if previous_merge else "Merge authorized for the existing delivered PR"),
+                response,
             )
-        db.execute(
-            "INSERT INTO delivery_commands VALUES (?,?,?,?)",
-            (request["command_id"], run_id, bound, canonical_json(response)),
-        )
-        store._event(
-            db,
-            run_id,
-            row["revision"],
-            "merge_continued" if previous_merge else "merge_requested",
-            ("Continuing conflict resolution under the existing merge authorization"
-             if previous_merge else "Merge authorized for the existing delivered PR"),
-            response,
-        )
-    return response
+            if prelaunch:
+                prelaunch.recheck()
+        return response
 
 
 def authorize(store, spec, grant_sha256):
+    from .delivery_merge_execution import require_current
+
     with store._connect() as db:
+        require_current(db, spec)
         saved = current(db, spec["run_id"])
         if not saved:
             raise ValueError("merge follow-up has no durable authorization")
@@ -578,6 +631,9 @@ def record(store, spec, phase, result=None, error=None, *, only_if=None):
     """Merge progress is separate from the historical delivery projection."""
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
+        from .delivery_merge_execution import require_current
+
+        require_current(db, spec, required=True, phase=phase)
         saved = current(db, spec["run_id"])
         if only_if is not None and saved["phase"] != only_if:
             return
@@ -632,6 +688,9 @@ def step(store, spec, grant_sha256, cancel_event):
 
     try:
         with store._connect() as db:
+            from .delivery_merge_execution import require_current
+
+            require_current(db, spec, required=True)
             saved = current(db, spec["run_id"])
             if not saved or digest(json.loads(saved["grant_json"])) != grant_sha256:
                 raise ValueError("merge activity has no matching durable authorization")
@@ -685,6 +744,9 @@ def step(store, spec, grant_sha256, cancel_event):
 
 def failed(store, spec, grant_sha256, reason):
     with store._connect() as db:
+        from .delivery_merge_execution import require_current
+
+        require_current(db, spec, required=True)
         saved = current(db, spec["run_id"])
         if not saved or digest(json.loads(saved["grant_json"])) != grant_sha256:
             raise ValueError("failed merge activity has no matching durable authorization")
@@ -714,24 +776,33 @@ async def dispatch(service, client):
 
     pending = await asyncio.to_thread(pending_requests)
 
-    def acknowledge(run_id):
-        with service.store._connect() as db:
+    def acknowledge(selected, spec, execution_run_id):
+        from .delivery_merge_execution import bind_execution, existing_lease
+
+        with existing_lease(service.config), service.store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            bind_execution(db, spec, digest(json.loads(selected["grant_json"])), {
+                "workflow_id": selected["workflow_id"], "execution_run_id": execution_run_id})
             db.execute(
                 "UPDATE delivery_merge_requests SET dispatched=1,"
-                "error=CASE WHEN phase='queued' THEN NULL ELSE error END WHERE run_id=?",
-                (run_id,),
+                "error=CASE WHEN phase='queued' THEN NULL ELSE error END "
+                "WHERE run_id=? AND workflow_id=? AND grant_json=?",
+                (selected["run_id"], selected["workflow_id"], selected["grant_json"]),
             )
 
     def rejected(item, exc):
+        from .delivery_merge_execution import dispatch_scope
+
         spec = service.store.effective_spec(item["run_id"])
-        record(
-            service.store,
-            spec,
-            "queued",
-            {"state": "pending", "reason": "merge_dispatch"},
-            f"Merge dispatch pending: {type(exc).__name__}: {str(exc)[:300]}",
-            only_if="queued",
-        )
+        with dispatch_scope(service.store, spec, item):
+            record(
+                service.store,
+                spec,
+                "queued",
+                {"state": "pending", "reason": "merge_dispatch"},
+                f"Merge dispatch pending: {type(exc).__name__}: {str(exc)[:300]}",
+                only_if="queued",
+            )
 
     for item in pending:
         try:
@@ -747,7 +818,7 @@ async def dispatch(service, client):
                     raise
                 found = None
             if found is None:
-                await client.start_workflow(
+                started = await client.start_workflow(
                     MergeWorkflow.run,
                     args=[spec, bound],
                     id=item["workflow_id"],
@@ -756,9 +827,22 @@ async def dispatch(service, client):
                     id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
                     memo={"merge_authorization": bound},
                 )
-            elif await found.memo_value("merge_authorization", None) != bound:
-                raise ValueError("merge workflow ID belongs to another authorization")
-            await asyncio.to_thread(acknowledge, item["run_id"])
+                execution_run_id = started.first_execution_run_id
+            else:
+                if (found.id != item["workflow_id"]
+                        or found.workflow_type != "DevflowMergeWorkflow"
+                        or await found.memo_value("merge_authorization", None) != bound):
+                    raise ValueError("merge workflow ID belongs to another authorization")
+                execution_run_id = found.run_id
+                from .delivery_merge_execution import _original_start
+
+                # A reset copies workflow type, inputs and memo. Only its
+                # canonical original start can reconcile an unknown start ACK.
+                await asyncio.wait_for(_original_start(
+                    service.store, {"spec": spec, "merge_authorization": bound},
+                    {"workflow_id": item["workflow_id"], "execution_run_id": execution_run_id},
+                    require_running=False), timeout=10)
+            await asyncio.to_thread(acknowledge, item, spec, execution_run_id)
         except WorkflowAlreadyStartedError:
             # Lost start acknowledgement: the next pass reads the memo.
             continue

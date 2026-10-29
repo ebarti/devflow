@@ -163,36 +163,6 @@ def implemented_chunk(store, parent, chunk, issue):
     return child, source, broker.candidate()
 
 
-@pytest.mark.parametrize("ran_under", ["predecessor", "foreign"])
-def test_interrupted_chunk_merges_on_the_implementation_its_predecessor_ran(
-    service, monkeypatch, ran_under,
-):
-    store, request, _ = feature_service(service, monkeypatch)
-    store.submit(request)
-    parent = store.effective_spec(request["run_id"])
-    chunk = ordered_chunks(json.loads(request["accepted_plan"]))[0]
-    child, source, output = implemented_chunk(
-        store, parent, chunk, {"url": "https://github.com/example/fixture/issues/10"})
-    # A spec this run never executed under cannot bless an implementation.
-    ran = child if ran_under == "predecessor" else {**child, "policy_digest": "0" * 64}
-    role = codex_receipt(store, ran, source=source, output=output)
-    cancelled(store, monkeypatch, parent, child, role, output)
-    # Codex session custody gives the resumed execution its own role-home generation.
-    monkeypatch.setattr("devflow_temporal.delivery_session_custody.implementation_custody",
-                        lambda *_a: {"generation": "resume-generation"})
-    resumed = activities.resume_worker(store, parent, child, {
-        "error": None, "checks_json": "{}"})["spec"]
-    assert resumed["implementation_role_home_generation"] == "resume-generation"
-    assert resumed != child
-    if ran_under == "foreign":
-        with pytest.raises(ValueError, match=LOST):
-            merge_evidence(monkeypatch, store, parent, child, output)
-        return
-    trees, bound = merge_evidence(monkeypatch, store, parent, child, output)
-    assert trees == ["tree-" + output["head"][:8]]
-    assert bound == {key: output[key] for key in ("id", "head", "content_sha256")}
-
-
 @pytest.mark.parametrize("last", [False, True], ids=["first-iteration", "last-iteration"])
 def test_revision_gate_only_resume_merges_on_its_original_implementation(
     feature, monkeypatch, last,

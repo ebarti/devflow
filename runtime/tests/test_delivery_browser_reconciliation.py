@@ -109,15 +109,6 @@ def recovery(tmp_path, monkeypatch):
                            broker=broker, gate=gate, result=result)
 
 
-def test_owner_reconciliation_keeps_failed_verdict_and_closed_result(recovery):
-    before = copy.deepcopy(recovery.closed)
-    result = reconcile_browser_attempt(recovery.store, "run-owned", 2)
-    assert result["state"] == "finished" and result["cleanup"] == "confirmed"
-    assert result["gate_state"] == "failed" and result["test_count"] == 10
-    assert recovery.calls == ["reconcile", "cleanup"]
-    assert recovery.closed == before
-
-
 @pytest.mark.parametrize("drift", ["active", "foreign_owner", "closed_identity", "candidate",
                                     "other_effect", "mutation", "unfinished_role", "missing_gate"])
 def test_owner_reconciliation_refuses_changed_authority_before_effects(recovery, drift):

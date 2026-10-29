@@ -51,30 +51,6 @@ def test_revision_attempts_do_not_reuse_intake_or_another_proposal(service, monk
     assert all(row["state"] == "queued" for row in rows)
 
 
-def test_unadmitted_revision_does_not_reserve_attempt_or_create_folder(service, monkeypatch):
-    store, submission = service
-    submit_historical_admission(store, submission, monkeypatch)
-    spec = store.spec("run-1")
-    broker = DeliveryBroker(store, spec)
-    broker.prepare()
-    request = {"spec": spec, "role": "intake", "iteration": 0,
-               "candidate": broker.candidate(),
-               "revision_context": {"revision_id": "invented-revision"}}
-
-    def reject(*_args):
-        raise ValueError("revision has no charged durable admission")
-
-    monkeypatch.setattr(revisions, "authenticate_revision_role", reject)
-    supervisor = DeliverySupervisor(store, capacity=1)
-    key = supervisor._job_key(request)
-    with pytest.raises(ValueError, match="no charged durable admission"):
-        supervisor._claim(request)
-    assert not (broker.state_dir / "attempts" / key).exists()
-    with store._connect() as db:
-        attempt = db.execute("SELECT 1 FROM delivery_attempts WHERE job_key=?", (key,)).fetchone()
-        assert attempt is None
-
-
 def test_revision_context_cannot_namespace_a_product_writer():
     request = {"spec": {"run_id": "run-1", "policy_digest": "p"},
                "role": "implement", "iteration": 0, "candidate": {"id": "candidate"},

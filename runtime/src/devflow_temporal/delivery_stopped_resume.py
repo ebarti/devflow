@@ -852,7 +852,7 @@ def custody(db, recovery, *, retained_memo=None):
     browser_custody(db, spec, recovery)
     from .delivery_temporal_prerequisites import custody as temporal_custody
 
-    temporal_custody(db, spec, recovery)
+    temporal_custody(db, spec, recovery, retained_memo=retained_memo)
     if details.get('operational_capacity') is not None:
         if spec['policy']['capacity'] != details['predecessor_spec']['policy']['capacity']:
             raise ValueError('amended execution changed frozen policy capacity')

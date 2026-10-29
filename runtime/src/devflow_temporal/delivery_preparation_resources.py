@@ -80,11 +80,17 @@ def canonical_owner(spec):
         raise ValueError("native preparation changed its canonical database")
     state, path = Path(spec["state_dir"]), Path(supplied["intent_path"])
     canonical = Path(parent["state_dir"])
+    renewal_paths = {
+        canonical / "native-preparation-renewal/preparation.json",
+        canonical / "technical-successor/native-generation/preparation.json",
+        canonical / "resource-closure/native-generation/preparation.json",
+    }
+    renewal = path in renewal_paths
     if (
         not path.is_absolute()
         or path.resolve(strict=True) != path
         or not path.is_relative_to(canonical)
-        or path.name != "intent.json"
+        or (path.name != "intent.json" and not renewal)
         or state != path.parent / "probes" / str(supplied["attempt_index"]) / spec["run_id"]
         or ".." in state.parts
         or state.resolve() != state
@@ -92,6 +98,13 @@ def canonical_owner(spec):
         raise ValueError("native preparation left its exact finite resource generation")
     raw = private_bytes(path)
     intent = json.loads(raw)
+    authority_raw = None
+    authority_path = path.parent / "authority.json"
+    if renewal:
+        authority_raw = private_bytes(authority_path)
+        authority = json.loads(authority_raw)
+        if not isinstance(intent, dict) or digest(authority) != intent.get("binding_sha256"):
+            raise ValueError("native renewal lost its exact preparation authority")
     attempts = intent.get("preparation_attempts") if isinstance(intent, dict) else None
     if (
         not isinstance(attempts, list)
@@ -110,6 +123,17 @@ def canonical_owner(spec):
             "SELECT request_json,request_digest,work_id FROM delivery_runs WHERE run_id=?",
             (spec["run_id"],),
         ).fetchone()
+        if renewal:
+            try:
+                anchor = db.execute(
+                    "SELECT binding_sha256,parent_sha256 FROM delivery_native_renewal_anchors "
+                    "WHERE run_id=? AND namespace=?",
+                    (spec["run_id"], str(path.parent.relative_to(canonical))),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                raise ValueError("native renewal has no durable probe authority") from exc
+            if anchor != (digest(authority), digest(parent)):
+                raise ValueError("native renewal lost its durable probe authority")
     original = json.loads(row[0]) if row else None
     if (
         not isinstance(original, dict)
@@ -133,13 +157,15 @@ def canonical_owner(spec):
             )
         )
         or private_bytes(path) != raw
+        or (renewal and private_bytes(authority_path) != authority_raw)
     ):
         raise ValueError("native preparation lost its canonical admitted run")
     return parent
 
 
 @contextmanager
-def resource_scope(spec, canonical_state, intent, path, index):
+def resource_scope(spec, canonical_state, intent, path, index, *,
+                   renewal_binding=None, renewal_parent=None):
     """Re-observe old attempts without changing their recorded specs or journals."""
     parent = deepcopy(spec)
     parent.pop(FIELD, None)
@@ -147,7 +173,9 @@ def resource_scope(spec, canonical_state, intent, path, index):
     expected = binding(parent, intent, path, index)
     if FIELD in spec and spec[FIELD] != expected:
         raise ValueError("native preparation changed its recorded canonical parent")
-    token = _LEGACY.set((digest(spec), expected))
+    if renewal_binding is not None and parent != renewal_parent:
+        raise ValueError("native renewal probe changed its exact effective parent")
+    token = _LEGACY.set((digest(spec), expected, deepcopy(renewal_binding)))
     try:
         parent = canonical_owner(spec)
         if parent is None:

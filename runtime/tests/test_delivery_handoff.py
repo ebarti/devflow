@@ -66,7 +66,11 @@ async def test_stopped_mcp_handoff_starts_explicitly_before_required_reads(
             "id": run_id, "protocol_revision": 7, "events": [],
             "pending_decision": {"id": "question-1", "revision": 2, "candidate_revision": 3},
         })
-        monkeypatch.setattr(store, "evidence_index", lambda _run_id: [])
+        def evidence_index(run_id, *, details):
+            assert details["id"] == run_id
+            return []
+
+        monkeypatch.setattr(store, "evidence_index", evidence_index)
         # Real API authentication/forwarding; no Temporal or background dispatch.
         api = uvicorn.Server(uvicorn.Config(
             app, host="127.0.0.1", port=port, lifespan="off", log_level="error"))

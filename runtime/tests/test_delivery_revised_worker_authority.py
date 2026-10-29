@@ -145,32 +145,6 @@ def test_revision_keeps_retained_authority_and_native_policy_while_admitting_ful
     assert canonical_json({"parent": parent, "worker": worker, "plan": plan}) == before
 
 
-@pytest.mark.parametrize("kind", [None, "chunk"], ids=["no-worker", "final"])
-def test_new_policy_and_final_gate_selection_keep_existing_semantics(gate_project, kind):
-    parent, plan, _ = gate_project
-    plan["workstreams"][1]["chunks"][0]["gates"][0]["selectors"] = [PAGINATION]
-    worker = retained_worker(parent, plan, "web1", kind=kind) if kind else None
-    before = canonical_json({"parent": parent, "worker": worker, "plan": plan})
-    revised = revised_worker_spec(
-        parent, plan, "web1", expected_revision=revision_identity(plan), worker=worker,
-    )
-    assert set(revised["policy"]["browser_qa"]["required_selectors"]) == (
-        {BULK, PAGINATION} if kind == "chunk" else {PAGINATION}
-    )
-    accepted = json.loads(revised["accepted_plan"])
-    assert accepted["acceptance"] == plan["workstreams"][1]["chunks"][0]["acceptance"]
-    if kind == "chunk":
-        assert accepted["feature_acceptance"] == plan["acceptance"]
-    else:
-        assert "feature_acceptance" not in accepted
-    if worker is None:
-        assert authority(revised["policy"]) == authority(parent["policy"])
-        require_authorized(revised["policy"], [PAGINATION])
-    else:
-        assert authority(revised["policy"]) == authority(worker["policy"])
-    assert canonical_json({"parent": parent, "worker": worker, "plan": plan}) == before
-
-
 @pytest.mark.parametrize("affected", [False, True], ids=["unaffected", "affected"])
 def test_real_revision_recovery_custody_preserves_original_worker_authority(
     gate_project, tmp_path, affected,

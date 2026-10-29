@@ -504,9 +504,20 @@ def _refuses(fixture, kind, name, *, upgrade=True):
         _upgrade(fixture)
     driver = fixture.root / 'negative.py'
     driver.write_text(NEGATIVE_DRIVER)
-    result = subprocess.run([str(fixture.python), '-I', str(driver), str(fixture.package.parent),
-        str(fixture.spec_path), json.dumps([kind, name])],
-        capture_output=True, text=True, timeout=30)
+    # This case deliberately corrupts the admitted snapshot in a child process.
+    # Restore its exact bytes after the refusal so the fixture's authenticated
+    # resource finalizer can clean up the owned run even if the child fails.
+    snapshot = (Path(fixture.spec['state_dir']).parents[1] / 'configuration-snapshots'
+                / (fixture.spec['config_digest'] + '.json'))
+    original = snapshot.read_bytes() if (kind, name) == ('context', 'configuration') else None
+    try:
+        result = subprocess.run(
+            [str(fixture.python), '-I', str(driver), str(fixture.package.parent),
+             str(fixture.spec_path), json.dumps([kind, name])],
+            capture_output=True, text=True, timeout=30)
+    finally:
+        if original is not None:
+            snapshot.write_bytes(original)
     assert result.returncode == 0, (kind, name, result.stderr)
     assert result.stdout.startswith(('PreparationError:', 'ValueError:')), (
         kind, name, result.stdout)

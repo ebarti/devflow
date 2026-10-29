@@ -712,6 +712,157 @@ def test_amended_worker_and_launch_keep_exact_lineage_and_old_custody(stopped_br
             mode.launch_authority(current, case.broker.checkout)
 
 
+async def browser_timeout_diagnostics(handle, store, evidence_dir):
+    """Inspect only bounded lifecycle facts, never inputs, logs or environment."""
+    import os
+    import sqlite3
+    import stat
+    from datetime import timedelta
+
+    diagnostics = {"history": [], "history_truncated": False}
+    try:
+        async with asyncio.timeout(5):
+            history = handle.fetch_history_events(page_size=100, rpc_timeout=timedelta(seconds=2))
+            total = 0
+            for _ in range(5):
+                await history.fetch_next_page()
+                page = history.current_page or []
+                total += sum(event.ByteSize() for event in page)
+                if total > 8 * 1024 * 1024:
+                    diagnostics["history_truncated"] = True
+                    break
+                for event in page:
+                    name = event.WhichOneof("attributes") or "unknown"
+                    entry = {"id": event.event_id, "type": name,
+                             "time": event.event_time.ToDatetime().isoformat()}
+                    if name == "activity_task_scheduled_event_attributes":
+                        attrs = event.activity_task_scheduled_event_attributes
+                        activity_name = attrs.activity_type.name
+                        if (activity_name.startswith("delivery_")
+                                and activity_name.replace("_", "").isalnum()):
+                            entry["activity"] = activity_name[:100]
+                    elif name in {
+                        "activity_task_started_event_attributes",
+                        "activity_task_completed_event_attributes",
+                        "activity_task_failed_event_attributes",
+                        "activity_task_timed_out_event_attributes",
+                    }:
+                        entry["scheduled_id"] = getattr(event, name).scheduled_event_id
+                    diagnostics["history"].append(entry)
+                    diagnostics["history"] = diagnostics["history"][-20:]
+                if history.next_page_token is None:
+                    break
+            else:
+                diagnostics["history_truncated"] = True
+    except Exception as exc:
+        diagnostics["history_error"] = type(exc).__name__
+
+    try:
+        uri = store.config.tracking_db.as_uri() + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1) as db:
+            row = db.execute(
+                "SELECT phase,execution_state,iteration,outcome,cleanup FROM delivery_runs "
+                "WHERE run_id=?", ("run-1",)
+            ).fetchone()
+        allowed = {"queued", "running", "blocked", "cancelled", "delivered", "terminal",
+                   "confirmed", "unknown", "none", "cancelling", "finalizing",
+                   "preparing", "repair_preflight", "tracker_start", "implement", "repair",
+                   "prepublish_checks", "publishing", "checks", "browser_qa", "review",
+                   "verify", "waiting_ci", "tracker", "waiting_tracker", "merging"}
+        if row:
+            diagnostics["projection"] = {
+                key: (value if value in allowed else None)
+                for key, value in zip(("phase", "execution_state", "outcome", "cleanup"),
+                                      (row[0], row[1], row[3], row[4]), strict=True)
+            }
+            diagnostics["projection"]["iteration"] = row[2] if type(row[2]) is int else None
+    except Exception as exc:
+        diagnostics["projection_error"] = type(exc).__name__
+
+    path = Path(evidence_dir) / "browser-qa/4/native/native-process.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or info.st_size > 1024 * 1024):
+                raise ValueError("unsafe native journal")
+            with os.fdopen(fd, "rb", closefd=False) as source:
+                journal = json.loads(source.read(1024 * 1024 + 1))
+        finally:
+            os.close(fd)
+        result = journal.get("result") or {}
+        diagnostics["browser_native"] = {
+            "phase": journal.get("phase") if journal.get("phase") in {
+                "allocated", "authorized", "finished"} else None,
+            "monitoring_complete": journal.get("monitoring_complete") is True,
+            "cleanup": result.get("cleanup") if result.get("cleanup") in {
+                "observed-native-confirmed", "unknown"} else None,
+            "timed_out": result.get("timed_out") is True,
+        }
+    except FileNotFoundError:
+        diagnostics["browser_native"] = "absent"
+    except Exception as exc:
+        diagnostics["browser_native_error"] = type(exc).__name__
+    return diagnostics
+
+
+@pytest.mark.asyncio
+async def test_browser_timeout_diagnostics_redacts_inputs_and_bounds_history(tmp_path):
+    import sqlite3
+    from types import SimpleNamespace
+
+    from temporalio.api.common.v1 import ActivityType, Payload, Payloads
+    from temporalio.api.history.v1 import ActivityTaskScheduledEventAttributes, HistoryEvent
+
+    event = HistoryEvent(
+        event_id=1,
+        activity_task_scheduled_event_attributes=ActivityTaskScheduledEventAttributes(
+            activity_type=ActivityType(name="delivery_browser_qa"),
+            input=Payloads(payloads=[Payload(data=b"PRIVATE_DIAGNOSTIC_INPUT")]),
+        ),
+    )
+
+    class History:
+        current_page = [event] * 30
+        next_page_token = b"more"
+        pages = 0
+
+        async def fetch_next_page(self):
+            self.pages += 1
+
+    history = History()
+
+    class Handle:
+        def fetch_history_events(self, **_kwargs):
+            return history
+
+    database = tmp_path / "tracking.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE delivery_runs "
+                   "(run_id TEXT,phase TEXT,execution_state TEXT,iteration INTEGER,"
+                   "outcome TEXT,cleanup TEXT)")
+        db.execute("INSERT INTO delivery_runs VALUES (?,?,?,?,?,?)",
+                   ("run-1", "browser_qa", "running", 4, None, "unknown"))
+    state = tmp_path / "state"
+    path = state / "browser-qa/4/native/native-process.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"phase": "authorized", "monitoring_complete": False,
+                                "environment": "PRIVATE_DIAGNOSTIC_INPUT"}))
+    path.chmod(0o600)
+    store = SimpleNamespace(config=SimpleNamespace(tracking_db=database))
+    result = await browser_timeout_diagnostics(Handle(), store, state)
+    assert result["history"] == [{"id": 1, "type": "activity_task_scheduled_event_attributes",
+                                  "activity": "delivery_browser_qa",
+                                  "time": "1970-01-01T00:00:00"}] * 20
+    assert history.pages == 5 and result["history_truncated"] is True
+    assert result["projection"]["phase"] == "browser_qa"
+    assert result["projection"]["iteration"] == 4
+    assert result["browser_native"]["phase"] == "authorized"
+    assert "PRIVATE_DIAGNOSTIC_INPUT" not in json.dumps(result)
+
+
 @pytest.mark.asyncio
 async def test_public_browser_amendment_real_preparation_worker_native_gate_and_replay(
     service, monkeypatch
@@ -744,6 +895,7 @@ async def test_public_browser_amendment_real_preparation_worker_native_gate_and_
         )
         response, current, recovery = admitted(case)
         restore_native_observers(monkeypatch)
+        evidence_dir = DeliveryBroker(store, current).evidence_dir
         before = copy.deepcopy(recovery["state"])
         store.mark_start("run-1", accepted=True)
         calls = []
@@ -835,9 +987,16 @@ async def test_public_browser_amendment_real_preparation_worker_native_gate_and_
                 id=response["workflow_id"],
                 task_queue="browser-mode-recovery",
             )
-            result = await asyncio.wait_for(
-                handle.result(), getattr(case, "owner_test_timeout", 45)
-            )
+            try:
+                result = await asyncio.wait_for(
+                    handle.result(), getattr(case, "owner_test_timeout", 45)
+                )
+            except TimeoutError as exc:
+                diagnostics = await browser_timeout_diagnostics(handle, store, evidence_dir)
+                raise AssertionError(
+                    "Browser amendment workflow timed out; bounded lifecycle facts: "
+                    + json.dumps(diagnostics, sort_keys=True)
+                ) from exc
             assert result["outcome"] == "delivered", result.get("error")
             assert result["iteration"] == 4 and result["roles"][0] == before["roles"][0]
             assert result["checks"]["browser_qa"]["test_count"] == 2

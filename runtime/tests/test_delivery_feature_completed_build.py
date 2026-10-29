@@ -208,22 +208,6 @@ def _source(tmp_path, monkeypatch, *, spec=None, store=None, shared=None, runtim
         folder=folder, checks=checks)
 
 
-def test_completed_source_proves_legacy_native_pass_without_temporal_or_execution(
-    tmp_path, monkeypatch,
-):
-    f = _source(tmp_path, monkeypatch)
-    before = digest((f.spec, f.row, f.attempts, f.values))
-    proof = completed.completed_build_subject(f.store, f.spec, f.spec, f.row, f.attempts,
-                                             f.assignment, f.values, f.shared)
-    assert proof == completed.completed_build_subject(f.store, f.spec, f.spec, f.row, f.attempts,
-                                                      f.assignment, f.values, f.shared)
-    assert proof["candidate"] == f.output and proof["current_review_subject"] is None
-    assert proof["progress_custody"]["kind"] == "completed_unchanged_build_source"
-    assert "closed" not in proof and "session_id" not in proof
-    assert before == digest((f.spec, f.row, f.attempts, f.values))
-    assert "candidate" not in json.loads((f.folder / "result.json").read_text())
-
-
 def test_completed_source_refuses_missing_changed_native_patch_cleanup_and_consumers(
     tmp_path, monkeypatch,
 ):

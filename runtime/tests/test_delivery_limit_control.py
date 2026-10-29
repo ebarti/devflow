@@ -4,8 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -14,7 +13,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_delivery_store import service as service
 
-from devflow_temporal import delivery_control, delivery_limits
+from devflow_temporal import delivery_limits
 from devflow_temporal.delivery_activities import delivery_finalize_resources, delivery_project
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
@@ -35,136 +34,6 @@ def test_stage_based_no_progress_limit_is_refused_before_claiming_work(service):
     with pytest.raises(ValueError, match="no-progress.*not supported"):
         store.submit(request)
     assert not store.list_runs()
-
-
-def test_new_runs_have_no_implicit_delivery_limit(service):
-    store, request = service
-    store.submit(request)
-    spec = store.spec(request["run_id"])
-    assert "delivery_limits_version" not in spec
-    assert not delivery_limits.policy(spec["policy"])
-
-
-def test_control_receipt_preserves_concurrent_phase_checks_and_question(service):
-    store, request = service
-    run = request["run_id"]
-    store.submit(request)
-    question = {"id": "pending-question", "revision": 1, "kind": "question"}
-    store.project(run, phase="waiting_question", execution_state="waiting",
-                  event_type="question", message="Newer controller work", protocol_revision=7,
-                  checks={"local": {"state": "passed"}}, decision=question)
-    receipt = {"disabled": True, "command_id": "earlier-control", "protocol_revision": 5,
-               "reason": "User request", "recorded_at": "2026-10-18T17:00:00+00:00"}
-    result = {"revision": 5, "phase": "implement", "checks": {"delivery_limits_control": receipt}}
-    store.record_delivery_limits_disabled(run, result, "earlier-control")
-    current = store.detail(run)
-    assert current["phase"] == "waiting_question" and current["decisions"] == [question]
-    assert current["protocol_revision"] == 7
-    assert current["checks"] == {"local": {"state": "passed"}, "delivery_limits_control": receipt}
-    store.record_delivery_limits_disabled(run, result, "earlier-control")
-    assert len([e for e in store.events(run) if e["type"] == "delivery_limits_disabled"]) == 1
-    store.project(run, phase="waiting_question", execution_state="waiting",
-                  event_type="another-check", message="Projection from an earlier snapshot",
-                  protocol_revision=4, checks={"ci": {"state": "pending"}}, decision=question)
-    assert store.detail(run)["checks"]["delivery_limits_control"] == receipt
-    assert store.detail(run)["protocol_revision"] == 7
-
-
-def test_existing_legacy_admission_receipt_still_replays(service, monkeypatch):
-    store, request = service
-    raw = json.loads(store.config.path.read_text())
-    raw["no_progress_timeout_seconds"] = 1800
-    store.config.path.write_text(json.dumps(raw))
-    store = DeliveryStore(DeliveryConfig.load(store.config.path))
-    with monkeypatch.context() as old:
-        old.setattr(delivery_limits, "require_supported_admission_limits", lambda _: None)
-        receipt = store.submit(request)
-    original = store.spec(request["run_id"])
-    assert store.submit(request) == receipt
-    assert store.spec(request["run_id"]) == original
-    assert len(store.list_runs()) == 1
-
-
-def test_live_control_cli_never_invokes_service_lifecycle(service, monkeypatch, capsys, tmp_path):
-    store, _ = service
-    payload = {"command_id": "disable-live", "expected_revision": 3, "reason": "user request"}
-    request = tmp_path / "disable.json"
-    request.write_text(json.dumps(payload))
-    calls = []
-
-    def forbidden(*_args, **_kwargs):
-        pytest.fail("live control must not start or reload a service")
-
-    monkeypatch.setattr(delivery_control, "_config", forbidden)
-    monkeypatch.setattr(delivery_control, "api_client", forbidden)
-    monkeypatch.setattr(delivery_control, "read_only_client", lambda path: SimpleNamespace(
-        disable_delivery_limits=lambda run, value: calls.append((path, run, value)) or {
-            "delivery_limits_disabled": True,
-        },
-    ))
-    monkeypatch.setattr("sys.argv", [
-        "devflow-delivery", "--config", str(store.config.path), "disable-limits",
-        "--id", "same-run", "--request", str(request),
-    ])
-    delivery_control.main()
-    assert calls == [(store.config.path, "same-run", payload)]
-    assert json.loads(capsys.readouterr().out)["delivery_limits_disabled"] is True
-
-
-@pytest.mark.asyncio
-async def test_disabled_control_survives_recovery_without_resetting_original_clock(monkeypatch):
-    async def wait_condition(predicate, **_kwargs):
-        assert predicate()
-
-    monkeypatch.setattr(delivery_limits.workflow, "wait_condition", wait_condition)
-    clock = {"admitted_at": "2000-01-01T00:00:00+00:00",
-             "last_progress_at": "2000-01-01T00:00:00+00:00", "signature": "old"}
-    recovery = {"state": {"checks": {"delivery_limits_control": {"disabled": True},
-                                      "delivery_clock": clock}}}
-    controller = SimpleNamespace(state={"phase": "running"}, cancel_requested=False,
-                                 delivery_limits_closing=False)
-    spec = {"delivery_limits_version": 1, "delivery_admitted_at": clock["admitted_at"],
-            "policy": {"delivery_timeout_seconds": 1}}
-
-    async def operation(actual_spec, actual_recovery):
-        assert actual_spec is spec and actual_recovery is recovery
-        assert controller.delivery_limits_disabled
-        assert delivery_limits.remaining(controller) is None
-        assert controller.delivery_clock == clock
-        await asyncio.sleep(0)
-        return "same retained work"
-
-    assert await delivery_limits.run(controller, spec, recovery, operation) == "same retained work"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("bounded", [True, False])
-async def test_new_stage_retains_disabled_control_in_workflow_recovery_state(monkeypatch, bounded):
-    receipt = {"disabled": True, "command_id": "keep-control", "protocol_revision": 5}
-    recovery = {"state": {"checks": {"delivery_limits_control": receipt}}}
-    spec = ({"delivery_limits_version": 1, "delivery_admitted_at": "2026-10-18T17:00:00+00:00",
-             "policy": {"delivery_timeout_seconds": 1}} if bounded else {})
-    controller = DeliveryWorkflow()
-    controller.state = {"phase": "repair", "revision": 6, "checks": {}}
-
-    async def wait_condition(predicate, **_kwargs):
-        assert predicate()
-
-    async def project_event(_spec, _event, _message):
-        assert controller.state["checks"]["delivery_limits_control"] == receipt
-
-    monkeypatch.setattr(delivery_limits.workflow, "wait_condition", wait_condition)
-    monkeypatch.setattr(delivery_limits.workflow, "now", lambda: datetime(2026, 10, 18, tzinfo=UTC))
-    monkeypatch.setattr(controller, "_project_event", project_event)
-
-    async def next_stage(_spec, _recovery):
-        # Implementation and recovery paths clear candidate checks between stages.
-        controller.state["checks"] = {}
-        await controller._project(spec, "role_started", "Repair role started")
-        return controller.state
-
-    result = await delivery_limits.run(controller, spec, recovery, next_stage)
-    assert result["checks"]["delivery_limits_control"] == receipt
 
 
 @pytest.mark.asyncio

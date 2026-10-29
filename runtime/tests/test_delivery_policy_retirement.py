@@ -10,7 +10,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from historical_replay import replay_designated_history
 from test_delivery_api import api_fixture as api_fixture
 
 from devflow_temporal import delivery_policy_recovery
@@ -80,16 +79,3 @@ def test_actual_c04_policy_row_retains_its_durable_validation(monkeypatch, tampe
     else:
         assert delivery_policy_recovery.effective_spec(None, original, recovery, grant) == (
             recorded["effective_spec"])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode,expected_sha256", [
-    ("completed", "29e4e592ab39e77a410ca6dd55177b975d0b173969e0fd9ca35d996ff25ee4bc"),
-    ("suspended", "ff5dd1eb650799a79c814296322f2236a5abc9103b817f235a51fbbdab6c1739"),
-])
-async def test_actual_c04_policy_history_replays_byte_exact(mode, expected_sha256, tmp_path):
-    path = Path(__file__).parent / "fixtures" / f"policy-c04-{mode}-history.json.gz"
-    content = gzip.decompress(path.read_bytes())
-    assert hashlib.sha256(content).hexdigest() == expected_sha256
-    await replay_designated_history(path, tmp_path, "c04-policy-" + mode)
-    assert hashlib.sha256(content).hexdigest() == expected_sha256

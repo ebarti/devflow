@@ -12,6 +12,11 @@ class MergeWorkflow:
     @workflow.run
     async def run(self, spec: dict, grant_sha256: str) -> dict:
         request = {"spec": spec, "merge_authorization": grant_sha256}
+        if workflow.patched("ordinary-merge-execution-v1"):
+            request["merge_execution"] = {
+                "workflow_id": workflow.info().workflow_id,
+                "execution_run_id": workflow.info().run_id,
+            }
         while True:
             try:
                 result = await workflow.execute_activity(

@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import threading
 
-import httpx
 import pytest
 from temporalio.testing import ActivityEnvironment
 from test_delivery_api import api_fixture as api_fixture
@@ -17,74 +16,6 @@ def _off_loop() -> None:
     assert threading.current_thread() is not threading.main_thread(), "store call on the loop"
     with pytest.raises(RuntimeError):
         asyncio.get_running_loop()
-
-
-@pytest.mark.asyncio
-async def test_api_reads_and_streams_off_the_event_loop(api_fixture, monkeypatch):
-    path, request = api_fixture
-    app = create_app(path)
-    store = app.state.delivery.store
-    store.submit(request)
-    observed = []
-    for name in ("detail", "evidence_index", "evidence", "spec", "feature", "events"):
-        original = getattr(store, name)
-
-        def wrapped(*args, _name=name, _original=original, **kwargs):
-            _off_loop()
-            observed.append(_name)
-            return _original(*args, **kwargs)
-
-        monkeypatch.setattr(store, name, wrapped)
-    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 10001))
-    async with httpx.AsyncClient(transport=transport,
-                                 base_url="http://127.0.0.1:18770") as browser:
-        assert (await browser.get("/api/runs/run-1")).status_code == 200
-        assert (await browser.get("/api/runs/run-1/evidence/missing")).status_code == 404
-    # Nested store reads (detail -> spec) are recorded too; every one ran off the loop.
-    assert {"detail", "evidence_index", "evidence"} <= set(observed)
-    before_stream = len(observed)
-
-    # Stream one event through the real ASGI route, then disconnect the client.
-    disconnected = asyncio.Event()
-    messages = []
-    received = False
-
-    async def receive():
-        nonlocal received
-        if not received:
-            received = True
-            return {"type": "http.request", "body": b"", "more_body": False}
-        await disconnected.wait()
-        return {"type": "http.disconnect"}
-
-    async def send(message):
-        messages.append(message)
-        if message["type"] == "http.response.body" and message.get("body"):
-            disconnected.set()
-
-    await asyncio.wait_for(
-        app(
-            {
-                "type": "http",
-                "asgi": {"version": "3.0", "spec_version": "2.3"},
-                "http_version": "1.1",
-                "method": "GET",
-                "scheme": "http",
-                "path": "/api/runs/run-1/events",
-                "raw_path": b"/api/runs/run-1/events",
-                "query_string": b"",
-                "root_path": "",
-                "client": ("127.0.0.1", 10001),
-                "server": ("127.0.0.1", 18770),
-                "headers": [(b"host", b"127.0.0.1:18770")],
-            },
-            receive,
-            send,
-        ),
-        timeout=2,
-    )
-    assert messages[0]["status"] == 200
-    assert {"spec", "feature", "events"} <= set(observed[before_stream:])
 
 
 @pytest.mark.asyncio

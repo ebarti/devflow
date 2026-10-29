@@ -38,7 +38,8 @@ jobs:
                       yield test
 
           discovered = list(cases(unittest.defaultTestLoader.discover('tests')))
-          mac_modules = {'test_reconcile', 'test_service_entry_installation',
+          mac_modules = {'test_reconcile', 'test_production_installation',
+                         'test_service_entry_installation',
                          'test_upgrade_installation'}
           native = [test for test in discovered
                     if type(test).__module__ in mac_modules
@@ -56,14 +57,14 @@ jobs:
   temporal-runtime-tests:
     name: runtime shard ${{ matrix.shard }}
     runs-on: macos-latest
-    # Hosted Mac throughput varies; a passing shard reached 99% at the 20-minute limit.
-    timeout-minutes: 30
+    # Hosted Mac throughput varies; a progressing partition timed out at 82% after 30 minutes.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
-      # All three Mac hosts start together; host 0 also qualifies native source tests.
-      max-parallel: 3
+      # Two Mac hosts each run two partitions; host 0 also qualifies source tests.
+      max-parallel: 2
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,11 +84,24 @@ jobs:
       - run: echo "$RUNNER_TEMP/devflow-uv/bin" >> "$GITHUB_PATH"
       - run: uv sync --locked --python python
         working-directory: runtime
+      - name: Prepare exact Python for native location fixtures
+        run: |
+          uv python install --managed-python 3.12.13
+          fixture_python="$(uv python find --managed-python --no-python-downloads 3.12.13)"
+          "$fixture_python" -c 'import sys; assert sys.version_info[:3] == (3, 12, 13)'
+          printf 'DEVFLOW_TEST_RUNTIME_LOCATION_PYTHON=%s\n' "$fixture_python" >> "$GITHUB_ENV"
+      - name: Prepare disposable native SDK and official tool fixtures
+        env:
+          DEVFLOW_TEMPORAL_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .venv/bin/python tests/portable_temporal_fixture.py "$RUNNER_TEMP/devflow-portable-temporal"
+        working-directory: runtime
       - run: uv run --frozen ruff check src tests runtime_ci.py
         working-directory: runtime
       - name: Run assigned runtime modules and host 0 Mac source qualification
-        # Three hosted Mac jobs, each with four module-atomic internal partitions.
+        # Four complete, disjoint partitions; at most two pytest parents per host.
         run: |
+          result=0
           processes=()
           if [ '${{ matrix.shard }}' = 0 ]; then
             env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
@@ -99,14 +113,17 @@ jobs:
                 python3.12 -B -m unittest discover -s tests -p 'test_reconcile.py' -v
             ) &
             processes+=("$!")
+            for process in "${processes[@]}"; do
+              wait "$process" || result=1
+            done
+            processes=()
           fi
-          for lane in 0 1 2 3; do
-            index=$(( ${{ matrix.shard }} + lane * 3 ))
-            .venv/bin/python runtime_ci.py --index "$index" --count 12 \
+          for lane in 0 1; do
+            index=$(( ${{ matrix.shard }} + lane * 2 ))
+            .venv/bin/python runtime_ci.py --index "$index" --count 4 \
               --basetemp "$RUNNER_TEMP/devflow-pytest-$index" &
             processes+=("$!")
           done
-          result=0
           for process in "${processes[@]}"; do
             wait "$process" || result=1
           done
@@ -140,7 +157,7 @@ jobs:
           path: runtime/ci-results/
           merge-multiple: true
       - name: Verify complete and disjoint coverage at this revision
-        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 12
+        run: python runtime/runtime_ci.py --verify runtime/ci-results --count 4
   temporal-dashboard:
     runs-on: ubuntu-latest
     timeout-minutes: 5

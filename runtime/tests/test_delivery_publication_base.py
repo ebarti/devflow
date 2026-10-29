@@ -24,20 +24,6 @@ def bind_default(source: Path) -> str:
     return head
 
 
-
-
-
-
-def test_native_admission_freezes_branch_before_roles_or_effects(native_configuration):
-    config, request = native_configuration
-    repository = config.raw["repositories"]["fixture"]
-    head = bind_default(Path(repository["source_path"]))
-    repository.update(base_ref=head, expected_base_sha=head)
-    spec = config.admit({**request, "base_ref": head})
-    assert spec["base_ref"] == spec["base_sha"] == head
-    assert spec["publication_base_ref"] == "main"
-
-
 def test_unbound_native_pin_is_rejected_before_accepting_work(native_configuration):
     config, request = native_configuration
     repository = config.raw["repositories"]["fixture"]

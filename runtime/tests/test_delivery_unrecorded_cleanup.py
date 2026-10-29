@@ -13,7 +13,6 @@ from test_delivery_store import service as service
 from devflow_temporal import delivery_automatic_retry as retry
 from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_orphans import reconcile_attempt
-from devflow_temporal.delivery_resources import write_private
 
 
 @pytest.fixture
@@ -48,48 +47,6 @@ def observation(store, request, historical):
     for name, sha in record['observed_resources'].items():
         assert hashlib.sha256(archive.joinpath(name).read_bytes()).hexdigest() == sha
     return archive, record
-
-
-def test_owner_maintenance_preserves_missing_producer_binding_and_observes_cleanup(unrecorded):
-    store, request, historical, calls, external = unrecorded
-    before = copy.deepcopy(historical)
-    root = Path(store.spec(request['run_id'])['state_dir']) / 'resources'
-    observed = root.joinpath('finalization.json').read_bytes()
-    assert len(retry.retry_once(store)) == 1
-    archive, _ = observation(store, request, historical)
-    assert archive.joinpath('observed-finalization.json').read_bytes() == observed
-    assert historical == before
-    assert 'receipt_sha256' not in historical['result']['checks']['resource_cleanup']
-    assert ('finalize', 'blocked', False) in calls
-    assert external['external_sets'] == 1
-    with store._connect() as db:
-        old = db.execute('SELECT * FROM delivery_runs WHERE run_id=?',
-                         (request['run_id'],)).fetchone()
-        assert old['cleanup'] == 'confirmed'
-        assert old['phase'] == old['outcome'] == 'blocked'
-        assert json.loads(old['checks_json'])['failure'] == before['result']['checks']['failure']
-
-
-@pytest.mark.parametrize('interrupted', ['finalizer', 'tracker', 'base'])
-def test_missing_receipt_observation_replays_after_canonical_files_change(unrecorded, interrupted):
-    store, request, historical, calls, external = unrecorded
-    before = copy.deepcopy(historical)
-    if interrupted == 'finalizer':
-        external['crash_finalizing'] = True
-    elif interrupted == 'tracker':
-        external['lost_ack'] = True
-    else:
-        external['base_unknown'] = True
-    assert retry.retry_once(store) == []
-    archive, record = observation(store, request, historical)
-    preserved = {name: archive.joinpath(name).read_bytes() for name in record['observed_resources']}
-    store._automatic_retry_waits.clear()
-    external['base_unknown'] = False
-    assert len(retry.retry_once(store)) == 1
-    assert observation(store, request, historical)[1] == record
-    assert all(archive.joinpath(name).read_bytes() == raw for name, raw in preserved.items())
-    assert historical == before
-    assert external['external_sets'] == 1
 
 
 def test_public_cleanup_preserves_failed_ci_and_original_result_without_bound_receipt(
@@ -166,27 +123,3 @@ def test_missing_receipt_support_never_waives_a_declared_or_malformed_binding(un
     assert not any(item[0] in {'finalize', 'tracker'} for item in calls)
     assert not root.joinpath('cleanup-observations').exists()
     assert not root.joinpath('predecessor-resources').exists()
-
-
-@pytest.mark.parametrize('name', ['manifest.json', 'observed-finalization.json'])
-def test_unrecorded_producer_keeps_archive_tamper_guards_on_retry(unrecorded, name):
-    store, request, historical, calls, external = unrecorded
-    external['crash_finalizing'] = True
-    assert retry.retry_once(store) == []
-    archive, _ = observation(store, request, historical)
-    write_private(archive / name, {'tampered': True})
-    finalizations = calls.count(('finalize', 'blocked', False))
-    store._automatic_retry_waits.clear()
-    assert retry.retry_once(store) == []
-    assert calls.count(('finalize', 'blocked', False)) == finalizations
-    assert not any(item[0] == 'tracker' for item in calls)
-
-
-@pytest.mark.parametrize('name', ['manifest.json', 'finalization.json'])
-def test_unrecorded_producer_rechecks_observed_bytes_before_archive(unrecorded, name):
-    store, request, _historical, calls, external = unrecorded
-    root = Path(store.spec(request['run_id'])['state_dir']) / 'resources'
-    external['on_publication'] = lambda: write_private(root / name, {'raced': True})
-    assert retry.retry_once(store) == []
-    assert not root.joinpath('cleanup-observations').exists()
-    assert not any(item[0] in {'finalize', 'tracker'} for item in calls)

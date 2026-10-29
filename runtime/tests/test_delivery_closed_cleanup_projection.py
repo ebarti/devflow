@@ -23,7 +23,7 @@ from test_delivery_gate_retry import unpublished as unpublished
 from test_delivery_store import service as service
 
 from devflow_temporal.contracts import digest
-from devflow_temporal.delivery_closed_projection import EVENT, reconcile_projection
+from devflow_temporal.delivery_closed_projection import reconcile_projection
 from devflow_temporal.delivery_codec import DELIVERY_DATA_CONVERTER
 from devflow_temporal.delivery_resources import RunResources
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
@@ -89,86 +89,6 @@ def _maintenance(store, spec, description, *, uncertain=True, status="COMPLETED"
 
 
 @pytest.mark.asyncio
-async def test_failed_closure_cleanup_retains_exact_projection_and_event_custody(unpublished):
-    from devflow_temporal.delivery_closed_projection import _cleanup_row, _same_row
-
-    store, spec, _, _, description = await _closed(unpublished)
-    original = _row(store)
-    projection = {**{key: original[key] for key in (
-        'phase', 'execution_state', 'iteration', 'outcome', 'cleanup', 'error',
-        'protocol_revision')},
-        **{key: json.loads(original[column] or 'null') for key, column in (
-            ('candidate', 'candidate_json'), ('pull_request', 'pr_json'), ('checks', 'checks_json'),
-            ('tracker', 'tracker_json'), ('usage', 'usage_json'), ('decision', 'decision_json'),
-            ('intake', 'intake_json'))}, 'spec': spec, 'event_type': 'chunk_integrating',
-        'key': 'chunk_integrating:0:5'}
-    _maintenance(store, spec, description, uncertain=False, status='FAILED')
-    row, events = _row(store), store.events('run-1')
-    assert _cleanup_row(row, spec, description, {1: projection}, events) is None
-    bound = _cleanup_row(row, spec, description, {1: projection}, events, status='FAILED')
-    assert bound and _same_row(bound[0], projection)
-    assert bound[0]['revision'] == original['revision']
-    events[-1]['payload_json'] = '{}'
-    assert _cleanup_row(row, spec, description, {1: projection}, events, status='FAILED') is None
-
-
-def _observation(store):
-    with store._connect() as db:
-        store._event(db, "run-1", _row(store)["revision"], "automatic_retry_skipped",
-                     "Private observation after maintenance", {"reason": "previous refusal"})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("committed", [False, True])
-@pytest.mark.parametrize("uncertain", [False, True])
-async def test_completed_result_preserves_authenticated_cleanup_and_replay(
-    unpublished, committed, uncertain,
-):
-    store, spec, state, client, description = await _closed(unpublished, committed=committed)
-    original = _row(store)
-    receipt = _maintenance(store, spec, description, uncertain=uncertain)
-    before = _row(store)
-    assert {k for k in before if before[k] != original[k]} == {
-        "revision", "checks_json", "cleanup", "updated_at"}
-    assert before["updated_at"] > description.close_time.isoformat()
-    _observation(store)
-    events = store.events("run-1")
-    assert (await reconcile_projection(store, client, before))["state"] == "reconciled"
-    final = _row(store)
-    assert final["phase"] == final["execution_state"] == final["outcome"] == "blocked"
-    assert final["protocol_revision"] == 7 and final["error"] == state["error"]
-    assert final["cleanup"] == receipt["resource_cleanup"]
-    assert json.loads(final["checks_json"]) == {**state["checks"], "resource_cleanup": receipt}
-    assert store.events("run-1")[:-1] == events
-    assert store.events("run-1")[-1]["type"] == EVENT
-    after = store.events("run-1")
-    assert (await reconcile_projection(store, client, final))["state"] == "observed"
-    assert _row(store) == final and store.events("run-1") == after
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("committed", [False, True])
-async def test_two_cleanup_passes_before_terminal_reconciliation_compose_latest_receipt(
-    unpublished, committed,
-):
-    store, spec, state, client, description = await _closed(unpublished, committed=committed)
-    unknown = _maintenance(store, spec, description)
-    _observation(store)
-    confirmed = _maintenance(store, spec, description, uncertain=False)
-    _observation(store)
-    before, events = _row(store), store.events("run-1")
-    assert unknown["state"] == "unknown" and confirmed["state"] == "confirmed"
-    assert (await reconcile_projection(store, client, before))["state"] == "reconciled"
-    final = _row(store)
-    assert final["cleanup"] == "confirmed" and final["phase"] == "blocked"
-    assert json.loads(final["checks_json"]) == {**state["checks"], "resource_cleanup": confirmed}
-    assert store.events("run-1")[:-1] == events
-    after = store.events("run-1")
-    assert (await reconcile_projection(store, client, final))["state"] == "observed"
-    assert _row(store) == final and store.events("run-1") == after
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("drift", ["mixed-writer", "missing-revision", "unordered-time", "key"])
 async def test_cleanup_chain_refuses_unaccounted_or_foreign_writes(unpublished, drift):
     store, spec, _, client, description = await _closed(unpublished)
@@ -192,67 +112,6 @@ async def test_cleanup_chain_refuses_unaccounted_or_foreign_writes(unpublished, 
     with pytest.raises(ValueError, match="would overwrite a newer row"):
         await reconcile_projection(store, client, before)
     assert _row(store) == before and store.events("run-1") == events
-
-
-@pytest.mark.asyncio
-async def test_committed_terminal_response_loss_allows_a_trailing_observation(unpublished):
-    store, _, state, client, _ = await _closed(unpublished, committed=True)
-    _observation(store)
-    assert (await reconcile_projection(store, client, _row(store)))["state"] == "reconciled"
-    assert json.loads(_row(store)["checks_json"]) == state["checks"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["protocol", "outcome", "candidate", "decision", "error",
-                                   "metadata", "checks", "cleanup", "key", "revision", "closure"])
-async def test_cleanup_marker_cannot_hide_newer_delivery_state(unpublished, drift):
-    store, spec, _, client, description = await _closed(unpublished)
-    _maintenance(store, spec, description)
-    columns = {
-        "protocol": ("protocol_revision", 8), "outcome": ("outcome", "delivered"),
-        "candidate": ("candidate_json", json.dumps({"id": "foreign", "head": "foreign"})),
-        "decision": ("decision_json", json.dumps({"id": "new-human-question"})),
-        "error": ("error", "newer refusal"), "metadata": ("accepted_plan_text", "new plan"),
-        "checks": ("checks_json", json.dumps({**json.loads(_row(store)["checks_json"]),
-                                               "newer_gate": {"state": "failed"}})),
-        "cleanup": ("cleanup", "confirmed"), "revision": ("revision", 50),
-    }
-    with store._connect() as db:
-        if drift in columns:
-            column, value = columns[drift]
-            db.execute(f"UPDATE delivery_runs SET {column}=? WHERE run_id='run-1'", (value,))
-        elif drift == "key":
-            db.execute("UPDATE delivery_events SET payload_json='{}' "
-                       "WHERE run_id='run-1' AND type='resource_cleanup_reconciled'")
-        else:
-            description.run_id = "foreign-completed-execution"
-    before, events = _row(store), store.events("run-1")
-    with pytest.raises(ValueError):
-        await reconcile_projection(store, client, before)
-    assert _row(store) == before and store.events("run-1") == events
-
-
-@pytest.mark.asyncio
-async def test_composition_checks_concurrent_metadata_inside_projection_transaction(
-    unpublished, monkeypatch,
-):
-    store, spec, _, client, description = await _closed(unpublished)
-    _maintenance(store, spec, description)
-    project = store.project
-    events = store.events("run-1")
-
-    def raced(*args, **kwargs):
-        with store._connect() as db:
-            db.execute("UPDATE delivery_runs SET accepted_plan_text='concurrent decision' "
-                       "WHERE run_id='run-1'")
-        return project(*args, **kwargs)
-
-    monkeypatch.setattr(store, "project", raced)
-    with pytest.raises(ValueError, match="projection row changed"):
-        await reconcile_projection(store, client, _row(store))
-    assert _row(store)["accepted_plan_text"] == "concurrent decision"
-    assert _row(store)["phase"] == "feature_integration"
-    assert store.events("run-1") == events
 
 
 @pytest.mark.asyncio

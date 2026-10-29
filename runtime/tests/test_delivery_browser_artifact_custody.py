@@ -113,6 +113,8 @@ async def test_implementation_role_pins_output_without_dependency_checks(
                            checks=[{'id': 'configured-output', 'cwd': '.',
                                     'argv': [sys.executable, '-c', 'pass'],
                                     'generated_directories': ['dist/check-output']}])
+    owned['policy_digest'] = digest(owned['policy'])
+    candidate = broker.candidate()
     resources = RunResources(owned)
     outputs = ['dist/playwright-report', 'dist/check-output']
 

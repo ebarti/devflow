@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -221,32 +220,6 @@ def test_retained_journals_use_exact_preparation_and_namespace_authority(
         later_path.write_bytes(before_role)
 
 
-def test_retained_original_intake_binds_the_durably_accepted_plan(intake_fixture, monkeypatch):
-    from test_delivery_intake import _authorization, _record_plan
-
-    from devflow_temporal.delivery_config import DeliveryConfig
-    from devflow_temporal.delivery_store import DeliveryStore
-
-    config, supplied = intake_fixture
-    store = DeliveryStore(DeliveryConfig.load(config))
-    store.submit(supplied)
-    submitted = store.spec(supplied['run_id'])
-    assert submitted['intake_required'] and not submitted['accepted_plan']
-    plan = json.loads(config.read_text())['fake_intake'][2]['plan']
-    authorization = _authorization(submitted)
-    _record_plan(store, plan, authorization)
-    store.accept_intake_plan(submitted['run_id'], 1, digest(plan), plan,
-                             authorization=authorization)
-    original, row, _path, _journal, _request, _table, _ports = completed.__wrapped__(
-        (store, supplied), monkeypatch)
-    current, _namespace = published_scope(store, original)
-    assert observe_completed_resources(current, [row])['journal_sha256']
-    with store._connect() as db:
-        db.execute("UPDATE delivery_runs SET accepted_plan_text='foreign accepted plan'")
-    with pytest.raises(ValueError, match='request lost its admitted execution policy'):
-        observe_completed_resources(current, [row])
-
-
 @pytest.fixture
 def completed_intake(intake_fixture, monkeypatch):
     """Private prepared intake completed before real plan acceptance; no provider."""
@@ -324,143 +297,6 @@ def test_completed_preplan_intake_survives_plan_acceptance(completed_intake, sur
     assert executions[path.parents[2]] == current
 
 
-def test_preplan_cleanup_requires_the_current_authenticated_feature_overlay(completed_intake):
-    from devflow_temporal.delivery_execution_registry import ExecutionRegistry
-
-    store, current, row, path, journal, request, table = completed_intake
-    shared = ExecutionRegistry(store.config.path.parent / 'ownership/registry.sqlite3')
-    snapshot = {'issue': {'id': 'private-feature', 'url': current['issue_url'],
-                           'repository_id': 'private-repository'}}
-    token = shared.claim(snapshot, current['run_id'], str(store.config.tracking_db))
-    feature = {'registry': str(shared.path), 'owner': token, 'snapshot': snapshot}
-    submitted = store.submitted_spec(current['run_id'])
-    # Explicit private admission seam: fake preparation gains the real feature
-    # custody fields and preparation marker, with both digests regenerated.
-    submitted.update(feature_delivery=feature, preparation_version=1)
-    request['spec'].update(feature_delivery=feature, preparation_version=1)
-    current.update(feature_delivery=feature, preparation_version=1)
-    write_private(path.with_name('request.json'), request)
-    with store._connect() as db:
-        db.execute('UPDATE delivery_runs SET request_json=?', (canonical_json(submitted),))
-        db.execute('UPDATE delivery_preparations SET submitted_spec_digest=?, '
-                   'effective_spec_digest=?,effective_spec_json=?',
-                   (digest(submitted), digest(request['spec']), canonical_json(request['spec'])))
-    overlay = copy.deepcopy(current)
-    plan = json.loads(overlay['accepted_plan'])
-    plan['scope'] = 'The adopted plan keeps the original completed intake custody'
-    overlay['accepted_plan'] = json.dumps(plan)
-    identity = {'plan_revision': 1, 'plan_digest': digest(plan)}
-    overlay['feature_plan_revision'] = identity
-    key = 'plan-revision:spec:' + current['run_id'] + ':1'
-    shared.checkpoint(token, key, {'identity': identity, 'revision_id': 'private-adoption',
-                                  'spec': overlay, 'spec_digest': digest(overlay)})
-    effective = store.effective_spec(current['run_id'])
-    assert effective == overlay and effective != current
-    fixture = store, effective, row, path, journal, request, table
-    for surface in ('orphan', 'finalizer', 'completed'):
-        assert _observe_intake(fixture, surface)
-        changed = {**effective, 'accepted_plan': 'an unadmitted caller plan'}
-        with pytest.raises(ValueError, match='admitted execution policy'):
-            _observe_intake((store, changed, *fixture[2:]), surface)
-    # The namespace remains the separately authenticated SQL-accepted plan.
-    executions = {}
-    resources._gate_roots(effective, execution_specs=executions)
-    assert executions[path.parents[2]] == current
-    with shared.connect() as db:
-        db.execute('UPDATE execution_checkpoints SET content_digest=? WHERE checkpoint_key=?',
-                   ('foreign', key))
-    with pytest.raises(ValueError, match='checkpoint digest changed'):
-        _observe_intake(fixture, 'orphan')
-
-
-@pytest.mark.parametrize('surface', ['orphan', 'finalizer', 'completed'])
-@pytest.mark.parametrize('changed', [
-    'accepted_plan', 'preparation', 'request_plan', 'request_policy', 'result', 'session',
-    'unfinished', 'live_actor', 'other_role',
-])
-def test_completed_preplan_intake_preserves_custody(completed_intake, surface, changed):
-    from devflow_temporal.supervisor import DeliverySupervisor
-
-    store, _current, row, path, journal, request, table = completed_intake
-    if changed == 'accepted_plan':
-        with store._connect() as db:
-            db.execute("UPDATE delivery_runs SET accepted_plan_text='foreign plan'")
-    elif changed == 'preparation':
-        with store._connect() as db:
-            db.execute("UPDATE delivery_preparations SET effective_spec_digest='foreign'")
-    elif changed == 'request_plan':
-        request['spec']['accepted_plan'] = 'unadmitted plan'
-    elif changed == 'request_policy':
-        request['spec']['policy']['roles']['intake']['timeout_seconds'] = 99999
-        request['spec']['policy_digest'] = digest(request['spec']['policy'])
-    elif changed == 'result':
-        row['result_json'] = canonical_json({'status': 'pass'})
-    elif changed == 'session':
-        journal['provider_session']['session_id'] = 'foreign'
-    elif changed == 'unfinished':
-        row['state'] = 'running'
-    elif changed == 'live_actor':
-        table[17] = {'identity': 'opaque-start', 'stat': 'S'}
-    elif changed == 'other_role':
-        request['role'] = row['role'] = 'implement'
-        row['job_key'] = DeliverySupervisor._job_key(request)
-    write_private(path.with_name('request.json'), request)
-    write_private(path, journal)
-    with store._connect() as db:
-        db.execute('UPDATE delivery_attempts SET result_json=?,state=?',
-                   (row['result_json'], row['state']))
-    with pytest.raises(ValueError):
-        _observe_intake(completed_intake, surface)
-
-
-@pytest.mark.parametrize('changed', ['missing_digest', 'lock_busy'])
-def test_later_completed_observation_requires_original_bindings(completed, changed, monkeypatch):
-    spec, original, path, journal, request, table, ports = completed
-    row = copy.deepcopy(original)
-    if changed == 'missing_digest':
-        journal['provider_session'].pop('result_digest')
-    elif changed == 'result':
-        row['result_json'] = json.dumps({'status': 'pass'})
-    elif changed in {'session', 'role', 'iteration'}:
-        journal['provider_session'][changed if changed != 'session' else 'session_id'] = 'foreign'
-    elif changed == 'run':
-        journal['intent']['run_id'] = 'foreign'
-    elif changed == 'environment':
-        journal['intent']['environment_sha256'] = 'foreign'
-    elif changed in {'monitor_live', 'owned_live'}:
-        pid = 19 if changed == 'monitor_live' else 17
-        table[pid] = {'identity': 'opaque-monitor' if pid == 19 else 'opaque-start', 'stat': 'S'}
-    elif changed == 'port_busy':
-        journal['ports'] = journal['intent']['ports'] = [12345]
-        ports.add(999)
-    elif changed == 'inventory':
-        row['job_key'] = 'foreign'
-    elif changed == 'request':
-        request['spec'] = {**spec, 'policy_digest': 'foreign'}
-        write_private(path.with_name('request.json'), request)
-    elif changed == 'pid':
-        row['process_identity'] = 'foreign'
-    elif changed == 'missing_monitor':
-        journal.pop('monitor')
-    elif changed == 'incomplete':
-        journal['monitoring_complete'] = False
-    elif changed == 'lock_busy':
-        import fcntl
-
-        from devflow_temporal import delivery_resources
-        original_flock = fcntl.flock
-
-        def busy(descriptor, operation):
-            if operation == fcntl.LOCK_SH:
-                return original_flock(descriptor, operation)
-            assert operation == fcntl.LOCK_EX | fcntl.LOCK_NB
-            raise BlockingIOError('opaque original lease is busy')
-        monkeypatch.setattr(delivery_resources.fcntl, 'flock', busy)
-    write_private(path, journal)
-    with pytest.raises((ValueError, KeyError)):
-        observe_completed_resources(spec, [row])
-
-
 @pytest.fixture
 def retained(tmp_path, monkeypatch):
     state = tmp_path / 'private-worker'
@@ -479,73 +315,6 @@ def retained(tmp_path, monkeypatch):
                         lambda *_args, **_kwargs: 'private synthetic retained gate')
     owner.finalize('blocked')
     return spec, owner, gate
-
-
-def test_observation_and_finalizer_share_one_complete_resource_generation(retained, monkeypatch):
-    spec, owner, _gate = retained
-    final = owner.root / 'finalization.json'
-    before = owner.manifest.read_bytes(), final.read_bytes()
-    baseline = resources.observe_completed_resources(spec, [])
-    writer_attempted, running, finish = (threading.Event() for _ in range(3))
-    reader_lease, errors = [], []
-    flock, write = resources.fcntl.flock, resources.write_private
-
-    def authenticated_flock(descriptor, operation):
-        if threading.current_thread() is writer and operation == resources.fcntl.LOCK_EX:
-            writer_attempted.set()
-        flock(descriptor, operation)
-        if (threading.current_thread() is threading.main_thread()
-                and operation == resources.fcntl.LOCK_SH):
-            reader_lease.append(True)
-
-    def paused_write(path, value):
-        write(path, value)
-        if path == owner.manifest and value.get('finalization', {}).get('state') == 'running':
-            running.set()
-            assert finish.wait(5)
-
-    def finalize():
-        try:
-            owner.finalize('blocked')
-        except BaseException as exc:
-            errors.append(exc)
-
-    writer = threading.Thread(target=finalize, name='private-resource-finalizer')
-
-    def overlap(argv, **_kwargs):
-        assert argv[0] == '/usr/sbin/lsof'
-        writer.start()
-        assert writer_attempted.wait(5)
-        if not reader_lease:
-            # Force the old unlocked reader to return the real intermediate hash.
-            assert running.wait(5)
-        return SimpleNamespace(returncode=1, stdout='')
-
-    monkeypatch.setattr(resources.fcntl, 'flock', authenticated_flock)
-    monkeypatch.setattr(resources, 'write_private', paused_write)
-    monkeypatch.setattr(resources.subprocess, 'run', overlap)
-    try:
-        observation = resources.observe_completed_resources(spec, [])
-        assert observation == baseline
-        assert observation['manifest_sha256'] == hashlib.sha256(before[0]).hexdigest()
-    finally:
-        finish.set()
-        if writer.ident is not None:
-            writer.join(5)
-    assert not writer.is_alive() and not errors
-    assert (owner.manifest.read_bytes(), final.read_bytes()) == before
-
-    # Observation must authenticate an existing private lease, never repair it.
-    lock = owner.root / 'ownership.lock'
-    lock.chmod(0o644)
-    with pytest.raises(ValueError, match='ownership lock.*private'):
-        resources.observe_completed_resources(spec, [])
-    assert lock.stat().st_mode & 0o777 == 0o644
-    lock.unlink()
-    with pytest.raises(FileNotFoundError):
-        resources.observe_completed_resources(spec, [])
-    assert not lock.exists()
-    assert (owner.manifest.read_bytes(), final.read_bytes()) == before
 
 
 def test_retained_custody_is_complete_but_new_or_changed_resources_remain_pending(

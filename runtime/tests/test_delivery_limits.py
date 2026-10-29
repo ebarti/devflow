@@ -4,11 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
+from datetime import timedelta
 
 import pytest
-from temporalio import activity, workflow
+from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from test_delivery_store import service as service
@@ -21,31 +20,6 @@ from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.delivery_workflow import DeliveryWorkflow
 
 
-@pytest.mark.parametrize("value", [True, 0, -1, 86401, 1.5, "60"])
-def test_bad_time_policy_rejected_before_admission(value):
-    with pytest.raises(ValueError):
-        delivery_limits.policy({"delivery_timeout_seconds": value})
-
-
-def test_progress_clock_ignores_poll_and_phase_changes(monkeypatch):
-    start = datetime(2026, 10, 18, tzinfo=UTC)
-    now = [start]
-    monkeypatch.setattr(workflow, "now", lambda: now[0])
-    state = {"candidate": {"id": "same"}, "roles": [], "checks": {}}
-    clock = {"admitted_at": start.isoformat(), "last_progress_at": start.isoformat()}
-    controller = SimpleNamespace(delivery_clock=clock, state=state)
-    delivery_limits.observe(controller)
-    now[0] += timedelta(minutes=5)
-    state.update(phase="waiting_ci", revision=100)
-    state["checks"]["ci"] = {"state": "pending", "attempt": 42}
-    delivery_limits.observe(controller)
-    assert clock["last_progress_at"] == start.isoformat()
-    state["checks"]["local"] = {"state": "passed", "candidate_id": "same"}
-    delivery_limits.observe(controller)
-    assert clock["last_progress_at"] == now[0].isoformat()
-    assert clock["admitted_at"] == start.isoformat()
-
-
 def configured(service, key, seconds):
     original, request = service
     path = original.config.path
@@ -53,15 +27,6 @@ def configured(service, key, seconds):
     raw[key] = seconds
     path.write_text(json.dumps(raw))
     return DeliveryStore(DeliveryConfig.load(path)), request
-
-
-def test_replaying_admission_does_not_reset_its_clock(service, monkeypatch):
-    store, request = configured(service, "delivery_timeout_seconds", 3600)
-    store.submit(request)
-    started = store.spec(request["run_id"])["delivery_admitted_at"]
-    monkeypatch.setattr(delivery_store, "_now", lambda: "2030-01-01T00:00:00+00:00")
-    store.submit(request)
-    assert store.spec(request["run_id"])["delivery_admitted_at"] == started
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import io
 import json
+import marshal
 import os
 import shlex
 import stat
@@ -19,8 +20,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from contextvars import copy_context
 from copy import deepcopy
+from importlib.machinery import PathFinder
 from importlib.metadata import distributions
 from pathlib import Path
+from types import CodeType
 
 from .contracts import canonical_json, digest
 from .delivery_runtime_authority import (
@@ -303,6 +306,75 @@ def _records(prefix):
     return result
 
 
+# Trusted manifest for the exact distutils patch embedded by uv 0.12.17.
+# Upstream tag 0.12.17, commit 635500036e1705961315e86447f0fab0a8ddb309,
+# crates/uv-virtualenv/src/_virtualenv.py, Git blob c4af24d43878f22da47efa43a3ef7899c6a7c8aa.
+# virtualenv.rs writes the .pth as the exact 18 bytes below. This is not an
+# assertion based on a local uv version string or user-controlled pyvenv.cfg.
+_UV_01217_PATCH_SHA256 = "cfb3db86aaa53bb62b5ff764970bec2d71c9228590a0ebec57f6ec926cc0bf1a"
+_UV_01217_PTH = b"import _virtualenv"
+
+
+def _import_registrations(root, site):
+    """Authenticate every executable startup registration and its import target."""
+    registrations = {path.name: path for path in site.glob("*.pth")}
+    editable = "_editable_impl_devflow_temporal.pth"
+    permitted = {editable}
+    if "_virtualenv.pth" in registrations:
+        permitted.add("_virtualenv.pth")
+    if set(registrations) != permitted:
+        raise ValueError("permanent runtime has an unacknowledged external import registration")
+    editable_path = registrations[editable]
+    _hash(editable_path)
+    if editable_path.read_text().strip() != str(root / "runtime/src"):
+        raise ValueError("permanent runtime has an unacknowledged external import registration")
+    if len(permitted) == 1:
+        return
+    _directory(site)
+    pth = registrations["_virtualenv.pth"]
+    source = site / "_virtualenv.py"
+    if (_hash(pth) != hashlib.sha256(_UV_01217_PTH).hexdigest()
+            or pth.read_bytes() != _UV_01217_PTH
+            or _hash(source) != _UV_01217_PATCH_SHA256):
+        raise ValueError("permanent runtime has an unrecognized virtualenv startup patch")
+    raw = source.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != _UV_01217_PATCH_SHA256:
+        raise ValueError("virtualenv startup patch changed during observation")
+    # Python prefers a package or native module over the expected source.  A
+    # legacy adjacent pyc is also directly importable when source is missing.
+    for other in site.glob("_virtualenv*"):
+        if other not in (source, pth):
+            raise ValueError("virtualenv startup patch has an import shadow")
+    cache = site / "__pycache__"
+    if os.path.lexists(cache):
+        _directory(cache)
+        for compiled in cache.glob("_virtualenv.*.pyc"):
+            if compiled.lstat().st_size > 65536:
+                raise ValueError("virtualenv startup bytecode is not bounded")
+            before = _hash(compiled)
+            data = compiled.read_bytes()
+            if hashlib.sha256(data).hexdigest() != before or len(data) < 16:
+                raise ValueError("virtualenv startup bytecode changed during observation")
+            try:
+                observed = marshal.loads(data[16:])
+            except (EOFError, ValueError, TypeError) as exc:
+                raise ValueError("virtualenv startup bytecode is invalid") from exc
+            if not isinstance(observed, CodeType) or not any(
+                observed == compile(raw, str(source), "exec", dont_inherit=True, optimize=level)
+                for level in (0, 1, 2)
+            ):
+                raise ValueError("virtualenv startup bytecode differs from authenticated source")
+    loaded = sys.modules.get("_virtualenv")
+    resolved = PathFinder.find_spec("_virtualenv", sys.path)
+    if (loaded is None or getattr(loaded, "__file__", None) != str(source)
+            or getattr(getattr(loaded, "__spec__", None), "origin", None) != str(source)
+            or resolved is None or resolved.origin != str(source)):
+        raise ValueError("virtualenv startup import resolved outside its authenticated module")
+    if (_hash(source) != _UV_01217_PATCH_SHA256
+            or _hash(pth) != hashlib.sha256(_UV_01217_PTH).hexdigest()):
+        raise ValueError("virtualenv startup patch changed during observation")
+
+
 def destination(original):
     """The actual independently imported runtime, not an equal-hash chosen executable."""
     from .delivery_broker import _git
@@ -339,13 +411,7 @@ def destination(original):
     binary = Path(distribution("openai-codex-cli-bin").locate_file("codex_cli_bin/bin/codex"))
     if binary != site / "codex_cli_bin/bin/codex" or binary.resolve(strict=True) != binary:
         raise ValueError("permanent runtime is not using its own actual bundled SDK CLI")
-    pth = list(site.glob("*.pth"))
-    if (
-        len(pth) != 1
-        or pth[0].name != "_editable_impl_devflow_temporal.pth"
-        or pth[0].read_text().strip() != str(root / "runtime/src")
-    ):
-        raise ValueError("permanent runtime has an unacknowledged external import registration")
+    _import_registrations(root, site)
     direct = json.loads(distribution("devflow-temporal").read_text("direct_url.json"))
     from urllib.parse import unquote, urlsplit
 

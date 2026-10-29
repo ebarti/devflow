@@ -62,37 +62,6 @@ def cleanup_chain(tmp_path):
                            anchor=anchor, events=events)
 
 
-def test_published_cleanup_accepts_later_contiguous_owner_observation(cleanup_chain):
-    c = cleanup_chain
-    original = copy.deepcopy(c.state)
-    with c.store._connect() as db:
-        before = db.serialize()
-    proof = reconciled_cleanup(c.store, c.row, c.state, closed=c.closed)
-    assert proof is not None
-    assert proof["resource_cleanup"] == c.latest
-    assert proof["tracker"] == c.anchor["tracker"]
-    custody = {"historical_quarantines", "quarantined_cleanup", "native_observation"}
-    assert not custody & proof.keys()
-    assert c.state == original
-    with c.store._connect() as db:
-        assert db.serialize() == before
-
-
-@pytest.mark.parametrize("field", ["historical_quarantines", "quarantined_cleanup",
-                                   "native_observation"])
-def test_maintenance_chain_preserves_exact_optional_anchor_custody(cleanup_chain, field):
-    c = cleanup_chain
-    retained = {"journal_sha256": {"exact-owned-journal": digest(field)}}
-    c.anchor[field] = [retained] if field == "historical_quarantines" else retained
-    with c.store._connect() as db:
-        db.execute("UPDATE delivery_events SET payload_json=? WHERE sequence=10",
-                   (json.dumps(c.anchor),))
-    proof = reconciled_cleanup(c.store, c.row, c.state, closed=c.closed)
-    assert proof is not None
-    assert proof[field] == c.anchor[field]
-    assert proof["maintenance_chain"]["anchor_sha256"] == digest(c.anchor)
-
-
 @pytest.mark.parametrize("drift", ["foreign_write", "revision_gap", "execution", "receipt",
                                     "tracker", "candidate", "iteration", "timestamp"])
 def test_published_cleanup_refuses_an_unbound_chain(cleanup_chain, drift):

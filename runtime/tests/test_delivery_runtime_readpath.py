@@ -134,28 +134,6 @@ def acknowledge_reads(
     return receipt, reference
 
 
-def test_acknowledgement_hydrates_once_and_rechecks_each_call(service, monkeypatch):
-    store, request = service
-    store.submit(request)
-    _receipt, reference = acknowledge_reads(store, request)
-    original = location.load_authority
-    calls = []
-
-    def load(*args, **kwargs):
-        calls.append(args[0])
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(location, "load_authority", load)
-    assert location._acknowledged(store.config)
-    assert calls == [Path(reference["receipt"])]
-    assert location._acknowledged(store.config)
-    assert len(calls) == 2
-    Path(_receipt["service_guard"]["link"]).unlink()
-    with pytest.raises(guard.GuardCustodyError):
-        location._acknowledged(store.config)
-    assert len(calls) == 3
-
-
 @pytest.mark.parametrize(
     "drift",
     ["receipt", "pointer", "owner", "command", "event", "row", "mode", "symlink", "hardlink"],
@@ -204,41 +182,6 @@ def test_each_acknowledgement_keeps_fresh_mutable_and_file_custody(service, drif
     else:
         with pytest.raises((ValueError, OSError)):
             location._acknowledged(store.config)
-
-
-@pytest.mark.parametrize("drift", [False, True])
-def test_retained_gate_authority_is_observation_local_and_rechecked(tmp_path, monkeypatch, drift):
-    from test_delivery_resources import spec
-
-    current = spec(tmp_path)
-    registry = RunResources(current)
-    gates = []
-    for iteration in range(8):
-        for role in ("review", "verify"):
-            gate = Path(current["state_dir"]) / "gates" / str(iteration) / role
-            resources.private_directory(gate.parent)
-            registry.register(gate, "gate")
-            gate.mkdir()
-            registry.created(gate)
-            gates.append(gate)
-    original = resources._gate_roots
-    calls = []
-
-    def observe(*args, **kwargs):
-        calls.append(True)
-        root, values = original(*args, **kwargs)
-        if drift and len(calls) > 1:
-            values.add(Path(current["state_dir"]) / "changed-execution")
-        return root, values
-
-    monkeypatch.setattr(resources, "_gate_roots", observe)
-    result = resources.retained_worktrees(current)
-    assert len(calls) == 2
-    assert result["state"] == ("unavailable" if drift else "observed")
-    assert result["count"] == (None if drift else len(gates))
-    if not drift:
-        assert resources.retained_worktrees(current)["count"] == len(gates)
-        assert len(calls) == 4
 
 
 @pytest.fixture

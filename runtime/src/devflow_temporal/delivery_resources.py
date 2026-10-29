@@ -1090,9 +1090,14 @@ class RunResources:
             if Path('/usr/sbin/lsof').is_file():
                 users = subprocess.run(['/usr/sbin/lsof', '-nP', '-F', 'p', '+D', str(path)],
                                        text=True, capture_output=True, timeout=30)
-                if users.returncode not in (0, 1) or any(line.startswith('p')
-                        and line[1:].isdecimal() for line in users.stdout.splitlines()):
-                    raise ValueError('disposable check artifact root has a live holder')
+                if users.returncode not in (0, 1):
+                    raise ValueError('disposable check artifact root holder inspection failed '
+                                     f'(returncode={users.returncode})')
+                holders = [line[1:13] for line in users.stdout.splitlines()
+                           if line.startswith('p') and line[1:].isdecimal()]
+                if holders:
+                    raise ValueError('disposable check artifact root has a live holder '
+                                     f'(count={len(holders)}, pids={",".join(holders[:8])})')
             entry['state'] = 'removing'
             write_private(self.manifest, manifest)
             remove_directory(path, entry['identity'], spec=self.spec)

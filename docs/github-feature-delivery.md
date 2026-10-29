@@ -155,11 +155,50 @@ This follow-up keeps the same issue, run, PR, accepted implementation, independe
 reviews, repair count and original publication-only authorization. A separate
 durable merge command owns its Temporal workflow and claim. It mechanically
 reconciles a later main into the PR and waits for required CI on the combined
-tree, without replaying implementation/review workers. Conflicting upstream
-changes are reported for a user decision. The run's `merge` field and event
-timestamps distinguish requested, merging, waiting for CI, uncertain,
+tree, without replaying the original delivery workers. Textual conflicts use an
+isolated merge resolver and independent review against both parent versions;
+an opposing product requirement remains a user decision. The run's `merge` field
+and event timestamps distinguish requested, merging, waiting for CI, uncertain,
 decision-required and confirmed merge states. A lost update or merge response
 is observed under its existing effect identity, never blindly submitted again.
+
+After an acknowledged permanent installation move, merge roles prepare the
+same frozen bundled executable in a merge-owned native generation. Its immutable
+receipt binds the original merge grant and delivered spec, exact role/workflow,
+conflict workspace generation, both parent evidence files and derived native
+measurement. It does not rewrite the original delivered spec, gates, attempts,
+repair allowance or merge authorization. A caller cannot supply a replacement
+execution spec or executable path. Every current launch still verifies native
+authority, source, claim and the exact merge context.
+
+Every merge activity derives its workflow and execution run from the Temporal SDK
+context and binds that exact pair durably to the selected grant and original
+spec. A reset or a later workflow cannot adopt an earlier activity's progress,
+effect completion, publication or scratch cleanup authority. A cancelled waiter
+retains the effect lease until its synchronous body actually exits. Continuation
+requires the exclusive lease and the configured server's complete, bounded
+history for the exact completed predecessor, including original inputs, grant,
+result and close time; a running, reset, expired or otherwise unproven execution
+remains unavailable. The new command records the authenticated closure reference
+while keeping the original grant and historical role bindings intact. A lost
+start response is reconciled by workflow ID and exact SDK run before dispatch is
+acknowledged.
+
+A supervisor can fail before capacity admission and request-file creation.
+This remains a typed blocked `prelaunch` result, with no provider session or
+monitored-process cleanup claim. Merge preflight can observe such a continuation
+without creating request, scratch or owner-lock files or deleting anything.
+The same observation authenticates a derived native execution separately from
+the original merge grant. An existing or newly appearing scratch generation
+refuses this absent-provider route and is retained; these receipts do not grant
+filesystem cleanup authority.
+The original owner lease, exact immutable merge effect/job/attempt and private
+empty folder must all authenticate; missing authority, a busy lease or any launch
+evidence refuses. Only an explicit public merge continuation settles that setup
+intent under the original grant, preserving the failed attempt byte-for-byte.
+An uncertain provider or remote write cannot use this path or be retried with a
+new identity. Use a new command ID only for the explicitly observed continuation;
+an identical command always reads back its original acknowledgement.
 
 The merge boundary rereads the recorded stack and PR IDs, verifies the exact
 native evidence and required GitHub checks, and requires strict trunk protection

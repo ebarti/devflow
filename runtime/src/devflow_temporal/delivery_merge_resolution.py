@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
@@ -75,64 +74,9 @@ def role_keys(db, run_id):
 
 
 def prelaunch_receipts(store, spec, saved):
-    """Prove absence under each native owner's lease before continuing a failed setup."""
-    from .supervisor import DeliverySupervisor
+    from .delivery_merge_native_preparation import prelaunch_receipts as observe
 
-    with store._connect() as db:
-        effects = [dict(e) for e in db.execute(
-            "SELECT * FROM delivery_effects WHERE run_id=? AND state!='complete'",
-            (spec["run_id"],),
-        )]
-    if not effects:
-        raise ValueError("merge continuation has no confirmed prelaunch failure")
-    receipts = []
-    for effect in effects:
-        bound = json.loads(effect["request_json"])
-        if (effect["kind"] != "merge_resolution"
-                or bound["merge_authorization"] != digest(json.loads(saved["grant_json"]))):
-            raise ValueError("merge continuation retains an unresolved external effect")
-        key = bound["job_key"]
-        lock = DeliverySupervisor._owner_lock(spec, key)
-        if lock is None:
-            raise ValueError("merge prelaunch owner is still active")
-        try:
-            with store._connect() as db:
-                attempt = db.execute(
-                    "SELECT * FROM delivery_attempts WHERE job_key=? AND run_id=?",
-                    (key, spec["run_id"]),
-                ).fetchone()
-            result = json.loads(attempt["result_json"] or "null") if attempt else None
-            folder = Path(spec["state_dir"]) / "attempts" / key
-            info = folder.lstat()
-            request = read_private(folder / "request.json")
-            if (not attempt or attempt["state"] != "finished"
-                    or attempt["cleanup"] != "confirmed"
-                    or any(attempt[k] is not None
-                           for k in ("pid", "process_identity", "session_id"))
-                    or not isinstance(result, dict) or result.get("status") != "blocked"
-                    or result.get("cleanup") != "confirmed"
-                    or result.get("finish_reason") != "prelaunch"
-                    or result.get("session_id") is not None
-                    or attempt["result_path"] != str(folder / "result.json")
-                    or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700
-                    or info.st_uid != os.getuid() or folder.resolve() != folder
-                    or {p.name for p in folder.iterdir()}
-                    - {"request.json", "native-environment.json"}
-                    or request["spec"] != spec
-                    or request["candidate"] != bound["candidate"]
-                    or request["workspace"] != bound["workspace"]
-                    or request.get("merge_context") != bound["merge_context"]
-                    or DeliverySupervisor._job_key(request) != key
-                    or candidate_for(Path(bound["workspace"])) != bound["candidate"]):
-                raise ValueError("merge prelaunch provider absence is unproven")
-            shutil.rmtree(scratch(request))
-            receipts.append({"effect_key": effect["effect_key"],
-                             "request_json": effect["request_json"],
-                             "job_key": key, "assessment": result,
-                             "cleanup": "confirmed_prelaunch_absent"})
-        finally:
-            os.close(lock)
-    return receipts
+    return observe(store, spec, saved)
 
 
 def authenticate(request, store):
@@ -146,18 +90,18 @@ def authenticate(request, store):
     with store._connect() as db:
         saved = current(db, spec["run_id"])
         effect = db.execute(
-            "SELECT request_json FROM delivery_effects WHERE effect_key=? AND run_id=? "
+            "SELECT * FROM delivery_effects WHERE effect_key=? AND run_id=? "
             "AND kind='merge_resolution'", (context["effect_key"], spec["run_id"]),
         ).fetchone()
         claim = store.state.claim_for(db, spec["work_id"])
     if not saved or not effect:
         raise ValueError("merge role has no admitted resolution")
-    expected = json.loads(effect[0])
+    expected = json.loads(effect['request_json'])
+    original = store.effective_spec(spec['run_id'])
     if (
         saved["phase"] not in ACTIVE
         or expected["merge_authorization"] != digest(json.loads(saved["grant_json"]))
-        or expected["spec_sha256"] != digest(store.effective_spec(spec["run_id"]))
-        or expected["spec_sha256"] != digest(spec)
+        or expected["spec_sha256"] != digest(original)
         or expected["merge_context"] != context
         or expected["job_key"] != DeliverySupervisor._job_key(request)
         or expected["candidate"] != request["candidate"]
@@ -168,11 +112,19 @@ def authenticate(request, store):
         or not claim or claim["owner"] != "external:devflow:" + spec["run_id"]
     ):
         raise ValueError("merge role changed its admitted scope, candidate or authority")
+    from .delivery_merge_native_preparation import authenticate as native_authenticate
+
+    native_authenticate(store, original, request, expected, effect)
+
+
+def scratch_path(request):
+    root = Path("/private/tmp" if Path("/private/tmp").is_dir() else "/tmp")
+    path = root / ("dfmerge-" + digest(request["merge_context"]["effect_key"])[:24])
+    return path
 
 
 def scratch(request):
-    root = Path("/private/tmp" if Path("/private/tmp").is_dir() else "/tmp")
-    path = root / ("dfmerge-" + digest(request["merge_context"]["effect_key"])[:24])
+    path = scratch_path(request)
     private_directory(path)
     return path
 
@@ -338,6 +290,9 @@ def _prepare(broker, pr, conflict, authorization):
 
 
 async def _role(broker, spec, workspace, context, authorization, role):
+    from .delivery_merge_execution import FIELD as EXECUTION
+    from .delivery_merge_execution import identity, to_thread
+    from .delivery_merge_native_preparation import FIELD, prepare, recorded
     from .supervisor import DeliverySupervisor, get_supervisor
 
     key = "merge-resolution:" + spec["run_id"] + ":" + context["resolution_id"] + ":" + role
@@ -354,20 +309,39 @@ async def _role(broker, spec, workspace, context, authorization, role):
                    "merge_context": bound["merge_context"]}
         if bound.get("review_diff"):
             request["review_diff"] = bound["review_diff"]
+        if EXECUTION in bound:
+            request[EXECUTION] = bound[EXECUTION]
+        if bound.get(FIELD):
+            execution, _binding = recorded(spec, request, authorization, bound[FIELD])
+            request['spec'] = execution
+            request[FIELD] = bound[FIELD]
     else:
         request = {"spec": spec, "role": role, "iteration": 0,
                    "candidate": candidate_for(workspace), "workspace": str(workspace),
-                   "merge_context": {**context, "effect_key": key}}
+                   "merge_context": {**context, "effect_key": key}, EXECUTION: identity()}
         if role == "review":
             request["review_diff"] = review_diff(request)
+        execution, prepared = await to_thread(
+            broker.store, spec, prepare, broker.store, spec, request, authorization)
+        request['spec'] = execution
+        if prepared:
+            request[FIELD] = prepared
         bound = {"merge_authorization": authorization, "spec_sha256": digest(spec),
                  "candidate": request["candidate"], "workspace": request["workspace"],
                  "merge_context": request["merge_context"],
-                 "job_key": DeliverySupervisor._job_key(request)}
+                 "job_key": DeliverySupervisor._job_key(request), EXECUTION: request[EXECUTION]}
+        if prepared:
+            bound.update({FIELD: prepared, 'execution_spec_sha256': digest(execution)})
         if request.get("review_diff"):
             bound["review_diff"] = request["review_diff"]
         broker.intent(key, "merge_resolution", bound)
     result = await get_supervisor(broker.store).run(request)
+    if (result.get('status') == 'blocked' and result.get('finish_reason') == 'prelaunch'
+            and result.get('cleanup') == 'confirmed' and result.get('session_id') is None
+            and not result.get('native_process') and not result.get('process_cleanup')):
+        # Preserve the pending intent for the typed absent-provider continuation;
+        # no monitored-process receipt or provider verdict exists in this branch.
+        raise RuntimeError('merge native role was blocked before provider launch')
     if result.get("cleanup") != "confirmed" or result.get("process_cleanup") != (
         "observed-native-confirmed"
     ):
@@ -377,6 +351,10 @@ async def _role(broker, spec, workspace, context, authorization, role):
     except (ValueError, OSError, RuntimeError) as exc:
         result = {**result, "status": "blocked", "merge_decision": None,
                   "findings": [*result.get("findings", []), str(exc)]}
+    from .delivery_merge_execution import require_current
+
+    with broker.store._connect() as db:
+        require_current(db, spec, required=True)
     transient = scratch(request)
     shutil.rmtree(transient)
     if transient.exists():
@@ -388,16 +366,18 @@ async def _role(broker, spec, workspace, context, authorization, role):
 
 async def resolve(store, spec, authorization, conflict):
     from .delivery_merge import MergeBroker
+    from .delivery_merge_execution import to_thread
     from .delivery_merge_followup import authorize, record
 
-    proof = await asyncio.to_thread(authorize, store, spec, authorization)
+    proof = await to_thread(store, spec, authorize, store, spec, authorization)
     pr = proof["pull_request"]
     broker = MergeBroker(store, spec)
     expected = {"state": "resolve_conflicts", "target": conflict["target"],
                 "original_head": pr["head"], "previous_head": conflict["previous_head"]}
     if conflict != expected:
         raise ValueError("merge resolver input changed its owned reconciliation")
-    _, workspace, context = await asyncio.to_thread(_prepare, broker, pr, conflict, authorization)
+    _, workspace, context = await to_thread(
+        store, spec, _prepare, broker, pr, conflict, authorization)
     record(store, spec, "resolving_conflicts", {
         "state": "pending", "conflicts": context["conflicts"], "target": conflict["target"]})
     for role in ("implement", "review") if context["conflicts"] else ():
@@ -410,8 +390,8 @@ async def resolve(store, spec, authorization, conflict):
                       "decision": decision}
             record(store, spec, state, result, result["reason"])
             return result
-    await asyncio.to_thread(authorize, store, spec, authorization)
-    return await asyncio.to_thread(_publish, broker, spec, workspace, context, pr)
+    await to_thread(store, spec, authorize, store, spec, authorization)
+    return await to_thread(store, spec, _publish, broker, spec, workspace, context, pr)
 
 
 def _publish(broker, spec, workspace, context, pr):

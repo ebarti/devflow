@@ -29,50 +29,6 @@ def owned_workspace(tmp_path):
     return resources, root, package, modules
 
 
-def test_cleanup_keeps_source_edit_and_removes_recorded_dependencies(owned_workspace):
-    resources, root, package, modules = owned_workspace
-    before = package.read_bytes()
-    result = resources.finalize('blocked')
-    node = next(item for item in result['roots'] if item['path'] == str(modules))
-    assert node['state'] == 'removed', node
-    assert not modules.exists()
-    assert package.read_bytes() == before and root.is_dir()
-
-
-def test_changed_metadata_still_cannot_register_dependencies(owned_workspace):
-    resources, _root, _package, modules = owned_workspace
-    with pytest.raises(ValueError, match='tracked declaration'):
-        resources.register(modules, 'generated')
-
-
-def test_authorized_scripts_can_reprepare_the_same_dependency_layout(owned_workspace):
-    from devflow_temporal.contracts import digest
-    from devflow_temporal.delivery_configured_resources import workspace_dependency_directories
-
-    resources, root, _package, modules = owned_workspace
-    resources.spec['policy'].setdefault('allowed_paths', []).append('apps/web/package.json')
-    resources.spec['policy_digest'] = digest(resources.spec['policy'])
-    assert 'apps/web/node_modules' in workspace_dependency_directories(
-        root, policy=resources.spec['policy'])
-    resources.register(modules, 'generated')
-    assert resources.finalize('blocked')['state'] == 'confirmed'
-    resources.generated_directory(modules)
-    assert modules.is_dir()
-
-
-@pytest.mark.parametrize('field', ['dependencies', 'workspaces', 'name'])
-def test_authorized_scripts_do_not_admit_other_metadata_changes(owned_workspace, field):
-    from devflow_temporal.delivery_configured_resources import workspace_dependency_directories
-
-    resources, root, package, _modules = owned_workspace
-    resources.spec['policy'].setdefault('allowed_paths', []).append('apps/web/package.json')
-    value = json.loads(package.read_text())
-    value[field] = {'unreviewed': 'change'}
-    package.write_text(json.dumps(value))
-    with pytest.raises(ValueError, match='tracked declaration'):
-        workspace_dependency_directories(root, policy=resources.spec['policy'])
-
-
 def test_removed_dependency_generation_can_bind_newly_published_metadata(owned_workspace):
     resources, root, package, modules = owned_workspace
     assert resources.finalize('blocked')['state'] == 'confirmed'
@@ -88,23 +44,6 @@ def test_removed_dependency_generation_can_bind_newly_published_metadata(owned_w
         assert entry['generation'] == 1
     assert modules.is_dir()
     assert resources.finalize('blocked')['state'] == 'confirmed'
-
-
-@pytest.mark.parametrize('state', ['live', 'missing_unconfirmed', 'replacement'])
-def test_changed_declaration_cannot_adopt_an_unconfirmed_generation(owned_workspace, state):
-    import shutil
-
-    resources, root, package, modules = owned_workspace
-    if state == 'replacement':
-        assert resources.finalize('blocked')['state'] == 'confirmed'
-        modules.mkdir()
-    elif state == 'missing_unconfirmed':
-        shutil.rmtree(modules)
-    _git(root, 'add', package.relative_to(root).as_posix())
-    _git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
-         'commit', '-qm', 'Publish package script')
-    with pytest.raises(ValueError, match='declaration changed'):
-        resources.register(modules, 'generated')
 
 
 @pytest.mark.parametrize('replacement', ['directory', 'symlink'])

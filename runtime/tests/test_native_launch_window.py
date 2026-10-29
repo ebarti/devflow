@@ -18,6 +18,7 @@ from test_delivery_store import service as service
 
 from devflow_temporal import delivery_native_process as native
 from devflow_temporal import supervisor
+from devflow_temporal.contracts import digest
 from devflow_temporal.delivery_activities import delivery_role
 from devflow_temporal.delivery_orphans import _complete_attempt, reconcile_attempt
 from devflow_temporal.delivery_resources import (
@@ -306,6 +307,7 @@ def test_monitor_lost_before_authorization_is_retryable_prelaunch(
     # The sealed fixture run is the retry's authority; only the launch itself
     # needs the native backend the monitor insists on.
     authority = {**spec, "policy": {**spec["policy"], "execution_backend": "native-macos"}}
+    authority["policy_digest"] = digest(authority["policy"])
     outcome = native.NativeProcess(
         authority, folder, argv=[sys.executable, "-c", "pass"], cwd=tmp_path,
         environment={"PATH": os.environ["PATH"]}, timeout=10, cancelled=lambda: False,

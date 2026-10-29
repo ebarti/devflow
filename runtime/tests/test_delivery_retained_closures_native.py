@@ -12,27 +12,38 @@ from pathlib import Path
 
 import pytest
 from temporal_test_server import local_temporal
-from test_delivery_runtime_location import ROOT, command
-from test_delivery_runtime_location import installed_pair as installed_pair
+from test_delivery_runtime_location import (
+    ROOT,
+    command,
+    installed_pair_fixture,
+    sync_fixture_runtime,
+)
 
 SCENARIO = Path(__file__).with_name("retained_capture_scenario.py")
 pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="actual native macOS installation")
+
+
+@pytest.fixture(scope="module")
+def installed_pair(tmp_path_factory):
+    return installed_pair_fixture(tmp_path_factory, historical_venv=True)
 
 
 async def owned_retained_case(root, old_template, new, environment, python):
     old = Path(environment["HOME"]) / ".codex/worktrees/capture/developer-workflow"
     old.parent.mkdir(parents=True, exist_ok=True)
     command(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", old_template, old])
-    command(
-        ["uv", "sync", "--frozen", "--offline", "--python", python],
-        cwd=old / "runtime",
-        env=environment,
-    )
+    sync_fixture_runtime(old, python, environment, historical_venv=True)
+    from portable_capture_reader import prepare as prepare_fixture_reader
+    from portable_temporal_fixture import fixture_root
+
+    reader = prepare_fixture_reader(root / "capture-reader", fixture_root())
     case = root / "capture"
     original = root / "retained-temporal.sqlite3"
-    async with local_temporal(dev_server_database_filename=str(original)) as temporal:
+    async with local_temporal(dev_server_existing_path=str(reader),
+                              dev_server_database_filename=str(original)) as temporal:
         address = temporal.client.service_client.config.target_host
-        bound = {**environment, "DEVFLOW_TEST_LOCATION_TEMPORAL_ADDRESS": address}
+        bound = {**environment, "DEVFLOW_TEST_LOCATION_TEMPORAL_ADDRESS": address,
+                 "DEVFLOW_OWNED_CAPTURE_READER": str(reader)}
         command(
             [old / "runtime/.venv/bin/python", "-I", SCENARIO, "seed", case], env=bound, timeout=180
         )
@@ -195,9 +206,7 @@ async def test_previous_ba0_public_capture_reproduces_mixed_scope_refusal(instal
             "ba0efc53941dd3df47c71adef1b7bc640ee5b9a4",
         ]
     )
-    command(
-        ["uv", "sync", "--frozen", "--offline", "--python", python], cwd=new / "runtime", env=bound
-    )
+    sync_fixture_runtime(new, python, bound, historical_venv=True)
     case, state, _address, bound, original = await owned_retained_case(
         root, old_template, new, bound, python
     )
@@ -245,9 +254,7 @@ async def test_previous_030_public_capture_reproduces_complete_authority_size_re
             "030fda7b3c792eef0014aa4bc86c09a5f60ad091",
         ]
     )
-    command(
-        ["uv", "sync", "--frozen", "--offline", "--python", python], cwd=new / "runtime", env=bound
-    )
+    sync_fixture_runtime(new, python, bound, historical_venv=True)
     case, state, _address, bound, original = await owned_retained_case(
         root, old_template, new, bound, python
     )

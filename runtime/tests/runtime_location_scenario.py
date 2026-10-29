@@ -390,8 +390,22 @@ def auxiliary(store, index):
 
 
 def seed(root, kind):
+    from importlib.util import module_from_spec, spec_from_file_location
+
     from test_delivery_amendment_capacity import cut_operational_capacity
-    from test_delivery_temporal_prerequisites import temporal_case
+
+    # The retained runtime owns the production and scenario helpers. Its old
+    # test fixture assumed a private sibling and a fixed historical receipt;
+    # load only the current portable fixture adapter for synthetic setup.
+    fixture_directory = Path(__file__).resolve().parent
+    sys.path.append(str(fixture_directory))
+    module_spec = spec_from_file_location(
+        "portable_temporal_case_adapter",
+        fixture_directory / "test_delivery_temporal_prerequisites.py",
+    )
+    fixture_module = module_from_spec(module_spec)
+    module_spec.loader.exec_module(fixture_module)
+    temporal_case = fixture_module.temporal_case
 
     root.mkdir(parents=True)
     patch = pytest.MonkeyPatch()
@@ -1158,6 +1172,181 @@ def reject_active_guard_drift(case, current, request):
         assert db.execute("PRAGMA query_only").fetchone()[0] == 0
 
 
+def owned_probe_failure_diagnostic(result, check, state_dir):
+    """Read authenticated owned JUnit and expose only fixed probe metadata."""
+    import re
+    import xml.etree.ElementTree as ET
+
+    exception_types = {
+        "AssertionError", "RuntimeError", "TimeoutError", "CancelledError", "OSError",
+        "ValueError", "TypeError", "ImportError", "ModuleNotFoundError", "ConnectionError",
+        "RPCError", "ApplicationError", "ActivityError", "ParseError",
+    }
+    probes = {
+        "test_real_six_hour_time_skipping", "test_real_local_activity",
+        "test_real_same_workflow_after_worker_restart",
+    }
+    try:
+        from devflow_temporal.delivery_check_evidence import _retained_junit
+
+        reference = check.get("artifacts")
+        if not reference:
+            return {"state": "missing"}
+        candidate_id = (result.get("candidate") or {}).get("id")
+        if not isinstance(candidate_id, str) or not re.fullmatch(r"[0-9a-f]{64}", candidate_id):
+            return {"state": "unavailable", "reason": "candidate_unknown"}
+        if (type(reference.get("bytes")) is not int or reference["bytes"] > 262144
+                or type(reference.get("count")) is not int or reference["count"] > 16):
+            return {"state": "unavailable", "reason": "report_bound"}
+        content = _retained_junit(reference, candidate_id, Path(state_dir))
+        if (len(content) > 262144 or b"<!DOCTYPE" in content.upper()
+                or b"<!ENTITY" in content.upper()):
+            return {"state": "unavailable", "reason": "report_bound"}
+        root = ET.fromstring(content)
+        cases = list(root.iter("testcase"))
+        if root.tag not in {"testsuite", "testsuites"} or len(cases) > 16:
+            return {"state": "unavailable", "reason": "report_shape"}
+        failed, unknown = [], 0
+        counts = {"passed": 0, "failure": 0, "error": 0, "skipped": 0}
+        for case in cases:
+            kind = next((tag for tag in ("failure", "error", "skipped")
+                         if case.find(tag) is not None), "passed")
+            counts[kind] += 1
+            if kind not in {"failure", "error"}:
+                continue
+            name = case.get("name")
+            if name not in probes:
+                unknown += 1
+                continue
+            verdict = case.find(kind)
+            text = (verdict.get("message", "") + "\n" + (verdict.text or ""))[:262144]
+            exception = verdict.get("type", "").rsplit(".", 1)[-1]
+            if exception not in exception_types:
+                match = re.search(
+                    r"(?:^|\n)(?:E\s+)?(" + "|".join(sorted(exception_types)) + r"):", text,
+                )
+                exception = match.group(1) if match else "other"
+            lowered = text.lower()
+            startup_timeout = (
+                "failed starting" in lowered
+                and ("temporal dev server" in lowered or "temporal test server" in lowered)
+                and ("timed out" in lowered or "timeout" in lowered)
+            )
+            failed.append({"probe": name, "outcome": kind, "exception_type": exception,
+                           "known_startup_timeout": startup_timeout})
+        return {"state": "available", "counts": counts, "failed_cases": failed[:3],
+                "unknown_failed_case_count": min(unknown, 16)}
+    except Exception as exc:
+        category = type(exc).__name__
+        return {"state": "unavailable",
+                "exception_type": category if category in exception_types else "other"}
+
+
+def worker_failure_diagnostic(result, calls, native_checks, *, state_dir=None):
+    """Report bounded, allowlisted gate facts without copying untrusted output."""
+    def choice(value, allowed):
+        return value if isinstance(value, str) and value in allowed else "other"
+
+    def count(value):
+        return min(len(value), 1000) if isinstance(value, (list, tuple)) else 0
+
+    def number(value):
+        return value if type(value) is int and -2**31 <= value < 2**31 else None
+
+    def cleanup_summary(value):
+        import re
+
+        summary = {"state": "other", "refusal_category": "other"}
+        if not isinstance(value, dict):
+            return summary
+        summary["state"] = choice(value.get("state"), {
+            "removed", "already_absent", "failed_unknown",
+        })
+        reason = value.get("reason")
+        if (summary["state"] != "failed_unknown" or not isinstance(reason, str)
+                or len(reason) > 300):
+            return summary
+        categories = {
+            "disposable check artifact root was replaced": "root_replaced",
+            "disposable check output lost an original native journal": "journal_changed",
+            "registered native processes or ports remain active": "native_actor_or_port_live",
+        }
+        if reason in categories:
+            summary["refusal_category"] = categories[reason]
+            return summary
+        holders = re.fullmatch(
+            r"disposable check artifact root has a live holder "
+            r"\(count=([1-9][0-9]{0,6}), pids=([1-9][0-9]{0,9}(?:,[1-9][0-9]{0,9}){0,7})\)",
+            reason,
+        )
+        if holders:
+            count = int(holders.group(1))
+            pids = [int(value) for value in holders.group(2).split(",")]
+            if (count <= 1_000_000 and len(pids) == min(count, 8)
+                    and len(set(pids)) == len(pids) and all(pid < 2**31 for pid in pids)):
+                summary.update(refusal_category="live_holder", holder_count=count,
+                               holder_pids=pids)
+            return summary
+        inspection = re.fullmatch(
+            r"disposable check artifact root holder inspection failed "
+            r"\(returncode=(-?[1-9][0-9]{0,2})\)", reason,
+        )
+        if inspection:
+            returncode = int(inspection.group(1))
+            if -255 <= returncode <= 255 and returncode != 1:
+                summary.update(refusal_category="inspection_failed",
+                               inspection_returncode=returncode)
+        return summary
+
+    def check_summary(check):
+        summary = {
+            "id": choice(check.get("id"), {"worker-regressions", "owned-python-layout"}),
+            "passed": check.get("passed") if type(check.get("passed")) is bool else None,
+            "exit_code": number(check.get("exit_code")),
+            "test_count": number(check.get("test_count")),
+            "cleanup": choice(check.get("cleanup"), {"confirmed", "unknown"}),
+            "evidence_failure_present": bool(check.get("evidence_failure")),
+            "rejection_count": count(check.get("rejection_causes")),
+            "diagnostic_present": bool(check.get("diagnostic")),
+        }
+        if "artifact_cleanup" in check:
+            summary["artifact_cleanup"] = cleanup_summary(check["artifact_cleanup"])
+        if state_dir is not None and check.get("id") == "worker-regressions":
+            summary["inner_junit"] = owned_probe_failure_diagnostic(result, check, state_dir)
+        return summary
+
+    return {
+        "outcome": choice(result.get("outcome"), {"delivered", "blocked", "cancelled"}),
+        "error_category": choice(result.get("error"), {"repair limit exhausted"}),
+        "finding_count": count(result.get("findings")),
+        "stages": {
+            stage: {"state": choice(value.get("state"), {"passed", "failed", "unknown",
+                                                        "confirmed", "pending"}),
+                    "finding_count": count(value.get("findings"))}
+            for stage in ("prepublish", "local", "browser_qa", "review", "qa", "ci",
+                          "resource_cleanup")
+            if isinstance(value := (result.get("checks") or {}).get(stage), dict)
+        },
+        "calls": [choice(call, {"implement", "review", "verify", "precheck", "publish",
+                               "checks", "ci", "terminal_tracker"}) for call in calls[-12:]],
+        "roles": [{"role": choice(role.get("role"), {"implement", "review", "verify"}),
+                   "status": choice(role.get("status"), {"pass", "findings", "blocked"}),
+                   "finding_count": count(role.get("findings"))}
+                  for role in result.get("roles", [])[-4:]],
+        "checks": [{"state": choice(check.get("state"), {"passed", "failed", "unknown"}),
+                    "source_unchanged": (check.get("source_unchanged")
+                                         if type(check.get("source_unchanged")) is bool else None),
+                    "diagnostic_present": bool(check.get("diagnostic")),
+                    "results": [check_summary(item) for item in (check.get("results") or [])[-2:]]}
+                   for check in (native_checks[:1] + native_checks[-1:]
+                                 if len(native_checks) > 1 else native_checks)],
+    }
+
+def assert_native_checks_passed(result, calls, native_checks, *, state_dir=None):
+    assert native_checks and native_checks[0].get("state") == "passed", json.dumps(
+        worker_failure_diagnostic(result, calls, native_checks, state_dir=state_dir), sort_keys=True
+    )
+
 async def actual_worker(case, current, recovery, response, patch):
     """Actual workflow, readback, native checks/browser/finalization and replay.
 
@@ -1276,10 +1465,13 @@ async def actual_worker(case, current, recovery, response, patch):
             task_queue=queue,
         )
         result = await asyncio.wait_for(handle.result(), 150)
-        assert result["outcome"] == "delivered", result.get("error")
+        assert result["outcome"] == "delivered", json.dumps(
+            worker_failure_diagnostic(result, calls, native_checks,
+                                      state_dir=current["state_dir"]), sort_keys=True
+        )
         assert result["iteration"] == 4 and result["roles"][0] == recovery["state"]["roles"][0]
         assert result["cleanup"] == "confirmed"
-        assert native_checks and native_checks[0]["state"] == "passed", native_checks
+        assert_native_checks_passed(result, calls, native_checks, state_dir=current["state_dir"])
         worker = next(
             value for value in native_checks[0]["results"] if value["id"] == case.check["id"]
         )

@@ -320,6 +320,7 @@ def test_prompt_and_profile_name_authorized_output_without_exposing_controller(s
     request['spec']['provider'] = 'codex'
     request['spec']['policy'].update(host_sandbox='native-profile',
         execution_backend='native-macos', codex_auth_path=str(auth), codex_bin='/usr/bin/false')
+    request['spec']['policy_digest'] = digest(request['spec']['policy'])
     first = allocate(request, '2' * 64)
     attempt = Path(broker.spec['state_dir']) / 'attempts' / ('2' * 64)
     prepare_native_role(first, attempt)

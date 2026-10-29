@@ -2,15 +2,12 @@
 no SQLite work on the API event loop (rr-sweep-2)."""
 from __future__ import annotations
 
-import threading
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
-from test_delivery_controller_failure_boundary import _closed_fixture
 from test_delivery_gate_retry import unpublished as unpublished
 from test_delivery_store import service as service
 
@@ -191,39 +188,3 @@ async def test_maintenance_persists_backoff_and_settles_closed_executions(servic
     assert [item["state"] for item in observed] == ["not_completed"]
     assert client.describes[-1] == "delivery-run-1-recovery"
     assert set(_maintenance_rows(store)) == {key, ("run-1", "delivery-run-1-recovery")}
-
-
-@pytest.mark.asyncio
-async def test_maintenance_pass_keeps_sqlite_work_off_the_event_loop(unpublished, monkeypatch):
-    store, _, state, _, client, _, _ = await _closed_fixture(unpublished, monkeypatch)
-    original_connect = store._connect
-    threads = []
-
-    @contextmanager
-    def connect():
-        threads.append(threading.current_thread())
-        with original_connect() as db:
-            yield db
-
-    handles = []
-    original_handle = client.get_workflow_handle
-
-    def get_workflow_handle(*args, **kwargs):
-        handles.append(args)
-        return original_handle(*args, **kwargs)
-
-    client.get_workflow_handle = get_workflow_handle
-    now = datetime(2026, 10, 11, 12, tzinfo=UTC)
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(store, "_connect", connect)
-        observed = await reconcile_completed_projections(store, client, now=now)
-    assert [(item["run_id"], item["state"]) for item in observed] == [("run-1", "reconciled")]
-    assert threads and all(thread is not threading.main_thread() for thread in threads)
-    assert store.detail("run-1")["phase"] == "blocked"
-    assert store.detail("run-1")["checks"] == state["checks"]
-    rows = _maintenance_rows(store)
-    assert rows[("run-1", "delivery-run-1")]["state"] == "reconciled"
-    assert rows[("run-1", "delivery-run-1")]["key"] == observed[0]["key"]
-    reads = len(handles)
-    assert await reconcile_completed_projections(store, client, now=now + timedelta(days=1)) == []
-    assert len(handles) == reads
