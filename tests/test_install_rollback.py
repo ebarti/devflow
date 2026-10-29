@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,184 @@ class InstallRollback(unittest.TestCase):
         stage.symlink_to(self.helper)
         self.rollback.remember(self.backup, self.compatibility, self.rollback.identity(stage))
         os.replace(stage, self.compatibility)
+
+    def test_crashed_forward_capture_cannot_discard_unverified_replacement_on_restore(self):
+        for staged, oversized in ((False, False), (True, False), (False, True)):
+            with self.subTest(staged=staged, oversized=oversized):
+                case = self.root / ("forward-crash-" + str(staged) + str(oversized))
+                case.mkdir(mode=0o700)
+                target = case / "owned.plist"
+                target.write_bytes(b"original registration")
+                backup = self.rollback.backup_directory(case)
+                self.addCleanup(shutil.rmtree, backup, True)
+                saved = {}
+                before = self.rollback.identity(target, saved=saved)
+                saved.update(type=before["type"], before=before)
+                self.rollback.save_snapshot(backup / "snapshot.json", {str(target): saved})
+                (backup / "prior-checkout.json").write_text("null")
+                program = r"""
+import importlib.util,os,sys
+from pathlib import Path
+loader=importlib.util.spec_from_file_location('crashed_rollback',sys.argv[1])
+m=importlib.util.module_from_spec(loader);loader.loader.exec_module(m)
+backup,target=Path(sys.argv[2]),Path(sys.argv[3])
+replace,exchange=m.os.replace,m.exchange
+
+def replacement():
+    stage=target.with_name('older-writer');stage.write_bytes(b'foreign replacement')
+    if sys.argv[5]=='True':
+        with stage.open('r+b') as stream: stream.truncate(4*1024*1024+1)
+    replace(stage,target)
+
+def moved(source,destination):
+    if Path(source)==target:
+        replacement();replace(source,destination);os._exit(77)
+    return replace(source,destination)
+
+def exchanged(source,destination):
+    if Path(destination)==target:
+        replacement();exchange(source,destination);os._exit(77)
+    return exchange(source,destination)
+
+m.os.replace=moved;m.exchange=exchanged
+stage=None
+if sys.argv[4]=='True':
+    stage=target.with_name('requested');stage.write_bytes(b'requested new registration')
+m.effect(backup,target,stage)
+"""
+                result = subprocess.run([sys.executable, "-I", "-B", "-c", program,
+                    str(ROOT / "scripts/install-rollback.py"), str(backup), str(target), str(staged), str(oversized)],
+                    text=True, capture_output=True)
+                self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+                captured = list(backup.glob("forward-*"))
+                self.assertEqual(len(captured), 1)
+                with captured[0].open("rb") as stream:
+                    self.assertEqual(stream.read(19), b"foreign replacement")
+                captured_inode = captured[0].stat().st_ino
+                restored = subprocess.run([sys.executable, "-I", "-B",
+                    str(ROOT / "scripts/install-rollback.py"), "restore", str(backup)],
+                    text=True, capture_output=True)
+                self.assertEqual(restored.returncode, 1, restored.stdout + restored.stderr)
+                self.assertIn("unverified displaced object", restored.stderr)
+                self.assertTrue(backup.exists())
+                with captured[0].open("rb") as stream:
+                    self.assertEqual(stream.read(19), b"foreign replacement")
+                if oversized:
+                    self.assertEqual(target.stat().st_size, 4 * 1024 * 1024 + 1)
+                    self.assertEqual(target.stat().st_ino, captured_inode)
+                    with target.open("rb") as stream:
+                        self.assertEqual(stream.read(19), b"foreign replacement")
+                else:
+                    self.assertEqual(target.read_bytes(), b"original registration" if staged
+                                     else b"foreign replacement")
+
+    def test_snapshot_sync_failure_precedes_any_public_retirement(self):
+        target = self.home / "hooks.json"
+        target.write_bytes(b"original")
+        backup = self.rollback.backup_directory(self.home)
+        self.addCleanup(shutil.rmtree, backup, True)
+        saved = {}
+        before = self.rollback.identity(target, saved=saved)
+        saved.update(type=before["type"], before=before)
+        self.rollback.save_snapshot(backup / "snapshot.json", {str(target): saved})
+        original_snapshot = (backup / "snapshot.json").read_bytes()
+        sync = os.fsync
+
+        def fail_journal(descriptor):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("owned snapshot fsync fault")
+            return sync(descriptor)
+
+        with mock.patch.object(os, "fsync", fail_journal):
+            with self.assertRaisesRegex(OSError, "snapshot fsync fault"):
+                self.rollback.effect(backup, target)
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertEqual(list(backup.glob("forward-*")), [])
+        self.assertEqual((backup / "snapshot.json").read_bytes(), original_snapshot)
+
+    def test_retirement_syncs_journal_and_capture_before_deleting_prior_object(self):
+        target = self.home / "hooks.json"
+        target.write_bytes(b"original")
+        backup = self.rollback.backup_directory(self.home)
+        self.addCleanup(shutil.rmtree, backup, True)
+        saved = {}
+        before = self.rollback.identity(target, saved=saved)
+        saved.update(type=before["type"], before=before)
+        self.rollback.save_snapshot(backup / "snapshot.json", {str(target): saved})
+        snapshot = backup / "snapshot.json"
+        captured = backup / ("forward-" + hashlib.sha256(str(target).encode()).hexdigest())
+        original_inode = target.stat().st_ino
+        directories = {backup.stat().st_ino: "backup", target.parent.stat().st_ino: "parent"}
+        events = []
+        sync, replace, unlink = os.fsync, os.replace, Path.unlink
+
+        def synced(descriptor):
+            info = os.fstat(descriptor)
+            sync(descriptor)
+            if stat.S_ISDIR(info.st_mode):
+                events.append("sync-" + directories.get(info.st_ino, "other-directory"))
+            else:
+                events.append("sync-captured" if info.st_ino == original_inode else "sync-journal")
+
+        def moved(source, destination):
+            events.append("public-move" if Path(source) == target else "snapshot-publish"
+                          if Path(destination) == snapshot else "other-move")
+            return replace(source, destination)
+
+        def retired(path, *args, **kwargs):
+            if path == captured:
+                events.append("capture-delete")
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(os, "fsync", synced), mock.patch.object(os, "replace", moved), \
+                mock.patch.object(Path, "unlink", retired):
+            self.rollback.effect(backup, target)
+        published, moved_at, deleted = map(events.index,
+                                         ("snapshot-publish", "public-move", "capture-delete"))
+        self.assertIn("sync-journal", events[:published])
+        self.assertIn("sync-backup", events[published:moved_at])
+        self.assertIn("sync-parent", events[published:moved_at])
+        self.assertIn("sync-captured", events[moved_at:deleted])
+        self.assertIn("sync-backup", events[moved_at:deleted])
+        self.assertIn("sync-parent", events[moved_at:deleted])
+        self.assertIn("sync-backup", events[deleted + 1:])
+
+    def test_explicit_snapshot_bound_refuses_before_opening_oversized_content(self):
+        target = self.home / "oversized"
+        with target.open("wb") as stream:
+            stream.truncate(self.rollback.MAX_OBJECT_BYTES + 1)
+        opened = os.open
+
+        def no_content(path, *args, **kwargs):
+            if Path(path) == target:
+                self.fail("oversized object was opened before bounded refusal")
+            return opened(path, *args, **kwargs)
+
+        with mock.patch.object(os, "open", no_content):
+            with self.assertRaisesRegex(ValueError, "explicit snapshot bound"):
+                self.rollback.identity(target, saved={}, maximum=self.rollback.MAX_OBJECT_BYTES)
+        self.assertEqual(target.stat().st_size, self.rollback.MAX_OBJECT_BYTES + 1)
+
+    def test_large_valid_legacy_hooks_capture_and_restore_preserve_every_byte(self):
+        target = self.home / "hooks.json"
+        raw = b'{"hooks": {}}' + b" " * (self.rollback.MAX_OBJECT_BYTES + 1)
+        target.write_bytes(raw)
+        self.assertEqual(json.loads(raw), {"hooks": {}})
+        observed = self.rollback.identity(target)
+        self.assertEqual(observed["sha256"], hashlib.sha256(raw).hexdigest())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.rollback.capture(self.source, self.skills, self.home)
+        backup = Path(output.getvalue().strip())
+        self.addCleanup(shutil.rmtree, backup, True)
+        saved = json.loads((backup / "snapshot.json").read_text())[str(target)]
+        self.assertEqual(base64.b64decode(saved["bytes"]), raw)
+        stage = self.home / "replacement-hooks"
+        stage.write_bytes(b'{"hooks": {"requested": []}}')
+        self.rollback.effect(backup, target, stage)
+        self.rollback.restore(backup)
+        self.assertEqual(target.read_bytes(), raw)
+        self.assertFalse(backup.exists())
 
     def test_native_exchange_preserves_foreign_pointer_swapped_at_boundary(self):
         exchange = self.rollback.exchange
@@ -217,8 +396,8 @@ class InstallRollback(unittest.TestCase):
             def fileno(self):
                 return self.stream.fileno()
 
-            def read(self):
-                raw = self.stream.read()
+            def read(self, size=-1):
+                raw = self.stream.read(size)
                 return update_after_read(raw) if os.fstat(self.fileno()).st_ino == inode else raw
 
         def opened(descriptor, *args, **kwargs):
@@ -335,8 +514,8 @@ class InstallRollback(unittest.TestCase):
             def fileno(self):
                 return self.stream.fileno()
 
-            def read(self):
-                raw = self.stream.read()
+            def read(self, size=-1):
+                raw = self.stream.read(size)
                 if foreign_inode and os.fstat(self.fileno()).st_ino == foreign_inode[0] and not changed:
                     next(backup.glob("forward-*")).write_bytes(updated)
                     changed.append(True)
@@ -409,7 +588,7 @@ class InstallRollback(unittest.TestCase):
         self.assertTrue((backup / "snapshot.json").is_file())
 
     def test_aliased_install_and_canonical_replay_record_every_effect(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         alias = self.root / "alias"
         alias.symlink_to(self.root)
@@ -418,18 +597,18 @@ class InstallRollback(unittest.TestCase):
         for location in (alias, self.root):
             installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"),
                                         str(location / "fresh-skills"), str(location / "fresh-codex")],
-                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"), capture_output=True, text=True)
             self.assertEqual(installed.returncode, 0, installed.stderr)
         self.assertTrue((self.root / "fresh-skills/devflow/scripts/state.py").is_file())
         self.assertTrue((self.root / "fresh-skills/devflow-local-delivery/SKILL.md").is_file())
 
     def test_umask002_install_replay_uses_protected_backup_ancestor(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         skills, home = self.root / "fresh-skills", self.root / "fresh-codex"
         for _ in range(2):
             installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
-                                       umask=0o002, env=dict(os.environ, DEVFLOW_PYTHON=sys.executable),
+                                       umask=0o002, env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"),
                                        capture_output=True, text=True)
             self.assertEqual(installed.returncode, 0, installed.stderr)
             self.assertEqual(home.stat().st_mode & 0o777, 0o775)
@@ -447,7 +626,7 @@ class InstallRollback(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in home.iterdir()), before)
 
     def test_symlinked_agent_directory_installs_and_refuses_foreign_drift(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         skills, home, agents = self.root / "fresh-skills", self.root / "fresh-codex", self.root / "agents-real"
         home.mkdir()
@@ -457,13 +636,13 @@ class InstallRollback(unittest.TestCase):
         foreign.write_bytes(b"foreign agent data")
         for _ in range(2):
             installed = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
-                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+                                       env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"), capture_output=True, text=True)
             self.assertEqual(installed.returncode, 0, installed.stderr)
         self.assertEqual(len(list(agents.glob("devflow-*.toml"))), 4)
         target = agents / "devflow-implementer.toml"
         target.write_bytes(b"user changed the installed agent")
         refused = subprocess.run(["sh", str(self.source / "scripts/install.sh"), str(skills), str(home)],
-                                 env=dict(os.environ, DEVFLOW_PYTHON=sys.executable), capture_output=True, text=True)
+                                 env=dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development"), capture_output=True, text=True)
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertEqual(target.read_bytes(), b"user changed the installed agent")
         self.assertEqual(foreign.read_bytes(), b"foreign agent data")
@@ -533,7 +712,7 @@ class InstallRollback(unittest.TestCase):
         self.assertTrue((self.backup / "snapshot.json").is_file())
 
     def test_group_backup_recovery_restores_public_old_updater_checkout(self):
-        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py"):
+        for name in ("install.sh", "install-service-entry.py", "install-rollback.py", "install-agents.py", "installation-paths.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.source / "scripts" / name)
         for key, value in (("core.hooksPath", "/dev/null"), ("commit.gpgsign", "false"),
                            ("gc.auto", "0"), ("maintenance.auto", "false"),
@@ -549,7 +728,7 @@ class InstallRollback(unittest.TestCase):
         skills, home = self.root / "old-skills", self.root / "old-codex"
         home.mkdir(mode=0o775)
         home.chmod(0o775)
-        env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        env = dict(os.environ, DEVFLOW_PYTHON=sys.executable, DEVFLOW_INSTALL_MODE="development", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
         installed = subprocess.run(["sh", str(checkout / "scripts/install.sh"), str(skills), str(home)],
                                    env=env, capture_output=True, text=True)
         self.assertEqual(installed.returncode, 0, installed.stderr)

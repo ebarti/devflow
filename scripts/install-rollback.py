@@ -13,6 +13,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+MAX_OBJECT_BYTES = 4 * 1024 * 1024
+
 
 def exchange_function():
     """Require the native no-gap exchange; unsupported hosts never use replace."""
@@ -41,7 +43,7 @@ def exchange(left, right):
         raise OSError(error, os.strerror(error), str(right))
 
 
-def identity(path, *, saved=None):
+def identity(path, *, saved=None, maximum=None):
     if not os.path.lexists(path):
         return {"type": "absent"}
     info = path.lstat()
@@ -49,6 +51,8 @@ def identity(path, *, saved=None):
     if path.is_symlink():
         result.update(type="link", target=os.readlink(path))
     elif stat.S_ISREG(info.st_mode):
+        if maximum is not None and info.st_size > maximum:
+            raise ValueError("installer object exceeds its explicit snapshot bound: " + str(path))
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             fields = ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink",
@@ -58,11 +62,25 @@ def identity(path, *, saved=None):
             if tuple(getattr(opened, field) for field in fields) != observation:
                 raise ValueError("installer path changed while reading: " + str(path))
             info = opened
-            raw = stream.read()
+            if saved is not None:
+                raw = stream.read(info.st_size + 1)
+                count = len(raw)
+                sha = hashlib.sha256(raw).hexdigest()
+            else:
+                # Observation does not need a second in-memory copy of a large
+                # existing hooks/agent file. Capture retains its legacy format.
+                whole, count = hashlib.sha256(), 0
+                while count <= info.st_size:
+                    chunk = stream.read(min(1024 * 1024, info.st_size - count + 1))
+                    if not chunk:
+                        break
+                    whole.update(chunk)
+                    count += len(chunk)
+                sha = whole.hexdigest()
             after = os.fstat(stream.fileno())
-            if tuple(getattr(after, field) for field in fields) != observation:
+            if count != info.st_size or tuple(getattr(after, field) for field in fields) != observation:
                 raise ValueError("installer file changed while reading: " + str(path))
-            result.update(type="file", sha256=hashlib.sha256(raw).hexdigest(),
+            result.update(type="file", sha256=sha,
                           version=[info.st_nlink, info.st_size, info.st_mtime_ns])
             if saved is not None:
                 saved.update(bytes=base64.b64encode(raw).decode(), mode=stat.S_IMODE(info.st_mode))
@@ -119,6 +137,26 @@ def remember(directory, path, installed):
     save_snapshot(snapshot, entries)
 
 
+def sync_directories(*directories):
+    for directory in dict.fromkeys(map(Path, directories)):
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def sync_object(path):
+    path = Path(path)
+    if not os.path.lexists(path) or path.is_symlink():
+        return
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def effect(directory, path, stage=None):
     """Authenticate the object displaced by a forward installer mutation."""
     path = canonical_target(path)
@@ -126,9 +164,12 @@ def effect(directory, path, stage=None):
     entries = json.loads(snapshot.read_text())
     expected = entries[str(path)].get("installed", entries[str(path)]["before"])
     remember(directory, path, identity(stage) if stage else {"type": "absent"})
+    if stage:
+        sync_object(stage)
     if expected["type"] == "absent":
         if stage:
             os.link(stage, path, follow_symlinks=False)  # Never overwrite a new object.
+            sync_directories(path.parent, directory)
         return
     captured = Path(directory) / ("forward-" + hashlib.sha256(str(path).encode()).hexdigest())
     if stage:
@@ -136,6 +177,7 @@ def effect(directory, path, stage=None):
         exchange(captured, path)  # The displaced object is already in the private backup.
     else:
         os.replace(path, captured)
+    sync_directories(directory, path.parent)
     reason = None
     try:
         matches = identity(captured) == expected
@@ -151,11 +193,14 @@ def effect(directory, path, stage=None):
         if stage is None:
             try:
                 os.link(captured, path, follow_symlinks=False)
+                sync_directories(path.parent, directory)
             except OSError:
                 pass  # Never overwrite a concurrently recreated destination.
         raise ValueError("forward installer drift preserved: " + message
                          + "; inspect retained backup " + str(directory))
+    sync_object(captured)
     captured.unlink()  # Only the authenticated prior installer object is retired.
+    sync_directories(directory, path.parent)
 
 
 def save_snapshot(snapshot, entries):
@@ -163,8 +208,12 @@ def save_snapshot(snapshot, entries):
     try:
         with temporary.open("x") as stream:
             stream.write(json.dumps(entries, sort_keys=True))
-        temporary.chmod(0o600)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o600)
+            os.fsync(stream.fileno())
         os.replace(temporary, snapshot)
+        sync_object(snapshot.with_name("prior-checkout.json"))
+        sync_directories(snapshot.parent, snapshot.parent.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -241,6 +290,7 @@ def backup_directory(codex):
         break
     directory = Path(tempfile.mkdtemp(prefix="devflow-install-rollback-", dir=anchor))
     directory.chmod(0o700)
+    sync_directories(anchor, directory)
     return directory
 
 
@@ -397,12 +447,61 @@ def restore_targets(directory, conflicts):
             restore_object(name, entries[name])
         except (OSError, ValueError, KeyError) as exc:
             conflicts.append(f"{name}: destination recovery failed: {exc}")
+    for name in entries:
+        sync_object(Path(name))
+        parent = Path(name).parent
+        if parent.exists():
+            sync_directories(parent)
+    sync_directories(directory)
+    return conflicts
+
+
+def reattach_unknown(captured, name, directory):
+    """Restore a displaced name using metadata only, without reading its contents."""
+    try:
+        info = captured.lstat()
+        if (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) and not os.path.lexists(name):
+            os.link(captured, name, follow_symlinks=False)
+            sync_directories(Path(name).parent, directory)
+    except OSError:
+        pass  # Never overwrite a recreated destination or discard the retained node.
+
+
+def retained_forward_conflicts(directory, entries):
+    """A crash can precede effect() authenticating the displaced object.
+
+    Never let later snapshot cleanup discard that unknown object. Restore its
+    public name when still absent, retain both names/evidence, and let the usual
+    identity checks restore only other independently known installed objects.
+    """
+    conflicts = []
+    changed = False
+    for name, saved in entries.items():
+        captured = directory / ("forward-" + hashlib.sha256(name.encode()).hexdigest())
+        if not os.path.lexists(captured):
+            continue
+        try:
+            observed = identity(captured)
+            if observed in (saved["before"], saved.get("installed")):
+                continue
+            reason = "unverified displaced object"
+        except (OSError, ValueError) as exc:
+            reason = "unverified displaced object: " + str(exc)
+        reattach_unknown(captured, name, directory)
+        message = f"{name} captured at {captured}; {reason} preserved"
+        conflicts.append(message)
+        if saved.get("drift") != message:
+            saved["drift"] = message
+            changed = True
+    if changed:
+        save_snapshot(directory / "snapshot.json", entries)
     return conflicts
 
 
 def restore(directory, *, checkout_only=False):
     entries = json.loads((directory / "snapshot.json").read_text())
     conflicts = [saved["drift"] for saved in entries.values() if "drift" in saved]
+    conflicts.extend(retained_forward_conflicts(directory, entries))
     if not checkout_only:
         try:
             restore_targets(directory, conflicts)
@@ -423,7 +522,9 @@ def restore(directory, *, checkout_only=False):
 
 def discard(directory):
     if directory.name.startswith("devflow-install-rollback-") and (directory / "snapshot.json").is_file():
+        parent = directory.parent
         shutil.rmtree(directory)
+        sync_directories(parent)
     else:
         raise ValueError("not a Devflow rollback directory: " + str(directory))
 

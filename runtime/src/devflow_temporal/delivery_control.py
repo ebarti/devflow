@@ -297,6 +297,9 @@ def _ports(config: DeliveryConfig) -> tuple[str, int, int, int]:
 
 
 def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
+    from .delivery_installation_owner import subprocess_options
+
+    ownership = subprocess_options(config)
     log = config.state_root / f"{name}.log"
     descriptor = os.open(log, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "ab") as stream:
@@ -307,6 +310,7 @@ def _launch(config: DeliveryConfig, name: str, argv: list[str]) -> dict:
             stdout=stream,
             stderr=stream,
             start_new_session=True,
+            **ownership,
         )
     try:
         for _ in range(20):

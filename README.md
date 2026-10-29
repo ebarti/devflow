@@ -23,7 +23,7 @@ Project tools and GitHub authentication retain their own requirements.
 
 ## Install
 
-Keep a trusted release checkout at a stable location. Set `RELEASE_TAG` to the
+Use a trusted release checkout for setup. Set `RELEASE_TAG` to the
 chosen [published release](https://github.com/ebarti/devflow/releases). `main`
 and open PRs contain unreleased work.
 
@@ -33,7 +33,13 @@ cd devflow
 sh scripts/install.sh
 ```
 
-The normal installer exposes the sole `devflow-local-delivery` service skill
+The normal installer creates or verifies the independently owned checkout at
+`~/.local/share/devflow/developer-workflow`, with its own Git objects and frozen
+runtime environment (`uv` is required). Registrations point into that durable
+checkout, so removing the setup checkout or allowing managed worktree cleanup
+does not remove the installed code, dependencies, helpers or entry points.
+The installer proves the actual imports and installed wheel contents before
+exposing the sole `devflow-local-delivery` service skill
 and copies four internal agent definitions as regular files. If a matching
 installed local delivery plugin already provides that skill, installation
 preserves it without creating a duplicate direct entry. The `devflow` path
@@ -47,7 +53,7 @@ Use explicit locations for another host configuration:
 sh scripts/install.sh /path/to/host/skills /path/to/codex-home
 ```
 
-Normal installation does not configure MCP, create a runtime, install metrics
+Normal installation does not configure MCP, install metrics
 hooks, activate a launchd reconciler or change global model settings. Existing
 foreign hooks, host configuration and user data are preserved. Internal agent
 copies are tracked by `agents/.devflow-agent-manifest.json`; installation
@@ -62,11 +68,36 @@ Global delivery commands require the explicit operation described in
 `devflow-delivery` and `devflow-delivery-mcp` environment and configuration.
 It can migrate the recognized historical `devflow` command into an alias of
 `devflow-delivery`, retaining the old immutable release and guarded rollback.
-Normal installation does not migrate a CLI or create a runtime.
+Normal installation does not migrate a CLI or activate a service.
+
+For a source trial, explicitly select isolated destinations:
+
+```sh
+sh scripts/install.sh --development /path/to/trial/skills /path/to/trial/codex
+```
+
+`DEVFLOW_INSTALL_MODE=development` provides the same explicit mode for historical
+updaters that cannot forward new flags. Development mode preserves source links
+and refuses the user's production registration directories. It does not provide
+a durable installation proof. Production launcher and supervisor registration
+reject temporary/managed source, shared Git objects, indirect environment/import
+dependencies, or temporary configuration and persistence roots.
+Hosts with additional cleanup roots can supply `DEVFLOW_MANAGED_WORKTREE_ROOTS`
+as a JSON array of absolute paths; the checks resolve configured aliases before
+testing every dependency. Production source must use the fixed independently
+owned installation root, including when launcher/service registration is invoked
+from another checkout.
+
+An interrupted installation retains its journal alongside the durable checkout.
+Replay the same setup request to reconcile it, or run `sh scripts/install.sh
+--rollback` to restore registrations and retain the unfinished owned checkout.
+Rollback never deletes run state, configuration or histories. Existing native
+execution grants and acknowledged runtime locations must use the supported
+stopped `runtime-installation` migration; normal setup does not rewrite them.
 
 ## Upgrade
 
-Between tasks, select a published release and update the existing checkout:
+Between tasks, select a published release and update the durable owner:
 
 ```sh
 sh scripts/update.sh "$RELEASE_TAG"
@@ -74,7 +105,40 @@ sh scripts/update.sh "$RELEASE_TAG"
 sh scripts/update.sh "$RELEASE_TAG" /path/to/host/skills /path/to/codex-home
 ```
 
-The updater fetches the tag, switches to its commit and reruns installation.
+The production updater operates on the durable owner even when invoked from a
+disposable setup checkout. It requires the worker and supervisor to be stopped,
+fetches the tag, switches to its commit, synchronizes the frozen environment and
+reconciles registrations. Source/environment recovery and registration snapshots
+remain journaled until verification. Replay an interrupted update or use
+`sh scripts/update.sh --rollback`; failed recovery retains its journal for retry.
+Before changing dependencies, the updater verifies an independent complete copy
+of the old environment. Rollback exchanges that copy back into place without
+network access or dependency resolution. The journal also records a recovery
+command using a separately proved base interpreter and retained controller;
+use that command if the candidate has broken its own updater script.
+Acknowledged native installations require their supported stopped authority
+transition before changing source/environment. Existing guards remain enforced.
+The ordinary updater currently supports fresh-owner fake-backend source updates.
+Native source-successor acknowledgements and authenticated legacy-owner enrollment
+remain tracked in [#237](https://github.com/ebarti/devflow/issues/237); those updates
+currently refuse. This installation foundation does not complete those transitions.
+New durable owners register every configuration loaded by the CLI/API, including
+custom state roots, under the same installation lock. Missing databases and
+unknown custody refuse an update. A legacy owner has no complete inventory merely
+because a directory scan found nothing: it requires an authenticated stopped
+cutover before ordinary updates can be enabled. Original native authority and
+historical run records are retained throughout that transition.
+Production console entries acquire a shared lifetime ownership lease through a
+retained stdlib bootstrap before importing the mutable environment or source.
+CLI/API/worker processes keep that lease until exit; the updater requires the
+exclusive lease. Concurrent configuration readers use a separate short inventory
+lock. An interrupted update keeps new operational starts blocked until its
+retained recovery command reconciles the source and environment.
+The installer prints immutable production command paths beside the runtime.
+Global launcher and launchd registrations call those retained bootstraps directly;
+they do not execute a mutable console script while `uv` replaces the environment.
+The `.venv/bin` scripts are internal environment entries. Use the printed commands
+or explicitly registered global launchers for production startup.
 Use a supported `DEVFLOW_PYTHON`; a retired historical interpreter need not exist. Tracked source edits stop
 an update. No database migration or service activation occurs in this normal
 installation path.

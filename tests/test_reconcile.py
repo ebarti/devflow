@@ -606,7 +606,13 @@ p.write_text(json.dumps(s))
         if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", baseline + "^{commit}"],
                           capture_output=True).returncode:
             self.skipTest("historical installed checkout is absent from this shallow clone")
-        fixture = self.root.resolve()
+        parent = os.environ.get("DEVFLOW_PRODUCTION_FIXTURE_PARENT")
+        if not parent:
+            raise RuntimeError("set an owned durable DEVFLOW_PRODUCTION_FIXTURE_PARENT "
+                               "for historical production updater replay")
+        temporary_fixture = tempfile.TemporaryDirectory(prefix="reconcile-upgrade-", dir=parent)
+        self.addCleanup(temporary_fixture.cleanup)
+        fixture = Path(temporary_fixture.name).resolve()
         origin, checkout = fixture / "origin", fixture / "checkout"
         # Preserve the historical Git objects and ancestry used by migration.
         subprocess.run(["git", "clone", "--quiet", "--shared", str(ROOT), str(origin)], check=True)
@@ -686,6 +692,29 @@ p.write_text(json.dumps(s))
         self.assertEqual(database.read_bytes(), prior_data)
         self.assertEqual(json.loads(launch_state.read_text())["calls"], [])
         (codex / "hooks.json").write_bytes(original_hooks)
+        manifest_path = codex / "agents/.devflow-agent-manifest.json"
+        if manifest_path.exists():
+            original_manifest = manifest_path.read_bytes()
+            manifest = json.loads(original_manifest)
+            name = "devflow-coordinator.toml"
+            agent_path = codex / "agents" / name
+            original_agent = agent_path.read_bytes()
+            changed_agent = original_agent + b"\n# Consistently forged historical registration\n"
+            agent_path.write_bytes(changed_agent)
+            manifest["agents"][name]["sha256"] = hashlib.sha256(changed_agent).hexdigest()
+            manifest_path.write_text(json.dumps(manifest))
+            tampered = registrations()
+            rejected = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
+                                      text=True, capture_output=True, timeout=90)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+            self.assertIn("Historical agent predecessor proof", rejected.stderr)
+            self.assertEqual(subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(), baseline)
+            self.assertEqual(registrations(), tampered)
+            self.assertEqual(database.read_bytes(), prior_data)
+            self.assertEqual(json.loads(launch_state.read_text())["calls"], [])
+            agent_path.write_bytes(original_agent)
+            manifest_path.write_bytes(original_manifest)
         for _ in range(2):
             upgraded = subprocess.run(["sh", str(checkout / "scripts/update.sh"), "v2"], env=env,
                                       text=True, capture_output=True, timeout=90)

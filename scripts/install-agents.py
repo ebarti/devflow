@@ -20,6 +20,14 @@ def rollback_module():
     return module
 
 
+def migration_module():
+    spec = importlib.util.spec_from_file_location(
+        "agent_install_migration", Path(__file__).with_name("install-migration.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def fail(message):
     raise ValueError(message)
 
@@ -86,7 +94,7 @@ def manifest_for(path, source_root):
     return saved
 
 
-def hook_pin(codex_home, source_root, force):
+def hook_pin(codex_home, source_root, force, predecessor=None):
     pin_path = codex_home / ".devflow-install.json"
     guard_path = codex_home / ".devflow-hook.py"
     pin = None
@@ -97,7 +105,7 @@ def hook_pin(codex_home, source_root, force):
                 or not isinstance(pin.get("files"), dict)
                 or not isinstance(pin["files"].get("scripts/install-guard.py"), str)):
             fail(f"Invalid Devflow installation pin: {pin_path}")
-        if pin["source"] != str(source_root) and not force:
+        if pin["source"] != str(source_root) and not force and pin["source"] != str(predecessor):
             fail("Devflow hook belongs to another checkout; use --force after checking its source")
         if not exists(guard_path) or guard_path.is_symlink() or not guard_path.is_file():
             fail(f"Installed Devflow hook guard is missing or changed: {guard_path}")
@@ -137,7 +145,7 @@ def hook_pin(codex_home, source_root, force):
                         # Legacy installs invoked telemetry through the skill
                         # symlink, which may live outside the checkout.
                         previous = str(Path(command[-2]).resolve(strict=True).parents[3])
-                        if previous == str(source_root) or force:
+                        if previous in {str(source_root), str(predecessor)} or force:
                             continue
                     fail(f"Unrecognized or differently pinned Devflow hook in {hooks_path}")
     return pin
@@ -158,7 +166,7 @@ def atomic_write(path, content, mode=0o644):
             temporary.unlink()
 
 
-def plan(source_root, skills, codex_home, force):
+def plan(source_root, skills, codex_home, force, *, predecessor=None, predecessor_revision=None):
     agent_dir = codex_home / "agents"
     for label, path in (("Codex home", codex_home), ("Agent directory", agent_dir)):
         if exists(path) and not path.is_dir():
@@ -171,10 +179,39 @@ def plan(source_root, skills, codex_home, force):
     hashes = {name: digest(path) for name, path in sources.items()}
     manifest_path = agent_dir / ".devflow-agent-manifest.json"
     manifest = manifest_for(manifest_path, source_root)
-    pin = hook_pin(codex_home, source_root, force)
-    if manifest["agents"] and manifest["source_root"] != str(source_root) and not force:
+    pin = hook_pin(codex_home, source_root, force, predecessor)
+    historical = None
+    if predecessor_revision is not None:
+        if predecessor is None:
+            fail("Historical agent predecessor proof requires its exact source")
+        migration = migration_module()
+        historical = migration.inventory(predecessor, predecessor_revision)
+        if pin is not None and (pin.get("head") != predecessor_revision
+                                or pin["files"] != historical):
+            fail("Historical agent predecessor proof differs from the installation pin")
+        if pin is None and not manifest["agents"] and predecessor_revision != migration.V022:
+            fail("Historical agent predecessor revision has no acknowledged registration proof")
+    if predecessor is not None and manifest["agents"]:
+        if manifest["source_root"] != str(predecessor):
+            fail("Agent predecessor differs from the exact acknowledged source")
+        for name, entry in manifest["agents"].items():
+            if historical is not None:
+                installed = agent_dir / name
+                if (historical.get("agents/" + name) != entry["sha256"]
+                        or installed.is_symlink() or not installed.is_file()
+                        or digest(installed) != entry["sha256"]):
+                    fail(f"Historical agent predecessor proof differs from manifest/copy: {name}")
+            else:
+                previous = predecessor / "agents" / name
+                if (previous.is_symlink() or not previous.is_file()
+                        or digest(previous) != entry["sha256"]):
+                    fail(f"Agent predecessor bytes differ from the acknowledged source: {name}")
+    if (manifest["agents"] and manifest["source_root"] != str(source_root)
+            and not force and manifest["source_root"] != str(predecessor)):
         fail("Agent copies belong to another checkout; use --force after checking its source")
     previous_roots = {str(source_root), manifest["source_root"]}
+    if predecessor is not None:
+        previous_roots.add(str(predecessor))
     if pin:
         previous_roots.add(pin["source"])
     skill_link = skills / "devflow"
@@ -188,8 +225,12 @@ def plan(source_root, skills, codex_home, force):
             actions[name] = "copy"
         elif target.is_symlink():
             target_path = link_target(target)
+            if (historical is not None and target_path == predecessor / "agents" / name
+                    and "agents/" + name not in historical):
+                fail(f"Unknown historical agent symlink preserved: {target}")
             owned_roots = {str(Path(root) / "agents" / name) for root in previous_roots}
-            if str(target_path) not in owned_roots or (target_path != source and not force):
+            if (str(target_path) not in owned_roots or (target_path != source and not force
+                    and target_path != (predecessor / "agents" / name if predecessor else None))):
                 fail(f"Unowned or differently pinned agent symlink preserved: {target}")
             actions[name] = "copy"
         elif target.is_file():
@@ -214,21 +255,35 @@ def plan(source_root, skills, codex_home, force):
     for root in previous_roots:
         for target in agent_dir.glob("devflow-*.toml") if agent_dir.is_dir() else ():
             if target.name not in sources and target.is_symlink() and link_target(target) == Path(root) / "agents" / target.name:
+                if (historical is not None and root == str(predecessor)
+                        and "agents/" + target.name not in historical):
+                    fail(f"Unknown historical agent symlink preserved: {target}")
                 obsolete.append(target)
     return sources, hashes, actions, sorted(set(obsolete)), manifest_path
 
 
 def main():
     global ROLLBACK
-    if len(sys.argv) not in {6, 7} or sys.argv[1] not in {"preflight", "apply"}:
+    arguments = sys.argv[1:]
+    predecessor = None
+    predecessor_revision = None
+    if len(arguments) >= 2 and arguments[-2] == "--predecessor-revision":
+        predecessor_revision = arguments[-1]
+        arguments = arguments[:-2]
+    if len(arguments) >= 2 and arguments[-2] == "--predecessor":
+        predecessor = Path(arguments[-1]).absolute()
+        arguments = arguments[:-2]
+    if len(arguments) not in {5, 6} or arguments[0] not in {"preflight", "apply"}:
         fail("usage: install-agents.py preflight|apply SOURCE_ROOT SKILLS CODEX_HOME FORCE [BACKUP]")
-    mode, source_root, skills, codex_home, force = sys.argv[1:6]
-    ROLLBACK = Path(sys.argv[6]) if len(sys.argv) == 7 else None
+    mode, source_root, skills, codex_home, force = arguments[:5]
+    ROLLBACK = Path(arguments[5]) if len(arguments) == 6 else None
     check_skills_destination(skills)
     source_root = Path(source_root).expanduser().resolve()
     skills = Path(skills).resolve()
     codex_home = Path(codex_home).expanduser().resolve()
-    sources, hashes, actions, obsolete, manifest_path = plan(source_root, skills, codex_home, force == "true")
+    sources, hashes, actions, obsolete, manifest_path = plan(
+        source_root, skills, codex_home, force == "true", predecessor=predecessor,
+        predecessor_revision=predecessor_revision)
     if mode == "preflight":
         return 0
     if ROLLBACK is None:
