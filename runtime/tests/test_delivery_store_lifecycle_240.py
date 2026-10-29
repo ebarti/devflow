@@ -63,17 +63,25 @@ async def test_default_repair_public_assessment_and_admission_agree(service, mon
 @pytest.mark.asyncio
 async def test_preplan_stop_refuses_implementation_resume_across_restart(service, monkeypatch):
     """A closed pre-intake preparation failure must not be resumed as implementation."""
+    import asyncio
     import copy
     import json
+    import socket
+    import sys
 
     import httpx
+    import uvicorn
 
     from devflow_temporal.delivery_api import create_app
     from devflow_temporal.delivery_config import DeliveryConfig
     from devflow_temporal.delivery_store import DeliveryStore
 
     initial, request = service
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(128)
     raw = copy.deepcopy(initial.config.raw)
+    raw['dashboard_url'] = f'http://127.0.0.1:{listener.getsockname()[1]}'
     raw['roles']['intake'] = {'model': 'fixture', 'effort': 'low'}
     initial.config.path.write_text(json.dumps(raw))
     store = DeliveryStore(DeliveryConfig.load(initial.config.path))
@@ -119,6 +127,29 @@ async def test_preplan_stop_refuses_implementation_resume_across_restart(service
         assert preview.status_code == 200 and not preview.json()['eligible']
         assert 'accepted_plan_unavailable' in {b['code'] for b in preview.json()['blockers']}
         assert response.status_code == 409 and response.json()['detail'] == preview.json()
+        expected_assessment = preview.json()
+    # Exercise the real read-only CLI and its loopback client against this owned API.
+    assessment_file = initial.config.path.parent / 'preplan-assessment.json'
+    assessment_file.write_text(json.dumps({'kind': 'stopped_delivery_resume', 'request': command}))
+    server = uvicorn.Server(uvicorn.Config(app, lifespan='off', log_level='error'))
+    serving = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        for _ in range(200):
+            if server.started:
+                break
+            await asyncio.sleep(.01)
+        assert server.started
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-m', 'devflow_temporal.delivery_control', '--config',
+            str(initial.config.path), 'assess-transition', '--id', 'run-1', '--request',
+            str(assessment_file), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 30)
+        assert process.returncode == 0, stderr.decode()
+        assert json.loads(stdout) == expected_assessment
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(serving, 10)
+        listener.close()
     with restarted._connect() as db:
         assert list(db.iterdump()) == before
         assert db.execute('SELECT request_json FROM delivery_runs').fetchone()[0] == saved_request

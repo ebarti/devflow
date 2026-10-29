@@ -221,6 +221,16 @@ def test_stale_older_resume_link_blocks_only_implementations_that_ran_under_it(
     role = codex_receipt(store, child, source=source, output=output)
     cancelled(store, monkeypatch, parent, child, role, output)
     row = {"error": None, "checks_json": "{}"}
+    original_admit = resume_mod.admit
+
+    def observed_admission(owner, run_id, command, **kwargs):
+        preview = original_admit(owner, run_id, command, preflight=True, **kwargs)
+        assessment = preview["lifecycle_assessment"]
+        assert assessment["eligible"] and assessment["normalized_lifecycle"] == "terminal"
+        assert assessment["transition"]["from"] == ["stopped", "terminal"]
+        return original_admit(owner, run_id, command, **kwargs)
+
+    monkeypatch.setattr(resume_mod, "admit", observed_admission)
     first = activities.resume_worker(store, parent, child, row)
     with store._connect() as db:
         older = json.loads(db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",

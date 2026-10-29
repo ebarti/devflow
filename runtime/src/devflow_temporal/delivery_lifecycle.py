@@ -23,7 +23,7 @@ PAUSE_EXTENSION_STATES = frozenset({'pausing', 'paused', 'resuming'})
 # checkpoint and rechecks it when acquiring admission custody.  The table does
 # not infer a route from an error or authorize a transition by itself.
 TRANSITION_TABLE = {
-    kind: {'from': ['stopped'], 'to': 'recovering'} for kind in (
+    kind: {'from': ('stopped',), 'to': 'recovering'} for kind in (
         'repair_continuation', 'stopped_delivery_resume', 'published_gate_retry',
         'prepublication_gate_retry', 'published_check_prelaunch_retry',
         'published_ci_retry', 'published_controller_retry', 'recover_publication',
@@ -33,7 +33,7 @@ TRANSITION_TABLE = {
 }
 # Cancelled feature workers and revision-owned completed workers can be resumed
 # only when their owner supplies the additional historical authority.
-TRANSITION_TABLE['stopped_delivery_resume']['from'].append('terminal')
+TRANSITION_TABLE['stopped_delivery_resume']['from'] = ('stopped', 'terminal')
 
 
 def lifecycle_from_row(row: Mapping[str, Any]) -> str:
@@ -43,7 +43,7 @@ def lifecycle_from_row(row: Mapping[str, Any]) -> str:
         return 'stopped'
     if execution == 'terminal' and outcome in {'delivered', 'cancelled', 'failed'}:
         return 'terminal'
-    if execution == 'stopping':
+    if execution in {'stopping', 'cancelling'}:
         return 'stopping'
     if execution in {'queued', 'pending', 'running'}:
         if row.get('recovery_json'):
@@ -138,11 +138,13 @@ def evaluate_transition(facts: Mapping[str, Any], request: Mapping[str, Any]) ->
                 'satisfied': predicate.get('satisfied'),
                 'user_input_required': predicate.get('user_input_required'),
             })
+    transition = TRANSITION_TABLE.get(operation)
     observed = {key: facts.get(key) for key in (
         'revision', 'iteration', 'candidate_id', 'candidate_head', 'publication_number')}
     return {'version': VERSION, 'operation': operation,
             'normalized_lifecycle': facts.get('normalized_lifecycle', 'unknown'),
-            'transition': TRANSITION_TABLE.get(operation),
+            'transition': ({'from': list(transition['from']), 'to': transition['to']}
+                           if transition is not None else None),
             'eligible': not blockers, 'observed_revision': observed['revision'],
             'candidate': {'id': observed['candidate_id'], 'head': observed['candidate_head']},
             'publication': ({'number': observed['publication_number']}

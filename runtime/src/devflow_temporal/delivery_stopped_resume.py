@@ -1117,7 +1117,11 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observati
     state_checks, row_checks = closed_checks(row, state, cleanup_authority)
     # Keep the closed verdict immutable while reporting later custody facts
     # separately.  These are exactly the facts checked by the original guard.
-    from .delivery_lifecycle import lifecycle_from_row, require_observed_predicates
+    from .delivery_lifecycle import (
+        RecoveryRefused,
+        lifecycle_from_row,
+        require_observed_predicates,
+    )
 
     status_matches = (row['phase'] in stopped and row['outcome'] == row['phase']
         and row['execution_state'] == expected_execution and state.get('run_id') == run_id
@@ -1137,42 +1141,49 @@ def _snapshot(store, run_id, *, _revision=None, review_subject=False, _observati
                       and bool(spec['accepted_plan'].strip()))
     effects_settled = all(e['state'] == 'complete' and e['observed_json'] is not None
                           for e in effects)
-    require_observed_predicates(KIND, 'delivery_stopped_resume', {'row': row, 'closed': closed}, [
-        {'code': 'stopped_state_unproven', 'satisfied': status_matches,
-         'missing_or_unknown_fact': 'matching stopped or supported terminal run state',
-         'next_action': 'inspect the retained run and closed predecessor',
-         'user_input_required': None},
-        {'code': 'stopped_cleanup_unconfirmed', 'satisfied': True if cleanup_matches else None,
-         'missing_or_unknown_fact': 'confirmed cleanup or authenticated later reconciliation',
-         'next_action': 'reconcile the original cleanup and custody',
-         'user_input_required': None},
-        {'code': 'stopped_predecessor_unproven', 'satisfied': identity_matches,
-         'missing_or_unknown_fact': 'matching workflow, admission and recovery identities',
-         'next_action': 'inspect the closed predecessor and its original admission',
-         'user_input_required': None},
-        {'code': 'stopped_checkpoint_changed', 'satisfied': checkpoint_matches,
-         'missing_or_unknown_fact': 'unchanged candidate, checks, publication and verdict',
-         'next_action': 'inspect retained checkpoint and immutable history',
-         'user_input_required': None},
-        {'code': 'stopped_owner_conflict', 'satisfied': claim is None,
-         'missing_or_unknown_fact': 'released original work claim',
-         'next_action': 'inspect and reconcile the current work owner',
-         'user_input_required': None},
-        {'code': 'stopped_effects_unsettled', 'satisfied': True if effects_settled else None,
-         'missing_or_unknown_fact': 'settled effects with observed outcomes',
-         'next_action': 'reconcile the original effects', 'user_input_required': None},
-        {'code': 'accepted_plan_unavailable', 'satisfied': plan_available,
-         'missing_or_unknown_fact': 'original accepted plan for implementation resume',
-         'next_action': 'inspect retained intake and preparation; no implementation resume '
-                        'is authorized without an accepted plan',
-         'user_input_required': None},
-    ], lifecycle=lifecycle_from_row(row), owner_proof=(
-        True if (status_matches and cleanup_matches and identity_matches and checkpoint_matches
-                 and claim is None and effects_settled) else None),
-        legacy_message=('resume requires a closed finalized delivery with released ownership'
-                        if not (status_matches and cleanup_matches and identity_matches
-                                and checkpoint_matches and claim is None and effects_settled)
-                        else 'implementation resume requires an accepted plan'))
+    try:
+        require_observed_predicates(
+            KIND, 'delivery_stopped_resume', {'row': row, 'closed': closed}, [
+            {'code': 'stopped_state_unproven', 'satisfied': status_matches,
+             'missing_or_unknown_fact': 'matching stopped or supported terminal run state',
+             'next_action': 'inspect the retained run and closed predecessor',
+             'user_input_required': None},
+            {'code': 'stopped_cleanup_unconfirmed', 'satisfied': True if cleanup_matches else None,
+             'missing_or_unknown_fact': 'confirmed cleanup or authenticated later reconciliation',
+             'next_action': 'reconcile the original cleanup and custody',
+             'user_input_required': None},
+            {'code': 'stopped_predecessor_unproven', 'satisfied': identity_matches,
+             'missing_or_unknown_fact': 'matching workflow, admission and recovery identities',
+             'next_action': 'inspect the closed predecessor and its original admission',
+             'user_input_required': None},
+            {'code': 'stopped_checkpoint_changed', 'satisfied': checkpoint_matches,
+             'missing_or_unknown_fact': 'unchanged candidate, checks, publication and verdict',
+             'next_action': 'inspect retained checkpoint and immutable history',
+             'user_input_required': None},
+            {'code': 'stopped_owner_conflict', 'satisfied': claim is None,
+             'missing_or_unknown_fact': 'released original work claim',
+             'next_action': 'inspect and reconcile the current work owner',
+             'user_input_required': None},
+            {'code': 'stopped_effects_unsettled', 'satisfied': True if effects_settled else None,
+             'missing_or_unknown_fact': 'settled effects with observed outcomes',
+             'next_action': 'reconcile the original effects', 'user_input_required': None},
+            {'code': 'accepted_plan_unavailable', 'satisfied': plan_available,
+             'missing_or_unknown_fact': 'original accepted plan for implementation resume',
+             'next_action': 'inspect retained intake and preparation; no implementation resume '
+                            'is authorized without an accepted plan',
+             'user_input_required': None},
+        ], lifecycle=lifecycle_from_row(row), owner_proof=(
+            True if (status_matches and cleanup_matches and identity_matches and checkpoint_matches
+                     and claim is None and effects_settled) else None),
+            legacy_message=('resume requires a closed finalized delivery with released ownership'
+                            if not (status_matches and cleanup_matches and identity_matches
+                                    and checkpoint_matches and claim is None and effects_settled)
+                            else 'implementation resume requires an accepted plan'))
+    except RecoveryRefused as exc:
+        if review_subject:
+            # Other owners must report their own operation, not a resume refusal.
+            raise ValueError(str(exc)) from exc
+        raise
     if spec.get('baseline_checks_version') in (1, 2):
         baseline = state.get('checks', {}).get('baseline', {})
         required = {check['id'] for check in spec['policy']['baseline_checks']}

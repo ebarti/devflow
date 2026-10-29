@@ -293,7 +293,25 @@ async def test_public_gate_retry_rechecks_candidate_and_owner(unpublished, monke
                                      headers=headers)
         assert not owned.json()['eligible']
         assert 'gate_owner_conflict' in {b['code'] for b in owned.json()['blockers']}
+        assert owned.json()['proof_digest'] is None
         assert response.status_code == 409 and response.json()['detail'] == owned.json()
+        # A diagnostic that observes this stopped subject owns a different route.
+        from devflow_temporal import delivery_native_diagnostic as diagnostic
+
+        monkeypatch.setattr(diagnostic, '_readonly', lambda value: value)
+        diagnostic_request = {
+            'command_id': 'diagnostic', 'expected_revision': state['revision'],
+            'expected_projection_revision': 0, 'expected_iteration': state['iteration'],
+            'expected_candidate_id': command['expected_candidate_id'],
+            'expected_candidate_head': command['expected_candidate_head'],
+            'expected_content_sha256': '0' * 64, 'expected_pr_number': 1,
+            'expected_pr_head': '0' * 40, 'check_id': diagnostic.CHECK_ID,
+            'expected_check_sha256': diagnostic.CHECK_SHA256,
+        }
+        diagnostic_result = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': diagnostic.KIND, 'request': diagnostic_request})
+        assert not diagnostic_result.json()['eligible']
+        assert diagnostic_result.json()['operation'] == diagnostic.KIND
         with store._connect() as db:
             assert not db.execute('SELECT 1 FROM delivery_gate_admissions').fetchone()
             store.state.release_work(db, broker.spec['work_id'], 'external:other')
