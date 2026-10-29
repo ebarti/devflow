@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -157,7 +159,7 @@ def _revision_diagnostic_for(spec, diagnostic, candidate):
 
 
 def _native_rejected_fixture(native_configuration, monkeypatch, *, prior_cycles=4,
-                             retain_worker=False):
+                             retain_worker=False, early_prelaunch=False):
     config, request = native_configuration
     config.raw["max_repairs"] = 10
     config.path.write_text(json.dumps(config.raw))
@@ -313,27 +315,49 @@ def _native_rejected_fixture(native_configuration, monkeypatch, *, prior_cycles=
         **revisions.authenticate_revision_role(store, review),
         "proposed_plan": value,
     }
-    key, _ = supervisor._claim(review)
-    folder = Path(spec["state_dir"]) / "attempts" / key
-    review.update(
-        findings=[],
-        native_authorized=True,
-        role_evidence_key=key,
-        result_path=str(folder / "result.json"),
-        start_path=str(folder / "start.json"),
-        workspace=str(Path(spec["state_dir"]) / "gates" / "0" / "review"),
-    )
-    review["review_diff"] = revision_diff(broker, review)
-    review["review_diff"].pop("candidate_id", None)
-    write_private(folder / "request.json", review)
-    with store._connect() as db:
-        expected = dict(
-            db.execute("SELECT * FROM delivery_attempts WHERE job_key=?", (key,)).fetchone()
+    if early_prelaunch:
+        workspace = broker.gate_checkout("review", 0, candidate)
+        review["workspace"] = str(workspace)
+        review["review_diff"] = revision_diff(broker, review)
+        key = supervisor._job_key(review)
+        folder = Path(spec["state_dir"]) / "attempts" / key
+
+        def refuse_preparation(*_args, **_kwargs):
+            raise ValueError("controlled verifier refusal before request persistence")
+
+        def no_process(*_args, **_kwargs):
+            raise AssertionError("provider was unexpectedly allocated")
+
+        with monkeypatch.context() as refusal:
+            refusal.setattr("devflow_temporal.delivery_preparation.verify_prepared_spec",
+                            refuse_preparation)
+            refusal.setattr("devflow_temporal.delivery_native_process.NativeProcess", no_process)
+            failure = asyncio.run(supervisor.run(review))
+        assert failure["finish_reason"] == "prelaunch" and failure["cleanup"] == "confirmed"
+        assert list(folder.iterdir()) == []
+    else:
+        key, _ = supervisor._claim(review)
+        folder = Path(spec["state_dir"]) / "attempts" / key
+        review.update(
+            findings=[],
+            native_authorized=True,
+            role_evidence_key=key,
+            result_path=str(folder / "result.json"),
+            start_path=str(folder / "start.json"),
+            workspace=str(Path(spec["state_dir"]) / "gates" / "0" / "review"),
         )
-    failure = supervisor._native_failure(
-        review, key, expected, "product patch shape rejected plan comparison", launch_absent=True
-    )
-    assert failure["finish_reason"] == "prelaunch" and failure["cleanup"] == "confirmed"
+        review["review_diff"] = revision_diff(broker, review)
+        review["review_diff"].pop("candidate_id", None)
+        write_private(folder / "request.json", review)
+        with store._connect() as db:
+            expected = dict(
+                db.execute("SELECT * FROM delivery_attempts WHERE job_key=?", (key,)).fetchone()
+            )
+        failure = supervisor._native_failure(
+            review, key, expected, "product patch shape rejected plan comparison",
+            launch_absent=True,
+        )
+        assert failure["finish_reason"] == "prelaunch" and failure["cleanup"] == "confirmed"
     rejection = revisions.reject_revision(store, spec, context["revision_id"], failure["summary"])
     row = _stop_revision_fixture(store, spec, shared)
     return store, spec, shared, value, diagnostic, candidate, context, proposal, rejection, row
@@ -578,3 +602,95 @@ def test_reconsideration_refuses_missing_stale_or_widened_proof_before_reservati
                         revised_worker_spec)
     response = revisions.revise_feature_plan(store, original["run_id"], command)
     assert response["repair_budget"]["used"] == 6
+
+
+@pytest.mark.parametrize("early_prelaunch", [False, True])
+def test_public_revision_retains_unreviewed_prelaunch(native_configuration, monkeypatch,
+                                                       early_prelaunch):
+    """A no-launch refusal is not a substantive rejection of a later correction."""
+    import httpx
+
+    from devflow_temporal.delivery_api import create_app
+
+    native_configuration[0].raw["execution_mode"] = "trusted-local"
+    fixture = _native_rejected_fixture(native_configuration, monkeypatch,
+                                       early_prelaunch=early_prelaunch)
+    store, original, shared, plan, diagnostic, _, previous, _, _, row = fixture
+    command = {"command_id": "prelaunch-revision", "expected_revision": row["revision"],
+               "reason": "Retry the correction after the environment refusal."}
+
+    async def admit():
+        app = create_app(store.config.path)
+        app.state.delivery.store = store
+        origin = store.config.dashboard_url.rstrip("/")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url=origin) as client:
+            csrf = (await client.get("/api/session")).json()["csrf_token"]
+            headers = {"Origin": origin, "X-Devflow-CSRF": csrf}
+            url = f"/api/runs/{original['run_id']}/revise-feature-plan"
+            first = await client.post(url, json=command, headers=headers)
+            replay = await client.post(url, json=command, headers=headers)
+            assert first.status_code == 200, first.text
+            assert replay.status_code == 200 and replay.json() == first.json()
+            return first.json()
+
+    admitted = asyncio.run(admit())
+    successor = prepare_authority(store, store.effective_spec(admitted["run_id"]))
+    broker = DeliveryBroker(store, successor)
+    broker.prepare()
+    context = revisions.begin_revision(store, successor)
+    diagnostic = _revision_diagnostic_for(successor, diagnostic, broker.candidate())
+    budget = shared.budget(previous["owner"]["issue_id"])
+    assert budget["used"] == 6
+    with store._connect() as db:
+        attempt = dict(db.execute(
+            "SELECT * FROM delivery_attempts WHERE run_id=? AND role='review'",
+            (original["run_id"],),
+        ).fetchone())
+    folder = Path(attempt["result_path"]).parent
+    if early_prelaunch:
+        assert list(folder.iterdir()) == []
+
+        def refused():
+            with pytest.raises(ValueError,
+                               match="nonprogressing repeated proposal is already rejected"):
+                revisions.record_proposal(store, successor, context["revision_id"], plan,
+                                          diagnostic=diagnostic)
+            assert shared.budget(previous["owner"]["issue_id"]) == budget
+
+        lease_path = Path(original["state_dir"]) / "attempt-owners" / attempt["job_key"]
+        assert lease_path.is_file()
+        lease = DeliverySupervisor._owner_lock(original, attempt["job_key"])
+        assert lease is not None
+        try:
+            refused()
+        finally:
+            os.close(lease)
+        marker = folder / "launch.json"
+        marker.write_text("{}")
+        refused()
+        marker.unlink()
+        with store._connect() as db:
+            db.execute("UPDATE delivery_attempts SET candidate_id=? WHERE job_key=?",
+                       ("forged", attempt["job_key"]))
+        refused()
+        with store._connect() as db:
+            db.execute("UPDATE delivery_attempts SET candidate_id=? WHERE job_key=?",
+                       (attempt["candidate_id"], attempt["job_key"]))
+        adverse = {**json.loads(attempt["result_json"]), "status": "findings",
+                   "finish_reason": "done"}
+        with store._connect() as db:
+            db.execute("UPDATE delivery_attempts SET result_json=? WHERE job_key=?",
+                       (canonical_json(adverse), attempt["job_key"]))
+        refused()
+        with store._connect() as db:
+            db.execute("UPDATE delivery_attempts SET result_json=? WHERE job_key=?",
+                       (attempt["result_json"], attempt["job_key"]))
+        assert list(folder.iterdir()) == []
+    proposal = revisions.record_proposal(store, successor, context["revision_id"], plan,
+                                         diagnostic=diagnostic)
+    assert proposal["unreviewed_predecessors"][0]["revision_id"] == previous["revision_id"]
+    assert shared.budget(previous["owner"]["issue_id"]) == budget
+    with store._connect() as db:
+        assert dict(db.execute("SELECT * FROM delivery_attempts WHERE job_key=?",
+                               (attempt["job_key"],)).fetchone()) == attempt

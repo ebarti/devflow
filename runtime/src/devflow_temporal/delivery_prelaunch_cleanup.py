@@ -24,12 +24,15 @@ def _stamp(info):
 
 
 @contextmanager
-def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intakes=()):
+def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intakes=(),
+                        early_revision_intent=None):
     """Authenticate the existing supervisor's typed pre-monitor failure, never settle it.
 
     The durable result is server-owned producer evidence. Neither a missing
     journal nor a null session suffices. Existing owner/lifecycle leases exclude
     an unfinished launch; this observer never creates a missing proof or lock.
+    An early revision identity must be reconstructed by the owning caller from
+    the sealed predecessor and proposal before it is passed here.
     """
     from .supervisor import DeliverySupervisor
 
@@ -103,20 +106,36 @@ def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intake
             else:
                 locks[name] = lease(folder / name, folder_fd)
 
-        fd = os.open('request.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                     dir_fd=folder_fd)
-        descriptors.append(fd)
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
-                or info.st_size > _LIMIT):
-            raise ValueError('completed prelaunch request is not bounded private evidence')
-        pinned.append((folder / 'request.json', fd, _stamp(info)))
-        with os.fdopen(os.dup(fd), 'rb') as stream:
-            raw = stream.read(_LIMIT + 1)
-        if len(raw) != info.st_size:
-            raise ValueError('completed prelaunch request changed during observation')
-        request = json.loads(raw)
+        early = False
+        try:
+            fd = os.open('request.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=folder_fd)
+        except FileNotFoundError:
+            # Only the revision owner may supply a reconstructed identity after
+            # authenticating its sealed predecessor, proposal and owner records.
+            # The exact typed supervisor result and the held owner lease above
+            # establish no launch; an absent request is never sufficient.
+            if early_revision_intent is None or os.listdir(folder_fd):
+                raise
+            early = True
+            request = early_revision_intent
+            raw = None
+            if (not isinstance(request, dict) or request.get('role') != 'review'
+                    or not isinstance(request.get('revision_context'), dict)):
+                raise ValueError('early prelaunch requires a sealed review identity') from None
+        else:
+            descriptors.append(fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or info.st_size > _LIMIT):
+                raise ValueError('completed prelaunch request is not bounded private evidence')
+            pinned.append((folder / 'request.json', fd, _stamp(info)))
+            with os.fdopen(os.dup(fd), 'rb') as stream:
+                raw = stream.read(_LIMIT + 1)
+            if len(raw) != info.st_size:
+                raise ValueError('completed prelaunch request changed during observation')
+            request = json.loads(raw)
         if (not isinstance(request, dict) or not isinstance(request.get('spec'), dict)
                 or not isinstance(request.get('candidate'), dict)
                 or not isinstance(request['candidate'].get('id'), str)
@@ -136,13 +155,13 @@ def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intake
         if (not admitted or execution.get('provider') != 'codex'
                 or execution.get('policy', {}).get('execution_backend') != 'native-macos'
                 or execution.get('policy_digest') != digest(execution['policy'])
-                or request.get('native_authorized') is not True
+                or (not early and request.get('native_authorized') is not True)
                 or DeliverySupervisor._job_key(request) != key
                 or request.get('role') != attempt['role']
                 or request.get('iteration') != attempt['iteration']
                 or request['candidate']['id'] != attempt['candidate_id']
-                or request.get('result_path') != attempt['result_path']
-                or request.get('start_path') != str(folder / 'start.json')
+                or (not early and (request.get('result_path') != attempt['result_path']
+                                   or request.get('start_path') != str(folder / 'start.json')))
                 or role not in execution['policy']['roles']
                 or type(iteration) is not int or iteration < 0
                 or workspace not in expected_workspaces
@@ -154,6 +173,8 @@ def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intake
             raise ValueError('completed prelaunch lost its original admitted request')
 
         def unchanged():
+            if early and os.listdir(folder_fd):
+                raise ValueError('early prelaunch attempt is no longer empty')
             for path, descriptor, stamp in pinned:
                 current, named = os.fstat(descriptor), path.lstat()
                 if any(getattr(current, k) != v or getattr(named, k) != v
@@ -172,7 +193,8 @@ def completed_prelaunch(spec, attempt, executions, manifest, *, completed_intake
         unchanged()
         yield {'kind': 'completed_native_prelaunch', 'version': 1,
                'attempt_sha256': digest(attempt), 'result_sha256': digest(result),
-               'request_sha256': hashlib.sha256(raw).hexdigest(), 'leases': locks}
+               **({'revision_intent_sha256': digest(request)} if early else
+                  {'request_sha256': hashlib.sha256(raw).hexdigest()}), 'leases': locks}
         unchanged()
     finally:
         for fd in reversed(descriptors):

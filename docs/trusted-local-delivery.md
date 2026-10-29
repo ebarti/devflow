@@ -199,6 +199,15 @@ readiness path also requires an already authenticated successor assignment. The
 current coordinator examines the stopped worker before reserving that assignment,
 so an unreserved continuation remains blocked rather than bypassing ownership.
 
+For a feature-plan correction stopped before its review launch envelope is
+written, the unreviewed-predecessor check can reconstruct the review identity
+from the sealed revision, proposal, candidate and owner. It also requires the
+supervisor's completed prelaunch result, registered workspace, an empty attempt
+directory and the original unheld owner lease. A missing request alone does not
+prove the exception, and a real adverse review remains a rejection. Generic
+completed-resource observation still requires its existing request evidence for
+this early shape.
+
 An older run stopped by that browser-output registration defect can use one
 `published_check_prelaunch_retry` with zero additional implementation turns.
 Admission requires its exact closed UNKNOWN checkpoint, passed local checks and

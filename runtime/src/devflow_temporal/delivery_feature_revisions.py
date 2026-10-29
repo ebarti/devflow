@@ -2261,6 +2261,41 @@ def _unreviewed_rejection(store, spec, context, rejected, values):
                            str(Path(historical["state_dir"]) / "gates" / "0" / "review")),
             )
             request_path = folder / "request.json"
+            if role == "review" and not os.path.lexists(request_path):
+                # The revision and proposal identity were reconstructed from
+                # immutable coordinator checkpoints above, not from a caller.
+                # A supervisor may refuse preparation before it persists the
+                # later native launch envelope, so prove the typed terminal
+                # attempt under its original owner lease instead.
+                if not attempt:
+                    return None
+                from .delivery_prelaunch_cleanup import completed_prelaunch
+                from .delivery_resources import RunResources
+
+                intent = {key: expected[key] for key in (
+                    "spec", "role", "iteration", "candidate", "resume_session", "revision_context",
+                    "workspace",
+                )}
+                manifest = read_private(RunResources(historical).manifest)
+                with completed_prelaunch(historical, dict(attempt),
+                        {Path(historical["state_dir"]): historical}, manifest,
+                        early_revision_intent=intent) as observed:
+                    with store._connect() as db:
+                        current_attempt = db.execute(
+                            "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                            (owner["run_id"], key),
+                        ).fetchone()
+                    if (not current_attempt or dict(current_attempt) != dict(attempt)
+                            or datetime.fromisoformat(attempt["finished_at"]) > closed_at):
+                        return None
+                    result = json.loads(attempt["result_json"])
+                    proof = {
+                        "revision_id": revision_id, "review_job_key": key,
+                        "review_intent_digest": observed["revision_intent_sha256"],
+                        "review_result_digest": digest(result), "predecessor_closure": closure,
+                        "prelaunch_evidence": observed,
+                    }
+                continue
             if request_path.resolve(strict=True) != request_path:
                 return None
             request = read_private(request_path)
