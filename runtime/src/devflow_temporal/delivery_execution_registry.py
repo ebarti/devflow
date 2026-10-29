@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import canonical_json, digest
+from .delivery_registry_epoch import initialize as initialize_authority_epochs
 
 PREPARATION_CONTINUATION_LIMIT = 3
 
@@ -172,6 +173,7 @@ class ExecutionRegistry:
                 CREATE TABLE IF NOT EXISTS execution_migrated_stores (
                     store_path TEXT PRIMARY KEY, imported_at TEXT NOT NULL);
             """)
+            initialize_authority_epochs(db)
 
     @contextmanager
     def connect(self):

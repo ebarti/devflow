@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
 import pytest
+from runtime_location_scenario import artifact_holder_failure_snapshot
 from test_delivery_api import api_fixture as api_fixture
 from test_delivery_intake import intake_fixture as intake_fixture
 from test_delivery_native import native_configuration as native_configuration
@@ -13,6 +15,7 @@ from test_delivery_native import native_store as native_store
 from test_delivery_store import service as service
 from test_native_interrupted_gate import native_gates as native_gates
 
+from devflow_temporal import delivery_resources as resources
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_preparation import prepare_authority
 from devflow_temporal.delivery_resources import (
@@ -97,6 +100,18 @@ def test_native_profile_measurement_journals_bind_to_the_measured_digest(native_
         assert broker.run_prechecks(0, candidate)["state"] == "passed"
         execution, _ = _assert_measured_binding(store, prepared)
         assert RunResources(prepared).finalize("blocked")["outcome"] == "blocked"
-        assert observe_completed_resources(execution, [])["journal_sha256"]
+        try:
+            assert observe_completed_resources(execution, [])["journal_sha256"]
+        except ValueError as exc:
+            if str(exc) == "predecessor has a live root user or unreadable lease":
+                try:
+                    facts = artifact_holder_failure_snapshot(
+                        exc, resources._observe_locked_resources, root_observation=True)
+                    if facts is not None:
+                        exc.add_note("native preparation root observation: "
+                                     + json.dumps(facts, sort_keys=True))
+                except BaseException:
+                    pass  # Diagnostic failure must preserve the original refusal.
+            raise
     finally:
         assert RunResources(prepared).finalize("blocked")["resource_cleanup"] == "confirmed"
