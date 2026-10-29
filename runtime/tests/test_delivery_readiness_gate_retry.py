@@ -715,6 +715,117 @@ async def test_public_published_readiness_retains_candidate_and_full_selector(
     assert execution["policy"]["checks"] == spec["policy"]["checks"]
     assert readback(store, execution, recovery) == state["pull_request"]
 
+    import asyncio
+
+    from temporal_test_server import local_temporal
+    from temporalio import activity
+    from temporalio.worker import Worker
+
+    from devflow_temporal.delivery_activities import (
+        delivery_checks,
+        delivery_finalize_resources,
+        delivery_gates_readback,
+        delivery_precheck,
+        delivery_project,
+    )
+    from devflow_temporal.delivery_workflow import DeliveryWorkflow
+
+    store.mark_start("run-1", accepted=True)
+    monkeypatch.setattr(
+        DeliveryBroker,
+        "run_implementation_preparation",
+        lambda self, _i, value, **_k: {
+            "state": "passed",
+            "results": [],
+            "candidate_id": value["id"],
+            "source_unchanged": True,
+        },
+    )
+    monkeypatch.setattr(
+        "devflow_temporal.delivery_readiness.probe_tools",
+        lambda _broker, requirements, value, **_kw: {
+            "state": "passed",
+            "cleanup": "confirmed",
+            "component": "tools",
+            "candidate": value,
+            "requirement_sha256": digest(requirements),
+            "items": [],
+        },
+    )
+    monkeypatch.setattr("devflow_temporal.delivery_readiness_verify.tools", lambda *_a: None)
+    calls = []
+
+    @activity.defn(name="delivery_publish")
+    async def unexpected_publish(_body):
+        pytest.fail("published retry must never publish the candidate again")
+
+    @activity.defn(name="delivery_role")
+    async def role(body):
+        calls.append(body["role"])
+        assert body["role"] in {"review", "verify"}
+        assert body["candidate"] == candidate
+        return {
+            "role": body["role"],
+            "iteration": body["iteration"],
+            "status": "pass",
+            "session_id": "independent-" + body["role"],
+            "candidate": body["candidate"],
+            "cleanup": "confirmed",
+            "findings": [],
+        }
+
+    @activity.defn(name="delivery_tracker_start")
+    async def start(_body):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_tracker")
+    async def tracker(_body):
+        return {"state": "consistent"}
+
+    @activity.defn(name="delivery_ci")
+    async def ci(body):
+        calls.append("ci")
+        assert body["pull_request"] == state["pull_request"]
+        return {"state": "passed"}
+
+    async with local_temporal() as env:
+        async with Worker(
+            env.client,
+            task_queue="issue-243-published",
+            workflows=[DeliveryWorkflow],
+            activities=[
+                delivery_gates_readback,
+                delivery_project,
+                delivery_precheck,
+                delivery_checks,
+                delivery_finalize_resources,
+                unexpected_publish,
+                role,
+                start,
+                tracker,
+                ci,
+            ],
+        ):
+            handle = await env.client.start_workflow(
+                DeliveryWorkflow.run,
+                args=[execution, recovery],
+                id=response.json()["workflow_id"],
+                task_queue="issue-243-published",
+            )
+            finished = await asyncio.wait_for(handle.result(), 60)
+    assert finished["outcome"] == "delivered", finished
+    assert calls == ["review", "verify", "ci"]
+    assert finished["candidate"] == candidate
+    assert finished["checks"]["local"]["results"][0]["argv"] == spec["policy"]["checks"][0]["argv"]
+    with store._connect() as db:
+        assert [
+            dict(row) for row in db.execute("SELECT * FROM delivery_effects ORDER BY effect_key")
+        ] == effects
+        assert [
+            dict(row) for row in db.execute("SELECT * FROM delivery_attempts ORDER BY job_key")
+        ] == attempts
+        assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stopped_readiness", ["missing-browser"], indirect=True)
