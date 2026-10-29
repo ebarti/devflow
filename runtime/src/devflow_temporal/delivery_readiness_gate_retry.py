@@ -8,13 +8,38 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .contracts import digest
 from .delivery_runtime_location import private_bytes
 
 RETRY_LIMIT = 2
+BACKOFF_SECONDS = 30
 SLOTS = {"prepublish": 100, "local": 101, "browser_qa": 102}
+
+
+def _utc_now():
+    return datetime.now(UTC)
+
+
+def retry_backoff(closed_at, generation):
+    """Bind the next retry's delay to the authentic predecessor closure."""
+    if type(generation) is not int or not 1 <= generation <= RETRY_LIMIT:
+        raise ValueError("readiness retry generation exceeds its finite bound")
+    delay = BACKOFF_SECONDS * 2 ** (generation - 1)
+    proof = {"closed_at": closed_at, "delay_seconds": delay, "retry_not_before": None}
+    if not isinstance(closed_at, str):
+        return proof, None
+    try:
+        stopped = datetime.fromisoformat(closed_at)
+        if stopped.tzinfo is None or stopped.utcoffset() is None:
+            return proof, None
+        retry_at = stopped.astimezone(UTC) + timedelta(seconds=delay)
+    except (ValueError, OverflowError):
+        return proof, None
+    proof["retry_not_before"] = retry_at.isoformat()
+    return proof, _utc_now() >= retry_at
 
 
 def probe_attempt(spec, candidate, slot):

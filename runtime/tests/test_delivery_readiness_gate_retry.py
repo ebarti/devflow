@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -169,6 +170,7 @@ def stopped_readiness(unpublished, monkeypatch, request):
     closed = {
         "workflow_id": "delivery-run-1",
         "execution_run_id": "closed-original",
+        "closed_at": "2020-01-01T00:00:00+00:00",
         "request_digest": spec["request_digest"],
         "recovery_digest": None,
         "result": state,
@@ -194,8 +196,15 @@ async def client_for(store):
 
 
 @pytest.mark.asyncio
-async def test_public_retry_preserves_receipts_and_bounds_repeated_failures(stopped_readiness):
+async def test_public_retry_preserves_receipts_and_bounds_repeated_failures(
+    stopped_readiness, monkeypatch
+):
     store, broker, state, command, original, closed, failure = stopped_readiness
+    from devflow_temporal import delivery_readiness_gate_retry
+
+    clock = [datetime(2020, 1, 1, tzinfo=UTC)]
+    monkeypatch.setattr(delivery_readiness_gate_retry, "_utc_now", lambda: clock[0], raising=False)
+    closed["closed_at"] = clock[0].isoformat()
     candidate = deepcopy(state["candidate"])
     retained = Path(original["readiness"]["receipt"]).read_bytes()
     with store._connect() as db:
@@ -203,7 +212,64 @@ async def test_public_retry_preserves_receipts_and_bounds_repeated_failures(stop
         initial_effects = [dict(x) for x in db.execute("SELECT * FROM delivery_effects")]
     attempts = [original["readiness"]["attempt"]]
     async with client_for(store) as (client, headers):
+        # A missing close time cannot grant a retry or silently disable backoff.
+        for invalid_close in (None, "2020-01-01T00:00:00"):
+            closed["closed_at"] = invalid_close
+            assessment = await client.post(
+                "/api/runs/run-1/assess-transition",
+                json={"kind": command["continuation_kind"], "request": command},
+            )
+            assert assessment.status_code == 200
+            assert any(item["code"] == "readiness_retry_clock_unknown"
+                       and item["satisfied"] is None
+                       for item in assessment.json()["blockers"])
+        closed["closed_at"] = clock[0].isoformat()
         for generation in (1, 2):
+            # Infrastructure retries wait 30 seconds and then 60 seconds;
+            # no product allowance or attempt is allocated during the wait.
+            waiting = await client.post(
+                "/api/runs/run-1/assess-transition",
+                json={"kind": command["continuation_kind"], "request": command},
+            )
+            assert waiting.status_code == 200
+            assert any(item["code"] == "readiness_retry_backoff"
+                       for item in waiting.json()["blockers"])
+            if generation == 2:
+                # Restarting the control service must not reset the delay.
+                restarted_store = DeliveryStore(DeliveryConfig.load(store.config.path))
+                async with client_for(restarted_store) as (restarted_client, _):
+                    after_restart = await restarted_client.post(
+                        "/api/runs/run-1/assess-transition",
+                        json={"kind": command["continuation_kind"], "request": command},
+                    )
+                    assert after_restart.status_code == 200
+                    assert any(item["code"] == "readiness_retry_backoff"
+                               for item in after_restart.json()["blockers"])
+            with store._connect() as db:
+                admissions = [dict(x) for x in db.execute("SELECT * FROM delivery_gate_admissions")]
+            denied = await client.post(
+                "/api/runs/run-1/continue-repair", json=command, headers=headers
+            )
+            assert denied.status_code == 409
+            with store._connect() as db:
+                assert [dict(x) for x in db.execute("SELECT * FROM delivery_attempts")] == (
+                    initial_attempts
+                )
+                assert [dict(x) for x in db.execute("SELECT * FROM delivery_effects")] == (
+                    initial_effects
+                )
+                assert [dict(x) for x in db.execute("SELECT * FROM delivery_gate_admissions")] == (
+                    admissions
+                )
+                assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
+            delay = 30 * 2 ** (generation - 1)
+            clock[0] += timedelta(seconds=delay - 1)
+            before_deadline = await client.post(
+                "/api/runs/run-1/repair-admission-preflight", json=command
+            )
+            assert before_deadline.status_code == 409
+            assert "readiness_retry_backoff" in before_deadline.text
+            clock[0] += timedelta(seconds=1)
             preflight = await client.post(
                 "/api/runs/run-1/repair-admission-preflight", json=command
             )
@@ -237,6 +303,10 @@ async def test_public_retry_preserves_receipts_and_bounds_repeated_failures(stop
                 assert not db.execute("SELECT 1 FROM delivery_repair_grants").fetchone()
             assert execution["gate_retry_generation"] == generation
             assert execution["gate_retry_stage"] == "readiness"
+            assert recovery["seal"]["readiness_backoff"]["delay_seconds"] == delay
+            assert recovery["seal"]["readiness_backoff"]["retry_not_before"] == (
+                clock[0].isoformat()
+            )
             assert recovery["state"]["checks"]["prepublish"]["readiness"]["state"] == "failed"
             assert readback(store, execution, recovery) is None
             if generation == 1:
@@ -276,6 +346,7 @@ async def test_public_retry_preserves_receipts_and_bounds_repeated_failures(stop
             closed.update(
                 workflow_id=admitted["workflow_id"],
                 execution_run_id=f"closed-{generation}",
+                closed_at=clock[0].isoformat(),
                 recovery_digest=digest(recovery),
                 result=current,
             )

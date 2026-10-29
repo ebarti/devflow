@@ -188,6 +188,12 @@ for the unchanged candidate, preserving the old receipt, attempt and effect
 ledger. Every retry probes readiness again and runs the original frozen gate;
 its readiness receipt is never a gate pass. Other failed gates, pending product
 findings, uncertain cleanup, changed source or unsettled effects refuse admission.
+The first readiness retry waits 30 seconds after the authenticated predecessor
+closes; the second waits 60 seconds after its predecessor closes. A missing or
+ambiguous close time is reported as `readiness_retry_clock_unknown`, and an
+unexpired delay as `readiness_retry_backoff`. Waiting allocates no new attempt,
+admission, effect or product-repair grant. The delay is derived from the closed
+workflow, so restarting the control service does not restart or bypass it.
 The initial route is qualified only for the fake fixture provider: native runs
 refuse with `native_descendant_settlement_unknown` until a complete descendant
 settlement contract can be authenticated. An exhausted retry allowance reports

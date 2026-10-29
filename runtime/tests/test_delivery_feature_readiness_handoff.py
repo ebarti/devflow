@@ -161,6 +161,7 @@ def test_feature_readiness_requires_reserved_successor_and_preserves_budget(serv
     closed = {
         "workflow_id": row["workflow_id"],
         "execution_run_id": "closed-worker",
+        "closed_at": "2020-01-01T00:00:00+00:00",
         "request_digest": child["request_digest"],
         "recovery_digest": None,
         "result": state,

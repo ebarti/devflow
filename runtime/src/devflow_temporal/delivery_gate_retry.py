@@ -897,9 +897,17 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
                else historical_teardown or prelaunch_observation or (
                    _stopped_cleanup(spec, read_only=True) if _observation
                    else _stopped_cleanup(spec)))
+    readiness_backoff = None
     if readiness_retry:
         from .delivery_lifecycle import require_transition
-        from .delivery_readiness_gate_retry import RETRY_LIMIT
+        from .delivery_readiness_gate_retry import RETRY_LIMIT, retry_backoff
+
+        remaining = readiness_generations < RETRY_LIMIT
+        backoff_elapsed = None
+        if remaining:
+            readiness_backoff, backoff_elapsed = retry_backoff(
+                closed.get('closed_at'), readiness_generations + 1)
+        clock_known = not remaining or backoff_elapsed is not None
 
         # An observed native monitor does not prove its complete descendant set.
         # The fake fixture has no native actor; real execution needs a separate
@@ -909,6 +917,7 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
             'normalized_lifecycle': 'stopped',
             'proof_digest': digest({'row': _sealed_row(row), 'cleanup': cleanup,
                                     'readiness': readiness_observation,
+                                    'readiness_backoff': readiness_backoff,
                                     'prior_readiness_retries': readiness_generations}),
             'comparisons': [], 'predicates': [
                 {'code': 'native_descendant_settlement_unknown',
@@ -916,9 +925,18 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
                  'missing_or_unknown_fact': 'complete native descendant settlement',
                  'next_action': 'obtain authenticated native descendant settlement'},
                 {'code': 'readiness_retry_limit_exhausted',
-                 'satisfied': readiness_generations < RETRY_LIMIT,
+                 'satisfied': remaining,
                  'missing_or_unknown_fact': 'remaining infrastructure retry allowance',
                  'next_action': 'inspect retained failures and reconcile the environment'},
+                {'code': 'readiness_retry_clock_unknown',
+                 'satisfied': True if clock_known else None,
+                 'missing_or_unknown_fact': 'authenticated predecessor close time',
+                 'next_action': 'inspect the retained workflow closure'},
+                {'code': 'readiness_retry_backoff',
+                 'satisfied': backoff_elapsed if remaining and clock_known else True,
+                 'missing_or_unknown_fact': 'elapsed infrastructure retry backoff',
+                 'next_action': ('retry after ' + readiness_backoff['retry_not_before']
+                                 if remaining and clock_known else 'inspect the retry allowance')},
             ],
         }, {})
     result = {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
@@ -932,6 +950,7 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
             **({'ordinary_prerequisite_observation': prerequisite_observation}
                if prerequisite_observation else {}),
             **({'readiness_observation': readiness_observation} if readiness_observation else {}),
+            **({'readiness_backoff': readiness_backoff} if readiness_backoff else {}),
             **({'report_observation': report_observation} if report_observation else {}),
             **({'verification_observation': verification_observation}
                if verification_observation else {}),
