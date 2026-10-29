@@ -689,7 +689,7 @@ class DeliveryStore:
             initialize_writer_custody(db)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, write_authorizer=None) -> Iterator[sqlite3.Connection]:
         from .delivery_execution_config import is_observation_mode
 
         if is_observation_mode():
@@ -698,7 +698,8 @@ class DeliveryStore:
                 yield db
             return
         if getattr(self, "read_only", False):
-            db = sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True)
+            db = sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=ro", uri=True,
+                                 cached_statements=0 if write_authorizer is not None else 128)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA query_only=ON")
         else:
@@ -708,7 +709,22 @@ class DeliveryStore:
             from .delivery_installation_owner import before_store_write
 
             before_store_write(self.config)
+            # A changing authorizer is a capability boundary. Cached statements
+            # skip reauthorization, so restricted connections must prepare each
+            # statement under the currently active policy.
             db = self.state.connect(self.config.tracking_db)
+            if write_authorizer is not None:
+                # Historical authenticated helpers expose connect(path) only.
+                # Preserve their initialization contract, then use an uncached
+                # connection for this runtime's phase-specific write policy.
+                pending = db.in_transaction
+                db.close()
+                if pending:
+                    raise ValueError(
+                        "restricted tracking connection requires settled initialization")
+                db = sqlite3.connect(self.config.tracking_db.as_uri() + "?mode=rw", uri=True,
+                                     timeout=30, cached_statements=0)
+                db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         feature_event = False
 
@@ -716,6 +732,10 @@ class DeliveryStore:
             nonlocal feature_event
             if action == sqlite3.SQLITE_INSERT and table == "delivery_feature_events":
                 feature_event = True
+            if (write_authorizer is not None
+                    and write_authorizer(action, table, _column, _database, _trigger)
+                    != sqlite3.SQLITE_OK):
+                return sqlite3.SQLITE_DENY
             return sqlite3.SQLITE_OK
 
         # This hook observes statements; it does not send anything inside the
