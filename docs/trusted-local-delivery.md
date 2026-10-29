@@ -181,6 +181,42 @@ create its reports before the dedicated browser gate. Nested output parents are
 created only inside an authenticated checkout. Existing unregistered outputs,
 tracked contents, protected paths and symlinked parents remain rejected.
 
+A check stopped before launch by execution readiness records a versioned failure
+class with its stage, candidate and immutable readiness-receipt digest. The
+existing zero-repair gate control can admit at most two fresh readiness retries
+for the unchanged candidate, preserving the old receipt, attempt and effect
+ledger. Every retry probes readiness again and runs the original frozen gate;
+its readiness receipt is never a gate pass. Other failed gates, pending product
+findings, uncertain cleanup, changed source or unsettled effects refuse admission.
+The first readiness retry waits 30 seconds after the authenticated predecessor
+closes; the second waits 60 seconds after its predecessor closes. A missing or
+ambiguous close time is reported as `readiness_retry_clock_unknown`, and an
+unexpired delay as `readiness_retry_backoff`. Waiting allocates no new attempt,
+admission, effect or product-repair grant. The delay is derived from the closed
+workflow, so restarting the control service does not restart or bypass it.
+The initial route is qualified only for the fake fixture provider: native runs
+refuse with `native_descendant_settlement_unknown` until a complete descendant
+settlement contract can be authenticated. An exhausted retry allowance reports
+`readiness_retry_limit_exhausted`. Neither blocker is a launch grant. A transient
+unpublished stop with a recorded passing implementation is retained for an
+authenticated same-candidate continuation; the automatic fresh-run path refuses
+to replace it with another implementation. For a feature worker, the new
+readiness path also requires an already authenticated successor assignment. The
+current coordinator examines the stopped worker before reserving that assignment,
+so an unreserved continuation remains blocked rather than bypassing ownership.
+
+For a feature-plan correction stopped before its review launch envelope is
+written, the unreviewed-predecessor check can reconstruct the review identity
+from the sealed revision, proposal, candidate and owner. It also requires the
+supervisor's completed prelaunch result, registered workspace, an empty attempt
+directory and the original unheld owner lease. A missing request alone does not
+prove the exception, and a real adverse review remains a rejection. The strict
+reconsideration reader classifies the same evidence as prelaunch, never as an
+independent review. When a later genuine review is reconsidered, its history
+retains the earlier prelaunch intent digest without inventing a request digest.
+Generic completed-resource observation still requires its existing request
+evidence for this early shape.
+
 An older run stopped by that browser-output registration defect can use one
 `published_check_prelaunch_retry` with zero additional implementation turns.
 Admission requires its exact closed UNKNOWN checkpoint, passed local checks and

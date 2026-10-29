@@ -1652,6 +1652,32 @@ def _private_canonical(path, expected):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _early_revision_prelaunch(store, spec, attempt, expected, *, closed_at=None):
+    """Observe a sealed revision review that stopped before persisting its envelope."""
+    from .delivery_prelaunch_cleanup import completed_prelaunch
+    from .delivery_resources import RunResources
+
+    intent = {key: expected[key] for key in (
+        "spec", "role", "iteration", "candidate", "resume_session", "revision_context",
+        "workspace",
+    )}
+    registry = RunResources(spec, read_only=True)
+    with registry.locked(read_only=True) as manifest:
+        with completed_prelaunch(spec, dict(attempt), {Path(spec["state_dir"]): spec}, manifest,
+                                 early_revision_intent=intent) as observed:
+            with store._connect() as db:
+                current = db.execute(
+                    "SELECT * FROM delivery_attempts WHERE run_id=? AND job_key=?",
+                    (spec["run_id"], attempt["job_key"]),
+                ).fetchone()
+            finished = datetime.fromisoformat(attempt["finished_at"])
+            if (not current or dict(current) != dict(attempt) or finished.tzinfo is None
+                    or (closed_at is not None and finished > closed_at)):
+                raise ValueError("early revision attempt changed or did not precede closure")
+            result = json.loads(attempt["result_json"])
+    return result, observed
+
+
 def _saved_revision_role(store, spec, context, proposal, candidate, role, *, closed_at=None,
                          shared=None):
     """Authenticate the exact supervised launcher and actual completed provider."""
@@ -1692,6 +1718,13 @@ def _saved_revision_role(store, spec, context, proposal, candidate, role, *, clo
     if steering and json.loads(steering[0]):
         expected["steering"] = json.loads(steering[0])
     request_path = folder / "request.json"
+    if role == "review" and not os.path.lexists(request_path):
+        result, observed = _early_revision_prelaunch(store, spec, saved, expected,
+                                                     closed_at=closed_at)
+        return result, {"run_id": spec["run_id"], "job_key": key,
+                        "intent_sha256": observed["revision_intent_sha256"],
+                        "result_sha256": digest(result), "session_id": None,
+                        "classification": "prelaunch", "prelaunch_evidence": observed}
     if request_path.resolve(strict=True) != request_path:
         raise ValueError("historical native request left its exact owned path")
     request = read_private(request_path)
@@ -2011,10 +2044,13 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
                 _text(text, "unresolved prior finding", maximum=16 * 1024)
                 if text not in findings:
                     findings.append(text)
+        review = proof["review"]
+        review_identity = ({"review_request_sha256": review["request_sha256"]}
+                           if "request_sha256" in review else
+                           {"review_intent_sha256": review["intent_sha256"]})
         predecessors.append({"revision_id": proof["revision_id"],
-                             "classification": proof["classification"],
-                             "review_request_sha256": proof["review"]["request_sha256"],
-                             "review_result_sha256": proof["review"]["result_sha256"]})
+                             "classification": proof["classification"], **review_identity,
+                             "review_result_sha256": review["result_sha256"]})
     product_findings = [text for worker in subject["worker_summaries"]
                         for text in (worker.get("current_review_subject") or {}).get(
                             "unresolved_product_findings", [])]
@@ -2261,6 +2297,23 @@ def _unreviewed_rejection(store, spec, context, rejected, values):
                            str(Path(historical["state_dir"]) / "gates" / "0" / "review")),
             )
             request_path = folder / "request.json"
+            if role == "review" and not os.path.lexists(request_path):
+                # The revision and proposal identity were reconstructed from
+                # immutable coordinator checkpoints above, not from a caller.
+                # A supervisor may refuse preparation before it persists the
+                # later native launch envelope, so prove the typed terminal
+                # attempt under its original owner lease instead.
+                if not attempt:
+                    return None
+                result, observed = _early_revision_prelaunch(
+                    store, historical, attempt, expected, closed_at=closed_at)
+                proof = {
+                    "revision_id": revision_id, "review_job_key": key,
+                    "review_intent_digest": observed["revision_intent_sha256"],
+                    "review_result_digest": digest(result), "predecessor_closure": closure,
+                    "prelaunch_evidence": observed,
+                }
+                continue
             if request_path.resolve(strict=True) != request_path:
                 return None
             request = read_private(request_path)

@@ -30,7 +30,7 @@ def stopped(service, monkeypatch):
               'closed_at': '2026-10-07T00:00:00+00:00', 'request_digest': spec['request_digest'],
               'recovery_digest': None, 'result': {'run_id': request['run_id'], 'outcome': 'blocked',
               'phase': 'blocked', 'execution_state': 'blocked',
-              'cleanup': 'confirmed', 'checks': checks}}
+              'cleanup': 'confirmed', 'checks': checks, 'roles': []}}
     monkeypatch.setattr(DeliveryStore, '_completed_temporal_result', lambda *_a, **_k: closed)
     monkeypatch.setattr(retry, 'observe_finalized_resources',
                         lambda *_a, **_k: {'finalization_sha256': 'fixture-finalization'})
@@ -150,3 +150,16 @@ def test_automatic_generations_spend_one_original_total_ceiling(service, monkeyp
     assert retry.retry_once(store) == []
     with store._connect() as db:
         assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 3
+
+def test_transient_stop_after_implementation_retains_candidate_instead_of_fresh_run(
+    service, monkeypatch,
+):
+    store, request, closed = stopped(service, monkeypatch)
+    closed['result'].update(candidate={'id': 'retained-candidate'}, iteration=0, roles=[{
+        'role': 'implement', 'iteration': 0, 'status': 'pass', 'session_id': 'retained-session'}])
+    assert retry.retry_once(store) == []
+    with store._connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM delivery_runs').fetchone()[0] == 1
+        events = [json.loads(row[0]) for row in db.execute(
+            "SELECT payload_json FROM delivery_events WHERE type='automatic_retry_skipped'")]
+    assert any('same-candidate continuation' in event['reason'] for event in events)

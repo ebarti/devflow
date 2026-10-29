@@ -2664,6 +2664,16 @@ class DeliveryWorkflow:
                         return await self._stop(spec, 'technical prepublication checks failed: '
                                                 + type(exc).__name__, cause=exc)
                     self.state['checks']['prepublish'] = checked
+                    if (spec.get('gate_retry_stage') == 'readiness'
+                            and spec.get('readiness_version') == 1
+                            and checked.get('readiness')):
+                        self.state['checks']['readiness'] = checked['readiness']
+                        if (checked.get('failure_kind') == 'readiness_preparation'
+                                and checked.get('launched') is False):
+                            if checked.get('cleanup') == 'unknown':
+                                self.state['cleanup'] = 'unknown'
+                            return await self._stop(
+                                spec, 'execution readiness prevented prepublication')
                     if checked.get('state') != 'passed' or checked.get('cleanup') == 'unknown':
                         return await self._stop(spec, 'technical prepublication checks failed')
             elif recovery is not None and iteration == start_iteration:

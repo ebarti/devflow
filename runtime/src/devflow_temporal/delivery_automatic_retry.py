@@ -554,6 +554,19 @@ def retry_once(store, *, stopped=lambda: False):
                     'SELECT issue_url FROM delivery_runs'))
                 if count >= spec['policy']['max_attempts'] or unavailable(store, db, spec):
                     continue
+            roles = result.get('roles')
+            if not isinstance(roles, list) or any(not isinstance(role, dict) for role in roles):
+                _record_skip(store, row, ValueError(
+                    'closed run lacks its complete implementation history'))
+                continue
+            if any(role.get('role') == 'implement' and role.get('status') == 'pass'
+                   for role in roles):
+                # A fresh run would start implementation again and abandon the
+                # stopped candidate. It is not a same-candidate retry grant.
+                _record_skip(store, row, ValueError(
+                    'retained implementation requires an authenticated same-candidate '
+                    'continuation; inspect the stopped recovery options'))
+                continue
             base = fresh_unpublished_base(store, spec)
             identity = digest({'run_id': spec['run_id'],
                                'request_digest': row['request_digest']})[:24]

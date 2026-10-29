@@ -1221,12 +1221,13 @@ def _check_readiness(broker, request, attempt):
         workspace = broker.gate_checkout("verify", request["iteration"], request["candidate"])
     requirements = describe_requirements(
         request["spec"], workspace, request["spec"].get("accepted_plan", ""))
-    generation = int(digest({"spec": request["spec"], "candidate": request["candidate"]})[:5],
-                     16) % 300000
-    probe_attempt = 10 + generation * 3 + {100: 0, 101: 1, 102: 2}[attempt]
+    from .delivery_readiness_gate_retry import SLOTS, failure, probe_attempt
+
+    stage = next(name for name, slot in SLOTS.items() if slot == attempt)
+    selected_attempt = probe_attempt(request["spec"], request["candidate"], attempt)
     readiness = prepare_and_probe(broker.store, request["spec"], request["candidate"],
                                   requirements, "plan", iteration=request["iteration"],
-                                  attempt=probe_attempt, workspace=workspace)
+                                  attempt=selected_attempt, workspace=workspace)
     if readiness.get("state") == "passed":
         verify_receipt(broker.store, request["spec"], request["candidate"], readiness, requirements)
         return readiness
@@ -1237,7 +1238,8 @@ def _check_readiness(broker, request, attempt):
             "failure_kind": "readiness_preparation", "launched": False,
             "cleanup": cleanup, "candidate_id": request["candidate"]["id"],
             "source_unchanged": broker.candidate() == request["candidate"],
-            "reason": "execution readiness prevented the check", "readiness": readiness}
+            "reason": "execution readiness prevented the check", "readiness": readiness,
+            "failure_class": failure(readiness, stage, request["candidate"]["id"], cleanup)}
 
 
 @activity.defn(name="delivery_checks")
