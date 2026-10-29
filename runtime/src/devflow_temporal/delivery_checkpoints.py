@@ -875,7 +875,11 @@ def _state_artifacts(spec, frozen, stage, inventory, journals, settlements=None)
             if not home.is_relative_to(state):
                 raise ValueError("checkpoint session home escaped its original run")
             _openers(home)
-            paths = session_state_paths(home, attempt["session_id"])
+            # The fixed fake provider has a synthetic session ID but writes no
+            # transcript. Preserve fixture transcripts when present; native
+            # providers must always supply their required session.
+            paths = session_state_paths(
+                home, attempt["session_id"], allow_absent=spec["provider"] == "fake")
             selected_manifest(home, paths)  # Private owned regular files, no linked ancestors.
             selected.update((home / item).relative_to(state).as_posix() for item in paths)
         elif attempt["session_id"] and spec["provider"] != "fake":
@@ -1423,11 +1427,41 @@ def read_checkpoint(store, run_id, checkpoint_id):
     spec = store.effective_spec(run_id)
     with store._connect() as db:
         value, receipt = _read_acknowledged(db, spec, checkpoint_id)
-        current_effects = _frozen(db, _row(db, run_id))["delivery_effects"]
+        # Keep the tracking snapshot coherent without holding a SQL read
+        # transaction while the potentially large artifact inventory is hashed.
+        db.execute("BEGIN")
+        row = _row(db, run_id)
+        current = _frozen(db, row)
+        claim = store.state.claim_for(db, row["work_id"])
+        owner = dict(claim) if claim else None
+        db.commit()
     # Readback retains the original ACK, but does not advertise a native
     # checkpoint as resumable under today's admission contract. Current custody
     # can have changed since the ACK; inability to inspect it is also unknown.
     blockers = list(value.get("resume_blockers", []))
+    if digest(spec) != value["spec_sha256"]:
+        blockers.append({"scope": "authority", "reason": "checkpoint_authority_changed"})
+    if not store.owns_execution(spec):
+        blockers.append({"scope": "authority", "reason": "checkpoint_transport_ownership_unknown"})
+    if not _same_snapshot(current, value):
+        blockers.append({"scope": "run", "reason": "checkpoint_run_state_changed"})
+    if owner != value["owner"]:
+        blockers.append({"scope": "owner", "reason": "checkpoint_execution_owner_changed"})
+    try:
+        from .delivery_workspace_custody import source_for
+
+        source = source_for(spec)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        blockers.append({"scope": "source", "reason": "checkpoint_workspace_owner_unknown"})
+    else:
+        try:
+            head = _git(source, "rev-parse", "refs/heads/" + value["source"]["branch"])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            blockers.append({"scope": "source", "reason": "checkpoint_candidate_branch_unknown"})
+        else:
+            if head.decode().strip() != value["source"]["candidate"]["head"]:
+                blockers.append({"scope": "source",
+                                 "reason": "checkpoint_candidate_branch_changed"})
     effect_blockers = []
     feature_unknown = None
     current_feature = None
@@ -1446,7 +1480,7 @@ def read_checkpoint(store, run_id, checkpoint_id):
             feature_unknown = "registry_observation_unknown"
     for scope, effects in (
         ("delivery", value["frozen"]["delivery_effects"]),
-        ("delivery", current_effects),
+        ("delivery", current["delivery_effects"]),
         ("feature", (value.get("execution_ledger") or {}).get("execution_effects", [])),
         ("feature", (current_feature or {}).get("execution_effects", [])),
     ):
@@ -1459,14 +1493,49 @@ def read_checkpoint(store, run_id, checkpoint_id):
                     effect_blockers.append(blocker)
                 if blocker not in blockers:
                     blockers.append(blocker)
+    retained_source_unknown = False
     try:
         registry = RunResources(spec, read_only=True)
         with registry.locked(read_only=True) as resources:
             custody_unknown = bool(value.get("closed_journals") or resources["processes"])
+            entry = resources["roots"].get(spec["checkout"])
+            resource_changed = (
+                not entry
+                or entry.get("kind") != "checkout"
+                or entry.get("identity") != value["checkout_identity"]
+                or _hash(read_private(registry.manifest, raw=True))
+                != value["resource_manifest_sha256"]
+            )
+            try:
+                # Follow creation/restoration's resource-before-writer lock order.
+                # The exclusive witness is observational and grants no later work.
+                with store._checkpoint_writer_context(spec):
+                    writer_unknown = False
+                    checkout = Path(spec["checkout"])
+                    if os.path.lexists(checkout) and _index_baseline_supported(value):
+                        try:
+                            from .delivery_retained_checkpoint import verify_retained_source
+
+                            _openers(checkout)
+                            verify_retained_source(
+                                spec, value, _root(spec) / checkpoint_id, resources)
+                        except (OSError, ValueError, KeyError, sqlite3.Error,
+                                subprocess.SubprocessError):
+                            retained_source_unknown = True
+            except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+                writer_unknown = True
     except (OSError, ValueError, KeyError):
         custody_unknown = True
+        resource_changed = True
+        writer_unknown = True
     if custody_unknown:
         blockers.append({"scope": "native", "reason": NativeCheckpointCustodyUnknown.code})
+    if resource_changed:
+        blockers.append({"scope": "resource", "reason": "checkpoint_resource_custody_unknown"})
+    if writer_unknown:
+        blockers.append({"scope": "writer", "reason": "checkpoint_writer_custody_unknown"})
+    if retained_source_unknown:
+        blockers.append({"scope": "source", "reason": "checkpoint_retained_source_unverified"})
     if feature_unknown:
         blockers.append({"scope": "feature", "reason": feature_unknown})
     index_unknown = not _index_baseline_supported(value)
@@ -1475,8 +1544,7 @@ def read_checkpoint(store, run_id, checkpoint_id):
     return {
         **receipt,
         "acknowledged_resumable": receipt["resumable"],
-        "resumable": (receipt["resumable"] and not custody_unknown
-                      and not effect_blockers and not feature_unknown and not index_unknown),
+        "resumable": receipt["resumable"] and not blockers,
         "resume_blockers": blockers,
         "authority_sha256": value["spec_sha256"],
         "owner": value["owner"],

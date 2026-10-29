@@ -93,6 +93,16 @@ The existing loopback API and CSRF boundary expose these operations:
 - `POST /api/runs/{run_id}/checkpoints/{checkpoint_id}/restore` accepts a new
   `command_id` and `expected_revision`.
 
+Readback preserves the original `acknowledged_resumable` value as history. Its
+current `resumable` observation also compares the admitted authority, run and
+cumulative budget, issue owner, independent Git owner and candidate branch,
+original resource manifest, and the current writer witness. If the checkout is
+still present, it compares its retained source and index under that witness;
+an absent checkout can still be restored from the sealed artifacts. Changed or
+unavailable proof appears in `resume_blockers`. This is a read-only observation,
+not a reservation or permission to resume: restoration must reacquire custody
+and repeat its own admission checks.
+
 Creation requires a stopped run, reconciled external effects, closed original
 launch and role leases, proven registered workspace ownership, and a fresh check
 for open workspace actors. Registered native journals currently cause a typed
@@ -210,7 +220,10 @@ publication only when current fenced source/state reproduces its exact manifest
 and every artifact. Corrupt, incomplete, foreign or inconsistent bytes still refuse.
 Resource pressure or an interrupted write cannot produce a
 successful checkpoint receipt. Checkpoint directories live outside disposable
-worktrees and have no automatic expiry or cleanup path.
+worktrees and have no automatic expiry or cleanup path. Explicit retained-resource
+pruning preserves checkpoint directories and durable session/evidence material;
+a blocked candidate remains retained. No checkpoint expiration operation is
+currently provided.
 
 Restoration validates every artifact and current execution authority, budget,
 owner, original resource generation and native closure again. It reconstructs a
