@@ -181,6 +181,24 @@ create its reports before the dedicated browser gate. Nested output parents are
 created only inside an authenticated checkout. Existing unregistered outputs,
 tracked contents, protected paths and symlinked parents remain rejected.
 
+A check stopped before launch by execution readiness records a versioned failure
+class with its stage, candidate and immutable readiness-receipt digest. The
+existing zero-repair gate control can admit at most two fresh readiness retries
+for the unchanged candidate, preserving the old receipt, attempt and effect
+ledger. Every retry probes readiness again and runs the original frozen gate;
+its readiness receipt is never a gate pass. Other failed gates, pending product
+findings, uncertain cleanup, changed source or unsettled effects refuse admission.
+The initial route is qualified only for the fake fixture provider: native runs
+refuse with `native_descendant_settlement_unknown` until a complete descendant
+settlement contract can be authenticated. An exhausted retry allowance reports
+`readiness_retry_limit_exhausted`. Neither blocker is a launch grant. A transient
+unpublished stop with a recorded passing implementation is retained for an
+authenticated same-candidate continuation; the automatic fresh-run path refuses
+to replace it with another implementation. For a feature worker, the new
+readiness path also requires an already authenticated successor assignment. The
+current coordinator examines the stopped worker before reserving that assignment,
+so an unreserved continuation remains blocked rather than bypassing ownership.
+
 An older run stopped by that browser-output registration defect can use one
 `published_check_prelaunch_retry` with zero additional implementation turns.
 Admission requires its exact closed UNKNOWN checkpoint, passed local checks and
