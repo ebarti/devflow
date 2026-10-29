@@ -496,7 +496,7 @@ def _report_layout_validate(store, spec, recovery, *, resource_spec=None):
 
     historical_records(store, recovery, latest)
 
-def snapshot(store, run_id, kind=KIND):
+def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None):
     unpublished = kind == PREPUBLICATION_KIND
     spec = store.effective_spec(run_id)
     row, attempts, effects, claim = _rows(store, run_id)
@@ -844,13 +844,22 @@ def snapshot(store, run_id, kind=KIND):
                          or (digest(prior_gate) != attribution_observation['prior_gate_digest']
                              if attribution_retry else prior_gate != ancestor)):
             raise ValueError('this run already received its bounded gate assessment retry')
+    historical_teardown = None
+    if ci_only:
+        from .delivery_ci_teardown import snapshot_cleanup
+
+        historical_teardown = snapshot_cleanup(
+            store, spec, previous, candidate, publication, _inventory_profile)
+    elif _inventory_profile is not None:
+        raise ValueError('inventory physical custody belongs only to zero-model CI')
     result = {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
             'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
             'cleanup': (prerequisite_observation['resources'] if prerequisite_retry
                         else verification_observation['resources'] if verification_retry
                         else report_observation['resources'] if layout_report
-                        else prelaunch_observation or _stopped_cleanup(spec)),
+                        else historical_teardown or prelaunch_observation
+                        or _stopped_cleanup(spec)),
             'work_binding': binding,
             'previous_digest': digest(previous) if previous else None,
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,
@@ -884,6 +893,10 @@ def snapshot(store, run_id, kind=KIND):
                            or (browser_prelaunch and spec.get('gate_retry_stage') == 'published')
                            else 1)}
     if ci_only:
+        if historical_teardown:
+            from .delivery_ci_teardown import FIELD
+
+            result[FIELD] = historical_teardown['context']
         from .delivery_ci_inventory import FIELD, for_seal
 
         if observation := for_seal(store, spec, result):

@@ -6,8 +6,10 @@ the source/config/native/resource/claim owners and public API are real.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,10 +23,12 @@ from test_delivery_store import _git
 from test_delivery_store import service as service
 
 from devflow_temporal import delivery_ci_inventory as owner
+from devflow_temporal import delivery_control
 from devflow_temporal.contracts import canonical_json
 from devflow_temporal.delivery_api import create_app
 from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_ci_inventory_io import GitHubRead
+from devflow_temporal.delivery_client import DeliveryClient
 from devflow_temporal.delivery_resources import RunResources, read_private
 from devflow_temporal.delivery_store import DeliveryStore
 
@@ -185,6 +189,62 @@ async def public(case):
 
 
 @pytest.mark.asyncio
+async def test_cli_readback_routes_to_public_archive_without_starting_or_accepting(
+    ci_case, monkeypatch, capsys,
+):
+    """The CLI/client are real; its HTTP transport uses the owned ASGI app."""
+    c = ci_case
+    async with public(c) as (client, headers):
+        preflight = await client.post("/api/runs/run-1/ci-inventory-preflight", json=c.command)
+        assert preflight.status_code == 200, preflight.text
+        response = await client.post("/api/runs/run-1/ack-ci-inventory", headers=headers, json={
+            **c.command, "preflight_key": preflight.json()["preflight_key"],
+            "acknowledgement": owner.ACK})
+        assert response.status_code == 200, response.text
+        acknowledgement = response.json()
+    routes = []
+
+    async def read(method, path):
+        async with public(c) as (client, _headers):
+            response = await client.request(method, path)
+            assert response.status_code == 200, response.text
+            return response.json()
+
+    def transport(method, path):
+        routes.append((method, path))
+        return asyncio.run(read(method, path))
+
+    caller = object.__new__(DeliveryClient)
+    caller._request = transport
+
+    def readonly(path):
+        assert path == c.store.config.path
+        return caller
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("CI inventory readback must not start or reload a service")
+
+    monkeypatch.setattr(delivery_control, "read_only_client", readonly)
+    monkeypatch.setattr(delivery_control, "api_client", forbidden)
+    monkeypatch.setattr(delivery_control, "service_start", forbidden)
+    monkeypatch.setattr(sys, "argv", ["devflow-delivery", "--config", str(c.store.config.path),
+                                     "ci-inventory", "--id", "run-1"])
+    with c.store._connect() as db:
+        before = [dict(row) for row in db.execute("SELECT * FROM delivery_runs")]
+    await asyncio.to_thread(delivery_control.main)
+    result = json.loads(capsys.readouterr().out)
+    assert result == acknowledgement
+    assert result["state"] == "acknowledged" and result["delivery_acceptance"] is False
+    assert result["ci_assessment"]["delivery_policy"]["state"] == "not_evaluated"
+    assert result["ci_assessment"]["pr_eligibility"]["state"] == "not_established"
+    assert result["ci_assessment"]["merge_readiness"]["state"] == "unverified"
+    assert routes == [("GET", "/api/runs/run-1/ci-inventory")]
+    with c.store._connect() as db:
+        assert [dict(row) for row in db.execute("SELECT * FROM delivery_runs")] == before
+        assert not db.execute("SELECT 1 FROM delivery_ci_inventory_results").fetchone()
+
+
+@pytest.mark.asyncio
 async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_success(ci_case):
     c = ci_case
     before = copy.deepcopy(c.closed)
@@ -204,6 +264,10 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
         pre = await client.post(path + "ci-inventory-preflight", json=c.command)
         assert pre.status_code == 200, pre.text
         assert pre.json()["delivery_acceptance"] is False
+        assert pre.json()["ci_assessment"]["execution"]["state"] == "observed"
+        assert pre.json()["ci_assessment"]["execution"]["read_complete"] is True
+        assert pre.json()["ci_assessment"]["execution"]["source"] == owner.METHOD
+        assert pre.json()["ci_assessment"]["delivery_policy"]["state"] == "not_evaluated"
         assert not (await client.get(path + "ci-inventory")).status_code == 200
         ack = {
             **c.command,
@@ -217,6 +281,8 @@ async def test_public_ack_is_metadata_only_and_cannot_mint_normal_or_merge_succe
         assert receipt["PR_ruleset_eligibility"] is False
         assert receipt["merge_context_verified"] is False
         assert receipt["additional_iterations"] == 0
+        assert receipt["ci_assessment"]["pr_eligibility"]["state"] == "not_established"
+        assert receipt["ci_assessment"]["merge_readiness"]["state"] == "unverified"
         replay = await client.post(path + "ack-ci-inventory", json=ack, headers=headers)
         assert replay.status_code == 200 and replay.json()["replayed"] is True, replay.text
         foreign = await client.post(

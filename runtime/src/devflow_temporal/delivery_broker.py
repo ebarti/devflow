@@ -2003,9 +2003,15 @@ class DeliveryBroker:
     async def checks(
         self, pr: dict[str, Any], *, timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
+        from .delivery_ci_inventory_io import GitHubRead, PRHeadChanged
+        from .delivery_ci_inventory_state import assessment
+
         required = set(self.spec["policy"].get("required_ci", []))
         if not required:
-            return {"state": "unverified", "reason": "no required CI checks configured"}
+            return {"state": "unverified", "reason": "no required CI checks configured",
+                    "ci_assessment": assessment(
+                        "unverified", pr.get("head"), source="authenticated_PR_check_contexts",
+                        complete=False, required=required)}
         if getattr(self, "store", None) is not None:
             from .delivery_ci_inventory import result_for
 
@@ -2017,47 +2023,73 @@ class DeliveryBroker:
         if timeout_seconds is None:
             timeout_seconds = self.spec["policy"].get("ci_wait_seconds", 1200)
         deadline = asyncio.get_running_loop().time() + timeout_seconds
-        delay, checks, diagnostic = 15, {}, None
-        argv = ["gh", "pr", "view", str(pr["number"]), "--repo", self.spec["github_repo"],
-                "--json", "headRefOid,statusCheckRollup"]
+        delay, checks, diagnostic, observations = 15, {}, None, []
+
+        def result(state, *, complete=False, **details):
+            return {"state": state, "checks": checks, "observations": observations,
+                    "ci_assessment": assessment(
+                        state, pr["head"], source="authenticated_PR_check_contexts",
+                        complete=complete, required=required,
+                        present=(any(item.get("__typename") == "CheckRun"
+                                     and item.get("name") in required for item in observations)
+                                 if complete else None)), **details}
+
+        def readback(remaining):
+            reader = GitHubRead(repositories={self.spec["github_repo"]},
+                                timeout=max(1, min(60, remaining)))
+            return reader.rollup(self.spec["github_repo"], pr["number"], pr["head"])
+
         while True:
             try:
-                if patient:
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    found = json.loads(await asyncio.to_thread(
-                        _run, argv, timeout=max(1, min(60, remaining))))
-                else:
-                    found = json.loads(_run(argv, timeout=60))
-            except (RuntimeError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
-                if not patient:
-                    raise
+                remaining = deadline - asyncio.get_running_loop().time()
+                found = await asyncio.to_thread(readback, remaining)
+            except PRHeadChanged:
+                return result("stale", reason="PR head changed while checks were pending")
+            except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
                 diagnostic = str(exc)[:500]
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    return {"state": "pending", "checks": checks, "reason": "CI deadline reached",
-                            "diagnostic": diagnostic}
+                    return result("pending", reason="CI deadline reached", diagnostic=diagnostic)
                 await asyncio.sleep(min(delay, remaining))
-                delay = min(delay * 2, 60)
+                if patient:
+                    delay = min(delay * 2, 60)
                 continue
-            if found["headRefOid"] != pr["head"]:
-                return {"state": "stale", "reason": "PR head changed while checks were pending"}
-            checks = {
-                item["name"]: item
-                for item in found.get("statusCheckRollup", [])
-                if item.get("__typename") == "CheckRun"
-            }
+            observations = found["contexts"]
+            matches = {}
+            for item in observations:
+                if item.get("__typename") == "CheckRun":
+                    matches.setdefault(item.get("name"), []).append(item)
+                elif item.get("__typename") == "StatusContext":
+                    matches.setdefault(item.get("context"), []).append(item)
+            # Preserve every identity. A name cannot choose between two jobs,
+            # regardless of response order, conclusion, app or workflow.
+            checks = {name: items[0] for name, items in matches.items()
+                      if len(items) == 1 and items[0].get("__typename") == "CheckRun"}
+            ambiguous = sorted(name for name in required if len(matches.get(name, [])) > 1)
+            if ambiguous:
+                return result("failed", complete=True, ambiguous=ambiguous,
+                              reason="required CI check identity is ambiguous",
+                              next_action="resolve_ambiguous_required_check_identity")
             failed = [
                 name
-                for name in required
-                if checks.get(name, {}).get("conclusion") in {"FAILURE", "CANCELLED", "TIMED_OUT"}
+                for name in sorted(required)
+                if (checks.get(name, {}).get("status") == "COMPLETED"
+                    and checks[name].get("conclusion") in {
+                        "FAILURE", "CANCELLED", "TIMED_OUT", "SKIPPED", "NEUTRAL",
+                        "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"})
             ]
             if failed:
-                return {"state": "failed", "failed": failed, "checks": checks}
-            if all(checks.get(name, {}).get("conclusion") == "SUCCESS" for name in required):
-                return {"state": "passed", "checks": checks, "head": pr["head"]}
+                return result("failed", complete=True, failed=failed,
+                              next_action="inspect_required_job_failure")
+            if all(checks.get(name, {}).get("status") == "COMPLETED"
+                   and checks[name].get("conclusion") == "SUCCESS" for name in required):
+                return result("passed", complete=True, head=pr["head"],
+                              next_action="verify_PR_eligibility_and_merge_gates_separately")
             if asyncio.get_running_loop().time() >= deadline:
-                return {"state": "pending", "checks": checks, "reason": "CI deadline reached"}
+                return result("pending", complete=True, reason="CI deadline reached",
+                              missing=sorted(required - checks.keys()),
+                              next_action="observe_required_CI_on_the_same_candidate")
             remaining = deadline - asyncio.get_running_loop().time()
-            await asyncio.sleep(min(delay, remaining) if patient else 15)
+            await asyncio.sleep(min(delay, remaining))
             if patient:
                 delay = min(delay * 2, 60)

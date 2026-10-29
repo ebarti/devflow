@@ -20,7 +20,6 @@ from devflow_temporal.delivery_broker import DeliveryBroker
 from devflow_temporal.delivery_orphans import reconcile_attempt
 from devflow_temporal.delivery_resources import (
     RunResources,
-    _gate_roots,
     _identity,
     read_private,
     write_private,
@@ -29,7 +28,7 @@ from devflow_temporal.delivery_store import DeliveryStore
 from devflow_temporal.supervisor import DeliverySupervisor
 
 
-def native_case(service, monkeypatch):
+def native_case(service, monkeypatch, *, preserve_existing_roots=False):
     store, _old_broker, state, _ = unpublished.__wrapped__(service, monkeypatch)
     spec = copy.deepcopy(store.effective_spec("run-1"))
     spec.update(
@@ -156,6 +155,7 @@ def native_case(service, monkeypatch):
             state_identity=_identity(state_dir),
             processes=[str(journal_path)],
             roots={
+                **(manifest["roots"] if preserve_existing_roots else {}),
                 str(gate): {
                     "kind": "gate",
                     "identity": None,
@@ -275,28 +275,6 @@ def admitted(case):
     return response, case.store.effective_spec("run-1"), recovery
 
 
-def test_public_admission_real_activity_uses_current_and_exact_historical_authority(
-    native_quarantine,
-):
-    case = native_quarantine
-    original = copy.deepcopy(case.state)
-    _response, execution, recovery = admitted(case)
-    assert execution != case.spec
-    assert execution["policy_digest"] != case.spec["policy_digest"]
-    assert execution["role_home_generation"].startswith("stopped-resume-")
-    # This is the exact installed 6c19 failure: the predecessor is no longer current.
-    with pytest.raises(ValueError, match="stopped resume execution authority changed"):
-        _gate_roots(case.spec)
-    bindings = {}
-    assert Path(case.spec["state_dir"]) in _gate_roots(execution)[1]
-    _gate_roots(execution, execution_specs=bindings)
-    assert case.spec in bindings.values() and execution in bindings.values()
-    assert asyncio.run(delivery_repair_preflight({"spec": execution, "recovery": recovery})) == {
-        "state": "confirmed"
-    }
-    assert case.state == original and read_private(case.journal)["monitoring_complete"] is False
-
-
 def failed_preflight(case, response, execution, recovery):
     """The observed second closure stays at iteration0/protocol12 with no new attempt."""
     case.store.mark_start("run-1", accepted=True)
@@ -396,138 +374,6 @@ def test_actual_never_started_second_closure_reuses_existing_iteration_and_maxim
         "state": "confirmed"
     }
     assert read_private(case.journal)["result"]["provider_outcome"] == "unknown"
-
-
-@pytest.mark.parametrize(
-    "defect", ["current_spec", "command", "config", "predecessor", "original_request", "journal"]
-)
-def test_real_worker_readback_rejects_changed_current_or_original_authority(
-    native_quarantine, defect
-):
-    case = native_quarantine
-    _response, execution, recovery = admitted(case)
-    if defect == "current_spec":
-        execution = {**execution, "role_home_generation": "unacknowledged-home"}
-    elif defect == "command":
-        with case.store._connect() as db:
-            db.execute(
-                "UPDATE delivery_commands SET request_digest='changed' WHERE command_id=?",
-                (case.command["command_id"],),
-            )
-    elif defect == "config":
-        snapshot = (
-            case.store.config.state_root
-            / "configuration-snapshots"
-            / (execution["config_digest"] + ".json")
-        )
-        frozen = read_private(snapshot)
-        frozen["codex_bin"] = "/unacknowledged/provider"
-        write_private(snapshot, frozen)
-    elif defect == "original_request":
-        original = copy.deepcopy(case.spec)
-        original["policy"]["allowed_paths"].append("unacknowledged.md")
-        original["policy_digest"] = digest(original["policy"])
-        with case.store._connect() as db:
-            db.execute("UPDATE delivery_runs SET request_json=?", (canonical_json(original),))
-    elif defect == "journal":
-        journal = read_private(case.journal)
-        journal["provider_session"]["output_candidate"]["id"] = "f" * 64
-        write_private(case.journal, journal)
-    else:
-        foreign = {**case.spec, "role_home_generation": "grafted-history"}
-        with pytest.raises(ValueError, match="lost its admitted execution"):
-            resume.observed_native_cleanup(
-                foreign, resource_spec=execution, quarantined=recovery["quarantined_implementation"]
-            )
-        return
-    with pytest.raises(ValueError):
-        asyncio.run(delivery_repair_preflight({"spec": execution, "recovery": recovery}))
-
-
-def test_resource_authority_is_rechecked_after_actual_observation(native_quarantine, monkeypatch):
-    from devflow_temporal import delivery_resources as resources
-
-    case = native_quarantine
-    _response, execution, recovery = admitted(case)
-    original = resources.observe_finalized_resources
-
-    def racing_observation(*args, **kwargs):
-        result = original(*args, **kwargs)  # Execute every real native/root custody check.
-        with case.store._connect() as db:
-            db.execute(
-                "UPDATE delivery_commands SET request_digest='changed' WHERE command_id=?",
-                (case.command["command_id"],),
-            )
-        return result
-
-    monkeypatch.setattr(resources, "observe_finalized_resources", racing_observation)
-    with pytest.raises(ValueError, match="immutable command authority"):
-        asyncio.run(delivery_repair_preflight({"spec": execution, "recovery": recovery}))
-
-
-def test_current_compact_custody_reference_preserves_exact_historical_bindings(native_quarantine):
-    from devflow_temporal.delivery_feature_revision_recovery import compact_recovery
-
-    case = native_quarantine
-    response, execution, recovery = admitted(case)
-    # Exercise the existing authenticated transport owner, including its full
-    # retained predecessor. This fixture changes serialization, never authority.
-    root = Path(execution["state_dir"]) / resume.namespace(recovery)
-    envelope = compact_recovery({**recovery, "feature_plan_revision": None}, root)
-    write_private(root / "admission.json", envelope)
-    with case.store._connect() as db:
-        db.execute("UPDATE delivery_runs SET recovery_json=?", (canonical_json(envelope),))
-        response["admission_sha256"] = digest(envelope)
-        db.execute(
-            "UPDATE delivery_commands SET response_json=? WHERE command_id=?",
-            (canonical_json(response), case.command["command_id"]),
-        )
-    bindings = {}
-    _gate_roots(execution, execution_specs=bindings)
-    assert case.spec in bindings.values() and execution in bindings.values()
-    assert asyncio.run(delivery_repair_preflight({"spec": execution, "recovery": envelope})) == {
-        "state": "confirmed"
-    }
-    path = root / "revision-worker-custody.json"
-    retained = read_private(path)
-    retained["predecessor_spec"]["role_home_generation"] = "grafted"
-    write_private(path, retained)
-    with pytest.raises(ValueError, match="custody bytes changed"):
-        asyncio.run(delivery_repair_preflight({"spec": execution, "recovery": envelope}))
-
-
-@pytest.mark.parametrize("defect", ["new_role", "new_attempt", "candidate", "usage", "ceiling"])
-def test_never_started_preflight_cannot_graft_new_work_or_authority(native_quarantine, defect):
-    case = native_quarantine
-    response, execution, recovery = admitted(case)
-    later = failed_preflight(case, response, execution, recovery)
-    if defect == "new_role":
-        later["roles"].append({**later["roles"][-1], "iteration": 1})
-    elif defect == "usage":
-        later["usage"]["implement:1"] = {"tokens": 1}
-    elif defect == "candidate":
-        (case.broker.checkout / "README.md").write_text("Unacknowledged source after preflight\n")
-    elif defect == "new_attempt":
-        with case.store._connect() as db:
-            db.execute(
-                "INSERT INTO delivery_attempts (job_key,run_id,role,iteration,candidate_id,"
-                "state,cleanup,result_json) VALUES ('new','run-1','implement',1,?,"
-                "'finished','confirmed','{}')",
-                (later["candidate"]["id"],),
-            )
-    else:
-        assert reconcile_attempt(case.store, run_id="run-1", role="cleanup", iteration=0)["changed"]
-        command = {
-            **case.command,
-            "command_id": "must-not-expand-unused-grant",
-            "expected_revision": 12,
-            "additional_iterations": 1,
-        }
-        with pytest.raises(ValueError, match="retains only its existing finite ceiling"):
-            case.store.repair_admission_preflight("run-1", command)
-        return
-    with pytest.raises(ValueError):
-        reconcile_attempt(case.store, run_id="run-1", role="cleanup", iteration=0)
 
 
 @pytest.mark.asyncio

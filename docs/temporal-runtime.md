@@ -788,3 +788,43 @@ verification gates remain required. The result always states
 `PR_ruleset_eligibility: false` and `merge_context_verified: false`. Merge
 readback keeps its independent pull-request event, current-base, hosted-tree,
 ruleset and all other stronger predicates; this receipt never satisfies them.
+
+CI command and normal observation responses include `ci_assessment` with four
+independent states. `execution.read_complete` describes the read independently
+of execution presence. `execution.state` reports `observed`, `absent` or `unknown`
+for the listed required checks within its named source. Empty PR contexts, an
+explicit null PR rollup and unrelated-only contexts mean those executions are
+absent from the PR-context source; they do not prove absence from Actions or
+another source. The typed execution inventory reports observed executions only
+after its separate workflow/run/job proof succeeds.
+`delivery_policy` remains `not_evaluated` on the metadata-only preflight/ACK and
+becomes `passed` only in the separately admitted CI execution. `pr_eligibility`
+is `not_established` by dispatched execution evidence and stays `unverified`
+for ordinary PR observations until the ruleset owner evaluates it.
+`merge_readiness` stays `unverified` until the independent merge owner runs its
+current-candidate checks. An acknowledged command is never a completed delivery.
+Historical saved acknowledgements retain their original immutable response.
+
+Ordinary required-check polling uses the same authenticated, bounded, paginated
+PR-context reader. It retains every check identity instead of choosing the last
+check with a matching name. Two required checks with the same name refuse with
+`resolve_ambiguous_required_check_identity`, even if both succeeded or the
+successful check arrived last. A required job must be completed successfully;
+skipped, cancelled and other completed non-success conclusions fail the gate.
+Missing jobs and incomplete or failed readback remain pending/unknown. A changed
+head is stale. No observation dispatches a workflow or changes protections.
+Legacy policies without `ci_wait_seconds` retain their frozen twenty-minute
+window and fifteen-second cadence. Failed or malformed reads remain unknown
+until reconciled, including on that legacy path; exhausting the same window
+returns pending with the diagnostic and does not grant another allowance.
+
+The CI-only cleanup reader can reuse a historical interrupted-role teardown
+already authenticated by an admitted stopped continuation. It seals the exact
+canonical recovery chain, immutable admission command/response and original
+request/result/session/journal hashes into the zero-model CI admission. Current
+resources still require their own process, port, lease, root and ownership
+observations. Historical unknown provider outcomes remain unknown; their bytes
+are never rewritten into a successful role result. A changed historical member,
+an unrelated unknown current actor, or lost current admission refuses. This
+exception is specific to the acknowledged CI inventory and cannot authorize a
+role launch or a broader retry.
