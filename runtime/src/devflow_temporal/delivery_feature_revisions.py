@@ -2044,10 +2044,13 @@ def _prove_reconsideration(store, spec, selectors, record, closure, values, *, p
                 _text(text, "unresolved prior finding", maximum=16 * 1024)
                 if text not in findings:
                     findings.append(text)
+        review = proof["review"]
+        review_identity = ({"review_request_sha256": review["request_sha256"]}
+                           if "request_sha256" in review else
+                           {"review_intent_sha256": review["intent_sha256"]})
         predecessors.append({"revision_id": proof["revision_id"],
-                             "classification": proof["classification"],
-                             "review_request_sha256": proof["review"]["request_sha256"],
-                             "review_result_sha256": proof["review"]["result_sha256"]})
+                             "classification": proof["classification"], **review_identity,
+                             "review_result_sha256": review["result_sha256"]})
     product_findings = [text for worker in subject["worker_summaries"]
                         for text in (worker.get("current_review_subject") or {}).get(
                             "unresolved_product_findings", [])]

@@ -719,3 +719,78 @@ def test_public_revision_retains_unreviewed_prelaunch(native_configuration, monk
     with store._connect() as db:
         assert dict(db.execute("SELECT * FROM delivery_attempts WHERE job_key=?",
                                (attempt["job_key"],)).fetchone()) == attempt
+
+def test_public_reconsideration_preserves_early_and_genuine_reviews(
+    native_configuration, monkeypatch, tmp_path,
+):
+    """An unlaunched review stays unreviewed beside a later genuine rejection."""
+    import httpx
+
+    from devflow_temporal.delivery_api import create_app
+
+    native_configuration[0].raw['execution_mode'] = 'trusted-local'
+    fixture = _native_rejected_fixture(native_configuration, monkeypatch,
+                                       retain_worker='build', early_prelaunch=True)
+    store, original, shared, plan, diagnostic, _, prior, _, rejection, row = fixture
+    _, _, historical, current = context_repository(tmp_path, monkeypatch)
+    _complete_native_role_fixture(store, original, prior, plan, diagnostic, 'intake', historical)
+    command = {'command_id': 'mixed-ordinary-revision', 'expected_revision': row['revision'],
+               'reason': 'Retry an unreviewed plan correction.'}
+
+    async def post(run_id, command):
+        app = create_app(store.config.path)
+        app.state.delivery.store = store
+        origin = store.config.dashboard_url.rstrip('/')
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as c:
+            csrf = (await c.get('/api/session')).json()['csrf_token']
+            return await c.post(f'/api/runs/{run_id}/revise-feature-plan', json=command,
+                                headers={'Origin': origin, 'X-Devflow-CSRF': csrf})
+
+    early_selectors = {'version': 1, 'kind': 'derivation_context_change',
+                       'rejected_revision_id': prior['revision_id'],
+                       'proposal_sha256': digest(plan),
+                       'expected_runtime_revision': current['revision'],
+                       'expected_runtime_payload_sha256': current['runtime_payload_sha256']}
+    early_command = {**command, 'command_id': 'reject-unreviewed-reconsideration',
+                     'reconsideration': early_selectors}
+    denied = asyncio.run(post(original['run_id'], early_command))
+    assert denied.status_code == 409, denied.text
+    assert 'genuine completed independent review' in denied.text
+    assert shared.budget(prior['owner']['issue_id'])['used'] == 5
+    response = asyncio.run(post(original['run_id'], command))
+    assert response.status_code == 200, response.text
+    successor = prepare_authority(store, store.effective_spec(response.json()['run_id']))
+    broker = DeliveryBroker(store, successor)
+    broker.prepare()
+    with store._connect() as db:
+        db.execute('UPDATE delivery_runs SET candidate_json=? WHERE run_id=?',
+                   (canonical_json(broker.candidate()), successor['run_id']))
+    context = revisions.begin_revision(store, successor)
+    diagnostic = _revision_diagnostic_for(successor, diagnostic, broker.candidate())
+    _complete_native_role_fixture(store, successor, context, plan, diagnostic, 'intake', historical)
+    proposal = revisions.record_proposal(store, successor, context['revision_id'], plan,
+                                         diagnostic=diagnostic)
+    assert proposal['unreviewed_predecessors'][0]['revision_id'] == prior['revision_id']
+    _complete_native_role_fixture(store, successor, context, plan, diagnostic, 'review', historical)
+    rejected = revisions.reject_revision(store, successor, context['revision_id'],
+                                          'A genuine independent review found a defect.')
+    stopped = _stop_revision_fixture(store, successor, shared)
+    selectors = {'version': 1, 'kind': 'derivation_context_change',
+                 'rejected_revision_id': context['revision_id'], 'proposal_sha256': digest(plan),
+                 'expected_runtime_revision': current['revision'],
+                 'expected_runtime_payload_sha256': current['runtime_payload_sha256']}
+    command = {'command_id':'mixed-reconsideration','expected_revision':stopped['revision'],
+               'reason':'Reconsider after the verified derivation change.',
+               'reconsideration':selectors}
+    response = asyncio.run(post(successor['run_id'], command))
+    assert response.status_code == 200, response.text
+    proofs = response.json()['reconsideration']['prior_rejections']
+    earlier = next(x for x in proofs if x['revision_id'] == prior['revision_id'])
+    later = next(x for x in proofs if x['revision_id'] == context['revision_id'])
+    assert earlier['classification'] == 'prelaunch' and len(earlier['review_intent_sha256']) == 64
+    assert 'review_request_sha256' not in earlier
+    assert later['classification'] == 'genuine' and len(later['review_request_sha256']) == 64
+    assert response.json()['repair_budget']['used'] == 6
+    checkpoints = shared.checkpoints(prior['owner']['issue_id'])
+    assert checkpoints[revisions.PREFIX + 'rejected:' + prior['revision_id']] == rejection
+    assert checkpoints[revisions.PREFIX + 'rejected:' + context['revision_id']] == rejected
