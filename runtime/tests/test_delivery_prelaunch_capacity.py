@@ -173,7 +173,9 @@ async def test_actual_monitor_prelaunch_failure_releases_owned_capacity(
         original = subprocess.Popen
 
         def popen(argv, *args, **kwargs):
-            if argv[-1] == 'devflow_temporal.delivery_native_process':
+            owner = sys._getframe(1).f_locals.get('self')
+            if (argv[-1] == 'devflow_temporal.delivery_native_process'
+                    and getattr(owner, 'folder', None) == case.folder):
                 if failure == 'spawn':
                     raise OSError('fixture monitor exec failed before spawn')
                 script = 'raise SystemExit(2)'
