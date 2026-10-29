@@ -188,11 +188,14 @@ class DeliveryService:
         self.dispatch_task: asyncio.Task | None = None
 
     async def client(self) -> Client:
-        return await Client.connect(
+        from .delivery_operation_temporal import wrap_client
+
+        client = await Client.connect(
             self.config.temporal_address,
             namespace=self.config.raw.get("temporal_namespace", "default"),
             data_converter=DELIVERY_DATA_CONVERTER,
         )
+        return wrap_client(self, client)
 
     async def healthy_client(self) -> Client:
         try:
@@ -412,6 +415,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await service.resume_pending_operations()
         service.dispatch_task = asyncio.create_task(service.dispatch_loop())
         try:
             yield
@@ -896,8 +900,10 @@ def create_app(config_path: Path) -> FastAPI:
         if set(payload) != expected:
             raise HTTPException(400, "mutation fields do not match the contract")
         try:
+            from .delivery_operations import begin_temporal_mutation
+
             prior = await asyncio.to_thread(
-                service.store.begin_mutation, run_id, command_id, name, payload
+                begin_temporal_mutation, service, run_id, command_id, name, payload
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -1008,4 +1014,7 @@ def create_app(config_path: Path) -> FastAPI:
             return FileResponse(dist / "index.html")
         return HTMLResponse("<h1>Devflow delivery</h1><p>Dashboard assets are not built.</p>")
 
+    from .delivery_operations import register_operations
+
+    register_operations(app, service, _host, _mutation)
     return app

@@ -261,3 +261,44 @@ use bounded backoff while the activity heartbeats. GitHub reads run off the
 worker loop, and required success must still match the exact PR head. A failed
 check or changed head stops immediately; the deadline leaves CI pending.
 Older frozen specifications keep their original twenty-minute waiting behavior.
+
+### Durable control operations
+
+`POST /api/operations` accepts an envelope with `operation_id`, `run_id` (null
+for submit), `kind`, and the original `request` object. Operation IDs are a
+separate namespace from domain command IDs; keep both and the complete request
+unchanged after a timeout. The response is the operation record: pending or
+running means the original work continues, not that its result is available.
+The operation and per-run operation list are available from
+`GET /api/operations/{id}` and `GET /api/runs/{id}/operations`. A different
+request with the same operation ID is refused. For effectful commands, a second
+operation ID carrying the same domain command and request returns the original
+operation; a conflicting command ID is refused. Observations retain separate
+identities so a fresh preflight can be followed by its distinct acknowledgement.
+
+The service dispatches persisted pending work on restart. A previously running
+operation is unknown once its exclusive owner is gone; it is not launched
+again. `POST /api/operations/{id}/reconcile` checks supported original domain
+receipts without creating another command. Temporal updates record the exact
+workflow, execution run, update ID, request and transport binding before sending;
+reconciliation reads only that original update. If no exact receipt establishes
+the outcome, the operation remains unknown and requires domain-specific recovery.
+A recorded success is historical evidence and does not establish current
+execution or merge eligibility. Original preflight, acknowledgement and
+admission boundaries continue to check the current owner and authority.
+
+CLI `operation-create --request envelope.json`, `operation --id ID`,
+`operation-reconcile --id ID`, and `run-operations --id RUN` use an already
+running service. The corresponding MCP tools and dashboard operation panel
+expose the same state; none reissues an uncertain effect under a fresh ID.
+
+Routine CLI `run --id RUN` and MCP `get_run` read the versioned persisted
+status projection. They do not reconstruct current execution authority. Use
+CLI `run-detail --id RUN` or MCP `get_run_detail` for explicit full-detail
+and evidence reconstruction.
+
+The dashboard retains an uncertain submitted run, decision, or feature request
+in tab-scoped session storage so reopening the form keeps the original command
+and request. It clears that intent only after a durable success or known
+refusal. The operation panel exposes the recorded status; a pending response
+never creates a successor link or navigates to an undefined run.

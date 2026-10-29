@@ -22,8 +22,12 @@ describe('anonymous local CSRF state', () => {
   })
 
   it('automatically bootstraps and renews before commands without a credential', async () => {
-    const responses = [{ csrf_token: 'first-csrf' }, {}, { csrf_token: 'renewed-csrf' }, {}]
-    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => responses.shift() }))
+    const tokens = ['first-csrf', 'renewed-csrf']
+    const fetchMock = vi.fn(async (path: string, init: RequestInit) => {
+      if (path === '/api/session') return { ok: true, status: 200, json: async () => ({ csrf_token: tokens.shift() }) }
+      const envelope = JSON.parse(String(init.body))
+      return { ok: true, status: 200, json: async () => ({ ...envelope, state: 'succeeded', result: { run_id: envelope.run_id, phase: 'cancelling', revision: 5 } }) }
+    })
     vi.stubGlobal('fetch', fetchMock)
     vi.resetModules()
     const { api } = await import('../src/api')
@@ -39,8 +43,9 @@ describe('anonymous local CSRF state', () => {
     }
     for (const [index, csrf] of [[1, 'first-csrf'], [3, 'renewed-csrf']] as const) {
       const [path, init] = fetchMock.mock.calls[index] as unknown as [string, RequestInit]
-      expect(path).toBe('/api/runs/fixture-run/cancel')
+      expect(path).toBe('/api/operations')
       expect(init.headers).toMatchObject({ 'X-Devflow-CSRF': csrf })
+      expect(JSON.parse(String(init.body))).toMatchObject({ run_id: 'fixture-run', kind: 'cancel', request: { reason: 'fixture reason' } })
       expect(JSON.parse(String(init.body))).not.toHaveProperty('token')
     }
   })
@@ -48,16 +53,17 @@ describe('anonymous local CSRF state', () => {
   it('shares first-visit bootstrap across concurrent commands', async () => {
     let resolveSession!: (value: object) => void
     const session = new Promise<object>(resolve => { resolveSession = resolve })
-    const fetchMock = vi.fn(async (path: string) => ({
-      ok: true, status: 200,
-      json: async () => path === '/api/session' ? await session : {},
-    }))
+    const fetchMock = vi.fn(async (path: string, init: RequestInit) => {
+      if (path === '/api/session') return { ok: true, status: 200, json: async () => await session }
+      const envelope = JSON.parse(String(init.body))
+      return { ok: true, status: 200, json: async () => ({ ...envelope, state: 'succeeded', result: { run_id: envelope.run_id, phase: 'cancelling', revision: 5 } }) }
+    })
     vi.stubGlobal('fetch', fetchMock)
     vi.resetModules()
     const { api } = await import('../src/api')
     const body = { command_id: 'fixture-command', expected_revision: 4, reason: 'fixture reason' }
-    const commands = [api.cancel('first-run', body), api.cancel('second-run', body)]
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const commands = [api.cancel('first-run', body), api.cancel('second-run', { ...body, command_id: 'other-command' })]
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
     resolveSession({ csrf_token: 'shared-csrf' })
     await Promise.all(commands)
     expect(fetchMock).toHaveBeenCalledTimes(3)
@@ -72,7 +78,7 @@ describe('anonymous local CSRF state', () => {
     vi.resetModules()
     const { api } = await import('../src/api')
     const body = { command_id: 'fixture-command', expected_revision: 4, reason: 'fixture reason' }
-    await expect(api.cancel('fixture-run', body)).rejects.toMatchObject({ status: 403 })
+    await expect(api.cancel('fixture-run', body)).rejects.toMatchObject({ status: 0 })
     expect(fetchMock).toHaveBeenCalledTimes(2)
     fetchMock.mockImplementation(async path => {
       if (path === '/api/session') return { ok: true, status: 200, json: async () => ({ csrf_token: 'csrf' }) }

@@ -890,6 +890,10 @@ async def worker(
 
 
 _COMMANDS = (
+    "operation-create",
+    "operation",
+    "operation-reconcile",
+    "run-operations",
     "start",
     "status",
     "stop",
@@ -901,6 +905,7 @@ _COMMANDS = (
     "submit",
     "runs",
     "run",
+    "run-detail",
     "evidence",
     "decision",
     "merge",
@@ -971,6 +976,22 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         getattr(args, "deployment_name", None), getattr(args, "deployment_build_id", None))
     if deployment is not None and args.command not in {"start", "worker"}:
         parser.error("worker deployment options apply only to start or worker")
+    if args.command in {"operation-create", "operation", "operation-reconcile", "run-operations"}:
+        caller = read_only_client(Path(args.config).expanduser().resolve(strict=True))
+        if args.command == "operation-create":
+            if args.request is None:
+                parser.error("operation-create requires --request")
+            result = caller.create_operation(json.loads(args.request.read_text(encoding="utf-8")))
+        else:
+            if not args.id:
+                parser.error("--id is required")
+            result = {
+                "operation": caller.operation,
+                "operation-reconcile": caller.reconcile_operation,
+                "run-operations": caller.run_operations,
+            }[args.command](args.id)
+        print(json.dumps(result, sort_keys=True, indent=2))
+        return
     if args.command == "capture-retained-closures":
         if args.request is None:
             parser.error("--request is required for explicit retained-history capture")
@@ -1000,7 +1021,8 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         return
     read_commands = {"merge-preflight",
         'ci-inventory-preflight', 'ack-ci-inventory', 'ci-inventory',
-        "runs", "run", "evidence", "gates-only-preflight", "repair-admission-preflight",
+        "runs", "run", "run-detail", "evidence", "gates-only-preflight",
+        "repair-admission-preflight",
         'native-diagnostic-preflight', 'native-diagnostic', 'ack-native-diagnostic',
         "filesystem-custody-preflight",
     }
@@ -1061,6 +1083,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         "submit",
         "runs",
         "run",
+        "run-detail",
         "evidence",
         "decision",
         "merge",
@@ -1106,6 +1129,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             args.command
             in {
                 "run",
+                "run-detail",
                 "evidence",
                 "decision",
                 "merge",
@@ -1148,6 +1172,7 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                                             cursor=getattr(args, "cursor", None),
                                             archived=getattr(args, "archived", False)),
                 "run": lambda: caller.status(args.id),
+                "run-detail": lambda: caller.detail(args.id),
                 "evidence": lambda: caller.evidence(args.id, args.evidence_id),
                 "decision": lambda: caller.decision(args.id, request),
                 "merge": lambda: caller.merge(args.id, request),

@@ -1,16 +1,21 @@
 import { useRef, useState } from 'react'
-import { api, ApiError, safeWebUrl } from './api'
+import { api, safeWebUrl } from './api'
+import { loadIntent, saveIntent } from './operationIntent'
 import { titleCase } from './format'
 import type { RunDetail } from './model'
 
 export function FeatureDelivery({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
+  const continueKey = `devflow.continue-feature:${run.id}`
+  const revisionKey = `devflow.revise-feature-plan:${run.id}`
+  const [savedContinue] = useState(() => loadIntent<{ command_id: string; expected_revision: number }>(continueKey))
+  const [savedRevision] = useState(() => loadIntent<{ command_id: string; expected_revision: number; reason: string }>(revisionKey))
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [revisionReason, setRevisionReason] = useState('')
+  const [error, setError] = useState<string | null>(savedContinue || savedRevision ? 'A previous feature request is retained. Check its operation.' : null)
+  const [revisionReason, setRevisionReason] = useState(savedRevision?.reason ?? '')
   const [requestedRevision, setRequestedRevision] = useState(false)
-  const revisionIntent = useRef<{ command_id: string; expected_revision: number; reason: string } | null>(null)
+  const revisionIntent = useRef<{ command_id: string; expected_revision: number; reason: string } | null>(savedRevision)
   const [successor, setSuccessor] = useState<string | null>(null)
-  const intent = useRef<{ command_id: string; expected_revision: number } | null>(null)
+  const intent = useRef<{ command_id: string; expected_revision: number } | null>(savedContinue)
   const delivery = run.feature_delivery
   if (!delivery) return null
   const planUrl = safeWebUrl(delivery.github_plan_url)
@@ -18,39 +23,63 @@ export function FeatureDelivery({ run, onRefresh }: { run: RunDetail; onRefresh:
   const plan = run.feature_plan
 
   async function continueFeature() {
-    if (busy || run.projection_revision == null) return
-    intent.current ??= { command_id: crypto.randomUUID(), expected_revision: run.projection_revision }
+    if (busy || (!intent.current && run.projection_revision == null)) return
+    intent.current ??= { command_id: crypto.randomUUID(), expected_revision: run.projection_revision! }
+    saveIntent(continueKey, intent.current)
     setBusy(true)
     setError(null)
     try {
-      const result = await api.continueFeature(run.id, intent.current)
-      setSuccessor(result.run_id)
-      await onRefresh()
+      const request = intent.current
+      const operation = await api.createOperation({
+        operation_id: `continue-feature:${request.command_id}`, run_id: run.id,
+        kind: 'continue-feature', request,
+      })
+      if (operation.state === 'succeeded') {
+        const result = operation.result as { run_id?: unknown } | null
+        if (!result || typeof result.run_id !== 'string' || !result.run_id) throw new Error('The completed operation has no successor identity.')
+        saveIntent(continueKey, null); intent.current = null
+        setSuccessor(result.run_id)
+        await onRefresh()
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        saveIntent(continueKey, null); intent.current = null
+        setError(operation.error || 'Feature continuation was refused.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not continue this feature.')
-      if (cause instanceof ApiError && cause.status === 409) {
-        intent.current = null
-        await onRefresh()
-      }
     } finally { setBusy(false) }
   }
 
   async function reviseFeaturePlan() {
     if (busy || !plan || (!revisionIntent.current && (!plan.can_revise || plan.expected_revision == null || !revisionReason.trim()))) return
     revisionIntent.current ??= { command_id: crypto.randomUUID(), expected_revision: plan.expected_revision!, reason: revisionReason }
+    saveIntent(revisionKey, revisionIntent.current)
     setBusy(true)
     setError(null)
     try {
-      const result = await api.reviseFeaturePlan(run.id, revisionIntent.current)
-      setRequestedRevision(true)
-      setSuccessor(result.run_id)
-      await onRefresh()
+      const request = revisionIntent.current
+      const operation = await api.createOperation({
+        operation_id: `revise-feature-plan:${request.command_id}`, run_id: run.id,
+        kind: 'revise-feature-plan', request,
+      })
+      if (operation.state === 'succeeded') {
+        const result = operation.result as { run_id?: unknown } | null
+        if (!result || typeof result.run_id !== 'string' || !result.run_id) throw new Error('The completed operation has no successor identity.')
+        saveIntent(revisionKey, null); revisionIntent.current = null
+        setRequestedRevision(true)
+        setSuccessor(result.run_id)
+        await onRefresh()
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        saveIntent(revisionKey, null); revisionIntent.current = null
+        setError(operation.error || 'Feature plan revision was refused.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not request a plan revision.')
-      if (cause instanceof ApiError && cause.status === 409) {
-        revisionIntent.current = null
-        await onRefresh()
-      }
     } finally { setBusy(false) }
   }
 
@@ -82,11 +111,11 @@ export function FeatureDelivery({ run, onRefresh }: { run: RunDetail; onRefresh:
         return <tr key={worker.run_id}><td><a href={`/runs/${encodeURIComponent(worker.run_id)}`}>{worker.chunk_id}</a></td><td>{['build', 'chunk'].includes(worker.kind) ? 'Implementation' : 'Integration and verification'}</td><td>{titleCase(worker.phase)}</td><td>{childUrl ? <a href={childUrl} target="_blank" rel="noopener noreferrer">{worker.workstream_id ?? 'Workstream'}</a> : 'Pending'}</td><td>{prUrl ? <a href={prUrl} target="_blank" rel="noopener noreferrer">#{worker.pull_request?.number}</a> : 'Pending'}</td></tr>
       })}</tbody>
     </table></div> : null}
-    {delivery.can_continue && ['blocked', 'cancelled'].includes(run.outcome ?? '') && !successor ? <button className="primary-button" type="button" disabled={busy || revisionIntent.current != null || run.projection_revision == null} onClick={() => void continueFeature()}>{busy ? 'Continuing…' : 'Continue this feature'}</button> : null}
+    {(intent.current != null || delivery.can_continue && ['blocked', 'cancelled'].includes(run.outcome ?? '')) && !successor ? <button className="primary-button" type="button" disabled={busy || revisionIntent.current != null || (!intent.current && run.projection_revision == null)} onClick={() => void continueFeature()}>{busy ? 'Continuing…' : intent.current ? 'Check feature continuation' : 'Continue this feature'}</button> : null}
     {plan && (plan.can_revise || revisionIntent.current != null) && !successor ? <form className="steering-form feature-revision-form" onSubmit={event => { event.preventDefault(); void reviseFeaturePlan() }}>
       <label htmlFor="revision-reason">Planning defect</label>
       <textarea id="revision-reason" rows={3} maxLength={4000} value={revisionReason} disabled={busy || revisionIntent.current != null} onChange={event => setRevisionReason(event.target.value)} placeholder="Describe the flawed assumption, dependency, or verification gate." />
-      <button className="primary-button" type="submit" disabled={busy || intent.current != null || plan.expected_revision == null || !revisionReason.trim()}>{busy ? 'Requesting…' : revisionIntent.current ? 'Retry plan revision request' : 'Request plan revision'}</button>
+      <button className="primary-button" type="submit" disabled={busy || intent.current != null || (!revisionIntent.current && (plan.expected_revision == null || !revisionReason.trim()))}>{busy ? 'Requesting…' : revisionIntent.current ? 'Retry plan revision request' : 'Request plan revision'}</button>
     </form> : null}
     {plan && !plan.can_revise && plan.reason_ineligible ? <p>Plan revision unavailable: {plan.reason_ineligible}.</p> : null}
     {successor ? <p role="status">{requestedRevision ? 'Plan revision requested.' : 'Continuation started.'} <a href={`/runs/${encodeURIComponent(successor)}`}>Open the coordinating run</a>.</p> : null}

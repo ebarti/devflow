@@ -4,6 +4,8 @@ import { CheckIcon, ExternalIcon } from './icons'
 import { display, time, timelineTime, titleCase, tokens, tone } from './format'
 import type { ActivityEvent, CheckState, Decision, IntakePlan, PhaseGate, RoleState, RunDetail } from './model'
 import { RunControls } from './RunControls'
+import { DurableOperations } from './DurableOperations'
+import { loadIntent, saveIntent } from './operationIntent'
 import { FeatureDelivery } from './FeatureDelivery'
 import { runStatus } from './runStatus'
 
@@ -192,11 +194,14 @@ function UsageSection({ run }: { run: RunDetail }) {
 }
 
 function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: Decision; onRefresh: () => Promise<void> }) {
-  const [choice, setChoice] = useState('')
-  const [freeText, setFreeText] = useState('')
-  const [commandId, setCommandId] = useState(() => crypto.randomUUID())
+  const intentKey = `devflow.decision:${run.id}:${decision.id}:${decision.revision}`
+  const [saved] = useState(() => loadIntent<Parameters<typeof api.answer>[1]>(intentKey))
+  const [choice, setChoice] = useState(() => decision.kind === 'question' ? '' : saved?.answer ?? '')
+  const [freeText, setFreeText] = useState(() => decision.kind === 'question' ? saved?.answer ?? '' : saved?.response ?? '')
+  const [commandId, setCommandId] = useState(() => saved?.command_id ?? crypto.randomUUID())
+  const [intent, setIntent] = useState<Parameters<typeof api.answer>[1] | null>(saved)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState(saved ? 'A previous decision request is retained. Check its operation.' : '')
   const [stale, setStale] = useState(false)
 
   const plan = decision.kind === 'plan' ? run.intake?.plans.find(item => item.revision === decision.plan_revision)?.content : null
@@ -205,22 +210,30 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
   const valid = Boolean(answerText) && (decision.kind !== 'plan' || choice !== 'change' || Boolean(freeText.trim()))
 
   async function answer() {
-    if (run.execution_retired || !valid || run.protocol_revision == null || decision.candidate_revision == null || busy || stale) return
-    setBusy(true); setError('')
+    if (run.execution_retired || busy || stale || (!intent && (!valid || run.protocol_revision == null || decision.candidate_revision == null))) return
+    const request = intent ?? {
+      command_id: commandId, expected_revision: run.protocol_revision!,
+      decision_id: decision.id, decision_revision: decision.revision,
+      candidate_revision: decision.candidate_revision!, answer: answerText,
+      ...(decision.kind === 'plan' && choice === 'change' ? { response: freeText.trim() } : {}),
+    }
+    saveIntent(intentKey, request); setIntent(request); setBusy(true); setError('')
     try {
-      await api.answer(run.id, {
-        command_id: commandId, expected_revision: run.protocol_revision,
-        decision_id: decision.id, decision_revision: decision.revision,
-        candidate_revision: decision.candidate_revision, answer: answerText,
-        ...(decision.kind === 'plan' && choice === 'change' ? { response: freeText.trim() } : {}),
+      const operation = await api.createOperation({
+        operation_id: `decision:${request.command_id}`, run_id: run.id, kind: 'decision', request,
       })
-      await onRefresh()
-    } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 409) {
-        setStale(true)
-        setError('The decision changed. The latest run is loading; review it before responding.')
+      if (operation.state === 'succeeded') {
+        saveIntent(intentKey, null); setIntent(null)
         await onRefresh()
-      } else setError(cause instanceof Error ? cause.message : 'Could not submit the decision.')
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        saveIntent(intentKey, null); setIntent(null); setStale(true)
+        setError(operation.error || 'The decision was refused; review the latest run.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not submit the decision.')
     } finally { setBusy(false) }
   }
 
@@ -233,7 +246,7 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
     {plan ? <div className="intake-plan"><h3>Scope</h3><p>{plan.scope}</p><h3>Steps</h3><ol>{plan.steps.map((item, index) => <li key={index}>{item}</li>)}</ol><h3>Verification</h3><ul>{plan.verification.map((item, index) => <li key={index}>{item}</li>)}</ul><h3>Acceptance</h3><ul>{plan.acceptance.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}
     {plan ? <Workstreams plan={plan} /> : null}
     {decision.candidate_revision != null ? <p className="subtle">Candidate revision {decision.candidate_revision}</p> : null}
-    {run.execution_retired ? <p className="subtle">Saved decision · read-only</p> : <><fieldset disabled={busy || stale}>
+    {run.execution_retired ? <p className="subtle">Saved decision · read-only</p> : <><fieldset disabled={busy || stale || intent !== null}>
       <legend className="sr-only">Choose a response</legend>
       {decision.options.map(option => {
         const value = typeof option === 'string' ? option : option.value
@@ -245,9 +258,9 @@ function DecisionCard({ run, decision, onRefresh }: { run: RunDetail; decision: 
         </label>
       })}
     </fieldset>
-    {decision.kind === 'question' || (decision.kind === 'plan' && choice === 'change') ? <label className="field-wide">{decision.kind === 'question' ? 'Your answer (or choose a suggestion)' : 'What should change in the plan?'}<textarea value={freeText} onChange={event => { setFreeText(event.target.value); if (decision.kind === 'question') setChoice(''); setCommandId(crypto.randomUUID()) }} rows={3} maxLength={4000} disabled={busy || stale} /></label> : null}
+    {decision.kind === 'question' || (decision.kind === 'plan' && choice === 'change') ? <label className="field-wide">{decision.kind === 'question' ? 'Your answer (or choose a suggestion)' : 'What should change in the plan?'}<textarea value={freeText} onChange={event => { setFreeText(event.target.value); if (decision.kind === 'question') setChoice(''); setCommandId(crypto.randomUUID()) }} rows={3} maxLength={4000} disabled={busy || stale || intent !== null} /></label> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
-    <button className="primary-button" type="button" disabled={!valid || busy || stale || run.protocol_revision == null || decision.candidate_revision == null} onClick={() => void answer()}>{busy ? 'Submitting…' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : decision.kind === 'merge' ? 'Merge this feature' : 'Submit decision'}</button>
+    <button className="primary-button" type="button" disabled={busy || stale || (!intent && (!valid || run.protocol_revision == null || decision.candidate_revision == null))} onClick={() => void answer()}>{busy ? 'Submitting…' : intent ? 'Check submitted decision' : decision.kind === 'plan' && choice === 'proceed' ? 'Accept this plan' : decision.kind === 'question' ? 'Submit answer' : decision.kind === 'plan' ? 'Submit plan response' : decision.kind === 'merge' ? 'Merge this feature' : 'Submit decision'}</button>
     </>}
   </section>
 }
@@ -272,40 +285,70 @@ function IntakeHistory({ run }: { run: RunDetail }) {
 }
 
 function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
-  const [reason, setReason] = useState('')
-  const intent = useRef<Parameters<typeof api.cancel>[1] | null>(null)
-  const [open, setOpen] = useState(false)
+  const intentKey = `devflow.cancel:${run.id}`
+  const [saved] = useState(() => {
+    try {
+      const raw = sessionStorage.getItem(intentKey)
+      if (raw === null) return { request: null, blocked: false }
+      const value: unknown = JSON.parse(raw)
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return { request: null, blocked: true }
+      const request = value as Record<string, unknown>
+      if (Object.keys(request).length !== 3 || typeof request.command_id !== 'string' || !request.command_id ||
+          typeof request.expected_revision !== 'number' || !Number.isInteger(request.expected_revision) ||
+          typeof request.reason !== 'string' || !request.reason.trim()) return { request: null, blocked: true }
+      return { request: request as Parameters<typeof api.cancel>[1], blocked: false }
+    } catch { return { request: null, blocked: true } }
+  })
+  const [reason, setReason] = useState(saved.request?.reason ?? '')
+  const intent = useRef<Parameters<typeof api.cancel>[1] | null>(saved.request)
+  const [open, setOpen] = useState(Boolean(saved.request))
   const [busy, setBusy] = useState(false)
-  const [uncertain, setUncertain] = useState(false)
+  const [uncertain, setUncertain] = useState(Boolean(saved.request))
   const [settled, setSettled] = useState<{ acknowledged: boolean; revision: number } | null>(null)
   const [observed, setObserved] = useState<RunDetail | null>(null)
-  const [error, setError] = useState('')
+  const [error, setError] = useState(saved.blocked ? 'The retained cancellation request is unavailable. Resolve it before starting another cancellation.' : saved.request ? 'A previous cancellation request is retained. Retry to confirm the same request.' : '')
   const canRequest = !run.execution_retired && run.outcome == null && !run.checks?.terminal_tracker_checkpoint && !['blocked', 'terminal', 'cancelling'].includes(run.execution_state ?? '')
   const observedCurrent = observed?.id === run.id && observed.protocol_revision === run.protocol_revision && observed.outcome === run.outcome && observed.execution_state === run.execution_state && Boolean(observed.execution_retired) === Boolean(run.execution_retired) && Boolean(observed.checks?.terminal_tracker_checkpoint) === Boolean(run.checks?.terminal_tracker_checkpoint)
-  const canStart = canRequest && (!settled || observedCurrent && (!settled.acknowledged || run.protocol_revision !== settled.revision))
+  const canStart = canRequest && (!settled || !settled.acknowledged && observedCurrent)
   const awaitingObservation = Boolean(settled) && !canStart
-  if (!canRequest && !intent.current) return null
+  if (!canRequest && !intent.current && !saved.blocked) return null
 
-  async function refresh(observeResponse: boolean) {
+  async function refresh(observeResponse: boolean, acknowledged = false) {
+    let terminalObserved = false
     if (observeResponse) {
       // The parent refresh may resolve without a successful detail read.
       // Bind a fresh command only to a post-response read displayed by the page.
-      try { setObserved(await api.getRun(run.id)) }
+      try {
+        const latest = await api.getRun(run.id)
+        setObserved(latest)
+        terminalObserved = latest.id === run.id && (latest.execution_state === 'cancelling' || latest.outcome != null || Boolean(latest.execution_retired))
+      }
       catch { setObserved(null); setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
     }
-    try { await onRefresh() } catch { setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
+    try {
+      await onRefresh()
+      if (acknowledged && terminalObserved) {
+        try { sessionStorage.removeItem(intentKey) } catch { /* A retained receipt is safe to replay. */ }
+      }
+    } catch { setError(current => current || 'The run could not be refreshed. Review its latest state before continuing.') }
   }
 
   async function cancel() {
-    if (busy || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))) return
-    intent.current ??= { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision!, reason: reason.trim() }
-    const request = intent.current
+    if (busy || saved.blocked || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))) return
+    const request = intent.current ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision!, reason: reason.trim() }
+    if (!intent.current) {
+      try { sessionStorage.setItem(intentKey, JSON.stringify(request)) }
+      catch { setError('The cancellation request could not be retained. It was not submitted.'); return }
+      intent.current = request
+    }
     let knownResponse = false
+    let acknowledged = false
     setSettled(null); setObserved(null)
     setBusy(true); setError('')
     try {
       await api.cancel(run.id, request)
       knownResponse = true
+      acknowledged = true
       intent.current = null
       setSettled({ acknowledged: true, revision: request.expected_revision })
       setUncertain(false); setOpen(false)
@@ -314,44 +357,56 @@ function CancelRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promis
       setUncertain(unknown)
       if (!unknown) {
         knownResponse = true
+        try { sessionStorage.removeItem(intentKey) } catch { /* A retained refusal is safe to recheck. */ }
         intent.current = null
         setSettled({ acknowledged: false, revision: request.expected_revision })
       }
       setError(unknown ? 'The cancellation outcome is unknown. Retry to confirm the same request.' : cause.status === 409 ? 'Run state changed. Review the latest state before cancelling.' : cause.message)
     } finally {
-      await refresh(knownResponse)
+      await refresh(knownResponse, acknowledged)
       setBusy(false)
     }
   }
   return <div className="cancel-control">
     {settled?.acknowledged && awaitingObservation ? <p role="status">Cancellation requested. Waiting for the latest run state.</p> : open ? <div className="cancel-form"><label htmlFor="cancel-reason">Reason for cancellation</label><input id="cancel-reason" value={reason} disabled={busy || uncertain} onChange={event => setReason(event.target.value)} required />
       <div className="button-row"><button type="button" className="danger-button" onClick={() => void cancel()} disabled={busy || (!intent.current && (!canStart || !reason.trim() || run.protocol_revision == null))}>{busy ? 'Requesting…' : uncertain ? 'Retry cancellation request' : 'Request cancellation'}</button><button type="button" className="text-button" disabled={busy || uncertain} onClick={() => setOpen(false)}>Keep run</button></div>
-    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={!canStart || run.protocol_revision == null}>Cancel run</button>}
+    </div> : <button type="button" className="text-button" onClick={() => setOpen(true)} disabled={saved.blocked || !canStart || run.protocol_revision == null}>Cancel run</button>}
     {awaitingObservation ? <button type="button" className="text-button" disabled={busy} onClick={async () => { if (busy) return; setBusy(true); await refresh(true); setBusy(false) }}>Refresh run state</button> : null}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
   </div>
 }
 
 function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
-  const [body, setBody] = useState<{ command_id: string; expected_revision: number } | null>(null)
+  const intentKey = `devflow.reconcile-tracker:${run.id}`
+  const [body, setBody] = useState<{ command_id: string; expected_revision: number } | null>(() => loadIntent(intentKey))
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState(body ? 'A previous tracker request is retained. Check its operation.' : '')
   const checkpoint = run.checks?.terminal_tracker_checkpoint
   if (!checkpoint || run.execution_retired || run.outcome != null) return null
   const available = run.phase === 'waiting_tracker' && (checkpoint.waiting || checkpoint.closed)
 
   async function reconcile() {
-    if (busy || run.protocol_revision == null || (!body && !available)) return
-    const request = body ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision }
-    setBody(request); setBusy(true); setError('')
+    if (busy || (!body && (run.protocol_revision == null || !available))) return
+    const request = body ?? { command_id: crypto.randomUUID(), expected_revision: run.protocol_revision! }
+    saveIntent(intentKey, request); setBody(request); setBusy(true); setError('')
     try {
-      await api.reconcileTracker(run.id, request)
-      await onRefresh()
-      setBody(null)
+      const operation = await api.createOperation({
+        operation_id: `tracker:${request.command_id}`, run_id: run.id,
+        kind: 'reconcile-tracker', request,
+      })
+      if (operation.state === 'succeeded') {
+        saveIntent(intentKey, null); setBody(null)
+        await onRefresh()
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        saveIntent(intentKey, null); setBody(null)
+        setError(operation.error || 'Tracker reconciliation was refused.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Tracker readback could not be confirmed.')
       await onRefresh()
-      if (cause instanceof ApiError && cause.status === 409 && cause.message.includes('stale run revision')) setBody(null)
     } finally { setBusy(false) }
   }
 
@@ -359,7 +414,7 @@ function TrackerRecovery({ run, onRefresh }: { run: RunDetail; onRefresh: () => 
     <h2 id="tracker-recovery-heading">Confirm terminal tracker</h2>
     <p>The terminal transition is fixed. Reconciliation confirms the issue, assignee and Project readback without rerunning development.</p>
     <p className="subtle">{available ? 'Readback is waiting for explicit reconciliation.' : 'The current bounded reconciliation is running or queued.'}</p>
-    <button type="button" className="primary-button" disabled={busy || run.protocol_revision == null || (!body && !available)} onClick={() => void reconcile()}>{busy ? 'Reconciling…' : error && body ? 'Retry same reconciliation' : 'Reconcile tracker'}</button>
+    <button type="button" className="primary-button" disabled={busy || (!body && (run.protocol_revision == null || !available))} onClick={() => void reconcile()}>{busy ? 'Reconciling…' : error && body ? 'Retry same reconciliation' : 'Reconcile tracker'}</button>
     {error ? <p className="form-error" role="alert">{error} {body ? 'The request identity is retained while its response is unconfirmed.' : 'Review the refreshed run before reconciling again.'}</p> : null}
   </section>
 }
@@ -387,16 +442,18 @@ export function RunDetails({ run, onRefresh }: { run: RunDetail; onRefresh: () =
     <p className="stream-note">Updates stream from the local service. Waiting uses no model calls. Last observation: {time(run.observed_at || run.updated_at)}.</p>
     {!run.feature_delivery ? <><EvidenceAndQuality run={run} /><GateDetails gates={run.phase_gates} /></> : null}
     <Operations run={run} />
+    <DurableOperations runId={run.id} />
     <UsageSection run={run} />
     <TrackerRecovery key={run.id} run={run} onRefresh={onRefresh} />
-    <CancelRun run={run} onRefresh={onRefresh} />
+    <CancelRun key={`cancel-${run.id}`} run={run} onRefresh={onRefresh} />
   </div>
 }
 
 function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise<void> }) {
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [body, setBody] = useState<Parameters<typeof api.merge>[1] | null>(null)
+  const intentKey = `devflow.merge:${run.id}`
+  const [body, setBody] = useState<Parameters<typeof api.merge>[1] | null>(() => loadIntent(intentKey))
+  const [error, setError] = useState(body ? 'A previous merge request is retained. Check its operation.' : '')
   const merge = run.merge
   if (!merge || merge.phase === 'unavailable' || run.feature_delivery || run.execution_retired) return null
   const ready = merge.available && run.protocol_revision != null && !!merge.candidate_id && !!merge.head && !!merge.pr_number
@@ -408,14 +465,23 @@ function MergeRun({ run, onRefresh }: { run: RunDetail; onRefresh: () => Promise
       candidate_id: merge!.candidate_id!, head: merge!.head!,
       pr_number: merge!.pr_number!, answer: 'merge' as const,
     }
-    setBody(request); setBusy(true); setError('')
+    saveIntent(intentKey, request); setBody(request); setBusy(true); setError('')
     try {
-      await api.merge(run.id, request)
-      setBody(null)
-      await onRefresh()
+      const operation = await api.createOperation({
+        operation_id: `merge:${request.command_id}`, run_id: run.id, kind: 'merge', request,
+      })
+      if (operation.state === 'succeeded') {
+        saveIntent(intentKey, null); setBody(null)
+        await onRefresh()
+      } else if (operation.state === 'refused' || operation.state === 'failed') {
+        saveIntent(intentKey, null); setBody(null)
+        setError(operation.error || 'Merge admission was refused.')
+        await onRefresh()
+      } else {
+        setError(`Operation ${operation.operation_id} is ${operation.state}. Check durable operations before retrying.`)
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Merge admission could not be confirmed.')
-      if (cause instanceof ApiError && cause.status === 409) setBody(null)
       await onRefresh()
     } finally { setBusy(false) }
   }

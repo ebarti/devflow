@@ -6,7 +6,9 @@ import { FeatureDelivery } from '../src/FeatureDelivery'
 import type { RunDetail } from '../src/model'
 import { mockRun } from './fixtures'
 
-afterEach(() => vi.restoreAllMocks())
+const completedOperation = (result: unknown = {}) => ({ operation_id: 'fixture-op', run_id: 'fixture-run', kind: 'fixture', stage: 'execution', state: 'succeeded' as const, progress: 'succeeded', next_action: 'inspect_result', result, error: null, authority: 'current_authority_unverified' })
+
+afterEach(() => { vi.restoreAllMocks(); sessionStorage.clear() })
 
 const feature: RunDetail = {
   ...mockRun, projection_revision: 12, outcome: 'blocked',
@@ -42,7 +44,7 @@ it('renders the adopted revision, exact child ownership, affected chunks and fro
 })
 
 it('requests only a bounded reason and observed revision, then links the same feature successor', async () => {
-  const request = vi.spyOn(api, 'reviseFeaturePlan').mockResolvedValue({ run_id: 'next-feature', phase: 'queued', revision_phase: 'requested' })
+  const request = vi.spyOn(api, 'createOperation').mockResolvedValue(completedOperation({ run_id: 'next-feature', phase: 'queued', revision_phase: 'requested' }))
   const refresh = vi.fn().mockResolvedValue(undefined)
   const user = userEvent.setup()
   render(<FeatureDelivery run={feature} onRefresh={refresh} />)
@@ -51,7 +53,7 @@ it('requests only a bounded reason and observed revision, then links the same fe
   await user.type(screen.getByLabelText('Planning defect'), 'The API gate selects a browser file owned by web1.')
   await user.click(button)
   await waitFor(() => expect(refresh).toHaveBeenCalledOnce())
-  const body = request.mock.calls[0][1]
+  const body = request.mock.calls[0][0].request as { command_id: string; expected_revision: number; reason: string }
   expect(Object.keys(body).sort()).toEqual(['command_id', 'expected_revision', 'reason'])
   expect(body.expected_revision).toBe(12)
   expect(body.reason).toBe('The API gate selects a browser file owned by web1.')
@@ -60,9 +62,9 @@ it('requests only a bounded reason and observed revision, then links the same fe
 })
 
 it('preserves the full command after an uncertain response even if local eligibility changes', async () => {
-  const request = vi.spyOn(api, 'reviseFeaturePlan')
+  const request = vi.spyOn(api, 'createOperation')
     .mockRejectedValueOnce(new ApiError('Response unavailable', 503))
-    .mockResolvedValueOnce({ run_id: 'next-feature', phase: 'queued', revision_phase: 'requested' })
+    .mockResolvedValueOnce(completedOperation({ run_id: 'next-feature', phase: 'queued', revision_phase: 'requested' }))
   const refresh = vi.fn().mockResolvedValue(undefined)
   const user = userEvent.setup()
   const { rerender } = render(<FeatureDelivery run={feature} onRefresh={refresh} />)
@@ -74,13 +76,13 @@ it('preserves the full command after an uncertain response even if local eligibi
   await user.click(screen.getByRole('button', { name: 'Retry plan revision request' }))
   await waitFor(() => expect(refresh).toHaveBeenCalledOnce())
   expect(request.mock.calls[1]).toEqual(request.mock.calls[0])
-  expect(request.mock.calls[1][1].expected_revision).toBe(12)
+  expect((request.mock.calls[1][0].request as { expected_revision: number }).expected_revision).toBe(12)
 })
 
 it('refreshes a rejected stale request before binding a new command', async () => {
-  const request = vi.spyOn(api, 'reviseFeaturePlan')
-    .mockRejectedValueOnce(new ApiError('Stale projection revision', 409))
-    .mockResolvedValueOnce({ run_id: 'next-feature', phase: 'queued', revision_phase: 'requested' })
+  const request = vi.spyOn(api, 'createOperation')
+    .mockResolvedValueOnce({ ...completedOperation(), state: 'refused', result: null, error: 'Stale projection revision', next_action: 'inspect_error', authority: null })
+    .mockResolvedValueOnce(completedOperation({ run_id: 'next-feature', phase: 'queued', revision_phase: 'requested' }))
   const refresh = vi.fn().mockResolvedValue(undefined)
   const user = userEvent.setup()
   const { rerender } = render(<FeatureDelivery run={feature} onRefresh={refresh} />)
@@ -90,8 +92,8 @@ it('refreshes a rejected stale request before binding a new command', async () =
   rerender(<FeatureDelivery run={{ ...feature, feature_plan: { ...feature.feature_plan!, expected_revision: 14 } }} onRefresh={refresh} />)
   await user.click(screen.getByRole('button', { name: 'Request plan revision' }))
   await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2))
-  expect(request.mock.calls[1][1].command_id).not.toBe(request.mock.calls[0][1].command_id)
-  expect(request.mock.calls[1][1].expected_revision).toBe(14)
+  expect((request.mock.calls[1][0].request as { command_id: string }).command_id).not.toBe((request.mock.calls[0][0].request as { command_id: string }).command_id)
+  expect((request.mock.calls[1][0].request as { expected_revision: number }).expected_revision).toBe(14)
 })
 
 
@@ -104,4 +106,19 @@ it('describes fresh intake as unplanned until a GitHub revision is published', (
   expect(screen.getByText('Plan state: Unplanned.')).toBeTruthy()
   expect(screen.queryByText(/GitHub plan revision/)).toBeNull()
   expect(screen.queryByRole('button', { name: 'Request plan revision' })).toBeNull()
+})
+
+it('retains a feature revision command after an operation submission conflict', async () => {
+  const request = vi.spyOn(api, 'createOperation')
+    .mockRejectedValueOnce(new ApiError('Operation ID conflicts', 409))
+    .mockImplementationOnce(async envelope => ({ ...completedOperation(), operation_id: envelope.operation_id, state: 'unknown', result: null, progress: 'unknown', next_action: 'reconcile', authority: null }))
+  const refresh = vi.fn().mockResolvedValue(undefined)
+  const user = userEvent.setup()
+  render(<FeatureDelivery run={feature} onRefresh={refresh} />)
+  await user.type(screen.getByLabelText('Planning defect'), 'The selector belongs to web1.')
+  await user.click(screen.getByRole('button', { name: 'Request plan revision' }))
+  expect(await screen.findByText('Operation ID conflicts')).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: 'Retry plan revision request' }))
+  expect(request.mock.calls[1]).toEqual(request.mock.calls[0])
+  expect(refresh).not.toHaveBeenCalled()
 })
