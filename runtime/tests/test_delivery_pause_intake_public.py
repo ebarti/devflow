@@ -53,6 +53,53 @@ async def test_public_intake_pause_refuses_a_previously_admitted_start(service, 
                                            'expected_revision': status['revision']})
         assert rejected.status_code == 409
         assert 'after start admission' in rejected.text
+        # A legacy direct caller has reserved a different rejected command ID.
+        legacy = {'command_id': 'late-legacy', 'expected_revision': status['revision']}
+        assert (await client.post('/api/runs/run-1/pause', headers=headers,
+                                  json=legacy)).status_code == 409
+        conflict_envelope = {'operation_id': 'late-conflict', 'run_id': 'run-1', 'kind': 'pause',
+                             'request': {**legacy, 'expected_revision': status['revision'] + 1}}
+        assert (await client.post('/api/operations', headers=headers,
+                                  json=conflict_envelope)).status_code in (200, 202)
+        envelope = {'operation_id': 'late-op', 'run_id': 'run-1', 'kind': 'pause',
+                    'request': {'command_id': 'late-pause',
+                                'expected_revision': status['revision']}}
+        response = await client.post('/api/operations', headers=headers, json=envelope)
+        assert response.status_code in (200, 202)
+        import asyncio
+
+        async with asyncio.timeout(10):
+            while True:
+                refused = (await client.get('/api/operations/late-op')).json()
+                if refused['state'] not in {'pending', 'running'}:
+                    break
+                await asyncio.sleep(.02)
+        assert refused['state'] == 'refused' and 'after start admission' in refused['error']
+        async with asyncio.timeout(10):
+            while True:
+                conflict = (await client.get('/api/operations/late-conflict')).json()
+                if conflict['state'] not in {'pending', 'running'}:
+                    break
+                await asyncio.sleep(.02)
+        assert conflict['state'] == 'refused' and 'different inputs' in conflict['error']
+        assert (await client.get('/api/runs/run-1/pause-control')).json()['observed'] == 'running'
+        # A separate ordinary run has no admitted pause scope at all.
+        ordinary = {**request, 'run_id': 'run-2', 'work_id': 'work-2',
+                    'command_id': 'command-2', 'branch': 'feat/fixture-2',
+                    'issue_url': 'https://github.com/example/fixture/issues/4'}
+        created = await client.post('/api/runs', headers=headers, json=ordinary)
+        assert created.status_code == 200, created.text
+        unsupported = {'operation_id': 'unsupported-op', 'run_id': 'run-2', 'kind': 'pause',
+                       'request': {'command_id': 'unsupported-cmd', 'expected_revision': 0}}
+        assert (await client.post('/api/operations', headers=headers,
+                                  json=unsupported)).status_code in (200, 202)
+        async with asyncio.timeout(10):
+            while True:
+                scope = (await client.get('/api/operations/unsupported-op')).json()
+                if scope['state'] not in {'pending', 'running'}:
+                    break
+                await asyncio.sleep(.02)
+        assert scope['state'] == 'refused' and 'scope is not enabled' in scope['error']
 
 
 @pytest.mark.asyncio
@@ -234,11 +281,14 @@ async def test_public_intake_pump_restart_resume_and_real_temporal_dispatch(serv
 async def test_public_pause_operations_reconcile_lost_acknowledgements(unstarted, monkeypatch):
     """A lost response never repeats a fenced command or fabricates its outcome."""
     import asyncio
+    import json
+    from contextlib import contextmanager
 
     from test_delivery_pause_intake import begin_intake_settlement, controlled_no_start
 
     from devflow_temporal import delivery_pause as pause
     from devflow_temporal import delivery_pause_intake as intake
+    from devflow_temporal import delivery_pause_namespace
 
     _controlled_cutover(monkeypatch)
     store, spec, run = unstarted
@@ -248,12 +298,18 @@ async def test_public_pause_operations_reconcile_lost_acknowledgements(unstarted
     calls = []
     original_pause = pause.request_pause
 
-    def lost_pause(*args, **kwargs):
+    def tracked_pause(*args, **kwargs):
         calls.append('pause')
-        original_pause(*args, **kwargs)
-        raise OSError('fixture lost acknowledgement after commit')
+        return original_pause(*args, **kwargs)
 
-    monkeypatch.setattr(pause, 'request_pause', lost_pause)
+    monkeypatch.setattr(pause, 'request_pause', tracked_pause)
+    original_scope = delivery_pause_namespace.intake_namespace_scope
+
+    @contextmanager
+    def fail_on_scope_exit(config):
+        with original_scope(config):
+            yield
+        raise ValueError('fixture namespace revalidation failed after commit')
 
     async def operation(client, headers, envelope):
         response = await client.post('/api/operations', headers=headers, json=envelope)
@@ -269,9 +325,55 @@ async def test_public_pause_operations_reconcile_lost_acknowledgements(unstarted
         session = await client.get('/api/session')
         headers = {'Origin': origin, 'X-Devflow-CSRF': session.json()['csrf_token']}
         status = (await client.get(f'/api/runs/{root}/pause-control')).json()
+        stale = {'operation_id': 'stale-op', 'run_id': root, 'kind': 'pause',
+                 'request': {'command_id': 'stale-cmd', 'expected_revision': 99}}
+        refused = await operation(client, headers, stale)
+        assert refused['state'] == 'refused' and 'revision changed' in refused['error']
+        assert (await client.get(f'/api/runs/{root}/pause-control')).json()['observed'] == 'running'
+        assert (await operation(client, headers, stale))['state'] == 'refused'
+        alias = await client.post('/api/operations', headers=headers,
+                                  json={**stale, 'operation_id': 'stale-alias'})
+        assert alias.json()['operation_id'] == 'stale-op'
+        direct = await client.post(f'/api/runs/{root}/pause', headers=headers,
+                                   json=stale['request'])
+        assert direct.status_code == 409
+        conflict = await client.post('/api/operations', headers=headers,
+            json={**stale, 'operation_id': 'stale-conflict',
+                  'request': {**stale['request'], 'expected_revision': status['revision']}})
+        assert conflict.status_code == 409
+        # Simulate loss after the owner saved its no-effect receipt. Changed
+        # transport identity or a corrupted receipt cannot manufacture a refusal.
+        with store._connect() as db:
+            receipt = db.execute("SELECT response_json FROM delivery_pause_commands "
+                                 "WHERE command_id='stale-cmd'").fetchone()[0]
+            db.execute("UPDATE delivery_operations SET state='unknown',request_json=? "
+                       "WHERE operation_id='stale-op'",
+                       (json.dumps({**stale['request'], 'expected_revision': 98}),))
+        assert (await client.post('/api/operations/stale-op/reconcile',
+                                  headers=headers)).json()['state'] == 'unknown'
+        with store._connect() as db:
+            db.execute("UPDATE delivery_operations SET request_json=? "
+                       "WHERE operation_id='stale-op'", (json.dumps(stale['request']),))
+            bad_receipt = {**json.loads(receipt), 'root_id': 'substituted'}
+            db.execute("UPDATE delivery_pause_commands SET response_json=? WHERE command_id=?",
+                       (json.dumps(bad_receipt), 'stale-cmd'))
+        assert (await client.post('/api/operations/stale-op/reconcile',
+                                  headers=headers)).json()['state'] == 'unknown'
+        assert (await client.post(f'/api/runs/{root}/pause', headers=headers,
+                                  json=stale['request'])).status_code == 409
+        with store._connect() as db:
+            db.execute("UPDATE delivery_pause_commands SET response_json=? WHERE command_id=?",
+                       (receipt, 'stale-cmd'))
+        assert (await client.post('/api/operations/stale-op/reconcile',
+                                  headers=headers)).json()['state'] == 'refused'
+        calls.clear()
         envelope = {'operation_id': 'pause-op', 'run_id': root, 'kind': 'pause',
                     'request': {'command_id': 'pause-cmd', 'expected_revision': status['revision']}}
+        # The owner commits, then namespace revalidation fails with HTTP 409.
+        # This is ambiguous until the exact successful owner receipt is read.
+        monkeypatch.setattr(delivery_pause_namespace, 'intake_namespace_scope', fail_on_scope_exit)
         lost = await operation(client, headers, envelope)
+        monkeypatch.setattr(delivery_pause_namespace, 'intake_namespace_scope', original_scope)
         assert lost['state'] == 'unknown'
         assert (await client.get(f'/api/runs/{root}/pause-control')).json()[
             'observed'] == 'pause_requested'
@@ -292,6 +394,16 @@ async def test_public_pause_operations_reconcile_lost_acknowledgements(unstarted
                                  base_url=origin) as client:
         session = await client.get('/api/session')
         headers = {'Origin': origin, 'X-Devflow-CSRF': session.json()['csrf_token']}
+        with store._connect() as db:
+            saved_digest = db.execute("SELECT request_digest FROM delivery_pause_commands "
+                                      "WHERE command_id='pause-cmd'").fetchone()[0]
+            db.execute("UPDATE delivery_pause_commands SET request_digest='corrupt' "
+                       "WHERE command_id='pause-cmd'")
+        assert (await client.post('/api/operations/pause-op/reconcile',
+                                  headers=headers)).json()['state'] == 'unknown'
+        with store._connect() as db:
+            db.execute("UPDATE delivery_pause_commands SET request_digest=? "
+                       "WHERE command_id='pause-cmd'", (saved_digest,))
         recovered = (await client.post('/api/operations/pause-op/reconcile',
                                        headers=headers)).json()
         assert recovered['state'] == 'succeeded'
@@ -302,6 +414,18 @@ async def test_public_pause_operations_reconcile_lost_acknowledgements(unstarted
         intake.seal_unstarted(store, root, 1, run['revision'],
                               prove_unstarted=controlled_no_start(store))
         paused = pause.publish_paused(store, root, 1)
+        invalid = {'operation_id': 'invalid-resume-op', 'run_id': root, 'kind': 'resume',
+                   'request': {'command_id': 'invalid-resume-cmd',
+                               'expected_revision': paused['revision'], 'epoch': 0}}
+        assert (await operation(client, headers, invalid))['state'] == 'refused'
+        assert (await client.post(f'/api/runs/{root}/resume', headers=headers,
+                                  json=invalid['request'])).status_code == 409
+        with store._connect() as db:
+            db.execute("UPDATE delivery_operations SET state='unknown' "
+                       "WHERE operation_id='invalid-resume-op'")
+        assert (await client.post('/api/operations/invalid-resume-op/reconcile',
+                                  headers=headers)).json()['state'] == 'refused'
+        assert (await client.get(f'/api/runs/{root}/pause-control')).json()['observed'] == 'paused'
         original_resume = pause.begin_resume
 
         def lost_resume(*args, **kwargs):
@@ -315,8 +439,6 @@ async def test_public_pause_operations_reconcile_lost_acknowledgements(unstarted
                               'epoch': 1}}
         # Simulate a restart after transport persistence but before admission.
         # Startup must leave this resume pending until the user repeats it.
-        import json
-
         from devflow_temporal.contracts import digest
 
         with store._connect() as db:
@@ -357,6 +479,16 @@ async def test_public_pause_operations_reconcile_lost_acknowledgements(unstarted
                                          headers=headers)).json()
         assert substituted['state'] == 'unknown'
         assert calls == ['pause', 'resume']
+        # A successful historical receipt still rejects a conflicting request
+        # and replays unchanged after state advances.
+        direct_conflict = await client.post(f'/api/runs/{root}/pause', headers=headers,
+            json={**envelope['request'], 'expected_revision': status['revision'] + 1})
+        assert direct_conflict.status_code == 409
+        replay = await client.post(f'/api/runs/{root}/pause', headers=headers,
+                                   json=envelope['request'])
+        assert replay.status_code == 200 and replay.json() == recovered['result']
+        current = (await client.get(f'/api/runs/{root}/pause-control')).json()
+        assert current['observed'] == 'resuming'
 
 
 @pytest.mark.asyncio
@@ -422,6 +554,18 @@ async def test_cli_and_mcp_use_the_same_durable_pause_commands(unstarted, monkey
             while not server.started:
                 await asyncio.sleep(.02)
         assert (await cli('pause-control'))['scope'] == 'before_start'
+        stale = {'operation_id': 'cross-stale', 'command_id': 'cross-stale-cmd',
+                 'expected_revision': 99}
+        assert (await cli('pause', stale))['operation_id'] == 'cross-stale'
+        async with httpx.AsyncClient(base_url=host) as client:
+            assert (await completed(client, 'cross-stale'))['state'] == 'refused'
+        async with create_connected_server_and_client_session(
+            build_server(store.config.path)
+        ) as mcp:
+            repeated = await mcp.call_tool('pause_run', {
+                'run_id': spec['run_id'], 'request_json': json.dumps(stale)})
+            assert not repeated.isError
+            assert json.loads(repeated.content[0].text)['state'] == 'refused'
         request = {'operation_id': 'cross-pause', 'command_id': 'cross-pause-cmd',
                    'expected_revision': 0}
         first = await cli('pause', request)
@@ -456,7 +600,7 @@ async def test_cli_and_mcp_use_the_same_durable_pause_commands(unstarted, monkey
                 assert (await cli('pause-control'))['observed'] == 'resuming'
                 with store._connect() as db:
                     assert db.execute('SELECT COUNT(*) FROM delivery_pause_commands '
-                                      'WHERE root_id=?', (spec['run_id'],)).fetchone()[0] == 2
+                                      'WHERE root_id=?', (spec['run_id'],)).fetchone()[0] == 3
     finally:
         server.should_exit = True
         await asyncio.wait_for(serving, 10)

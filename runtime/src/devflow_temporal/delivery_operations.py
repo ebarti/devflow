@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -356,6 +357,14 @@ def _execute(service, endpoints, operation_id):
             if rejection is not None:
                 _set(service.store, operation_id, "refused", error=rejection)
                 return
+            if operation["kind"] in {"pause", "resume"} and exc.status_code == 409:
+                from .delivery_operation_receipts import settle_pause_refusal
+
+                try:
+                    if settle_pause_refusal(service.store, operation, now()):
+                        return
+                except (ValueError, TypeError, KeyError, OSError, sqlite3.Error):
+                    pass  # Missing or invalid owner evidence is still unknown.
             state = (
                 "refused"
                 if exc.status_code in (400, 403, 404, 422)
@@ -562,6 +571,14 @@ def register_operations(app, service, hostguard, mutationguard):
             return operation
         if operation["state"] != "unknown":
             return operation
+        if operation["kind"] in {"pause", "resume"}:
+            from .delivery_operation_receipts import settle_pause_refusal
+
+            try:
+                if await asyncio.to_thread(settle_pause_refusal, service.store, operation, now()):
+                    return await asyncio.to_thread(read, service.store, operation_id)
+            except (ValueError, TypeError, KeyError, OSError, sqlite3.Error):
+                pass  # A changed or unavailable owner receipt cannot prove refusal.
         payload, run_id, kind = (
             operation["request"],
             operation["run_id"],

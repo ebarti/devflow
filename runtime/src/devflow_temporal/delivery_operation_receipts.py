@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 
 _PHASES = {
     "recover-publication": {"publication_recovery_queued"},
@@ -18,6 +18,38 @@ _PHASES = {
     "retry-prelaunch": {"repair_prelaunch_retry_queued"},
     "amend-scope": {"scope_amendment_queued"},
 }
+
+
+def settle_pause_refusal(store, operation, timestamp):
+    """Settle only an exact operation bound to durable no-effect owner evidence."""
+    from .delivery_pause import _command_identity, refusal_from_row
+
+    kind, run_id, payload = operation["kind"], operation["run_id"], operation["request"]
+    if (kind not in {"pause", "resume"} or _command_identity(run_id, kind, payload) is None
+            or operation.get("domain_command_id") != payload["command_id"]
+            or operation.get("request_digest") != digest({
+                "run_id": run_id, "kind": kind, "request": payload})):
+        return False
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute("SELECT * FROM delivery_operations WHERE operation_id=?",
+                             (operation["operation_id"],)).fetchone()
+        if (current is None or current["state"] not in {"running", "unknown"}
+                or current["owner_generation"] != operation.get("owner_generation")
+                or current["kind"] != kind or current["run_id"] != run_id
+                or current["domain_command_id"] != payload["command_id"]
+                or current["request_digest"] != operation["request_digest"]
+                or canonical_json(json.loads(current["request_json"])) != canonical_json(payload)):
+            return False
+        row = db.execute("SELECT * FROM delivery_pause_commands WHERE command_id=?",
+                         (payload["command_id"],)).fetchone()
+        refusal = refusal_from_row(row, run_id, kind, payload)
+        if refusal is None:
+            return False
+        db.execute("""UPDATE delivery_operations SET state='refused',updated_at=?,finished_at=?,
+                      progress='refused',result_json=NULL,error=? WHERE operation_id=?""",
+                   (timestamp, timestamp, refusal, operation["operation_id"]))
+        return True
 
 
 def receipt(store, operation):
