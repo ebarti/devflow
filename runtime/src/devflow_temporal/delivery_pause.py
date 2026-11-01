@@ -48,6 +48,11 @@ def initialize(db):
         epoch INTEGER NOT NULL, workflow_id TEXT NOT NULL, execution_run_id TEXT NOT NULL,
         owner_generation INTEGER NOT NULL, admitted_at TEXT NOT NULL,
         PRIMARY KEY(root_id, operation_key, step))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_pause_denials (
+        root_id TEXT NOT NULL, operation_key TEXT NOT NULL, step TEXT NOT NULL,
+        epoch INTEGER NOT NULL, workflow_id TEXT NOT NULL, execution_run_id TEXT NOT NULL,
+        owner_generation INTEGER NOT NULL, denied_at TEXT NOT NULL,
+        PRIMARY KEY(root_id, operation_key, step, epoch))""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pause_pending_merges (
         root_id TEXT NOT NULL, workflow_id TEXT NOT NULL, grant_sha256 TEXT NOT NULL,
         state TEXT NOT NULL, execution_run_id TEXT, PRIMARY KEY(root_id, workflow_id))""")
@@ -239,6 +244,118 @@ def _missing_clock(db, root_id, epoch, *, finished):
             AND r.execution_run_id=a.execution_run_id
         WHERE a.root_id=? AND s.state IN ('running', 'resume_pending') AND ("""
         + condition + ") LIMIT 1", (epoch, root_id)).fetchone() is not None
+
+
+@contextmanager
+def launch_admission_graph(store, bindings, operation_key, step, *, workflow_id,
+                           execution_run_id, owner_generation, validate_graph, graph_guard=None):
+    """Admit one actual handoff under every authenticated ancestor fence.
+
+    The caller owns actor and graph authentication; this internal interface does
+    not accept a validator from a public request. Locks are retained through the
+    caller's handoff, but the tracking write transaction is committed first.
+    An admitted step cannot be repeated without a separate readback proving the
+    outcome. A denial is recorded before it is returned to the owning workflow.
+    """
+    from contextlib import ExitStack
+
+    if not isinstance(bindings, dict) or not bindings or not callable(validate_graph):
+        raise ValueError("pause graph bindings and validator are required")
+    for value, name in ((operation_key, "operation key"), (step, "step"),
+                        (workflow_id, "workflow ID"), (execution_run_id, "execution run ID")):
+        _nonempty(value, name)
+    if type(owner_generation) is not int or owner_generation < 1:
+        raise ValueError("invalid pause actor generation")
+    for root_id, epoch in bindings.items():
+        _nonempty(root_id, "root ID")
+        _epoch(epoch)
+
+    class Handoff:
+        active = True
+
+        def no_process_started(self):
+            """Withdraw only after the immediate Popen reports a pre-exec failure."""
+            if not self.active:
+                raise ValueError("pause handoff no longer holds its admission locks")
+            with store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                validate_graph(db, bindings, workflow_id, execution_run_id, owner_generation)
+                for root_id, epoch in sorted(bindings.items()):
+                    row = _row(db, root_id)
+                    actor = db.execute("""SELECT a.execution_run_id,a.owner_generation,s.state
+                        FROM delivery_pause_actors a JOIN delivery_pause_actor_status s
+                        ON s.root_id=a.root_id AND s.workflow_id=a.workflow_id
+                        WHERE a.root_id=? AND a.workflow_id=?""",
+                        (root_id, workflow_id)).fetchone()
+                    if (row["state"] != "running" or row["epoch"] != epoch or actor is None
+                            or actor["state"] != "running"
+                            or actor["execution_run_id"] != execution_run_id
+                            or actor["owner_generation"] != owner_generation):
+                        raise ValueError("pause actor changed before no-launch acknowledgement")
+                    removed = db.execute("""DELETE FROM delivery_pause_steps WHERE root_id=?
+                        AND operation_key=? AND step=? AND epoch=? AND workflow_id=?
+                        AND execution_run_id=? AND owner_generation=?""",
+                        (root_id, operation_key, step, epoch, workflow_id,
+                         execution_run_id, owner_generation)).rowcount
+                    if removed != 1:
+                        raise ValueError("pause handoff no-launch identity changed")
+            self.active = False
+
+    with ExitStack() as stack:
+        for root_id in sorted(bindings):
+            stack.enter_context(root_mutex(store, root_id))
+        if graph_guard is not None:
+            stack.enter_context(graph_guard())
+        denied = None
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            validate_graph(db, bindings, workflow_id, execution_run_id, owner_generation)
+            controls = []
+            for root_id in sorted(bindings):
+                row = _row(db, root_id)
+                actor = db.execute("""SELECT a.execution_run_id,a.owner_generation,s.state
+                    FROM delivery_pause_actors a JOIN delivery_pause_actor_status s
+                    ON s.root_id=a.root_id AND s.workflow_id=a.workflow_id
+                    WHERE a.root_id=? AND a.workflow_id=?""", (root_id, workflow_id)).fetchone()
+                if (actor is None or actor["execution_run_id"] != execution_run_id
+                        or actor["owner_generation"] != owner_generation
+                        or actor["state"] not in {"running", "resume_pending"}):
+                    raise ValueError("pause graph actor changed or completed")
+                controls.append((row, actor["state"]))
+            for row, actor_state in controls:
+                if (row["state"] == "running" and actor_state == "running"
+                        and row["epoch"] == bindings[row["root_id"]]):
+                    continue
+                db.execute("""INSERT OR IGNORE INTO delivery_pause_denials
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row["root_id"], operation_key, step,
+                    row["epoch"], workflow_id, execution_run_id, owner_generation, _now()))
+                existing = db.execute("""SELECT * FROM delivery_pause_denials WHERE root_id=?
+                    AND operation_key=? AND step=? AND epoch=?""",
+                    (row["root_id"], operation_key, step, row["epoch"])).fetchone()
+                if (existing["workflow_id"] != workflow_id
+                        or existing["execution_run_id"] != execution_run_id
+                        or existing["owner_generation"] != owner_generation):
+                    raise ValueError("pause denial belongs to a different actor")
+                if denied is None:
+                    denied = row
+            if denied is None:
+                for row, _actor_state in controls:
+                    old = db.execute("""SELECT 1 FROM delivery_pause_steps WHERE root_id=?
+                        AND operation_key=? AND step=?""",
+                        (row["root_id"], operation_key, step)).fetchone()
+                    if old is not None:
+                        raise ValueError("pause handoff already admitted or outcome unknown")
+                    db.execute("INSERT INTO delivery_pause_steps VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               (row["root_id"], operation_key, step, row["epoch"], workflow_id,
+                                execution_run_id, owner_generation, _now()))
+        if denied is not None:
+            raise PauseDeferred("pause fence closed before handoff", root_id=denied["root_id"],
+                                operation_key=operation_key, step=step, epoch=denied["epoch"])
+        handoff = Handoff()
+        try:
+            yield handoff
+        finally:
+            handoff.active = False
 
 
 @contextmanager
