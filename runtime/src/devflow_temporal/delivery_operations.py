@@ -463,6 +463,13 @@ def register_operations(app, service, hostguard, mutationguard):
             raise HTTPException(400, "run_id is required except for submit")
         if KINDS[kind][1] != "observation" or kind == "issue-context":
             mutationguard(request)
+        if kind in {"pause", "resume"}:
+            from .delivery_pause import _command_identity
+
+            if _command_identity(run_id, kind, payload) is None:
+                raise HTTPException(
+                    400, "pause operation requires exact command identity and fields"
+                )
         request_digest = digest({"run_id": run_id, "kind": kind, "request": payload})
         command_id = payload.get("command_id")
         if KINDS[kind][1] == "observation" or not isinstance(command_id, str) or not command_id:

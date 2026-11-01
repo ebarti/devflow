@@ -506,6 +506,7 @@ async def test_cli_and_mcp_use_the_same_durable_pause_commands(unstarted, monkey
 
     from devflow_temporal import delivery_pause as pause
     from devflow_temporal import delivery_pause_intake as intake
+    from devflow_temporal.contracts import digest
     from devflow_temporal.delivery_mcp import build_server
 
     _controlled_cutover(monkeypatch)
@@ -529,7 +530,7 @@ async def test_cli_and_mcp_use_the_same_durable_pause_commands(unstarted, monkey
     server = uvicorn.Server(uvicorn.Config(app, host='127.0.0.1', port=port, log_level='error'))
     serving = asyncio.create_task(server.serve(sockets=[listener]))
 
-    async def cli(command, request=None):
+    async def cli(command, request=None, *, error=None):
         argv = [sys.executable, '-m', 'devflow_temporal.delivery_control',
                 '--config', str(store.config.path), command, '--id', spec['run_id']]
         if request is not None:
@@ -538,6 +539,9 @@ async def test_cli_and_mcp_use_the_same_durable_pause_commands(unstarted, monkey
             argv += ['--request', str(request_path)]
         result = await asyncio.to_thread(subprocess.run, argv, capture_output=True, text=True,
                                          timeout=15)
+        if error is not None:
+            assert result.returncode != 0 and error in result.stderr
+            return None
         assert result.returncode == 0, result.stderr
         return json.loads(result.stdout)
 
@@ -553,7 +557,52 @@ async def test_cli_and_mcp_use_the_same_durable_pause_commands(unstarted, monkey
         async with asyncio.timeout(10):
             while not server.started:
                 await asyncio.sleep(.02)
-        assert (await cli('pause-control'))['scope'] == 'before_start'
+        before = await cli('pause-control')
+        assert before['scope'] == 'before_start'
+        malformed = [
+            ('pause', {'command_id': '', 'expected_revision': 0}),
+            ('pause', {'command_id': 17, 'expected_revision': 0}),
+            ('pause', {'command_id': 'x' * 513, 'expected_revision': 0}),
+            ('pause', {'expected_revision': 0}),
+            ('pause', {'command_id': 'missing-revision'}),
+            ('pause', {'command_id': 'extra-pause', 'expected_revision': 0, 'extra': True}),
+            ('resume', {'command_id': 'missing-epoch', 'expected_revision': 0}),
+            ('resume', {'command_id': 'extra-resume', 'expected_revision': 0, 'epoch': 1,
+                        'extra': True}),
+        ]
+        with store._connect() as db:
+            counts = (db.execute('SELECT COUNT(*) FROM delivery_operations').fetchone()[0],
+                      db.execute('SELECT COUNT(*) FROM delivery_pause_commands').fetchone()[0])
+        async with httpx.AsyncClient(base_url=host) as client:
+            session = await client.get('/api/session')
+            headers = {'Origin': host, 'X-Devflow-CSRF': session.json()['csrf_token']}
+            for index, (kind, payload) in enumerate(malformed):
+                response = await client.post('/api/operations', headers=headers,
+                    json={'operation_id': f'malformed-{index}', 'run_id': spec['run_id'],
+                          'kind': kind, 'request': payload})
+                assert response.status_code == 400, response.text
+            await cli('pause', {'operation_id': 'malformed-cli', 'command_id': '',
+                                'expected_revision': 0}, error='service HTTP 400')
+            with store._connect() as db:
+                assert counts == (db.execute('SELECT COUNT(*) FROM delivery_operations')
+                                  .fetchone()[0],
+                                  db.execute('SELECT COUNT(*) FROM delivery_pause_commands')
+                                  .fetchone()[0])
+            assert (await client.get(f"/api/runs/{spec['run_id']}/pause-control")).json() == before
+            # Existing unaddressable journal rows stay unknown rather than being
+            # rewritten or treated as proof of a refusal.
+            payload = {'command_id': '', 'expected_revision': 0}
+            with store._connect() as db:
+                db.execute("""INSERT INTO delivery_operations
+                    (operation_id,run_id,kind,stage,request_digest,request_json,state,
+                     created_at,updated_at,progress)
+                    VALUES ('legacy-malformed',?,'pause','execution',?,?,'unknown',
+                            '2026','2026','reconciliation required')""",
+                    (spec['run_id'], digest({'run_id': spec['run_id'], 'kind': 'pause',
+                                            'request': payload}), json.dumps(payload)))
+            legacy = (await client.post('/api/operations/legacy-malformed/reconcile',
+                                        headers=headers)).json()
+            assert legacy['state'] == 'unknown'
         stale = {'operation_id': 'cross-stale', 'command_id': 'cross-stale-cmd',
                  'expected_revision': 99}
         assert (await cli('pause', stale))['operation_id'] == 'cross-stale'
