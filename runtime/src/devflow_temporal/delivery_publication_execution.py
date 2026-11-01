@@ -117,11 +117,14 @@ class Execution:
             raise ValueError("publication executor no longer owns this generation")
         return row
 
-    def state(self, operation):
+    def mutation(self, operation):
         row = self.check()
-        return json.loads(row["mutations_json"]).get(operation, {}).get("state")
+        return json.loads(row["mutations_json"]).get(operation, {})
 
-    def _record(self, operation, state):
+    def state(self, operation):
+        return self.mutation(operation).get("state")
+
+    def _record(self, operation, state, *, evidence=None):
         with self.broker.store._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self.check(db)
@@ -129,6 +132,8 @@ class Execution:
             mutations[operation] = {
                 "state": state, "generation": self.generation, "owner": self.token,
             }
+            if evidence is not None:
+                mutations[operation]["evidence"] = evidence
             db.execute(
                 "UPDATE delivery_publication_executors SET mutations_json=? WHERE effect_key=?",
                 (canonical_json(mutations), self.key),
@@ -145,7 +150,7 @@ class Execution:
                 and json.loads(row["mutations_json"]).get(operation, {}).get("state")
                 in {None, "not_started"})
 
-    def mutate(self, operation, function):
+    def mutate(self, operation, function, *, observe_completion=None):
         from .delivery_writer_custody import require_writer
 
         require_writer(self.broker.spec, store=self.broker.store)
@@ -158,12 +163,24 @@ class Execution:
             # Popen did not launch. No CLI exit code or diagnostic text grants this.
             self._record(operation, "not_started")
             raise
-        except BaseException:
+        except BaseException as exc:
+            from .delivery_pause import PauseDeferred
+
+            if isinstance(exc, PauseDeferred):
+                # The pause admission rejected the exact handoff before Popen.
+                self._record(operation, "not_started")
+                raise
             self._record(operation, "unknown")
             raise
         finally:
             _MUTATION.reset(token)
-        self._record(operation, "complete")
+        try:
+            evidence = observe_completion() if observe_completion is not None else None
+        except BaseException:
+            # The mutation launched; failed completion readback is not a no-launch proof.
+            self._record(operation, "unknown")
+            raise
+        self._record(operation, "complete", evidence=evidence)
         return result
 
     def require(self, operation):

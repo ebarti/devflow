@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,8 @@ KINDS = {
     "amend-scope": ("amend_scope", "admission"),
     "decision": ("decision", "execution"),
     "cancel": ("cancel", "execution"),
+    "pause": ("request_pause", "execution"),
+    "resume": ("request_resume", "execution"),
     "disable-limits": ("disable_delivery_limits", "execution"),
     "reconcile-tracker": ("reconcile_tracker", "execution"),
 }
@@ -65,6 +68,8 @@ NO_START = {
 def _domain_namespaces(kind):
     # These are the existing owners' command journals. A preflight is never
     # bound here, so its ID may be reused by its distinct acknowledgement.
+    if kind in {"pause", "resume"}:
+        return {"pause-commands"}
     if kind == "issue-context":
         return {"issue-context"}
     if kind in {"decision", "cancel", "disable-limits"}:
@@ -131,6 +136,9 @@ def _row(row) -> dict:
         "refused": "inspect_error",
         "failed": "inspect_error",
     }[value["state"]]
+    if (value["kind"] == "resume" and value["state"] == "pending"
+            and value["progress"] == "explicit resume required after restart"):
+        value["next_action"] = "resubmit_same_operation"
     return value
 
 
@@ -349,6 +357,14 @@ def _execute(service, endpoints, operation_id):
             if rejection is not None:
                 _set(service.store, operation_id, "refused", error=rejection)
                 return
+            if operation["kind"] in {"pause", "resume"} and exc.status_code == 409:
+                from .delivery_operation_receipts import settle_pause_refusal
+
+                try:
+                    if settle_pause_refusal(service.store, operation, now()):
+                        return
+                except (ValueError, TypeError, KeyError, OSError, sqlite3.Error):
+                    pass  # Missing or invalid owner evidence is still unknown.
             state = (
                 "refused"
                 if exc.status_code in (400, 403, 404, 422)
@@ -399,14 +415,22 @@ def register_operations(app, service, hostguard, mutationguard):
 
     async def resume_pending():
         with service.store._connect() as db:
+            # A resume queued but not admitted before restart must not
+            # open a pause without another explicit submission of the same
+            # operation. Running/unknown commands still reconcile by receipt.
+            db.execute(
+                "UPDATE delivery_operations SET progress=?,updated_at=? "
+                "WHERE kind='resume' AND state='pending'",
+                ("explicit resume required after restart", now()),
+            )
             rows = db.execute(
-                "SELECT operation_id,state FROM delivery_operations "
+                "SELECT operation_id,state,kind FROM delivery_operations "
                 "WHERE state IN ('pending','running')"
             ).fetchall()
         for row in rows:
-            if row["state"] == "pending":
+            if row["state"] == "pending" and row["kind"] != "resume":
                 dispatch(row["operation_id"])
-            else:
+            elif row["state"] == "running":
                 await asyncio.to_thread(_recover_abandoned, service.store, row["operation_id"])
 
     service.resume_pending_operations = resume_pending
@@ -439,6 +463,13 @@ def register_operations(app, service, hostguard, mutationguard):
             raise HTTPException(400, "run_id is required except for submit")
         if KINDS[kind][1] != "observation" or kind == "issue-context":
             mutationguard(request)
+        if kind in {"pause", "resume"}:
+            from .delivery_pause import _command_identity
+
+            if _command_identity(run_id, kind, payload) is None:
+                raise HTTPException(
+                    400, "pause operation requires exact command identity and fields"
+                )
         request_digest = digest({"run_id": run_id, "kind": kind, "request": payload})
         command_id = payload.get("command_id")
         if KINDS[kind][1] == "observation" or not isinstance(command_id, str) or not command_id:
@@ -547,6 +578,14 @@ def register_operations(app, service, hostguard, mutationguard):
             return operation
         if operation["state"] != "unknown":
             return operation
+        if operation["kind"] in {"pause", "resume"}:
+            from .delivery_operation_receipts import settle_pause_refusal
+
+            try:
+                if await asyncio.to_thread(settle_pause_refusal, service.store, operation, now()):
+                    return await asyncio.to_thread(read, service.store, operation_id)
+            except (ValueError, TypeError, KeyError, OSError, sqlite3.Error):
+                pass  # A changed or unavailable owner receipt cannot prove refusal.
         payload, run_id, kind = (
             operation["request"],
             operation["run_id"],

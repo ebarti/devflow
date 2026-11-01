@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from .contracts import digest
+from .contracts import canonical_json, digest
 
 _PHASES = {
     "recover-publication": {"publication_recovery_queued"},
@@ -20,11 +20,76 @@ _PHASES = {
 }
 
 
+def settle_pause_refusal(store, operation, timestamp):
+    """Settle only an exact operation bound to durable no-effect owner evidence."""
+    from .delivery_pause import _command_identity, refusal_from_row
+
+    kind, run_id, payload = operation["kind"], operation["run_id"], operation["request"]
+    if (kind not in {"pause", "resume"} or _command_identity(run_id, kind, payload) is None
+            or operation.get("domain_command_id") != payload["command_id"]
+            or operation.get("request_digest") != digest({
+                "run_id": run_id, "kind": kind, "request": payload})):
+        return False
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute("SELECT * FROM delivery_operations WHERE operation_id=?",
+                             (operation["operation_id"],)).fetchone()
+        if (current is None or current["state"] not in {"running", "unknown"}
+                or current["owner_generation"] != operation.get("owner_generation")
+                or current["kind"] != kind or current["run_id"] != run_id
+                or current["domain_command_id"] != payload["command_id"]
+                or current["request_digest"] != operation["request_digest"]
+                or canonical_json(json.loads(current["request_json"])) != canonical_json(payload)):
+            return False
+        row = db.execute("SELECT * FROM delivery_pause_commands WHERE command_id=?",
+                         (payload["command_id"],)).fetchone()
+        refusal = refusal_from_row(row, run_id, kind, payload)
+        if refusal is None:
+            return False
+        db.execute("""UPDATE delivery_operations SET state='refused',updated_at=?,finished_at=?,
+                      progress='refused',result_json=NULL,error=? WHERE operation_id=?""",
+                   (timestamp, timestamp, refusal, operation["operation_id"]))
+        return True
+
+
 def receipt(store, operation):
     kind, run_id, payload = operation["kind"], operation["run_id"], operation["request"]
     command_id = payload.get("command_id")
     if not isinstance(command_id, str):
         return None
+    if kind in {"pause", "resume"}:
+        # A stored acknowledgement is historical evidence of intent, not a
+        # fresh observation that settlement or activation has completed.
+        keys = {"command_id", "expected_revision"} | ({"epoch"} if kind == "resume" else set())
+        revision = payload.get("expected_revision")
+        epoch = payload.get("epoch")
+        if (set(payload) != keys or not command_id or len(command_id) > 512
+                or operation.get("domain_command_id") != command_id
+                or operation.get("request_digest") != digest({
+                    "run_id": run_id, "kind": kind, "request": payload})
+                or type(revision) is not int or revision < 0
+                or (kind == "resume" and (type(epoch) is not int or epoch < 1))):
+            return None
+        expected = {"action": kind, "root_id": run_id, "expected_revision": revision}
+        if kind == "resume":
+            expected["epoch"] = epoch
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT root_id,request_digest,response_json FROM delivery_pause_commands "
+                "WHERE command_id=?", (command_id,),
+            ).fetchone()
+        if row is None or row["root_id"] != run_id or row["request_digest"] != digest(expected):
+            return None
+        response = json.loads(row["response_json"])
+        state = "pause_requested" if kind == "pause" else "resuming"
+        if (not isinstance(response, dict)
+                or set(response) != {"root_id", "state", "revision", "epoch"}
+                or response["root_id"] != run_id or response["state"] != state
+                or type(response["revision"]) is not int or response["revision"] != revision + 1
+                or type(response["epoch"]) is not int or response["epoch"] < 1
+                or (kind == "resume" and response["epoch"] != epoch)):
+            return None
+        return response
     if kind == "issue-context":
         if set(payload) != {"command_id"}:
             return None

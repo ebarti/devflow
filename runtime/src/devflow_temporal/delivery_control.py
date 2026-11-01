@@ -899,6 +899,9 @@ _COMMANDS = (
     "operation",
     "operation-reconcile",
     "run-operations",
+    "pause-control",
+    "pause",
+    "resume",
     "start",
     "status",
     "stop",
@@ -1000,6 +1003,19 @@ def _run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 "operation-reconcile": caller.reconcile_operation,
                 "run-operations": caller.run_operations,
             }[args.command](args.id)
+        print(json.dumps(result, sort_keys=True, indent=2))
+        return
+    if args.command in {"pause-control", "pause", "resume"}:
+        if not args.id:
+            parser.error("--id is required for pause controls")
+        caller = read_only_client(Path(args.config).expanduser().resolve(strict=True))
+        if args.command == "pause-control":
+            result = caller.pause_control(args.id)
+        else:
+            if args.request is None:
+                parser.error("--request is required for pause and resume")
+            payload = json.loads(args.request.read_text(encoding="utf-8"))
+            result = getattr(caller, args.command)(args.id, payload)
         print(json.dumps(result, sort_keys=True, indent=2))
         return
     if args.command == "capture-retained-closures":

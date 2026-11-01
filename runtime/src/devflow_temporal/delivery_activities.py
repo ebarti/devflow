@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -65,12 +66,20 @@ def database_contention(exc: BaseException) -> bool:
 
 class _DatabaseContentionInbound(ActivityInboundInterceptor):
     async def execute_activity(self, input: ExecuteActivityInput) -> Any:
+        from .delivery_pause import PauseDeferred
+        from .delivery_pause_context import activate, split_activity_request
+
         try:
             # Only fresh ordinary histories opt in; legacy and merge workflows
             # retain their existing protocols. SDK context selects the execution.
             from . import delivery_execution_authority as authority
             info = activity.info()
-            request = input.args[0] if input.args else None
+            args = list(input.args)
+            context = None
+            if len(args) == 1:
+                args[0], context = split_activity_request(args[0], info)
+            adjusted = replace(input, args=args) if context is not None else input
+            request = args[0] if args else None
             spec = request.get("spec") if isinstance(request, dict) else None
             if (info.workflow_type == "DevflowDeliveryWorkflow" and isinstance(spec, dict)
                     and spec.get(authority.VERSION) == 1):
@@ -81,10 +90,21 @@ class _DatabaseContentionInbound(ActivityInboundInterceptor):
                     from .delivery_writer_custody import activity_custody
 
                     async with activity_custody(spec):
-                        return await super().execute_activity(input)
+                        with activate(context):
+                            return await super().execute_activity(adjusted)
                 finally:
                     authority._ACTIVITY_AUTHORITY.reset(token)
-            return await super().execute_activity(input)
+            with activate(context):
+                return await super().execute_activity(adjusted)
+        except PauseDeferred as exc:
+            if (not exc.root_id or not exc.operation_key or not exc.step
+                    or type(exc.epoch) is not int):
+                raise
+            raise ApplicationError(
+                str(exc), {"root_id": exc.root_id, "operation_key": exc.operation_key,
+                           "step": exc.step, "epoch": exc.epoch},
+                type="PauseDeferred", non_retryable=True,
+            ) from exc
         except sqlite3.OperationalError as exc:
             if not database_contention(exc):
                 raise
@@ -1099,6 +1119,7 @@ def _role_result(request, broker, workspace, review_diff, result):
 
 @activity.defn(name="delivery_publish")
 async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
+    from .delivery_pause import PauseDeferred
     from .delivery_writer_custody import to_thread
 
     def execute() -> dict[str, Any]:
@@ -1109,6 +1130,9 @@ async def delivery_publish(request: dict[str, Any]) -> dict[str, Any]:
 
                 return publish(store, broker, request)
             return broker.publish(request["iteration"], request["candidate"])
+        except PauseDeferred:
+            # The owner proved that this exact handoff never launched.
+            raise
         except Exception as exc:
             if (request["spec"].get("publication_readback_version") == 1
                     and broker.publication_may_have_effect is False):

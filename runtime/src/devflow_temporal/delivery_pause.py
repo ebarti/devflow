@@ -48,6 +48,11 @@ def initialize(db):
         epoch INTEGER NOT NULL, workflow_id TEXT NOT NULL, execution_run_id TEXT NOT NULL,
         owner_generation INTEGER NOT NULL, admitted_at TEXT NOT NULL,
         PRIMARY KEY(root_id, operation_key, step))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS delivery_pause_denials (
+        root_id TEXT NOT NULL, operation_key TEXT NOT NULL, step TEXT NOT NULL,
+        epoch INTEGER NOT NULL, workflow_id TEXT NOT NULL, execution_run_id TEXT NOT NULL,
+        owner_generation INTEGER NOT NULL, denied_at TEXT NOT NULL,
+        PRIMARY KEY(root_id, operation_key, step, epoch))""")
     db.execute("""CREATE TABLE IF NOT EXISTS delivery_pause_pending_merges (
         root_id TEXT NOT NULL, workflow_id TEXT NOT NULL, grant_sha256 TEXT NOT NULL,
         state TEXT NOT NULL, execution_run_id TEXT, PRIMARY KEY(root_id, workflow_id))""")
@@ -63,6 +68,111 @@ def initialize(db):
     initialize_start_receipts(db)
     initialize_dispatch_leases(db)
     initialize_intake_pump(db)
+
+
+_REFUSALS = {
+    "scope": "pause control scope is not enabled by this service",
+    "epoch": "invalid pause epoch",
+    "revision": "invalid control revision",
+    "conflict": "pause command ID reused with different inputs",
+    "pause_state": "pause control state or revision changed",
+    "start_admitted": "intake pause is unavailable after start admission",
+    "resume_state": "resume control state, revision or epoch changed",
+    "checkpoint": "checkpoint requires external effect reconciliation before resume",
+    "clock": "pause workflow clock start acknowledgements are pending",
+}
+
+
+class PauseRefused(ValueError):
+    """A named rejection established before this pause command changed state."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(_REFUSALS[reason])
+
+
+def _command_digest(root_id, action, body):
+    request = {"action": action, "root_id": root_id,
+               "expected_revision": body["expected_revision"]}
+    if action == "resume":
+        request["epoch"] = body["epoch"]
+    return digest(request)
+
+
+def _command_identity(root_id, action, body):
+    keys = {"command_id", "expected_revision"} | ({"epoch"} if action == "resume" else set())
+    if (action not in {"pause", "resume"} or not isinstance(body, dict) or set(body) != keys
+            or not isinstance(root_id, str) or not root_id or len(root_id) > 512
+            or not isinstance(body["command_id"], str) or not body["command_id"]
+            or len(body["command_id"]) > 512):
+        return None
+    return _command_digest(root_id, action, body)
+
+
+def _authenticated_command(row):
+    """Check the identity available in a historical success or refusal."""
+    response = json.loads(row["response_json"])
+    if not isinstance(response, dict):
+        return False
+    if response.get("state") == "refused":
+        action, body = response.get("action"), response.get("command")
+        return (isinstance(body, dict) and body.get("command_id") == row["command_id"]
+                and _command_identity(row["root_id"], action, body) == row["request_digest"]
+                and refusal_from_row(row, row["root_id"], action, body) is not None)
+    if (set(response) != {"root_id", "state", "revision", "epoch"}
+            or response["root_id"] != row["root_id"]
+            or response["state"] not in {"pause_requested", "resuming"}
+            or type(response["revision"]) is not int or response["revision"] < 1
+            or type(response["epoch"]) is not int or response["epoch"] < 0
+            or (response["state"] == "pause_requested" and response["epoch"] < 1)):
+        return False
+    action = "pause" if response["state"] == "pause_requested" else "resume"
+    body = {"command_id": row["command_id"],
+            "expected_revision": response["revision"] - 1}
+    if action == "resume":
+        body["epoch"] = response["epoch"]
+    return _command_identity(row["root_id"], action, body) == row["request_digest"]
+
+
+def refusal_from_row(row, root_id, action, body):
+    """Read a bound refusal, or the immutable conflicting command occupying its ID."""
+    expected = _command_identity(root_id, action, body)
+    if expected is None or row is None:
+        return None
+    if row["request_digest"] != expected:
+        # An occupied ID is evidence of conflict only if its own retained
+        # identity authenticates; a damaged digest is not a refusal.
+        return _REFUSALS["conflict"] if _authenticated_command(row) else None
+    if row["root_id"] != root_id:
+        return None
+    response = json.loads(row["response_json"])
+    if (not isinstance(response, dict)
+            or set(response) != {"state", "root_id", "action", "command", "reason", "digest"}
+            or response["state"] != "refused" or response["root_id"] != root_id
+            or response["action"] != action or response["digest"] != expected
+            or canonical_json(response["command"]) != canonical_json(body)
+            or response["reason"] not in _REFUSALS):
+        return None
+    return _REFUSALS[response["reason"]]
+
+
+def remember_refusal(store, root_id, action, body, reason):
+    """Reserve an exactly identified no-effect command before returning its refusal."""
+    expected = _command_identity(root_id, action, body)
+    if expected is None or reason not in _REFUSALS:
+        return None
+    with root_mutex(store, root_id), store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM delivery_pause_commands WHERE command_id=?",
+                         (body["command_id"],)).fetchone()
+        if row is not None:
+            # A concurrent successful replay must remain a success; never replace it.
+            return refusal_from_row(row, root_id, action, body)
+        response = {"state": "refused", "root_id": root_id, "action": action,
+                    "command": body, "reason": reason, "digest": expected}
+        db.execute("INSERT INTO delivery_pause_commands VALUES (?, ?, ?, ?)",
+                   (body["command_id"], root_id, expected, canonical_json(response)))
+        return _REFUSALS[reason]
 
 
 class PauseDeferred(RuntimeError):
@@ -139,7 +249,7 @@ def request_pause(store, root_id, command_id, expected_revision, *, intake_only=
         raise ValueError("running-workflow pause is not supported")
     _nonempty(command_id, "command ID")
     if type(expected_revision) is not int or expected_revision < 0:
-        raise ValueError("invalid control revision")
+        raise PauseRefused("revision")
     request_digest = digest({"action": "pause", "root_id": root_id,
                              "expected_revision": expected_revision})
     with root_mutex(store, root_id), store._connect() as db:
@@ -148,11 +258,19 @@ def request_pause(store, root_id, command_id, expected_revision, *, intake_only=
                            (command_id,)).fetchone()
         if prior is not None:
             if prior["request_digest"] != request_digest:
-                raise ValueError("pause command ID reused with different inputs")
-            return json.loads(prior["response_json"])
+                raise PauseRefused("conflict")
+            if not _authenticated_command(prior):
+                raise ValueError("invalid pause command receipt")
+            response = json.loads(prior["response_json"])
+            if response["state"] == "refused":
+                body = {"command_id": command_id, "expected_revision": expected_revision}
+                if refusal_from_row(prior, root_id, "pause", body) is None:
+                    raise ValueError("invalid pause refusal receipt")
+                raise PauseRefused(response["reason"])
+            return response
         row = _row(db, root_id)
         if row["revision"] != expected_revision or row["state"] != "running":
-            raise ValueError("pause control state or revision changed")
+            raise PauseRefused("pause_state")
         if intake_only:
             run = db.execute("""SELECT r.execution_state,o.state AS outbox_state
                 FROM delivery_runs r JOIN delivery_outbox o USING(run_id)
@@ -164,7 +282,7 @@ def request_pause(store, root_id, command_id, expected_revision, *, intake_only=
                                   "AND step='start' LIMIT 1", (root_id,)).fetchone()
                     or db.execute("SELECT 1 FROM delivery_pause_actors WHERE root_id=? LIMIT 1",
                                   (root_id,)).fetchone()):
-                raise ValueError("intake pause is unavailable after start admission")
+                raise PauseRefused("start_admitted")
         revision, epoch = row["revision"] + 1, row["epoch"] + 1
         db.execute("""UPDATE delivery_pause_control SET state='pause_requested', revision=?,
                       epoch=?, checkpoint_json=NULL, updated_at=? WHERE root_id=?""",
@@ -199,7 +317,7 @@ def begin_resume(store, root_id, command_id, expected_revision, epoch):
     _nonempty(command_id, "command ID")
     _epoch(epoch)
     if type(expected_revision) is not int or expected_revision < 0:
-        raise ValueError("invalid control revision")
+        raise PauseRefused("revision")
     request = {"action": "resume", "root_id": root_id, "expected_revision": expected_revision,
                "epoch": epoch}
     request_digest = digest(request)
@@ -209,17 +327,26 @@ def begin_resume(store, root_id, command_id, expected_revision, epoch):
                            (command_id,)).fetchone()
         if prior is not None:
             if prior["request_digest"] != request_digest:
-                raise ValueError("pause command ID reused with different inputs")
-            return json.loads(prior["response_json"])
+                raise PauseRefused("conflict")
+            if not _authenticated_command(prior):
+                raise ValueError("invalid pause command receipt")
+            response = json.loads(prior["response_json"])
+            if response["state"] == "refused":
+                body = {"command_id": command_id, "expected_revision": expected_revision,
+                        "epoch": epoch}
+                if refusal_from_row(prior, root_id, "resume", body) is None:
+                    raise ValueError("invalid pause refusal receipt")
+                raise PauseRefused(response["reason"])
+            return response
         row = _row(db, root_id)
         if (row["state"] != "paused" or row["revision"] != expected_revision
                 or row["epoch"] != epoch):
-            raise ValueError("resume control state, revision or epoch changed")
+            raise PauseRefused("resume_state")
         checkpoint = json.loads(row["checkpoint_json"])
         if not checkpoint["resumable"]:
-            raise ValueError("checkpoint requires external effect reconciliation before resume")
+            raise PauseRefused("checkpoint")
         if _missing_clock(db, root_id, epoch, finished=False):
-            raise ValueError("pause workflow clock start acknowledgements are pending")
+            raise PauseRefused("clock")
         revision = row["revision"] + 1
         db.execute("""UPDATE delivery_pause_control SET state='resuming', revision=?,
                       updated_at=? WHERE root_id=?""", (revision, _now(), root_id))
@@ -239,6 +366,118 @@ def _missing_clock(db, root_id, epoch, *, finished):
             AND r.execution_run_id=a.execution_run_id
         WHERE a.root_id=? AND s.state IN ('running', 'resume_pending') AND ("""
         + condition + ") LIMIT 1", (epoch, root_id)).fetchone() is not None
+
+
+@contextmanager
+def launch_admission_graph(store, bindings, operation_key, step, *, workflow_id,
+                           execution_run_id, owner_generation, validate_graph, graph_guard=None):
+    """Admit one actual handoff under every authenticated ancestor fence.
+
+    The caller owns actor and graph authentication; this internal interface does
+    not accept a validator from a public request. Locks are retained through the
+    caller's handoff, but the tracking write transaction is committed first.
+    An admitted step cannot be repeated without a separate readback proving the
+    outcome. A denial is recorded before it is returned to the owning workflow.
+    """
+    from contextlib import ExitStack
+
+    if not isinstance(bindings, dict) or not bindings or not callable(validate_graph):
+        raise ValueError("pause graph bindings and validator are required")
+    for value, name in ((operation_key, "operation key"), (step, "step"),
+                        (workflow_id, "workflow ID"), (execution_run_id, "execution run ID")):
+        _nonempty(value, name)
+    if type(owner_generation) is not int or owner_generation < 1:
+        raise ValueError("invalid pause actor generation")
+    for root_id, epoch in bindings.items():
+        _nonempty(root_id, "root ID")
+        _epoch(epoch)
+
+    class Handoff:
+        active = True
+
+        def no_process_started(self):
+            """Withdraw only after the immediate Popen reports a pre-exec failure."""
+            if not self.active:
+                raise ValueError("pause handoff no longer holds its admission locks")
+            with store._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                validate_graph(db, bindings, workflow_id, execution_run_id, owner_generation)
+                for root_id, epoch in sorted(bindings.items()):
+                    row = _row(db, root_id)
+                    actor = db.execute("""SELECT a.execution_run_id,a.owner_generation,s.state
+                        FROM delivery_pause_actors a JOIN delivery_pause_actor_status s
+                        ON s.root_id=a.root_id AND s.workflow_id=a.workflow_id
+                        WHERE a.root_id=? AND a.workflow_id=?""",
+                        (root_id, workflow_id)).fetchone()
+                    if (row["state"] != "running" or row["epoch"] != epoch or actor is None
+                            or actor["state"] != "running"
+                            or actor["execution_run_id"] != execution_run_id
+                            or actor["owner_generation"] != owner_generation):
+                        raise ValueError("pause actor changed before no-launch acknowledgement")
+                    removed = db.execute("""DELETE FROM delivery_pause_steps WHERE root_id=?
+                        AND operation_key=? AND step=? AND epoch=? AND workflow_id=?
+                        AND execution_run_id=? AND owner_generation=?""",
+                        (root_id, operation_key, step, epoch, workflow_id,
+                         execution_run_id, owner_generation)).rowcount
+                    if removed != 1:
+                        raise ValueError("pause handoff no-launch identity changed")
+            self.active = False
+
+    with ExitStack() as stack:
+        for root_id in sorted(bindings):
+            stack.enter_context(root_mutex(store, root_id))
+        if graph_guard is not None:
+            stack.enter_context(graph_guard())
+        denied = None
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            validate_graph(db, bindings, workflow_id, execution_run_id, owner_generation)
+            controls = []
+            for root_id in sorted(bindings):
+                row = _row(db, root_id)
+                actor = db.execute("""SELECT a.execution_run_id,a.owner_generation,s.state
+                    FROM delivery_pause_actors a JOIN delivery_pause_actor_status s
+                    ON s.root_id=a.root_id AND s.workflow_id=a.workflow_id
+                    WHERE a.root_id=? AND a.workflow_id=?""", (root_id, workflow_id)).fetchone()
+                if (actor is None or actor["execution_run_id"] != execution_run_id
+                        or actor["owner_generation"] != owner_generation
+                        or actor["state"] not in {"running", "resume_pending"}):
+                    raise ValueError("pause graph actor changed or completed")
+                controls.append((row, actor["state"]))
+            for row, actor_state in controls:
+                if (row["state"] == "running" and actor_state == "running"
+                        and row["epoch"] == bindings[row["root_id"]]):
+                    continue
+                db.execute("""INSERT OR IGNORE INTO delivery_pause_denials
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row["root_id"], operation_key, step,
+                    row["epoch"], workflow_id, execution_run_id, owner_generation, _now()))
+                existing = db.execute("""SELECT * FROM delivery_pause_denials WHERE root_id=?
+                    AND operation_key=? AND step=? AND epoch=?""",
+                    (row["root_id"], operation_key, step, row["epoch"])).fetchone()
+                if (existing["workflow_id"] != workflow_id
+                        or existing["execution_run_id"] != execution_run_id
+                        or existing["owner_generation"] != owner_generation):
+                    raise ValueError("pause denial belongs to a different actor")
+                if denied is None:
+                    denied = row
+            if denied is None:
+                for row, _actor_state in controls:
+                    old = db.execute("""SELECT 1 FROM delivery_pause_steps WHERE root_id=?
+                        AND operation_key=? AND step=?""",
+                        (row["root_id"], operation_key, step)).fetchone()
+                    if old is not None:
+                        raise ValueError("pause handoff already admitted or outcome unknown")
+                    db.execute("INSERT INTO delivery_pause_steps VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               (row["root_id"], operation_key, step, row["epoch"], workflow_id,
+                                execution_run_id, owner_generation, _now()))
+        if denied is not None:
+            raise PauseDeferred("pause fence closed before handoff", root_id=denied["root_id"],
+                                operation_key=operation_key, step=step, epoch=denied["epoch"])
+        handoff = Handoff()
+        try:
+            yield handoff
+        finally:
+            handoff.active = False
 
 
 @contextmanager

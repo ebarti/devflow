@@ -1,6 +1,7 @@
 """Public controls for the explicitly admitted queued-intake pause."""
 import asyncio
 import json
+import sqlite3
 
 from fastapi import HTTPException, Request
 
@@ -10,7 +11,7 @@ from .delivery_pause_context import intake_enabled
 
 def _admitted(store, root_id):
     if not intake_enabled(store.submitted_spec(root_id)):
-        raise ValueError('pause control scope is not enabled by this service')
+        raise pause.PauseRefused('scope')
 
 
 def status(store, root_id):
@@ -79,8 +80,16 @@ def mount(app, service, mutation, host):
             if not isinstance(body, dict) or set(body) != keys:
                 raise ValueError('invalid pause command body')
             if action == 'resume' and (type(body['epoch']) is not int or body['epoch'] < 1):
-                raise ValueError('invalid pause epoch')
+                raise pause.PauseRefused('epoch')
             return await asyncio.to_thread(apply_command, run_id, action, body)
+        except pause.PauseRefused as exc:
+            try:
+                await asyncio.to_thread(pause.remember_refusal, service.store, run_id,
+                                        action, body, exc.reason)
+            except (ValueError, TypeError, OSError, sqlite3.Error):
+                # A refusal without durable owner evidence remains ambiguous.
+                pass
+            raise HTTPException(409, str(exc)) from exc
         except (ValueError, TypeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 

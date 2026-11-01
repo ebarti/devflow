@@ -28,23 +28,65 @@ from .delivery_writer_custody import writer_method
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, timeout: int = 120) -> str:
+    from .delivery_pause_context import enabled as pause_enabled
+    from .delivery_publication_execution import current_mutation
     from .delivery_publication_execution import inherited_descriptors as publication_descriptors
     from .delivery_writer_custody import inherited_descriptors as writer_descriptors
 
     nul_output = argv[0] == 'git' and '-z' in argv
-    result = subprocess.run(
-        argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False,
-        pass_fds=tuple(dict.fromkeys((*publication_descriptors(), *writer_descriptors()))),
-    )
-    stdout = result.stdout.decode('utf-8', 'surrogateescape') if nul_output else result.stdout
-    stderr = result.stderr.decode('utf-8', 'surrogateescape') if nul_output else result.stderr
-    if result.returncode:
+    pass_fds = tuple(dict.fromkeys((*publication_descriptors(), *writer_descriptors())))
+    mutation = current_mutation()
+    if mutation is None or not pause_enabled(mutation[0].broker.spec):
+        result = subprocess.run(
+            argv, cwd=cwd, text=not nul_output, capture_output=True, timeout=timeout, check=False,
+            pass_fds=pass_fds,
+        )
+        returncode, stdout, stderr = result.returncode, result.stdout, result.stderr
+    else:
+        from .delivery_pause_context import publication_handoff
+
+        owner, step = mutation
+        with publication_handoff(owner, step) as handoff:
+            try:
+                process = subprocess.Popen(argv, cwd=cwd, text=not nul_output,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           pass_fds=pass_fds)
+            except (FileNotFoundError, PermissionError):
+                handoff.no_process_started()
+                raise
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr) from exc
+        except BaseException:
+            process.kill()
+            process.communicate()
+            raise
+        returncode = process.returncode
+    stdout = stdout.decode('utf-8', 'surrogateescape') if nul_output else stdout
+    stderr = stderr.decode('utf-8', 'surrogateescape') if nul_output else stderr
+    if returncode:
         raise RuntimeError(
-            f"command failed ({result.returncode}): {argv[0]} {argv[1]}: "
+            f"command failed ({returncode}): {argv[0]} {argv[1]}: "
             + (stderr.strip() or stdout.strip())[:500]
         )
     # Preserve exact filenames, including CR/LF and leading/trailing whitespace.
     return stdout if nul_output else stdout.strip()
+
+
+def _staged_index_evidence(checkout: Path) -> dict[str, str]:
+    """Observe supported index semantics without mutating or restaging."""
+    from .delivery_checkpoint_index import observe_index
+
+    def query(path, *args):
+        return _git(path, *args).encode("utf-8", "surrogateescape")
+
+    try:
+        return observe_index(checkout, query)
+    except ValueError as exc:
+        raise ValueError("staged publication index semantics are unproven") from exc
 
 
 def _git(path: Path, *args: str) -> str:
@@ -1708,6 +1750,12 @@ class DeliveryBroker:
                 return {"state": "pending", "reason": "original_" + exc.operation + "_readback"}
 
     def _publish_owned(self, iteration, input_candidate, owner):
+        from .delivery_pause_context import enabled as pause_enabled
+
+        pause_stage = pause_enabled(self.spec)
+        if pause_stage:
+            # Unsupported index flags can cause Git to omit reviewed worktree bytes.
+            _staged_index_evidence(self.checkout)
         # Only this invocation's confirmed pre-mutation failure can release uncertainty.
         # Any retained original effect may belong to an earlier lost completion.
         if self.spec.get("publication_readback_version") == 1:
@@ -1767,7 +1815,27 @@ class DeliveryBroker:
                                if path in indexed or os.path.lexists(self.checkout / path))
             # Already-staged removals are absent from both index and worktree;
             # preserve them without passing an unmatched pathspec to git add.
-            if stageable:
+            stage = owner.mutation("stage") if pause_stage else {}
+            if stage.get("state") == "complete":
+                # Path-only diffs ignore untracked files and index flags. Bind every
+                # logical index entry recorded after staging, even for pure deletions.
+                if stage.get("evidence") != _staged_index_evidence(self.checkout):
+                    raise ValueError("staged publication candidate changed during pause")
+                unstaged = set(_git(self.checkout, "diff", "--name-only", "-z").split("\0"))
+                staged = set(_git(
+                    self.checkout, "diff", "--cached", "--name-only", "-z").split("\0"))
+                unstaged.discard("")
+                staged.discard("")
+                if unstaged or staged != set(changed):
+                    raise ValueError("staged publication candidate changed during pause")
+            elif pause_stage:
+                # Even an already-staged deletion needs a recorded index before
+                # the commit fence, and an uncertain earlier stage cannot be replayed.
+                owner.mutate("stage", lambda: _git(
+                    self.checkout, *(['--literal-pathspecs', 'add', '--all', '--', *stageable]
+                                     if stageable else ['ls-files', '--stage', '-z'])),
+                    observe_completion=lambda: _staged_index_evidence(self.checkout))
+            elif stageable:
                 _git(self.checkout, '--literal-pathspecs', 'add', '--all', '--', *stageable)
             if _git(self.checkout, "diff", "--cached", "--name-only"):
                 owner.mutate("commit", lambda: _git(

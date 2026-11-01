@@ -136,6 +136,39 @@ def build_server(config_path: Path) -> FastMCP:
         """Read one indexed, contained evidence artifact for a run."""
         return read_only_client(config_path).evidence(run_id, evidence_id)
 
+    @server.tool(annotations=read)
+    async def get_pause_control(run_id: str) -> dict:
+        """Read current pause scope, eligibility, observed state and blockers.
+
+        Only explicitly admitted before-start runs currently support pause.
+        This read does not start the service or authorize a transition.
+        """
+        return await asyncio.to_thread(read_only_client(config_path).pause_control, run_id)
+
+    @server.tool(annotations=write)
+    async def pause_run(run_id: str, request_json: str) -> dict:
+        """Request an eligible queued pause through a durable operation.
+
+        Supply stable operation_id and command_id values and the expected_revision
+        from pause control. A succeeded result acknowledges pause_requested, not
+        that work is already paused; a pending operation has not yet done so. Keep
+        the complete request stable and inspect the operation after uncertainty.
+        The service must already be running.
+        """
+        return await asyncio.to_thread(
+            read_only_client(config_path).pause, run_id, json.loads(request_json))
+
+    @server.tool(annotations=write)
+    async def resume_run(run_id: str, request_json: str) -> dict:
+        """Explicitly request resume of an eligible queued pause.
+
+        Supply stable operation_id and command_id values and the expected_revision
+        and epoch from pause control. A resuming acknowledgement is not completed activation. Keep
+        the request stable after uncertainty; the service must already run.
+        """
+        return await asyncio.to_thread(
+            read_only_client(config_path).resume, run_id, json.loads(request_json))
+
     @server.tool(annotations=write)
     async def answer_decision(run_id: str, request_json: str) -> dict:
         """Answer a question, review a plan, or authorize the recorded feature merge."""

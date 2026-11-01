@@ -83,6 +83,27 @@ class DeliveryClient:
             "POST", "/api/operations/" + quote(operation_id, safe="") + "/reconcile", {}
         )
 
+    def pause_control(self, run_id: str) -> dict:
+        """Read the persisted pause scope, state and blockers without starting a service."""
+        return self._request("GET", "/api/runs/" + quote(run_id, safe="") + "/pause-control")
+
+    def _pause_operation(self, run_id: str, action: str, payload: dict[str, Any]) -> dict:
+        keys = {"operation_id", "command_id", "expected_revision"}
+        if action == "resume":
+            keys.add("epoch")
+        if not isinstance(payload, dict) or set(payload) != keys:
+            raise ValueError("pause operation requires the exact operation and command fields")
+        return self.create_operation({
+            "operation_id": payload["operation_id"], "run_id": run_id, "kind": action,
+            "request": {key: value for key, value in payload.items() if key != "operation_id"},
+        })
+
+    def pause(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._pause_operation(run_id, "pause", payload)
+
+    def resume(self, run_id: str, payload: dict[str, Any]) -> dict:
+        return self._pause_operation(run_id, "resume", payload)
+
     def submit(self, payload: dict[str, Any]) -> dict:
         return self._request("POST", "/api/runs", payload)
 

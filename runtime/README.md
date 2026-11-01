@@ -276,7 +276,8 @@ operation ID carrying the same domain command and request returns the original
 operation; a conflicting command ID is refused. Observations retain separate
 identities so a fresh preflight can be followed by its distinct acknowledgement.
 
-The service dispatches persisted pending work on restart. A previously running
+The service dispatches persisted pending work on restart, except pending resume
+operations described below. A previously running
 operation is unknown once its exclusive owner is gone; it is not launched
 again. `POST /api/operations/{id}/reconcile` checks supported original domain
 receipts without creating another command. Temporal updates record the exact
@@ -291,6 +292,28 @@ CLI `operation-create --request envelope.json`, `operation --id ID`,
 `operation-reconcile --id ID`, and `run-operations --id RUN` use an already
 running service. The corresponding MCP tools and dashboard operation panel
 expose the same state; none reissues an uncertain effect under a fresh ID.
+
+### Queued pause controls
+
+Pause currently applies only to explicitly admitted, untimed ordinary runs before
+their workflow has started. `GET /api/runs/{id}/pause-control`, CLI
+`pause-control --id RUN`, MCP `get_pause_control`, and the dashboard report the
+same scope, persisted observed state and blockers. A `pause_requested` or
+`pausing` state is not a completed pause. Running workflows, feature children,
+native work and timed runs are not yet supported by this control.
+
+The CLI `pause --id RUN --request FILE` and MCP `pause_run` accept an object
+with caller-chosen stable `operation_id` and `command_id` values and the
+`expected_revision` from pause control. `resume` and `resume_run` additionally
+require its `epoch`; resume is an explicit
+instruction. Both use the durable operation journal and require an already running
+service. A resume operation still pending when the service restarts is held;
+the user must explicitly resubmit the same operation to dispatch it. Preserve
+the complete request after a timeout, inspect the operation and reconcile an
+unknown result before attempting another command. A recovered
+acknowledgement records the original intent; read pause control again for current
+settlement or activation. The direct API and dashboard remain available with the
+same command ID, revision and epoch semantics.
 
 Routine CLI `run --id RUN` and MCP `get_run` read the versioned persisted
 status projection. They do not reconstruct current execution authority. Use
