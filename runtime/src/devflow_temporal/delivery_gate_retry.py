@@ -74,8 +74,11 @@ def transient_stop(state):
 def prepublication_preparation_failed(state):
     """Recognize the controller's exact preparation stop, never a product finding."""
     from .delivery_baseline_contract import preparation_failure
+    from .delivery_readiness_gate_retry import possible as readiness_possible
 
     precheck = state.get('checks', {}).get('prepublish', {})
+    if readiness_possible(state) == 'prepublish' and precheck.get('state') == 'failed':
+        return True  # Selection hint only; snapshot authenticates the receipt.
     prerequisite = preparation_failure(precheck)
     return (precheck.get('state') == 'failed' and prerequisite is not None
             and state.get('error') == f'environment preparation failed: {prerequisite}; '
@@ -547,6 +550,11 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
     from .delivery_prerequisite_gate_recovery import possible as prerequisite_possible
 
     prerequisite_retry = kind == KIND and prerequisite_possible(spec, state)
+    from .delivery_readiness_gate_retry import possible as readiness_possible
+
+    readiness_stage = readiness_possible(state)
+    readiness_retry = bool(readiness_stage and (
+        (unpublished and readiness_stage == 'prepublish') or kind == KIND))
     # A recorded gate verdict stands: a transport or controller stop after it is
     # never a fresh assessment of the same head.
     verdict = gate_failed(state.get('checks') or {})
@@ -587,7 +595,7 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
                    and previous.get('kind') == PREPUBLICATION_KIND
                    and spec.get('gate_retry_generation') == 1)
     history = previous
-    ci_observations = transient_generations = 0
+    ci_observations = transient_generations = readiness_generations = 0
     published_after_recovery = bool(not unpublished and previous and previous.get('kind') in {
         PREPUBLICATION_KIND, 'pending_publication_retry', 'repair_continuation',
         'published_head_validation'})
@@ -595,6 +603,8 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
             'finalized_checkpoint'):
         published_after_recovery = False
     while history:
+        if history.get('seal', {}).get('readiness_observation'):
+            readiness_generations += 1
         if prerequisite_retry and history.get('seal', {}).get('ordinary_prerequisite_observation'):
             raise ValueError('ordinary prerequisite already received its one gate recovery')
         if browser_prelaunch and history.get('kind') == PRELAUNCH_KIND:
@@ -613,7 +623,7 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
     if transient_retry and transient_generations >= TRANSIENT_GATE_RETRIES:
         raise ValueError('this run already received its bounded transient gate retries')
     if ((renewed or published_after_recovery or prelaunch or report_retry or controller_only)
-            and spec['provider'] != 'fake'):
+            and not readiness_retry and spec['provider'] != 'fake'):
         from .delivery_native_preparation import native_identity
         if native_identity(spec)['runtime_payload_sha256'] in _consumed_payloads(
                 spec, state, previous, include_implementation=controller_only):
@@ -672,6 +682,31 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
     browser_artifact_observation = None
     verification_observation = None
     prerequisite_observation = None
+    readiness_observation = None
+    if readiness_retry:
+        from .delivery_readiness_gate_retry import observe
+
+        if state_checks != row_checks:
+            raise ValueError('readiness retry lost its exact original checks')
+        if spec.get('feature_worker'):
+            from .delivery_feature_execution import require_worker_handoff
+
+            require_worker_handoff(store, spec)
+        readiness_observation = observe(spec, state)
+        latest = next((r for r in reversed(roles) if r.get('role') == 'implement'), None)
+        matches = [a for a in attempts if latest and a['role'] == 'implement'
+                   and a['iteration'] == row['iteration']
+                   and a['session_id'] == latest.get('session_id')]
+        from .delivery_stopped_resume import _implementation_receipt
+
+        if (not latest or latest.get('status') != 'pass' or latest.get('findings')
+                or latest.get('cleanup') != 'confirmed' or not latest.get('session_id')
+                or len(matches) != 1 or not _implementation_receipt(spec, latest, matches[0])
+                or any((latest.get('candidate') or {}).get(key) != candidate.get(key)
+                       for key in ('content_sha256', 'base_sha', 'environment_digest',
+                                   'policy_digest'))):
+            raise ValueError('readiness retry lacks its exact passing implementation receipt')
+        failed_gate = True
     if prerequisite_retry:
         from .delivery_prerequisite_gate_recovery import observe
 
@@ -766,46 +801,85 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
         raise ValueError('gate retry requires the existing trusted native execution policy')
     unpublished_error = (state.get('error') if prepublication_preparation_failed(state)
                          else 'prepublication repair limit exhausted')
-    if ((kind == PRELAUNCH_KIND and not prelaunch)
-            or (previous is not None and not (
-                renewed or published_after_recovery or prelaunch
-                or report_retry or ci_only or transient_retry or attribution_retry
-                or verification_retry or browser_artifact_retry or prerequisite_retry))
-            or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
-            or row['execution_state'] != 'blocked'
-            or row['cleanup'] != ('unknown' if prelaunch else 'confirmed')
-            or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
-            or (prelaunch and state.get('cleanup') != 'unknown')
-            or (not prelaunch and state.get('cleanup') != 'confirmed' and reconciled is None)
-            or row['error'] != state.get('error')
-            or (not (transient_retry or transient_ci or masked_exhaustion)
-                and state.get('error') not in ({'repair limit exhausted',
-                                          'required CI did not confirm this PR head'}
-                                        if report_retry
-                                        else {'required CI did not confirm this PR head'
-                                              if ci_only
-                                      else 'browser QA child cleanup is unknown'
-                                      if browser_prelaunch else
-                                      'local check process cleanup is unknown' if prelaunch
-                                      else unpublished_error
-                                      if unpublished else state.get('error')
-                                      if (controller_only or attribution_retry
-                                          or browser_artifact_retry or prerequisite_retry)
-                                      else 'repair limit exhausted'}))
-            or row['protocol_revision'] != state.get('revision')
-            or row['iteration'] != state.get('iteration')
-            or closed['request_digest'] != row['request_digest']
-            or closed['recovery_digest'] != (digest(previous) if previous else None)
-            or not implementation or (implementation.get('status') != 'pass'
-                                      and not (controller_only or attribution_retry
-                                               or browser_artifact_retry
-                                               or layout_report or verification_retry))
-            or not failed_gate
-            or any(a['state'] != 'finished' or a['cleanup'] != 'confirmed' for a in attempts)
-            or any((e['state'] != 'complete' or not e['observed_json'])
-                   and e != (browser_observation or {}).get('pending_effect') for e in effects)
-            or (claim is not None and not prelaunch)):
-        raise ValueError('gate retry requires a closed, finalized failed gate and released claim')
+    # Report the original guard's independent facts through the shared
+    # evaluator. The same snapshot is used for observation and
+    # admission, so neither surface needs to interpret English error strings.
+    from .delivery_lifecycle import lifecycle_from_row, require_observed_predicates
+
+    checkpoint_matches = not (
+        (kind == PRELAUNCH_KIND and not prelaunch)
+        or (previous is not None and not (
+            renewed or published_after_recovery or prelaunch or report_retry or ci_only
+            or transient_retry or attribution_retry or verification_retry
+            or browser_artifact_retry or prerequisite_retry or readiness_retry))
+        or row['phase'] != 'blocked' or row['outcome'] != 'blocked'
+        or row['execution_state'] != 'blocked'
+        or state.get('phase') != 'blocked' or state.get('outcome') != 'blocked'
+        or row['error'] != state.get('error')
+        or row['protocol_revision'] != state.get('revision')
+        or row['iteration'] != state.get('iteration')
+        or closed['request_digest'] != row['request_digest']
+        or closed['recovery_digest'] != (digest(previous) if previous else None))
+    cleanup_matches = (row['cleanup'] == ('unknown' if prelaunch else 'confirmed')
+                       and ((state.get('cleanup') == 'unknown') if prelaunch else
+                            (state.get('cleanup') == 'confirmed' or reconciled is not None)))
+    verdict_matches = (
+        (transient_retry or transient_ci or masked_exhaustion or readiness_retry
+         or state.get('error') in ({'repair limit exhausted',
+                                    'required CI did not confirm this PR head'} if report_retry
+             else {'required CI did not confirm this PR head' if ci_only
+                   else 'browser QA child cleanup is unknown' if browser_prelaunch
+                   else 'local check process cleanup is unknown' if prelaunch
+                   else unpublished_error if unpublished
+                   else state.get('error') if (controller_only or attribution_retry
+                       or browser_artifact_retry or prerequisite_retry)
+                   else 'repair limit exhausted'}))
+        and bool(implementation)
+        and (implementation.get('status') == 'pass' or controller_only or attribution_retry
+             or browser_artifact_retry or layout_report or verification_retry)
+        and failed_gate)
+    frozen_candidate = json.loads(row['candidate_json'] or 'null')
+    candidate_matches = (isinstance(frozen_candidate, dict)
+                         and not any(candidate.get(k) != frozen_candidate.get(k) for k in candidate)
+                         and frozen_candidate == state.get('candidate'))
+    attempts_settled = all(a['state'] == 'finished' and a['cleanup'] == 'confirmed'
+                           for a in attempts)
+    effects_settled = all((e['state'] == 'complete' and bool(e['observed_json']))
+                          or e == (browser_observation or {}).get('pending_effect')
+                          for e in effects)
+    released = claim is None or prelaunch
+    require_observed_predicates(kind, 'delivery_gate_retry', {'row': row, 'closed': closed}, [
+        {'code': 'gate_checkpoint_unproven', 'satisfied': checkpoint_matches,
+         'missing_or_unknown_fact': 'matching stopped run and closed predecessor',
+         'next_action': 'inspect the closed run and its retained recovery history',
+         'user_input_required': None},
+        {'code': 'gate_cleanup_unconfirmed', 'satisfied': True if cleanup_matches else None,
+         'missing_or_unknown_fact': 'confirmed cleanup or authenticated later reconciliation',
+         'next_action': 'reconcile the original cleanup and custody',
+         'user_input_required': None},
+        {'code': 'gate_candidate_changed', 'satisfied': candidate_matches,
+         'missing_or_unknown_fact': 'unchanged candidate matching the closed checkpoint',
+         'next_action': 'inspect the retained candidate and obtain fresh owner proof',
+         'user_input_required': None},
+        {'code': 'failed_gate_unproven', 'satisfied': verdict_matches,
+         'missing_or_unknown_fact': 'failed gate and its original implementation verdict',
+         'next_action': 'inspect the retained gate and implementation evidence',
+         'user_input_required': None},
+        {'code': 'gate_attempts_unsettled', 'satisfied': True if attempts_settled else None,
+         'missing_or_unknown_fact': 'finished attempts and confirmed cleanup',
+         'next_action': 'reconcile the original attempt custody',
+         'user_input_required': None},
+        {'code': 'gate_effects_unsettled', 'satisfied': True if effects_settled else None,
+         'missing_or_unknown_fact': 'settled effects with observed outcomes',
+         'next_action': 'reconcile the original effects', 'user_input_required': None},
+        {'code': 'gate_owner_conflict', 'satisfied': released,
+         'missing_or_unknown_fact': 'released work claim or allowed prelaunch custody',
+         'next_action': 'inspect and reconcile the current work owner',
+         'user_input_required': None},
+    ], lifecycle=lifecycle_from_row(row), owner_proof=(
+        True if (checkpoint_matches and cleanup_matches and candidate_matches
+                 and attempts_settled and effects_settled and released) else None),
+        legacy_message='gate retry requires a closed, finalized failed gate and released claim')
     frozen = json.loads(row['candidate_json'])
     publication = json.loads(row['pr_json'] or 'null')
     remote = _git(broker.source, 'ls-remote', 'origin', 'refs/heads/' + spec['branch'])
@@ -822,14 +896,32 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
         and remote and remote.split()[0] == candidate['head']
         and not _git(broker.checkout, 'status', '--porcelain', '--untracked-files=no')
     )
-    if (any(candidate.get(k) != frozen.get(k) for k in candidate)
-            or frozen != state.get('candidate') or not publication_matches
-            or _git(broker.checkout, 'branch', '--show-current')
-            != (spec.get('local_branch', spec['branch']) if unpublished else spec['branch'])
-            or _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') != spec['origin_url']
-            or _git(broker.source, 'remote', 'get-url', 'origin') != spec['origin_url']
-            or outside_scope(spec['policy'], broker._changed_paths(), checkout=broker.checkout)):
-        raise ValueError('gate retry lost unchanged owned source or exact published PR head')
+    candidate_unchanged = (not any(candidate.get(k) != frozen.get(k) for k in candidate)
+                           and frozen == state.get('candidate'))
+    repository_unchanged = (
+        _git(broker.checkout, 'branch', '--show-current')
+        == (spec.get('local_branch', spec['branch']) if unpublished else spec['branch'])
+        and _git(broker.checkout, 'remote', 'get-url', '--push', 'origin') == spec['origin_url']
+        and _git(broker.source, 'remote', 'get-url', 'origin') == spec['origin_url']
+        and not outside_scope(spec['policy'], broker._changed_paths(), checkout=broker.checkout))
+    require_observed_predicates(kind, 'delivery_gate_retry', {
+        'row': row, 'closed': closed, 'candidate': candidate, 'publication': publication,
+    }, [
+        {'code': 'gate_candidate_changed', 'satisfied': candidate_unchanged,
+         'missing_or_unknown_fact': 'unchanged candidate matching the closed checkpoint',
+         'next_action': 'inspect the retained candidate and obtain fresh owner proof',
+         'user_input_required': None},
+        {'code': 'gate_publication_unconfirmed', 'satisfied': bool(publication_matches),
+         'missing_or_unknown_fact': 'exact unpublished or published branch and PR identity',
+         'next_action': 'reconcile the original publication and branch',
+         'user_input_required': None},
+        {'code': 'gate_repository_authority_changed', 'satisfied': repository_unchanged,
+         'missing_or_unknown_fact': 'original branch, destination and authorized source scope',
+         'next_action': 'inspect the retained repository authority and changed paths',
+         'user_input_required': None},
+    ], lifecycle=lifecycle_from_row(row), owner_proof=(
+        True if candidate_unchanged and publication_matches and repository_unchanged else None),
+        legacy_message='gate retry lost unchanged owned source or exact published PR head')
     load_execution_config(spec)
     with store._connect() as db:
         binding = work_binding(store, spec, db)
@@ -842,7 +934,8 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
             ancestor = ancestor.get('original_recovery')
         if admitted and (not (renewed or published_after_recovery or prelaunch
                              or report_retry or ci_only or transient_retry or attribution_retry
-                             or verification_retry or browser_artifact_retry or prerequisite_retry)
+                             or verification_retry or browser_artifact_retry or prerequisite_retry
+                             or readiness_retry)
                          or (digest(prior_gate) != attribution_observation['prior_gate_digest']
                              if attribution_retry else prior_gate != ancestor)):
             raise ValueError('this run already received its bounded gate assessment retry')
@@ -854,21 +947,66 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
             store, spec, previous, candidate, publication, _inventory_profile)
     elif _inventory_profile is not None:
         raise ValueError('inventory physical custody belongs only to zero-model CI')
+    cleanup = (prerequisite_observation['resources'] if prerequisite_retry
+               else verification_observation['resources'] if verification_retry
+               else report_observation['resources'] if layout_report
+               else historical_teardown or prelaunch_observation or (
+                   _stopped_cleanup(spec, read_only=True) if _observation
+                   else _stopped_cleanup(spec)))
+    readiness_backoff = None
+    if readiness_retry:
+        from .delivery_lifecycle import require_transition
+        from .delivery_readiness_gate_retry import RETRY_LIMIT, retry_backoff
+
+        remaining = readiness_generations < RETRY_LIMIT
+        backoff_elapsed = None
+        if remaining:
+            readiness_backoff, backoff_elapsed = retry_backoff(
+                closed.get('closed_at'), readiness_generations + 1)
+        clock_known = not remaining or backoff_elapsed is not None
+
+        # An observed native monitor does not prove its complete descendant set.
+        # The fake fixture has no native actor; real execution needs a separate
+        # settlement contract before this newly introduced route can launch work.
+        require_transition({
+            'operation': kind, 'owner': 'delivery_gate_retry', 'owner_proof': True,
+            'normalized_lifecycle': 'stopped',
+            'proof_digest': digest({'row': _sealed_row(row), 'cleanup': cleanup,
+                                    'readiness': readiness_observation,
+                                    'readiness_backoff': readiness_backoff,
+                                    'prior_readiness_retries': readiness_generations}),
+            'comparisons': [], 'predicates': [
+                {'code': 'native_descendant_settlement_unknown',
+                 'satisfied': True if spec['provider'] == 'fake' else None,
+                 'missing_or_unknown_fact': 'complete native descendant settlement',
+                 'next_action': 'obtain authenticated native descendant settlement'},
+                {'code': 'readiness_retry_limit_exhausted',
+                 'satisfied': remaining,
+                 'missing_or_unknown_fact': 'remaining infrastructure retry allowance',
+                 'next_action': 'inspect retained failures and reconcile the environment'},
+                {'code': 'readiness_retry_clock_unknown',
+                 'satisfied': True if clock_known else None,
+                 'missing_or_unknown_fact': 'authenticated predecessor close time',
+                 'next_action': 'inspect the retained workflow closure'},
+                {'code': 'readiness_retry_backoff',
+                 'satisfied': backoff_elapsed if remaining and clock_known else True,
+                 'missing_or_unknown_fact': 'elapsed infrastructure retry backoff',
+                 'next_action': ('retry after ' + readiness_backoff['retry_not_before']
+                                 if remaining and clock_known else 'inspect the retry allowance')},
+            ],
+        }, {})
     result = {'row': _sealed_row(row), 'closed': closed, 'original_spec': spec,
             'attempts': attempts,
             'effects': effects, 'candidate': candidate, 'publication': publication,
-            'cleanup': (prerequisite_observation['resources'] if prerequisite_retry
-                        else verification_observation['resources'] if verification_retry
-                        else report_observation['resources'] if layout_report
-                        else historical_teardown or prelaunch_observation or (
-                            _stopped_cleanup(spec, read_only=True) if _observation
-                            else _stopped_cleanup(spec))),
+            'cleanup': cleanup,
             'work_binding': binding,
             'previous_digest': digest(previous) if previous else None,
             'prior_gate_digest': digest(prior_gate) if prior_gate else None,
             **({'local_download_retry': True} if local_download_retry else {}),
             **({'ordinary_prerequisite_observation': prerequisite_observation}
                if prerequisite_observation else {}),
+            **({'readiness_observation': readiness_observation} if readiness_observation else {}),
+            **({'readiness_backoff': readiness_backoff} if readiness_backoff else {}),
             **({'report_observation': report_observation} if report_observation else {}),
             **({'verification_observation': verification_observation}
                if verification_observation else {}),
@@ -881,13 +1019,14 @@ def snapshot(store, run_id, kind=KIND, *, _inventory_profile=None, _observation=
                if attribution_retry or layout_report or verification_retry else {}),
             **({'browser_prelaunch_observation': browser_observation}
                if browser_observation else {}),
-            'stage': 'prerequisite' if prerequisite_retry
+            'stage': 'readiness' if readiness_retry else 'prerequisite' if prerequisite_retry
                      else 'transient' if transient_retry or verification_retry
                      else 'report' if report_retry
                      else 'ci' if ci_only else 'published'
                      if published_after_recovery or prelaunch or controller_only
                      or attribution_retry or browser_artifact_retry else None,
-            'generation': (transient_generations + 1 if transient_retry
+            'generation': (readiness_generations + 1 if readiness_retry
+                           else transient_generations + 1 if transient_retry
                            else ci_observations + 1 if ci_only
                            else (2 if previous else 1)
                            if attribution_retry or browser_artifact_retry
@@ -932,14 +1071,22 @@ def admit(store, run_id, payload, *, preflight=False):
         raise ValueError('gate retry requires an exact zero-repair request')
     command_digest = digest({'run_id': run_id, **payload})
     with store._connect() as db:
+        db.execute('BEGIN')
         prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                            (payload['command_id'],)).fetchone()
-    if prior:
-        if prior['request_digest'] != command_digest:
-            raise ValueError('command ID already belongs to different inputs')
-        return json.loads(prior['response_json'])
+        if prior:
+            from .delivery_lifecycle import command_receipt
+
+            assessment = command_receipt(kind, prior, run_id, command_digest,
+                                         request=payload, db=db)
+            if preflight:
+                return {**json.loads(prior['response_json']), 'preflight': True,
+                        'lifecycle_assessment': assessment}
+            return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, kind, _observation=preflight)
     previous = _retained_recovery(store, run_id, seal)
+    if seal.get('readiness_observation') and 'verification_test_paths' in payload:
+        raise ValueError('readiness retry must retain the original frozen test selectors')
     if 'verification_test_paths' in payload:
         from .delivery_plan_checks import planned_checks
 
@@ -974,7 +1121,7 @@ def admit(store, run_id, payload, *, preflight=False):
     ordering = (seal.get('browser_artifact_observation') or {}).get(
         'cause') == 'browser_artifact_assessment_order'
     if (preflight_generation or seal.get('preparation_observation')
-            or layout or verification or ordering) \
+            or seal.get('readiness_observation') or layout or verification or ordering) \
             and spec.get('feature_worker'):
         from .delivery_feature_execution import require_worker_handoff
 
@@ -983,12 +1130,14 @@ def admit(store, run_id, payload, *, preflight=False):
         generation, seal['stage'], preflight_generation=preflight_generation)
     with _lock(root / 'controller.lock'):
         with store._connect() as db:
+            db.execute('BEGIN')
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                                (payload['command_id'],)).fetchone()
-        if prior:
-            if prior['request_digest'] != command_digest:
-                raise ValueError('command ID already belongs to different inputs')
-            return json.loads(prior['response_json'])
+            if prior:
+                from .delivery_lifecycle import command_receipt
+
+                command_receipt(kind, prior, run_id, command_digest, request=payload, db=db)
+                return json.loads(prior['response_json'])
         prepared = None
         if preflight_generation == 1:
             from .delivery_gate_preflight_continuation import prepared_handoff
@@ -1022,7 +1171,8 @@ def admit(store, run_id, payload, *, preflight=False):
         execution['implementation_role_home_generation'] = implementation_generation(
             spec, previous)
         execution['role_home_generation'] = (
-            f'report-retry-{generation}' if seal['stage'] == 'report'
+            f'readiness-retry-{generation}' if seal['stage'] == 'readiness'
+            else f'report-retry-{generation}' if seal['stage'] == 'report'
             else f'transient-gate-retry-{generation}' if seal['stage'] == 'transient'
             else f'gate-retry-{generation}')
         execution['gate_retry_generation'] = generation
@@ -1071,7 +1221,9 @@ def admit(store, run_id, payload, *, preflight=False):
                                     else {**seal['publication'], 'candidate': after})}
         _immutable(root / 'admission.json', recovery)
         preserve_resources(root, spec)
-        workflow_id = (f'delivery-{run_id}-ci-retry-{generation}' if kind == CI_KIND else
+        workflow_id = (f'delivery-{run_id}-readiness-gates-retry-{generation}'
+                       if seal['stage'] == 'readiness' else
+                       f'delivery-{run_id}-ci-retry-{generation}' if kind == CI_KIND else
                        f'delivery-{run_id}-report-gates-retry-{generation}'
                        if seal['stage'] == 'report' else
                        f'delivery-{run_id}-transient-gates-retry-{generation}'
@@ -1093,19 +1245,19 @@ def admit(store, run_id, payload, *, preflight=False):
             if canonical_json(_sealed_row(row)) != canonical_json(seal['row']):
                 raise ValueError('gate retry admission lost its stopped projection')
             if (verification or ordering or seal.get('ordinary_prerequisite_observation')
-                    or seal.get('ordinary_ci_inventory')):
+                    or seal.get('ordinary_ci_inventory') or seal.get('readiness_observation')):
                 if store.state.claim_for(db, spec['work_id']) is not None:
-                    raise ValueError('listener verification admission lost its released claim')
+                    raise ValueError('gate retry admission lost its released claim')
                 for table, key, expected in [('delivery_attempts', 'job_key', seal['attempts']),
                                              ('delivery_effects', 'effect_key', seal['effects'])]:
                     records = [dict(item) for item in db.execute(
                         f'SELECT * FROM {table} WHERE run_id=? ORDER BY {key}', (run_id,))]
                     if records != expected:
-                        raise ValueError('listener verification admission lost its full ledger')
+                        raise ValueError('gate retry admission lost its full ledger')
             if work_binding(store, spec, db) != seal['work_binding']:
                 raise ValueError('gate retry admission lost issue ownership')
             if ((preflight_generation or seal.get('preparation_observation')
-                 or layout or verification or ordering)
+                 or seal.get('readiness_observation') or layout or verification or ordering)
                     and spec.get('feature_worker')):
                 require_worker_handoff(store, spec)
             if preparation_owner is not None:
@@ -1171,6 +1323,8 @@ def gate_namespace(generation, stage=None, *, preflight_generation=0, prepared_h
         suffix = f'-{preflight_generation}' if preflight_generation > 1 else ''
         return gate_namespace(generation, stage) + '/preflight-continuation' + suffix
     if stage is not None:
+        if stage == 'readiness' and type(generation) is int and generation in (1, 2):
+            return f'readiness-gates-admission-{generation}'
         if stage == 'prerequisite' and type(generation) is int and generation == 1:
             return 'ordinary-prerequisite-gates-admission'
         if stage == 'preparation' and type(generation) is int and generation in (1, 2):
@@ -1226,6 +1380,17 @@ def readback(store, spec, recovery, *, resource_spec=None):
               if resource_spec is not None else DeliveryBroker(store, spec))
     if effective != spec or broker.candidate() != recovery['candidate']:
         raise ValueError('gate retry source or execution authority changed')
+    if expected := recovery['seal'].get('readiness_observation'):
+        from .delivery_readiness_gate_retry import observe
+
+        seal = recovery['seal']
+        _, attempts, effects, claim = _rows(store, spec['run_id'])
+        closed = store._completed_temporal_result(
+            spec['run_id'], workflow_id=seal['closed']['workflow_id'])
+        if (closed != seal['closed'] or attempts != seal['attempts'] or effects != seal['effects']
+                or claim is None or claim['owner'] != f"external:devflow:{spec['run_id']}"
+                or observe(seal['original_spec'], recovery['state']) != expected):
+            raise ValueError('readiness retry original evidence or ledger changed')
     if recovery['seal'].get('ordinary_ci_inventory'):
         from .delivery_ci_inventory import validate
 
