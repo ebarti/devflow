@@ -31,6 +31,8 @@ def test_scope_stale_request_never_mutates(service, monkeypatch, field, value):
 
 @pytest.mark.asyncio
 async def test_default_repair_public_assessment_and_admission_agree(service, monkeypatch):
+    import json
+
     import httpx
     from test_delivery_store import _failed_published_repair_fixture
 
@@ -164,15 +166,33 @@ async def test_default_repair_public_assessment_and_admission_agree(service, mon
                               (command['command_id'],)).fetchone()[0] == 1
             assert not db.execute('SELECT 1 FROM delivery_commands WHERE command_id=?',
                                   (another['command_id'],)).fetchone()
+            saved = db.execute('SELECT response_json FROM delivery_commands WHERE command_id=?',
+                               (command['command_id'],)).fetchone()[0]
+        receipt = accepted.json()
+        corruptions = [
+            {},
+            {**receipt, 'workflow_id': 'unrelated-workflow'},
+            {key: receipt[key] for key in ('run_id', 'phase', 'workflow_id')},
+            {**receipt, 'authorized_through_iteration':
+             receipt['authorized_through_iteration'] + 1},
+        ]
+        for corrupt in corruptions:
+            with store._connect() as db:
+                db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                           (json.dumps(corrupt), command['command_id']))
+            corrupt_preview = await client.post(base + 'assess-transition', json={
+                'kind': 'repair_continuation', 'request': command})
+            corrupt_admission = await client.post(base + 'continue-repair', json=command,
+                                                  headers=headers)
+            assert corrupt_admission.status_code == 409
+            assert corrupt_admission.json()['detail'] == corrupt_preview.json()
+            assert 'command_receipt_unknown' in {
+                b['code'] for b in corrupt_preview.json()['blockers']}
+        with store._connect() as db:
             db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
-                       ('{}', command['command_id']))
-        corrupt_preview = await client.post(base + 'assess-transition', json={
-            'kind': 'repair_continuation', 'request': command})
-        corrupt_admission = await client.post(base + 'continue-repair', json=command,
-                                              headers=headers)
-        assert corrupt_admission.status_code == 409
-        assert corrupt_admission.json()['detail'] == corrupt_preview.json()
-        assert 'command_receipt_unknown' in {b['code'] for b in corrupt_preview.json()['blockers']}
+                       (saved, command['command_id']))
+        assert (await client.post(base + 'continue-repair', json=command,
+                                  headers=headers)).json() == receipt
 
 
 @pytest.mark.asyncio

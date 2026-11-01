@@ -1987,12 +1987,14 @@ class DeliveryStore:
             raise ValueError("invalid repair continuation identity or grant")
         command_digest = digest({"run_id": run_id, **supplied})
         with self._connect() as db:
+            db.execute("BEGIN")
             prior = db.execute(
                 "SELECT run_id,request_digest,response_json FROM delivery_commands "
                 "WHERE command_id=?", (command_id,),
             ).fetchone()
             if prior:
-                receipt = command_receipt('repair_continuation', prior, run_id, command_digest)
+                receipt = command_receipt('repair_continuation', prior, run_id, command_digest,
+                                          request=supplied, db=db)
                 if preflight:
                     return {**json.loads(prior["response_json"]), "preflight": True,
                             "lifecycle_assessment": receipt}
@@ -2291,7 +2293,8 @@ class DeliveryStore:
                 "WHERE command_id=?", (command_id,),
             ).fetchone()
             if prior:
-                command_receipt('repair_continuation', prior, run_id, command_digest)
+                command_receipt('repair_continuation', prior, run_id, command_digest,
+                                request=supplied, db=db)
                 return json.loads(prior["response_json"])
             current = observe_admission(db)
             if stopped_claim:

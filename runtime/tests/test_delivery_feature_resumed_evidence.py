@@ -235,10 +235,17 @@ def test_stale_older_resume_link_blocks_only_implementations_that_ran_under_it(
     with store._connect() as db:
         older = json.loads(db.execute("SELECT recovery_json FROM delivery_runs WHERE run_id=?",
                                       (child["run_id"],)).fetchone()[0])
+        first_receipt = json.loads(db.execute(
+            "SELECT response_json FROM delivery_commands WHERE command_id=?",
+            (older["command"]["command_id"],)).fetchone()[0])
     # The resumed execution is cancelled again; a second admission chains onto the first.
     cancelled(store, monkeypatch, parent, child, role, output, workflow_id=first["workflow_id"],
               execution="closed-resume", recovery_digest=digest(older), revision=9, finish=False)
     second = activities.resume_worker(store, parent, child, row)
+    # The first command still identifies its original admission after the later resume.
+    preview = original_admit(store, child["run_id"], older["command"], preflight=True)
+    assert preview["lifecycle_assessment"]["disposition"] == "already_admitted"
+    assert original_admit(store, child["run_id"], older["command"]) == first_receipt
     specs = {"current": second["spec"], "middle": first["spec"], "oldest": child}
     assert len({digest(value) for value in specs.values()}) == 3
     if ran_under != "oldest":

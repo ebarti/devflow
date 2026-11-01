@@ -989,16 +989,18 @@ def admit(store, run_id, payload, *, preflight=False):
         raise ValueError('gate retry requires an exact zero-repair request')
     command_digest = digest({'run_id': run_id, **payload})
     with store._connect() as db:
+        db.execute('BEGIN')
         prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                            (payload['command_id'],)).fetchone()
-    if prior:
-        from .delivery_lifecycle import command_receipt
+        if prior:
+            from .delivery_lifecycle import command_receipt
 
-        assessment = command_receipt(kind, prior, run_id, command_digest)
-        if preflight:
-            return {**json.loads(prior['response_json']), 'preflight': True,
-                    'lifecycle_assessment': assessment}
-        return json.loads(prior['response_json'])
+            assessment = command_receipt(kind, prior, run_id, command_digest,
+                                         request=payload, db=db)
+            if preflight:
+                return {**json.loads(prior['response_json']), 'preflight': True,
+                        'lifecycle_assessment': assessment}
+            return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, kind, _observation=preflight)
     previous = _retained_recovery(store, run_id, seal)
     if 'verification_test_paths' in payload:
@@ -1044,13 +1046,14 @@ def admit(store, run_id, payload, *, preflight=False):
         generation, seal['stage'], preflight_generation=preflight_generation)
     with _lock(root / 'controller.lock'):
         with store._connect() as db:
+            db.execute('BEGIN')
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                                (payload['command_id'],)).fetchone()
-        if prior:
-            from .delivery_lifecycle import command_receipt
+            if prior:
+                from .delivery_lifecycle import command_receipt
 
-            command_receipt(kind, prior, run_id, command_digest)
-            return json.loads(prior['response_json'])
+                command_receipt(kind, prior, run_id, command_digest, request=payload, db=db)
+                return json.loads(prior['response_json'])
         prepared = None
         if preflight_generation == 1:
             from .delivery_gate_preflight_continuation import prepared_handoff

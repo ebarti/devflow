@@ -122,6 +122,16 @@ async def test_public_pending_assessment_agrees_with_admission(pending):
         assert accepted.status_code == 200 and not accepted.json()['implementation_authority']
         replay = await client.post(path + 'recover-publication', json=request, headers=headers)
         assert replay.status_code == 200 and replay.json() == accepted.json()
+        # The prior gate retry remains readable after publication starts a new workflow.
+        with store._connect() as db:
+            prior_gate = json.loads(db.execute(
+                'SELECT recovery_json FROM delivery_gate_admissions WHERE run_id=?',
+                ('run-1',)).fetchone()[0])['command']
+            prior_gate_response = json.loads(db.execute(
+                'SELECT response_json FROM delivery_commands WHERE command_id=?',
+                (prior_gate['command_id'],)).fetchone()[0])
+        historical = await client.post(path + 'continue-repair', json=prior_gate, headers=headers)
+        assert historical.status_code == 200 and historical.json() == prior_gate_response
         replay_preview = await client.post(path + 'assess-transition', json={
             'kind': 'recover_publication', 'request': request})
         conflict = {**request, 'expected_revision': request['expected_revision'] + 1}
@@ -138,12 +148,25 @@ async def test_public_pending_assessment_agrees_with_admission(pending):
         with store._connect() as db:
             assert db.execute('SELECT count(*) FROM delivery_commands WHERE command_id=?',
                               (request['command_id'],)).fetchone()[0] == 1
+            saved = db.execute('SELECT response_json FROM delivery_commands WHERE command_id=?',
+                               (request['command_id'],)).fetchone()[0]
+        receipt = accepted.json()
+        for corrupt in ({}, {**receipt, 'workflow_id': 'unrelated-workflow'},
+                        {key: receipt[key] for key in ('run_id', 'phase', 'workflow_id')},
+                        {**receipt, 'implementation_authority': True}):
+            with store._connect() as db:
+                db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                           (json.dumps(corrupt), request['command_id']))
+            corrupt_preview = await client.post(path + 'assess-transition', json={
+                'kind': 'recover_publication', 'request': request})
+            corrupt_admission = await client.post(path + 'recover-publication', json=request,
+                                                  headers=headers)
+            assert corrupt_admission.status_code == 409
+            assert corrupt_admission.json()['detail'] == corrupt_preview.json()
+            assert 'command_receipt_unknown' in {
+                b['code'] for b in corrupt_preview.json()['blockers']}
+        with store._connect() as db:
             db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
-                       ('{}', request['command_id']))
-        corrupt_preview = await client.post(path + 'assess-transition', json={
-            'kind': 'recover_publication', 'request': request})
-        corrupt_admission = await client.post(path + 'recover-publication', json=request,
-                                              headers=headers)
-        assert corrupt_admission.status_code == 409
-        assert corrupt_admission.json()['detail'] == corrupt_preview.json()
-        assert 'command_receipt_unknown' in {b['code'] for b in corrupt_preview.json()['blockers']}
+                       (saved, request['command_id']))
+        assert (await client.post(path + 'recover-publication', json=request,
+                                  headers=headers)).json() == receipt

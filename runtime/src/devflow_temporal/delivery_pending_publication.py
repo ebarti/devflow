@@ -271,14 +271,16 @@ def admit(store, run_id, payload, *, preflight=False):
 
     command_digest = digest({'run_id': run_id, **payload})
     with store._connect() as db:
+        db.execute('BEGIN')
         prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                            (payload['command_id'],)).fetchone()
-    if prior:
-        assessment = command_receipt('recover_publication', prior, run_id, command_digest)
-        if preflight:
-            return {**json.loads(prior['response_json']), 'preflight': True,
-                    'lifecycle_assessment': assessment}
-        return json.loads(prior['response_json'])
+        if prior:
+            assessment = command_receipt('recover_publication', prior, run_id, command_digest,
+                                         request=payload, db=db)
+            if preflight:
+                return {**json.loads(prior['response_json']), 'preflight': True,
+                        'lifecycle_assessment': assessment}
+            return json.loads(prior['response_json'])
     seal = snapshot(store, run_id, observation=preflight)
     previous = _retained_recovery(store, run_id, seal)
 
@@ -300,11 +302,13 @@ def admit(store, run_id, payload, *, preflight=False):
     root = Path(spec['state_dir']) / namespace
     with _lock(root / 'controller.lock'):
         with store._connect() as db:
+            db.execute('BEGIN')
             prior = db.execute('SELECT * FROM delivery_commands WHERE command_id=?',
                                (payload['command_id'],)).fetchone()
-        if prior:
-            command_receipt('recover_publication', prior, run_id, command_digest)
-            return json.loads(prior['response_json'])
+            if prior:
+                command_receipt('recover_publication', prior, run_id, command_digest,
+                                request=payload, db=db)
+                return json.loads(prior['response_json'])
         execution = prepare_runtime(spec, root, command_digest, digest(seal))
         require_same_proof('recover_publication', 'pending_publication',
                            digest(snapshot(store, run_id)), digest(seal))

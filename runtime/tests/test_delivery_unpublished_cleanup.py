@@ -225,14 +225,21 @@ async def test_public_unpublished_cleanup_then_existing_finite_continuation(clos
         with store._connect() as db:
             saved = db.execute('SELECT response_json FROM delivery_commands WHERE command_id=?',
                                (command['command_id'],)).fetchone()[0]
-            db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
-                       ('{}', command['command_id']))
-        corrupt = await client.post('/api/runs/run-1/assess-transition', json={
-            'kind': resume.KIND, 'request': command})
-        rejected = await client.post('/api/runs/run-1/continue-repair', json=command,
-                                     headers=headers)
-        assert 'command_receipt_unknown' in {b['code'] for b in corrupt.json()['blockers']}
-        assert rejected.status_code == 409 and rejected.json()['detail'] == corrupt.json()
+        receipt = response.json()
+        for damaged in ({}, {**receipt, 'workflow_id': 'unrelated-workflow'},
+                        {key: receipt[key] for key in ('run_id', 'phase', 'workflow_id')},
+                        {**receipt, 'authorized_through_iteration':
+                         receipt['authorized_through_iteration'] + 1},
+                        {**receipt, 'admission_sha256': 'invalid'}):
+            with store._connect() as db:
+                db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
+                           (json.dumps(damaged), command['command_id']))
+            corrupt = await client.post('/api/runs/run-1/assess-transition', json={
+                'kind': resume.KIND, 'request': command})
+            rejected = await client.post('/api/runs/run-1/continue-repair', json=command,
+                                         headers=headers)
+            assert 'command_receipt_unknown' in {b['code'] for b in corrupt.json()['blockers']}
+            assert rejected.status_code == 409 and rejected.json()['detail'] == corrupt.json()
         with store._connect() as db:
             db.execute('UPDATE delivery_commands SET response_json=? WHERE command_id=?',
                        (saved, command['command_id']))
