@@ -69,12 +69,30 @@ def test_unused_resume_keeps_the_original_failed_session_and_partial_source(fixe
 
 
 @pytest.mark.parametrize('iterations', [2, 3])
-def test_fixed_resume_cannot_extend_the_ceiling_or_prepare_runtime(fixed_stop, monkeypatch,
-                                                                 iterations):
+@pytest.mark.asyncio
+async def test_fixed_resume_cannot_extend_the_ceiling_or_prepare_runtime(fixed_stop, monkeypatch,
+                                                                       iterations):
     store, _, _, command = fixed_stop
     def unexpected(*_args, **_kwargs):
         pytest.fail('a budget extension reached runtime preparation')
     monkeypatch.setattr(resume, 'prepare_runtime', unexpected)
+    import httpx
+
+    from devflow_temporal.delivery_api import create_app
+
+    app = create_app(store.config.path)
+    app.state.delivery.store = store
+    host = store.config.dashboard_url
+    exhausted = {**command, 'additional_iterations': iterations}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=host) as client:
+        token = (await client.get('/api/session')).json()['csrf_token']
+        preview = await client.post('/api/runs/run-1/assess-transition', json={
+            'kind': resume.KIND, 'request': exhausted})
+        response = await client.post('/api/runs/run-1/continue-repair', json=exhausted,
+                                     headers={'Origin': host, 'X-Devflow-CSRF': token})
+        assert preview.status_code == 200 and not preview.json()['eligible']
+        assert preview.json()['blockers'][0]['code'] == 'product_budget_exhausted'
+        assert response.status_code == 409 and response.json()['detail'] == preview.json()
     with pytest.raises(ValueError, match='fixed repair budget'):
         store.continue_repair('run-1', {**command, 'additional_iterations': iterations})
     with store._connect() as db:
