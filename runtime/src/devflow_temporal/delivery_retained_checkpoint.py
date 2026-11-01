@@ -287,15 +287,18 @@ def _verify_recorded_source(spec, value, checkpoint_root, resources):
             "branch": branch, "head": head, "index_tree": value["source"]["index_tree"]}
 
 
-def verify_retained_state(spec, value, checkpoint_root):
-    """Verify every declared evidence/session byte and authenticated absence."""
+def verify_retained_state(spec, value, checkpoint_root, *, allow_missing=False):
+    """Verify state targets; missing files can be restored when explicitly allowed."""
     for relative, item in value["state_refs"].items():
         target = _path(Path(spec["state_dir"]), relative)
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            if item.get("kind") == "absent" or allow_missing:
+                continue
+            raise
         if item.get("kind") == "absent":
-            if os.path.lexists(target):
-                raise ValueError("retained checkpoint no-GO absence changed: " + relative)
-            continue
-        info = target.lstat()
+            raise ValueError("retained checkpoint no-GO absence changed: " + relative)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise ValueError("retained checkpoint evidence is not an owned file: " + relative)
         raw = target.read_bytes()

@@ -97,8 +97,9 @@ Readback preserves the original `acknowledged_resumable` value as history. Its
 current `resumable` observation also compares the admitted authority, run and
 cumulative budget, issue owner, independent Git owner and candidate branch,
 original resource manifest, and the current writer witness. If the checkout is
-still present, it compares its retained source and index under that witness;
-an absent checkout can still be restored from the sealed artifacts. Changed or
+still present, it compares its retained source and index under that witness.
+Existing evidence and session files must match their sealed state; missing files
+and an absent checkout can still be restored from the sealed artifacts. Changed or
 unavailable proof appears in `resume_blockers`. This is a read-only observation,
 not a reservation or permission to resume: restoration must reacquire custody
 and repeat its own admission checks.

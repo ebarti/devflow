@@ -1494,6 +1494,7 @@ def read_checkpoint(store, run_id, checkpoint_id):
                 if blocker not in blockers:
                     blockers.append(blocker)
     retained_source_unknown = False
+    retained_state_unknown = False
     try:
         registry = RunResources(spec, read_only=True)
         with registry.locked(read_only=True) as resources:
@@ -1511,6 +1512,13 @@ def read_checkpoint(store, run_id, checkpoint_id):
                 # The exclusive witness is observational and grants no later work.
                 with store._checkpoint_writer_context(spec):
                     writer_unknown = False
+                    try:
+                        from .delivery_retained_checkpoint import verify_retained_state
+
+                        verify_retained_state(
+                            spec, value, _root(spec) / checkpoint_id, allow_missing=True)
+                    except (OSError, ValueError, KeyError):
+                        retained_state_unknown = True
                     checkout = Path(spec["checkout"])
                     if os.path.lexists(checkout) and _index_baseline_supported(value):
                         try:
@@ -1536,6 +1544,8 @@ def read_checkpoint(store, run_id, checkpoint_id):
         blockers.append({"scope": "writer", "reason": "checkpoint_writer_custody_unknown"})
     if retained_source_unknown:
         blockers.append({"scope": "source", "reason": "checkpoint_retained_source_unverified"})
+    if retained_state_unknown:
+        blockers.append({"scope": "state", "reason": "checkpoint_retained_state_unverified"})
     if feature_unknown:
         blockers.append({"scope": "feature", "reason": feature_unknown})
     index_unknown = not _index_baseline_supported(value)

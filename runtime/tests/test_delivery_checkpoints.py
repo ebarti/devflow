@@ -582,13 +582,59 @@ async def test_public_checkpoint_routes_require_csrf_and_return_verified_readbac
         response = await client.post(path, json=command, headers=headers)
         assert response.status_code == 200, response.text
         receipt = response.json()
-        assert (await client.get(path + "/" + receipt["checkpoint_id"])).json()["resumable"]
+        checkpoint_url = path + "/" + receipt["checkpoint_id"]
+        assert (await client.get(checkpoint_url)).json()["resumable"]
+        # Existing state targets must still match the acknowledged evidence.
+        # Missing targets remain eligible because restore can recreate them.
+        for target in (evidence, transcript):
+            original = target.read_bytes()
+            original_stat = target.stat()
+            target.write_text("changed retained fixture\n")
+            observed = (await client.get(checkpoint_url)).json()
+            assert observed["acknowledged_resumable"] and not observed["resumable"]
+            assert "checkpoint_retained_state_unverified" in {
+                blocker["reason"] for blocker in observed["resume_blockers"]}
+            verified = await client.post(
+                checkpoint_url + "/verify-retained", headers=headers,
+                json={"command_id": "verify-changed-" + target.name,
+                      "expected_revision": row["revision"]})
+            assert verified.status_code == 409
+            assert target.read_text() == "changed retained fixture\n"
+            target.write_bytes(original)
+            os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        # An unobservable parent is not proof of an absent, restorable file.
+        evidence.parent.chmod(0)
+        try:
+            unreadable = (await client.get(checkpoint_url)).json()
+            assert not unreadable["resumable"]
+            assert "checkpoint_retained_state_unverified" in {
+                blocker["reason"] for blocker in unreadable["resume_blockers"]}
+        finally:
+            evidence.parent.chmod(0o700)
+        # A foreign target must not be followed or altered by observation.
+        original = evidence.read_bytes()
+        original_stat = evidence.stat()
+        other = state / "owned-sentinel.txt"
+        other.write_text("untouched fixture\n")
+        evidence.unlink()
+        evidence.symlink_to(other)
+        linked = (await client.get(checkpoint_url)).json()
+        assert not linked["resumable"]
+        assert "checkpoint_retained_state_unverified" in {
+            blocker["reason"] for blocker in linked["resume_blockers"]}
+        assert other.read_text() == "untouched fixture\n"
+        evidence.unlink()
+        evidence.write_bytes(original)
+        evidence.chmod(0o600)
+        os.utime(evidence, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        assert (await client.get(checkpoint_url)).json()["resumable"]
         checkpoint = state / "checkpoints" / receipt["checkpoint_id"]
         assert not list(checkpoint.rglob("auth.json"))
         shutil.rmtree(Path(spec["source_path"]))
         shutil.rmtree(broker.checkout)
         shutil.rmtree(home)
         evidence.unlink()
+        assert (await client.get(checkpoint_url)).json()["resumable"]
         response = await client.post(
             path + "/" + receipt["checkpoint_id"] + "/restore",
             json={"command_id": "http-restore", "expected_revision": row["revision"]},
