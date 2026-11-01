@@ -310,6 +310,32 @@ async def test_real_deadline_stop_is_admitted_and_completed_without_an_implement
             # PR readback; the publication lease alone is not native cleanup.
             actor = subprocess.Popen(['/bin/sleep', '30'], cwd=broker.checkout)
             try:
+                import httpx
+
+                from devflow_temporal.delivery_api import create_app
+
+                app = create_app(store.config.path)
+                app.state.delivery.store = store
+                host = store.config.dashboard_url
+                transport = httpx.ASGITransport(app=app, client=('127.0.0.1', 10001))
+                async with httpx.AsyncClient(transport=transport, base_url=host) as browser:
+                    token = (await browser.get('/api/session')).json()['csrf_token']
+                    headers = {'Origin': host, 'X-Devflow-CSRF': token}
+                    path = '/api/runs/run-1/'
+                    preflight = await browser.post(path + 'assess-transition', json={
+                        'kind': 'recover_publication', 'request': recover})
+                    refusal = await browser.post(path + 'recover-publication', json=recover,
+                                                 headers=headers)
+                assert preflight.status_code == 200 and not preflight.json()['eligible']
+                assert any(item['code'] == 'publication_native_custody_unknown'
+                           and item['satisfied'] is None
+                           for item in preflight.json()['blockers']), (
+                    preflight.json(), refusal.status_code, refusal.json())
+                assert refusal.status_code == 409 and refusal.json()['detail'] == preflight.json()
+                with store._connect() as db:
+                    assert not db.execute(
+                        'SELECT 1 FROM delivery_commands WHERE command_id=?',
+                        (recover['command_id'],)).fetchone()
                 with pytest.raises(ValueError, match='live root user|unreadable lease'):
                     await asyncio.to_thread(store.recover_publication, 'run-1', recover)
             finally:
