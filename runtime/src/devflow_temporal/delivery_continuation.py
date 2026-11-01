@@ -67,14 +67,18 @@ SESSION_DB_RE = re.compile(
 )
 
 
-def session_state_paths(role_home: Path, session_id: str) -> list[str]:
-    """Select only provider session data; auth, profile, caches and tools are regenerated."""
+def session_state_paths(
+    role_home: Path, session_id: str, *, allow_absent: bool = False,
+) -> list[str]:
+    """Select session data; allow absence only for fixed providers without transcripts."""
 
     home_info = role_home.lstat()
     if not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != os.getuid():
         raise ValueError("continuation role home is not an owned directory")
     codex = role_home / "codex"
     if not codex.is_dir() or codex.is_symlink():
+        if allow_absent and not os.path.lexists(codex):
+            return []
         raise ValueError("continuation Codex home is unavailable")
     paths = [
         "codex/" + file.name
@@ -89,6 +93,8 @@ def session_state_paths(role_home: Path, session_id: str) -> list[str]:
             if session_id in file.name and (file.is_file() or file.is_symlink())
         )
     if not any(session_id in Path(path).name for path in paths):
+        if allow_absent:
+            return []
         raise ValueError("continuation session transcript is missing")
     return sorted(paths)
 

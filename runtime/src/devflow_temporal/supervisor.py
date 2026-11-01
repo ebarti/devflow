@@ -550,6 +550,11 @@ class DeliverySupervisor:
             from .delivery_resources import read_private, write_private
 
             output_candidate = await writer_thread(spec, self._completed_candidate, request, result)
+            if spec.get("provider") == "fake":
+                # This fixed fixture role cannot launch candidate-controlled children.
+                # Bind the supervisor's joined-process observation to its result.
+                result.setdefault("cleanup", "confirmed")
+                write_private(result_path, result)
             metadata = read_private(start_path)
             metadata.update(output_candidate=output_candidate, result_digest=digest(result))
             write_private(start_path, metadata)
