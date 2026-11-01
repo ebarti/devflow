@@ -287,22 +287,87 @@ def _verify_recorded_source(spec, value, checkpoint_root, resources):
             "branch": branch, "head": head, "index_tree": value["source"]["index_tree"]}
 
 
+def _retained_state_bytes(target, expected, size):
+    """Return validated bytes, or a coherently observed initial absence."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with ExitStack() as stack:
+        parent = os.open(target.anchor, flags)
+        stack.callback(os.close, parent)
+        directories = []
+
+        def parents_unchanged():
+            keys = ("st_dev", "st_ino", "st_mode", "st_uid")
+            try:
+                for owner, name, descriptor, initial in directories:
+                    current = os.fstat(descriptor)
+                    named = os.stat(name, dir_fd=owner, follow_symlinks=False)
+                    if (any(getattr(initial, key) != getattr(current, key) for key in keys)
+                            or any(getattr(current, key) != getattr(named, key) for key in keys)):
+                        raise ValueError("retained checkpoint state parent changed")
+            except FileNotFoundError as exc:
+                raise ValueError("retained checkpoint state parent became unavailable") from exc
+
+        def open_entry(name, entry_flags):
+            try:
+                return os.open(name, entry_flags, dir_fd=parent)
+            except FileNotFoundError:
+                parents_unchanged()
+                try:
+                    os.stat(name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    parents_unchanged()
+                    return None
+                raise ValueError("retained checkpoint state entry changed") from None
+
+        for name in target.parts[1:-1]:
+            opened = open_entry(name, flags)
+            if opened is None:
+                return None
+            stack.callback(os.close, opened)
+            directories.append((parent, name, opened, os.fstat(opened)))
+            parent = opened
+        if expected is not None and os.fstat(parent).st_uid != os.getuid():
+            raise ValueError("retained checkpoint destination parent is not owned")
+        opened = open_entry(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if opened is None:
+            return None
+        stack.callback(os.close, opened)
+        before = os.fstat(opened)
+        if expected is None:
+            raise ValueError("retained checkpoint no-GO absence changed")
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_nlink != 1 or before.st_size != size
+                or stat.S_IMODE(before.st_mode) != expected["mode"]
+                or before.st_mtime_ns != expected["mtime_ns"]):
+            raise ValueError("retained checkpoint evidence metadata changed")
+        with os.fdopen(os.dup(opened), "rb") as stream:
+            raw = stream.read(size + 1)
+        keys = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size",
+                "st_mtime_ns", "st_ctime_ns")
+        after = os.fstat(opened)
+        try:
+            named = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise ValueError("retained checkpoint evidence became unavailable") from exc
+        if (len(raw) != size
+                or any(getattr(before, key) != getattr(after, key) for key in keys)
+                or any(getattr(after, key) != getattr(named, key) for key in keys)):
+            raise ValueError("retained checkpoint evidence changed during observation")
+        parents_unchanged()
+        return raw
+
+
 def verify_retained_state(spec, value, checkpoint_root, *, allow_missing=False):
     """Verify state targets; missing files can be restored when explicitly allowed."""
     for relative, item in value["state_refs"].items():
         target = _path(Path(spec["state_dir"]), relative)
-        try:
-            info = target.lstat()
-        except FileNotFoundError:
+        expected = (None if item.get("kind") == "absent" else
+                    read_private(checkpoint_root / item["artifact"], raw=True))
+        raw = _retained_state_bytes(target, item if expected is not None else None,
+                                    len(expected) if expected is not None else 0)
+        if raw is None:
             if item.get("kind") == "absent" or allow_missing:
                 continue
-            raise
-        if item.get("kind") == "absent":
-            raise ValueError("retained checkpoint no-GO absence changed: " + relative)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
-            raise ValueError("retained checkpoint evidence is not an owned file: " + relative)
-        raw = target.read_bytes()
-        if (raw != read_private(checkpoint_root / item["artifact"], raw=True)
-                or _hash(raw) != item["sha256"] or stat.S_IMODE(info.st_mode) != item["mode"]
-                or info.st_mtime_ns != item["mtime_ns"]):
+            raise FileNotFoundError("retained checkpoint evidence is absent: " + relative)
+        if raw != expected or _hash(raw) != item["sha256"]:
             raise ValueError("retained checkpoint original evidence changed: " + relative)
